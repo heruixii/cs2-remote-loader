@@ -693,8 +693,8 @@ void* GenerateIndirectSyscallStub(DWORD ssn, uintptr_t syscallRetGadget) {
     BYTE stubCode2[] = {
         0x4C, 0x8B, 0xD1,             // mov r10, rcx
         0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax, <SSN>
-        0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rax, <gadget_addr>
-        0xFF, 0xE0                     // jmp rax
+        0x49, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov r11, <gadget_addr>
+        0x41, 0xFF, 0xE3              // jmp r11
     };
     *reinterpret_cast<DWORD*>(stubCode2 + 4) = ssn;
     *reinterpret_cast<uintptr_t*>(stubCode2 + 10) = syscallRetGadget;
@@ -790,7 +790,7 @@ void* GenerateDeepSpoofStub(DWORD ssn, uintptr_t syscallRetGadget,
 {
     if (!IsValidSyscallGadget(syscallRetGadget) || retGadgets.empty()) return nullptr;
 
-    size_t chainCount = std::min(retGadgets.size(), (size_t)32);
+    size_t chainCount = std::min(retGadgets.size(), (size_t)4);
     if (chainCount < 4) return nullptr;
 
     const size_t codeHeaderSize = 1 + 1 + 3 + 5 + 7 + 3;
