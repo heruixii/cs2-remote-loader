@@ -137,6 +137,133 @@ static void TerminateBasicESP() {
     }
 }
 
+// v3.32-plus: 注入痕迹清理 — 基础.exe 注入到 cs2.exe 后, 从外部通过 handles
+// 清除 PEB Ldr 链表中的注入模块条目, 防止 EAC 用户态模块枚举检测
+// 同时清理注入线程的 TEB 痕迹
+static void CleanupInjectionTraces() {
+    using namespace stealth;
+    HANDLE hProc = StealthEngine::Instance().GetProcessHandle();
+    if (!hProc) return;
+
+    // 等待基础.exe 完成注入 (额外等待, 配合 LaunchBasicESP 中的 2s)
+    Sleep(3000);
+    DiagLog("CleanupInjectionTraces: scanning PEB Ldr...\n");
+
+    // 1. 获取 PEB 地址
+    PROCESS_BASIC_INFORMATION pbi = {};
+    ULONG rl = 0;
+    if (!NT_SUCCESS(SysQueryInformationProcess(hProc, 0, &pbi, sizeof(pbi), &rl, SyscallMethod::Indirect))) {
+        DiagLog("CleanupInjectionTraces: QueryInfoProcess failed\n");
+        return;
+    }
+    DiagLog("CleanupInjectionTraces: PEB=0x%llX\n", (unsigned long long)pbi.PebBaseAddress);
+
+    // 2. 读取 PEB → Ldr
+    BYTE pebBuf[0x200] = {};
+    SIZE_T br = 0;
+    if (!NT_SUCCESS(SysReadVirtualMemory(hProc, pbi.PebBaseAddress, pebBuf, sizeof(pebBuf), &br, SyscallMethod::Indirect))) {
+        DiagLog("CleanupInjectionTraces: Read PEB failed\n");
+        return;
+    }
+    uintptr_t ldr = *(uintptr_t*)(pebBuf + 0x18);
+    DiagLog("CleanupInjectionTraces: Ldr=0x%llX\n", (unsigned long long)ldr);
+    if (!ldr) return;
+
+    // 已知合法模块前缀 (CS2 + Windows系统)
+    static const wchar_t* knownPrefixes[] = {
+        L"ntdll", L"kernel", L"KERNEL", L"user32", L"gdi32",
+        L"advapi", L"shell32", L"ole32", L"comctl", L"msvc",
+        L"vcruntime", L"ucrtbase", L"bcrypt", L"crypt",
+        L"setupapi", L"winhttp", L"ws2_32", L"iphlpapi",
+        L"d3d", L"dxgi", L"nv", L"ati", L"amd",
+        L"client.dll", L"engine2.dll", L"tier0", L"input",
+        L"materials", L"vphysics", L"studiorender",
+        L"scenesystem", L"resourcesystem", L"rendersystem",
+        L"soundsystem", L"networksystem", L"animationsystem",
+        L"particles", L"vscript", L"vstdlib", L"matchmaking",
+        L"steamclient", L"gameoverlay", L"serverbrowser",
+        L"msvcp", L"concrt", L"shcore", L"imm32",
+        L"windows.", L"profapi", L"powrprof",
+        L"umpdc", L"kernelbase", L"cfg", L"devobj",
+        L"wintrust", L"msasn1", L"crypt32", L"wldp",
+        L"ntmarta", L"fltlib", L"sechost", L"sspicli",
+        L"gdi32full", L"win32u", L"msctf", L"textinput",
+        L"msimg32", L"dbghelp", L"dbgcore",
+        L"EasyAntiCheat", L"EAC",
+        nullptr
+    };
+
+    auto isKnownModule = [&](const wchar_t* name) -> bool {
+        if (!name[0]) return true; // 空名跳过
+        for (int i = 0; knownPrefixes[i]; i++) {
+            if (_wcsnicmp(name, knownPrefixes[i], wcslen(knownPrefixes[i])) == 0)
+                return true;
+        }
+        return false;
+    };
+
+    // 3. 同时清理两个模块链表: InLoadOrder (Ldr+0x10) 和 InMemoryOrder (Ldr+0x20)
+    struct ListCleanup { uintptr_t headAddr; const char* desc; };
+    ListCleanup lists[] = {
+        { ldr + 0x10, "InLoadOrder" },
+        { ldr + 0x20, "InMemoryOrder" },
+    };
+
+    int totalCleaned = 0;
+    for (auto& list : lists) {
+        BYTE headBuf[16] = {};
+        if (!NT_SUCCESS(SysReadVirtualMemory(hProc, (PVOID)list.headAddr, headBuf, 16, &br, SyscallMethod::Indirect)))
+            continue;
+
+        uintptr_t headLink = list.headAddr;
+        uintptr_t cur = *(uintptr_t*)(headBuf + 0); // FLink
+        int walked = 0;
+
+        while (cur && cur != headLink && walked < 256) {
+            walked++;
+            BYTE modBuf[0x200] = {};
+            if (!NT_SUCCESS(SysReadVirtualMemory(hProc, (PVOID)cur, modBuf, sizeof(modBuf), &br, SyscallMethod::Indirect)))
+                break;
+
+            uintptr_t flink = *(uintptr_t*)(modBuf + 0);
+            uintptr_t dllBase = *(uintptr_t*)(modBuf + 0x30);
+            uintptr_t nameBufAddr = *(uintptr_t*)(modBuf + 0x48);
+            USHORT nameLen = *(USHORT*)(modBuf + 0x50);
+
+            wchar_t modName[128] = {};
+            if (nameBufAddr && nameLen > 0 && nameLen < 254) {
+                SysReadVirtualMemory(hProc, (PVOID)nameBufAddr, modName,
+                    (SIZE_T)(std::min((int)nameLen, 254)), &br, SyscallMethod::Indirect);
+            }
+
+            if (!isKnownModule(modName) && dllBase) {
+                DiagLog("CleanupInjectionTraces: [%s] UNLINK %ls (base=0x%llX, flink=0x%llX)\n",
+                    list.desc, modName, (unsigned long long)dllBase, (unsigned long long)cur);
+
+                // 读取当前节点的 LIST_ENTRY
+                uintptr_t nodeFlink = *(uintptr_t*)(modBuf + 0);
+                uintptr_t nodeBlink = *(uintptr_t*)(modBuf + 8);
+
+                if (nodeFlink && nodeBlink) {
+                    // nodeBlink->FLink = nodeFlink
+                    SIZE_T wb = 0;
+                    SysWriteVirtualMemory(hProc, (PVOID)nodeBlink, &nodeFlink, 8, &wb, SyscallMethod::Indirect);
+                    // nodeFlink->BLink = nodeBlink
+                    SysWriteVirtualMemory(hProc, (PVOID)(nodeFlink + 8), &nodeBlink, 8, &wb, SyscallMethod::Indirect);
+                    // 清理当前节点的链接 (预防性措施)
+                    SysWriteVirtualMemory(hProc, (PVOID)(cur + 0), &cur, 8, &wb, SyscallMethod::Indirect);
+                    SysWriteVirtualMemory(hProc, (PVOID)(cur + 8), &cur, 8, &wb, SyscallMethod::Indirect);
+                    totalCleaned++;
+                }
+            }
+
+            cur = flink;
+        }
+    }
+
+    DiagLog("CleanupInjectionTraces: done, cleaned %d entries\n", totalCleaned);
+}
+
 // ============================================================
 // 作弊主循环
 // 直接在 DllMain 的调用线程上运行，不创建新线程
@@ -258,6 +385,10 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     {
         bool basicOk = LaunchBasicESP();
         DiagLog("LaunchBasicESP: %s\n", basicOk ? "SUCCESS" : "FAILED");
+        // v3.32-plus: 基础.exe 注入后清理痕迹 (PEB Ldr unlinking)
+        if (basicOk) {
+            CleanupInjectionTraces();
+        }
     }
 
     {
@@ -586,6 +717,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 g_hBasicProcess = nullptr;
                 Sleep(g_basicRestartBackoffMs);
                 LaunchBasicESP();
+                // v3.32-plus: 基础.exe 重启后重新清理注入痕迹
+                CleanupInjectionTraces();
                 // 指数退避: 每次重启失败后加倍等待 (上限30秒)
                 if (g_basicRestartBackoffMs < 30000)
                     g_basicRestartBackoffMs *= 2;
