@@ -217,6 +217,30 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             }
         }
         DiagLog("  -- found %d valid ptrs in range --\n", found);
+
+        // Dump entity system raw memory to understand structure
+        DiagLog("  -- entity system dump (first 512 bytes) --\n");
+        {
+            uintptr_t elBase = *(uintptr_t*)((BYTE*)nullptr + 0); // placeholder, we read from entity list offset
+            SIZE_T br = 0;
+            SysReadVirtualMemory(hProc, (PVOID)(cb + off.dwEntityList), &elBase, 8, &br, SyscallMethod::Indirect);
+            if (elBase) {
+                BYTE buf[512] = {};
+                SIZE_T br2 = 0;
+                SysReadVirtualMemory(hProc, (PVOID)elBase, buf, 512, &br2, SyscallMethod::Indirect);
+                for (int row = 0; row < 32; row++) {
+                    DiagLog("  +0x%03X: ", row * 16);
+                    for (int col = 0; col < 16; col++) DiagLog("%02X ", buf[row * 16 + col]);
+                    DiagLog("\n");
+                }
+                // Also read highest entity index at known offsets
+                for (int offTry : {0x2090, 0x20A0, 0x20F0, 0x118, 0x20}) {
+                    int hi = 0;
+                    SysReadVirtualMemory(hProc, (PVOID)(elBase + offTry), &hi, 4, &br2, SyscallMethod::Indirect);
+                    DiagLog("  highestIdx@+0x%X = %d\n", offTry, hi);
+                }
+            }
+        }
     }
     HWND cs2Hwnd = FindWindowW(nullptr, nullptr);
     while (cs2Hwnd) {
