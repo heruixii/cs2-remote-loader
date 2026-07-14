@@ -1,0 +1,11 @@
+# IDE
+.vs/
+
+# Temp
+*.tmp
+~*
+
+# Source files from parent stealth_lib (not needed in this repo)
+# These are compiled into payload.dll
+../*.cpp
+../*.h
