@@ -48,6 +48,9 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     uint64_t offset    = (dllBase && crashAddr >= dllBase) ? (crashAddr - dllBase) : 0;
     DiagLog("CRASH: code=0x%08X addr=0x%llX off=%llX\n",
         ep->ExceptionRecord->ExceptionCode, crashAddr, offset);
+    // 卸载 BYOVD 驱动 (崩溃后残留内核驱动可被EAC扫描到)
+    // 如果这里的卸载也崩溃, 进程本身已在崩溃中, 不影响
+    stealth::KernelDefense::DisableAll();
     return EXCEPTION_CONTINUE_SEARCH; // 让进程崩溃
 }
 
@@ -73,6 +76,20 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     PVOID vehHandle = AddVectoredExceptionHandler(1, DiagVehHandler);
     DiagLog("VEH registered, dllBase=0x%llX dllSize=%llu\n",
         (unsigned long long)dllBase, (unsigned long long)dllSize);
+
+    // ============================================================
+    // 注册 EkkoSleep 内存加密保护区
+    // 必须在 PE 头剥离前完成, 否则无法解析 section 边界
+    // Sleep 期间整段 DLL 被加密, 防止 EAC 内存扫描
+    // ============================================================
+    {
+        // 跳过第一页(PE头, 将被剥离), 保护剩余代码+数据段
+        SIZE_T codeSize = (dllSize > 0x1000) ? (dllSize - 0x1000) : dllSize;
+        SleepObfuscator::Instance().RegisterProtectedRegion(
+            (void*)((uintptr_t)dllBase + 0x1000), codeSize);
+        DiagLog("OK: EkkoSleep protected %llu bytes\n", 
+            (unsigned long long)codeSize);
+    }
 
     // --- 阶段1: 初始化规避引擎 (9层) ---
     if (!StealthEngine::Instance().Initialize()) {
