@@ -1120,41 +1120,10 @@ NTSTATUS SysOpenProcess(
     PHANDLE hProcess, ACCESS_MASK desiredAccess,
     POBJECT_ATTRIBUTES objAttr, PCLIENT_ID clientId, SyscallMethod method)
 {
-    MessageBoxW(0, L"SysOP: Instance...", L"DBG", 0);
-    auto& resolver = SyscallResolver::Instance();
-    MessageBoxW(0, L"SysOP: GetNumbers...", L"DBG", 0);
-    DWORD ssn = resolver.GetNumbers().NtOpenProcess;
-    if (!ssn) { resolver.InitializeHaloGate(); ssn = resolver.GetNumbers().NtOpenProcess; }
-
-    MessageBoxW(0, L"SysOP: DecideMethod...", L"DBG", 0);
-    SyscallMethod m = DecideMethod(method);
-    void* stub = nullptr;
-    if (m == SyscallMethod::StackSpoof) {
-        MessageBoxW(0, L"SysOP: StackSpoof path...", L"DBG", 0);
-        uintptr_t gadget = resolver.GetSyscallRetGadget();
-        auto retGadgets = GetRetGadgets(32);
-        auto spoofCtx = CallStackSpoofer::Instance().GetRandomSpoofContext();
-        if (gadget && !retGadgets.empty()) {
-            stub = GenerateDeepSpoofStub(ssn, gadget, retGadgets, spoofCtx);
-        }
-    }
-    if (!stub && m == SyscallMethod::Indirect) {
-        MessageBoxW(0, L"SysOP: Indirect path...", L"DBG", 0);
-        stub = GenerateIndirectSyscallStub(ssn, resolver.GetSyscallRetGadget());
-    }
-    if (!stub) {
-        MessageBoxW(0, L"SysOP: TartarusGate...", L"DBG", 0);
-        stub = TartarusGate::GenerateSyscallStub(ssn);
-    }
-    if (!stub) {
-        MessageBoxW(0, L"SysOP: GetProcAddress fallback...", L"DBG", 0);
-        using Fn = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID);
-        auto fn = reinterpret_cast<Fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtOpenProcess"));
-        return fn ? fn(hProcess, desiredAccess, objAttr, clientId) : STATUS_NOT_SUPPORTED;
-    }
-    MessageBoxW(0, L"SysOP: Calling stub...", L"DBG", 0);
+    // ManualMap 下 syscall stub 生成不稳定, 直接走 GetProcAddress 回退路径
     using Fn = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID);
-    return reinterpret_cast<Fn>(stub)(hProcess, desiredAccess, objAttr, clientId);
+    auto fn = reinterpret_cast<Fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtOpenProcess"));
+    return fn ? fn(hProcess, desiredAccess, objAttr, clientId) : STATUS_NOT_SUPPORTED;
 }
 
 // ---- SysQuerySystemInformation ----
