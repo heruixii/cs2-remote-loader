@@ -192,18 +192,21 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         diagRead("dwEntityList     ", cb + off.dwEntityList);
         diagRead("dwViewMatrix     ", cb + off.dwViewMatrix);
 
-        // 尝试 entity list 基地址附近的常见偏移
-        DiagLog("  -- scanning nearby entity list patterns --\n");
-        for (int step = -10; step <= 10; step++) {
+        // 宽范围扫描 entity list 偏移附近
+        DiagLog("  -- wide scan entity list candidates --\n");
+        int found = 0;
+        for (int step = -200; step <= 200 && found < 20; step++) {
             uintptr_t offAdj = off.dwEntityList + step * 8;
             uintptr_t val = 0;
             SIZE_T br = 0;
             SysReadVirtualMemory(hProc, (PVOID)(cb + offAdj), &val, 8, &br, SyscallMethod::Indirect);
             if (cb > 0 && val > cb && val < (cb + 0x20000000)) {
-                DiagLog("  ENTITY_CANDIDATE: off=0x%llX val=0x%llX delta=%+lld*8\n",
-                    (unsigned long long)offAdj, (unsigned long long)val, (long long)step);
+                DiagLog("  ENT: off=0x%llX val=0x%llX step=%+d (%+d bytes)\n",
+                    (unsigned long long)offAdj, (unsigned long long)val, step, step * 8);
+                found++;
             }
         }
+        if (found == 0) DiagLog("  ENT: no candidates in ±1600 bytes\n");
     }
     HWND cs2Hwnd = FindWindowW(nullptr, nullptr);
     while (cs2Hwnd) {

@@ -42,7 +42,7 @@ uintptr_t Memory::EntityList() {
 }
 
 uintptr_t Memory::LocalPlayerController() {
-    return Read<uintptr_t>(m_clientBase + m_offsets.dwLocalPlayerPawn);
+    return Read<uintptr_t>(m_clientBase + m_offsets.dwLocalPlayerController);
 }
 
 uintptr_t Memory::LocalPlayerPawn() {

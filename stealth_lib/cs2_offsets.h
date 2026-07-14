@@ -18,7 +18,8 @@ struct Offsets {
     // 引擎层 — 来自 a2x/cs2-dumper 2026-04-03
     uintptr_t dwViewMatrix       = 0x2313F10;
     uintptr_t dwViewAngles       = 0x231E9B8;
-    uintptr_t dwLocalPlayerPawn  = 0x206D9E0;
+    uintptr_t dwLocalPlayerController = 0x22F8028;  // controller (team/score/name)
+    uintptr_t dwLocalPlayerPawn  = 0x206D9E0;        // pawn 直接指针 (部分版本用)
     uintptr_t dwEntityList       = 0x24B3268;
     uintptr_t dwGameRules        = 0x2311ED0;
 
