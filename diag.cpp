@@ -1,4 +1,5 @@
-﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿#include <windows.h>
+#include <windows.h>
+#include <memoryapi.h>
 #include <winhttp.h>
 #include <cstdint>
 #include <cstdio>
