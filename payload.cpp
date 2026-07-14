@@ -19,29 +19,35 @@
 static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     using namespace stealth;
 
+    MessageBoxW(0, L"DBG1: Entering Initialize...", L"Payload Diag", 0);
+
     // 初始化规避引擎 (全部9层)
     if (!StealthEngine::Instance().Initialize()) {
+        MessageBoxW(0, L"FAIL: StealthEngine::Initialize()", L"Payload Diag", MB_ICONERROR);
         return 1;
     }
+
+    MessageBoxW(0, L"DBG2: Initialize OK. SelfCloak...", L"Payload Diag", 0);
 
     // === 自身内存隐身: PE头擦除 + 假Ldr条目 + 自断链 + 页保护随机化 ===
     if (dllBase && dllSize > 0) {
         SelfCloaker::CloakManualMap(dllBase, dllSize);
     }
 
-    // 附加到游戏进程 (使用PROCESS_QUERY_LIMITED_INFORMATION最小权限打开)
+    MessageBoxW(0, L"DBG3: SelfCloak OK. AttachToProcess...", L"Payload Diag", 0);
+
+    // 附加到游戏进程
     if (!StealthEngine::Instance().AttachToProcess(L"cs2.exe")) {
+        MessageBoxW(0, L"FAIL: AttachToProcess (cs2.exe not found or access denied)", L"Payload Diag", MB_ICONERROR);
         StealthEngine::Instance().Shutdown();
         return 2;
     }
 
+    MessageBoxW(0, L"DBG4: Attach OK. Starting main loop...", L"Payload Diag", 0);
+
     // 主循环
     while (true) {
         StealthEngine::Instance().OnFrame();
-
-        // === 在此处添加您的作弊逻辑 ===
-        // STEALTH_READ / STEALTH_WRITE / StealthSleep 等
-        // ===============================
 
         StealthEngine::Instance().StealthSleep(1);
     }
