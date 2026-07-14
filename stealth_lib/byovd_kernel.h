@@ -145,9 +145,6 @@ public:
     // 检查内核地址是否有效 (避免访问无效内存导致BSOD)
     bool IsKernelAddressValid(uint64_t va);
 
-    // 主动卸载已加载的 BYOVD 驱动
-    void EjectLoadedDrivers();
-
 private:
     KernelMemoryAccessor() = default;
 

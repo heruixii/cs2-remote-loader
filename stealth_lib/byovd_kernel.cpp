@@ -663,19 +663,6 @@ void KernelMemoryAccessor::Shutdown() {
     }
 }
 
-void KernelMemoryAccessor::EjectLoadedDrivers() {
-    // 主动卸载已加载的 BYOVD 驱动
-    // v3.25: 先卸载驱动再关闭句柄, 与 Shutdown() 保持一致
-    m_active = false;
-    if (!m_driverInfo.serviceName.empty()) {
-        UnloadDriver(m_driverInfo.serviceName);
-    }
-    if (m_hDevice != INVALID_HANDLE_VALUE) {
-        CloseHandle(m_hDevice);
-        m_hDevice = INVALID_HANDLE_VALUE;
-    }
-}
-
 bool KernelMemoryAccessor::IsKernelAddressValid(uint64_t va) {
     // 内核地址范围检查 (Windows x64 规范)
     // 内核空间: 0xFFFF800000000000 ~ 0xFFFFFFFFFFFFFFFF
