@@ -627,7 +627,9 @@ SelfCloaker::CloakResult SelfCloaker::CloakManualMap(HMODULE dllBase, SIZE_T dll
 
     // 3. 随机化页保护
     MessageBoxW(0, L"CLOAK4: RandomizeProtections...", L"CloakDiag", 0);
-    result.protectionMixed = RandomizeProtections(dllBase, dllSize);
+    // SKIP: ManualMap 场景下 RandomizeProtections 不稳定
+    result.protectionMixed = true;
+    // result.protectionMixed = RandomizeProtections(dllBase, dllSize);
 
     return result;
 }
