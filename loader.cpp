@@ -24,7 +24,7 @@
 // ============================================================
 
 // Payload 下载地址 — 部署时替换为你的服务器 URL
-static const wchar_t* PAYLOAD_URL = L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/main/payload.dat";
+static const wchar_t* PAYLOAD_URL = L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/master/payload.dat";
 
 // 备选 URL (主 URL 不可用时回退)
 static const wchar_t* PAYLOAD_URL_FALLBACK = L"";
