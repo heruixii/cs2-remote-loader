@@ -134,6 +134,29 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     cs2::ESP::Instance().SetConfig(espCfg);
 
     // --- 阶段7: 主循环 (ESP 渲染) ---
+    // ---- 预检查: 测试内存读取是否能读到正确数据 ----
+    {
+        uintptr_t cb = cs2::Memory::Instance().ClientBase();
+        uintptr_t elAddr = cb + offsets.dwEntityList;
+        uintptr_t lpAddr = cb + offsets.dwLocalPlayerPawn;
+
+        // 用普通路径读
+        uintptr_t elVal = cs2::Memory::Instance().Read<uintptr_t>(elAddr);
+        uintptr_t lpVal = cs2::Memory::Instance().Read<uintptr_t>(lpAddr);
+
+        // 读 clientBase 前2字节验证 (应为 "MZ" = 0x5A4D)
+        uint16_t magic = cs2::Memory::Instance().Read<uint16_t>(cb);
+
+        DiagLog("PRE-CHECK: cb=0x%llX elAddr=0x%llX elVal=0x%llX lpAddr=0x%llX lpVal=0x%llX magic=0x%04X(%s)\n",
+            (unsigned long long)cb,
+            (unsigned long long)elAddr,
+            (unsigned long long)elVal,
+            (unsigned long long)lpAddr,
+            (unsigned long long)lpVal,
+            magic,
+            (magic == 0x5A4D) ? "OK_MZ" : "BAD");
+    }
+
     DiagLog("=== MAIN LOOP START ===\n");
     int frameCount = 0;
     DWORD lastDiagTime = 0;
