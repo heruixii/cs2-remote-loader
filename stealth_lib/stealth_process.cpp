@@ -554,4 +554,40 @@ uintptr_t StealthMemory::AllocateViaSection(HANDLE hProcess, SIZE_T size) {
     return reinterpret_cast<uintptr_t>(remoteAddr);
 }
 
+// ============================================================
+// 内存释放 (v3.25)
+// ============================================================
+
+bool StealthMemory::FreeInExistingRegion(HANDLE hProcess, uintptr_t addr, SIZE_T size) {
+    if (!addr || size == 0) return false;
+
+    // 使用 NtFreeVirtualMemory (SyscallDispatcher 间接调用)
+    using NtFreeVirtualMemory_t = NTSTATUS(NTAPI*)(HANDLE, PVOID*, PSIZE_T, ULONG);
+    static auto pNtFreeVirtualMemory = reinterpret_cast<NtFreeVirtualMemory_t>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtFreeVirtualMemory"));
+
+    if (!pNtFreeVirtualMemory) {
+        // 降级到 Win32 VirtualFreeEx (MEM_RELEASE 要求 dwSize=0)
+        return VirtualFreeEx(hProcess, reinterpret_cast<LPVOID>(addr), 0, MEM_RELEASE) != 0;
+    }
+
+    PVOID baseAddr = reinterpret_cast<PVOID>(addr);
+    SIZE_T regionSize = 0; // MEM_RELEASE 要求 RegionSize=0
+    NTSTATUS st = pNtFreeVirtualMemory(hProcess, &baseAddr, &regionSize, MEM_RELEASE);
+    return NT_SUCCESS(st);
+}
+
+bool StealthMemory::UnmapSectionView(HANDLE hProcess, uintptr_t addr) {
+    if (!addr) return false;
+
+    using NtUnmapViewOfSection_t = NTSTATUS(NTAPI*)(HANDLE, PVOID);
+    static auto pNtUnmapViewOfSection = reinterpret_cast<NtUnmapViewOfSection_t>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtUnmapViewOfSection"));
+
+    if (!pNtUnmapViewOfSection) return false;
+
+    NTSTATUS st = pNtUnmapViewOfSection(hProcess, reinterpret_cast<PVOID>(addr));
+    return NT_SUCCESS(st);
+}
+
 } // namespace stealth

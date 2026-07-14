@@ -172,18 +172,19 @@ bool StealthEngine::AttachToProcessByWindow(
 void StealthEngine::OnFrame() {
     if (!m_initialized || !m_hProcess) return;
 
-    // === VAC 扫描周期管理 ===
+    // === VAC 完整性检查对抗 ===
+    // v3.25: 移除了针对自身 .text 段的 Restore→Reapply 空循环
+    //   原因: IntegrityBypass 操作的是 payload 自身 .text 段, 而 VAC 扫描
+    //   cs2.exe/engine.dll/ntdll.dll. 且 patchedBytes==originalBytes 导致
+    //   ReapplyTextPatches 是 nop, 循环无实际作用.
+    //   实际的 ntdll ETW/AMSI 补丁保护由 StealthSleep 中的
+    //   TelemetrySilencer::RestoreAll/SilenceAll 每500ms自动切换完成,
+    //   以及 verifyHook 检测中的 VerifyAndRepairAll (每5s) 兜底.
     if (m_config.enableVACSafety) {
-        DWORD now = GetTickCount();
-        if (now - m_lastVACCheck > m_vacScanInterval) {
-            m_lastVACCheck = now;
-
-            // 快速恢复 .text 段
-            IntegrityBypass::RestoreTextSection();
-            Sleep(150); // 等待扫描完成
-            IntegrityBypass::ReapplyTextPatches();
-        }
+        // 不再执行 payload .text Restore→Reapply 无用循环
+        // VAC 保护依赖 StealthSleep ETW toggle + ntdll stub 完整性检测
     }
+    // ※ 不要直接删除这个分支 — 保留 enableVACSafety 配置项兼容性
 
     // === 验证关键 API 是否被 Hook ===
     if (m_config.detectInHooks || m_config.detectIATHooks) {

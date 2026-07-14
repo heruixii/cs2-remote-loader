@@ -626,6 +626,25 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     m_ntosBase = GetNtoskrnlBase();
     m_pageTableWalker.reset();
 
+    // v3.25: 探测 IOCTL 验证驱动 R/W 确实可用
+    // 尝试读取 ntoskrnl.exe 的 MZ 头确认内核内存访问正常
+    if (m_ntosBase) {
+        uint16_t magic = 0;
+        bool probeOk = ReadKernelVA(m_ntosBase, &magic, 2);
+        if (!probeOk || magic != 0x5A4D) { // "MZ"
+            // IOCTL 通道阻塞 (微软黑名单 或 驱动版本不兼容)
+            // 标记为不可用但不崩溃, 后续回调摘除会静默失败
+            m_active = false;
+            CloseHandle(m_hDevice);
+            m_hDevice = INVALID_HANDLE_VALUE;
+            UnloadDriver(driver.serviceName);
+            return false;
+        }
+    } else {
+        // 无法定位 ntoskrnl, 驱动虽加载但无法验证
+        // 降级: 仍标记为 active, 回调操作将尝试
+    }
+
     return true;
 }
 
@@ -645,13 +664,16 @@ void KernelMemoryAccessor::Shutdown() {
 }
 
 void KernelMemoryAccessor::EjectLoadedDrivers() {
-    // 主动卸载已加载的 BYOVD 驱动 (在 shutdown 时调用)
+    // 主动卸载已加载的 BYOVD 驱动
+    // v3.25: 先卸载驱动再关闭句柄, 与 Shutdown() 保持一致
+    m_active = false;
+    if (!m_driverInfo.serviceName.empty()) {
+        UnloadDriver(m_driverInfo.serviceName);
+    }
     if (m_hDevice != INVALID_HANDLE_VALUE) {
         CloseHandle(m_hDevice);
         m_hDevice = INVALID_HANDLE_VALUE;
     }
-    UnloadDriver(m_driverInfo.serviceName);
-    m_active = false;
 }
 
 bool KernelMemoryAccessor::IsKernelAddressValid(uint64_t va) {

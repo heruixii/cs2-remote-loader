@@ -81,8 +81,10 @@ struct StealthConfig {
     bool enableAngleValidation  = true;  // 视角变化校验
 
     // 反调试 (anti_debug)
-    bool enableAntiDebug        = true;  // 启用全套反调试
-    bool aggressiveAntiDebug    = true;  // 主动规避 (HideAllThreads等)
+    // v3.25: aggressiveAntiDebug 默认 false — ThreadHideFromDebugger(0x11)
+    //   是 EAC 内核回调的重点监控目标, 在 EAC 环境下会暴露自身而非规避
+    bool enableAntiDebug        = true;
+    bool aggressiveAntiDebug    = false;
 
     // 注入方法 (stealth_injection)
     bool enableManualMap        = false; // 使用 Manual Map 替代 LoadLibrary

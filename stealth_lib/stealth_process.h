@@ -143,8 +143,16 @@ public:
     // 在已存在的合法内存区域中分配 (如目标进程的堆)
     static uintptr_t AllocateInExistingRegion(HANDLE hProcess, SIZE_T size);
 
+    // 释放 AllocateInExistingRegion 分配的内存
+    // v3.25: 补充 Free 接口防止内存泄漏
+    static bool FreeInExistingRegion(HANDLE hProcess, uintptr_t addr, SIZE_T size);
+
     // 使用文件映射共享内存 (更难追踪)
     static uintptr_t AllocateViaSection(HANDLE hProcess, SIZE_T size);
+
+    // 取消映射 AllocateViaSection 的远程视图
+    // v3.25: 补充 Unmap 接口释放 Section 映射
+    static bool UnmapSectionView(HANDLE hProcess, uintptr_t addr);
 
 private:
     StealthMemory() = default;
