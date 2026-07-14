@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 332
+// BUILD: 333
 // ============================================================
 
 #include "stealth_core.h"
@@ -486,7 +486,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.32 DIAG START ===\n");
+    DiagLog("=== v3.33 DIAG START ===\n");
     DiagLog("BEFORE Init...\n");
 
     // 安装 VEH 崩溃捕获器
@@ -902,9 +902,10 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         DiagLog("--- End Entity Chain Trace ---\n");
     }
 
-    DiagLog("=== MAIN LOOP START (v3.32: basic.exe ESP) ===\n");
+    DiagLog("=== MAIN LOOP START (v3.33: basic.exe ESP + 3-method anti-trace) ===\n");
     int frameCount = 0;
     DWORD lastDiagTime = 0;
+    DWORD lastRetryTime = 0;
     while (true) {
         frameCount++;
 
@@ -916,28 +917,39 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             stealth::SyscallGuard::VerifyAndRepair();
         }
 
-        // v3.32: 监控基础.exe 是否还活着 (带退避重试)
+        // v3.33: 监控基础.exe 是否还活着 (修复版: 失败后可重试, 成功后重置退避)
         if (g_hBasicProcess) {
             DWORD exitCode = STILL_ACTIVE;
             if (!GetExitCodeProcess(g_hBasicProcess, &exitCode) || exitCode != STILL_ACTIVE) {
-                DiagLog("WARN: basic.exe exited (code=%u), restart in %ums...\n",
-                    exitCode, g_basicRestartBackoffMs);
+                DiagLog("WARN: basic.exe exited (code=%u), will retry...\n", exitCode);
                 CloseHandle(g_hBasicProcess);
                 g_hBasicProcess = nullptr;
-                Sleep(g_basicRestartBackoffMs);
-                LaunchBasicESP();
-                // v3.32-plus: 基础.exe 重启后重新清理注入痕迹
-                CleanupInjectionTraces();
-                // 指数退避: 每次重启失败后加倍等待 (上限30秒)
-                if (g_basicRestartBackoffMs < 30000)
-                    g_basicRestartBackoffMs *= 2;
+                lastRetryTime = GetTickCount() - g_basicRestartBackoffMs; // 立即触发重试
             } else {
                 // 基础.exe 正常运行, 重置退避时间
                 g_basicRestartBackoffMs = 1000;
             }
         }
 
-        // 每秒一次诊断
+        // 重试启动 (独立判断, 不依赖 g_hBasicProcess 状态)
+        if (!g_hBasicProcess) {
+            DWORD nowTick = GetTickCount();
+            if (nowTick - lastRetryTime >= g_basicRestartBackoffMs) {
+                lastRetryTime = nowTick;
+                bool restartOk = LaunchBasicESP();
+                DiagLog("basic.exe retry: %s (backoff=%ums)\n",
+                    restartOk ? "OK" : "FAILED", g_basicRestartBackoffMs);
+                if (restartOk) {
+                    CleanupInjectionTraces();
+                    g_basicRestartBackoffMs = 1000; // 成功后重置
+                } else {
+                    if (g_basicRestartBackoffMs < 30000)
+                        g_basicRestartBackoffMs *= 2;
+                }
+            }
+        }
+
+        // 每5秒一次诊断
         DWORD now = GetTickCount();
         if (now - lastDiagTime >= 5000) {
             lastDiagTime = now;
@@ -949,7 +961,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 (unsigned long long)cs2::Memory::Instance().ClientBase());
         }
 
-        // v3.32: EkkoSleep 内存加密 (Sleep期间整段DLL被加密, 防EAC扫描)
+        // EkkoSleep 内存加密 (Sleep期间整段DLL被加密, 防EAC扫描)
         StealthEngine::Instance().StealthSleep(50); // 低频, 减少CPU占用
     }
 
