@@ -49,7 +49,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.2 DIAG START ===\n");
+    DiagLog("=== v3.8-e9ff50d DIAG START ===\n");
+    DiagLog("BEFORE Init...\n");
 
     // --- 阶段1: 初始化规避引擎 (9层) ---
     if (!StealthEngine::Instance().Initialize()) {
