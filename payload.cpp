@@ -4,11 +4,14 @@
 // 编译为 DLL, 经 XTEA 加密后托管在 HTTP 服务器上,
 // 由 loader.exe 下载 → 解密 → ManualMap 到内存中执行,
 // 全程不落盘, 规避 EAC minifilter 文件扫描。
-// v3.30: DecideMethod优先Indirect, 规避StackSpoof >=5参数AV崩溃
+//
+// v3.32: 嵌入基础.exe, 注入后自动启动基础.exe 做 ESP 渲染,
+//        本 DLL 只负责反检测 (BYOVD/Syscall/内存加密等),
+//        ESP 渲染由基础.exe (GDI overlay) 完成。
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 330
+// BUILD: 332
 // ============================================================
 
 #include "stealth_core.h"
@@ -59,6 +62,82 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     return EXCEPTION_CONTINUE_SEARCH; // 让进程崩溃
 }
 
+// v3.32: 基础.exe 进程句柄 (退出时清理)
+static HANDLE g_hBasicProcess = nullptr;
+static DWORD g_basicRestartBackoffMs = 1000;  // 退避时间, 防止快速重启循环
+
+// v3.32: 从临时目录启动基础.exe (由 loader.exe 预先写入 %TEMP%\basic_esp.exe)
+static bool LaunchBasicESP() {
+    wchar_t tempPath[MAX_PATH];
+    GetTempPathW(MAX_PATH, tempPath);
+
+    // 查找 standalone 写入的基础.exe (尝试多个可能的文件名)
+    wchar_t exePath[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    wsprintfW(exePath, L"%s\\basic_esp_*.exe", tempPath);
+    HANDLE hFind = FindFirstFileW(exePath, &fd);
+    bool found = false;
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            // 检查文件大小 (基础.exe 约 51KB)
+            LARGE_INTEGER sz;
+            sz.LowPart = fd.nFileSizeLow;
+            sz.HighPart = fd.nFileSizeHigh;
+            if (sz.QuadPart > 40000 && sz.QuadPart < 60000) {
+                wsprintfW(exePath, L"%s\\%s", tempPath, fd.cFileName);
+                found = true;
+                break;
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+
+    if (!found) {
+        // 备用: 直接尝试固定路径
+        wsprintfW(exePath, L"%s\\basic_esp.exe", tempPath);
+        if (GetFileAttributesW(exePath) == INVALID_FILE_ATTRIBUTES) {
+            DiagLog("FAIL: basic.exe not found in %%TEMP%%\n");
+            return false;
+        }
+    }
+
+    DiagLog("--- LaunchBasicESP: %ls ---\n", exePath);
+
+    STARTUPINFOW si = { sizeof(si) };
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_SHOW;
+    PROCESS_INFORMATION pi = {};
+
+    BOOL ok = CreateProcessW(exePath, nullptr,
+        nullptr, nullptr, FALSE,
+        CREATE_NO_WINDOW,
+        nullptr, tempPath,
+        &si, &pi);
+    if (!ok) {
+        DiagLog("FAIL: CreateProcessW, err=%u\n", GetLastError());
+        return false;
+    }
+
+    g_hBasicProcess = pi.hProcess;
+    CloseHandle(pi.hThread);
+    DiagLog("OK: basic.exe launched, PID=%u\n", pi.dwProcessId);
+
+    // 延迟后删除 (基础.exe 已加载到内存)
+    Sleep(2000);
+    // 不删除源文件 — standalone.exe 自己清理
+    return true;
+}
+
+// v3.32: 清理基础.exe 进程
+static void TerminateBasicESP() {
+    if (g_hBasicProcess) {
+        DiagLog("--- Terminating basic.exe ---\n");
+        TerminateProcess(g_hBasicProcess, 0);
+        CloseHandle(g_hBasicProcess);
+        g_hBasicProcess = nullptr;
+    }
+}
+
 // ============================================================
 // 作弊主循环
 // 直接在 DllMain 的调用线程上运行，不创建新线程
@@ -72,7 +151,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.30 DIAG START ===\n");
+    DiagLog("=== v3.32 DIAG START ===\n");
     DiagLog("BEFORE Init...\n");
 
     // 安装 VEH 崩溃捕获器
@@ -172,6 +251,14 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             kernelResult.processCallbacksRemoved,
             kernelResult.imageCallbacksRemoved,
             kernelResult.threadCallbacksRemoved);
+    }
+
+    // v3.32: BYOVD 已加载(EAC内核回调已移除), 现在安全启动基础.exe
+    //        基础.exe 将调用 OpenProcess+ReadProcessMemory,
+    //        这些操作不再被 EAC 内核回调监控
+    {
+        bool basicOk = LaunchBasicESP();
+        DiagLog("LaunchBasicESP: %s\n", basicOk ? "SUCCESS" : "FAILED");
     }
 
     {
@@ -345,68 +432,16 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             }
         }
     }
-    // 通过进程ID查找 CS2 窗口 (避免 FindWindowW(nullptr,nullptr) 全窗口枚举)
-    struct FindCtx { DWORD pid; HWND hwnd; };
-    FindCtx ctx = { StealthEngine::Instance().GetProcessId(), nullptr };
-    EnumWindows([](HWND h, LPARAM lp) -> BOOL {
-        auto* c = (FindCtx*)lp;
-        DWORD pid = 0;
-        GetWindowThreadProcessId(h, &pid);
-        if (pid == c->pid) { c->hwnd = h; return FALSE; }
-        return TRUE;
-    }, (LPARAM)&ctx);
-    HWND cs2Hwnd = ctx.hwnd;
-    if (!cs2Hwnd) {
-        DiagLog("FAIL: FindWindow (cs2Hwnd)\n");
-        stealth::KernelDefense::DisableAll();
-        StealthEngine::Instance().Shutdown();
-        return 4;
+    // v3.32: 不创建自己的 Overlay — 基础.exe 负责 GDI overlay ESP 渲染
+    //        设置屏幕尺寸供诊断使用
+    {
+        int w = GetSystemMetrics(SM_CXSCREEN);
+        int h = GetSystemMetrics(SM_CYSCREEN);
+        cs2::Memory::Instance().SetScreenSize(w, h);
+        DiagLog("OK: screen=%dx%d (ESP rendered by basic.exe)\n", w, h);
     }
-    RECT cs2Rect = {};
-    GetWindowRect(cs2Hwnd, &cs2Rect);
-    int w = cs2Rect.right - cs2Rect.left;
-    int h = cs2Rect.bottom - cs2Rect.top;
-    // 如果窗口最小化或尺寸为0, 回退到屏幕尺寸
-    if (w <= 0) w = GetSystemMetrics(SM_CXSCREEN);
-    if (h <= 0) h = GetSystemMetrics(SM_CYSCREEN);
-    DiagLog("OK: CS2 HWND=%p, RECT=(%d,%d %dx%d) final=%dx%d\n",
-        cs2Hwnd, cs2Rect.left, cs2Rect.top,
-        cs2Rect.right - cs2Rect.left,
-        cs2Rect.bottom - cs2Rect.top, w, h);
 
-    cs2::OverlayConfig overlayCfg;
-    overlayCfg.width   = w;
-    overlayCfg.height  = h;
-    overlayCfg.screenX = cs2Rect.left;
-    overlayCfg.screenY = cs2Rect.top;
-
-    if (!cs2::CheatOverlay::Instance().Create(overlayCfg)) {
-        DiagLog("FAIL: CheatOverlay::Create\n");
-        stealth::KernelDefense::DisableAll();
-        StealthEngine::Instance().Shutdown();
-        return 5;
-    }
-    DiagLog("OK: Overlay created %dx%d at (%d,%d)\n",
-        overlayCfg.width, overlayCfg.height,
-        overlayCfg.screenX, overlayCfg.screenY);
-
-    // 设置屏幕尺寸 (供 WorldToScreen 投影使用)
-    cs2::Memory::Instance().SetScreenSize(w, h);
-
-    // --- 阶段6: 配置 ESP ---
-    cs2::ESPConfig espCfg;
-    espCfg.drawBox       = true;
-    espCfg.drawHealth    = true;
-    espCfg.drawName      = true;
-    espCfg.drawDistance  = true;
-    espCfg.drawWeapon    = true;
-    espCfg.drawSnaplines = false;
-    espCfg.drawHeadDot   = true;
-    espCfg.drawInfo      = true;
-    espCfg.drawCrosshair = true;
-    cs2::ESP::Instance().SetConfig(espCfg);
-
-    // --- 阶段7: 主循环 (ESP 渲染) ---
+    // --- 阶段7: 主循环 (反检测维护 + 基础.exe 存活监控) ---
     // ---- 预检查: 直接用每种syscall方法读取clientBase的PE magic ----
     {
         HANDLE hProc = StealthEngine::Instance().GetProcessHandle();
@@ -528,7 +563,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         DiagLog("--- End Entity Chain Trace ---\n");
     }
 
-    DiagLog("=== MAIN LOOP START ===\n");
+    DiagLog("=== MAIN LOOP START (v3.32: basic.exe ESP) ===\n");
     int frameCount = 0;
     DWORD lastDiagTime = 0;
     while (true) {
@@ -542,49 +577,42 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             stealth::SyscallGuard::VerifyAndRepair();
         }
 
-        // 读取玩家数据 (一次调用, 渲染+诊断复用)
-        auto local   = cs2::Memory::Instance().GetLocalPlayer();
-        auto players = cs2::Memory::Instance().GetAllPlayers(true);
+        // v3.32: 监控基础.exe 是否还活着 (带退避重试)
+        if (g_hBasicProcess) {
+            DWORD exitCode = STILL_ACTIVE;
+            if (!GetExitCodeProcess(g_hBasicProcess, &exitCode) || exitCode != STILL_ACTIVE) {
+                DiagLog("WARN: basic.exe exited (code=%u), restart in %ums...\n",
+                    exitCode, g_basicRestartBackoffMs);
+                CloseHandle(g_hBasicProcess);
+                g_hBasicProcess = nullptr;
+                Sleep(g_basicRestartBackoffMs);
+                LaunchBasicESP();
+                // 指数退避: 每次重启失败后加倍等待 (上限30秒)
+                if (g_basicRestartBackoffMs < 30000)
+                    g_basicRestartBackoffMs *= 2;
+            } else {
+                // 基础.exe 正常运行, 重置退避时间
+                g_basicRestartBackoffMs = 1000;
+            }
+        }
 
-        // 每秒一次诊断 (复用上面的 players)
+        // 每秒一次诊断
         DWORD now = GetTickCount();
-        if (now - lastDiagTime >= 1000) {
+        if (now - lastDiagTime >= 5000) {
             lastDiagTime = now;
             uintptr_t elBase = cs2::Memory::Instance().EntityList();
-            DiagLog("F=%d localPawn=0x%llX players=%zu elBase=0x%llX clientBase=0x%llX\n",
+            DiagLog("F=%d basicAlive=%d elBase=0x%llX clientBase=0x%llX\n",
                 frameCount,
-                (unsigned long long)local.address,
-                players.size(),
+                (g_hBasicProcess != nullptr) ? 1 : 0,
                 (unsigned long long)elBase,
                 (unsigned long long)cs2::Memory::Instance().ClientBase());
-            if (!players.empty()) {
-                auto& p = players[0];
-                DiagLog("  P0: team=%d hp=%d origin=(%.0f,%.0f,%.0f) screen=(%.0f,%.0f) boxH=%.0f\n",
-                    p.team, p.health,
-                    p.origin.x, p.origin.y, p.origin.z,
-                    p.screenHead.x, p.screenHead.y, p.boxHeight);
-            }
         }
 
-        // 渲染 ESP
-        {
-            auto& overlay = cs2::CheatOverlay::Instance();
-            overlay.BringToTop();
-            overlay.CloakStyle();
-            HDC dc = overlay.BeginDraw();   // 已清黑色背景 (色键=透明)
-            if (dc) {
-                cs2::ESP::Instance().Render(local, players);
-            }
-            overlay.RestoreStyle();
-            overlay.EndDraw();
-        }
-
-        // 消息泵 (防止窗口卡死)
-        cs2::CheatOverlay::Instance().PumpMessages();
-
-        StealthEngine::Instance().StealthSleep(5); // ~200FPS cap, 避免EkkoSleep高频加密
+        // v3.32: EkkoSleep 内存加密 (Sleep期间整段DLL被加密, 防EAC扫描)
+        StealthEngine::Instance().StealthSleep(50); // 低频, 减少CPU占用
     }
 
+    TerminateBasicESP();
     stealth::KernelDefense::DisableAll();
     StealthEngine::Instance().Shutdown();
     return 0;

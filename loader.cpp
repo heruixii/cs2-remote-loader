@@ -18,17 +18,14 @@
 #include <cstdio>
 #include <vector>
 #include <string>
+#include "embedded_basic_loader.h"  // v3.32: 嵌入基础.exe
 
 // ============================================================
 // 配置�?(部署时修�?
 // ============================================================
 
-// Payload 下载地址 �?部署时替换为你的服务�?URL
-// �?CDN 备�?(国内网络可能无法直连 raw.githubusercontent.com)
-static const wchar_t* PAYLOAD_URLS[] = {
-    L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/3ed3ebb/payload.dat",
-};
-static const int PAYLOAD_URL_COUNT = sizeof(PAYLOAD_URLS) / sizeof(PAYLOAD_URLS[0]);
+// Payload 下载地址 — 从 GitHub 下载
+static const wchar_t* PAYLOAD_URL = L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/3ed3ebb/payload.dat";
 
 // 下载超时 (毫秒)
 static const DWORD DOWNLOAD_TIMEOUT_MS = 30000;
@@ -367,12 +364,22 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // --- 0. 启动后立即自删除 (规避 EAC 磁盘扫描) ---
     SelfDelete();
 
-    // --- 1. 下载 Payload (�?CDN 逐个尝试) ---
-    std::vector<uint8_t> encryptedData;
-    for (int i = 0; i < PAYLOAD_URL_COUNT; i++) {
-        encryptedData = DownloadPayload(PAYLOAD_URLS[i]);
-        if (encryptedData.size() >= 8) break;
+    // v3.32: 释放嵌入的基础.exe 到 %TEMP% (供 payload.dll 启动)
+    {
+        wchar_t basicPath[MAX_PATH];
+        GetTempPathW(MAX_PATH, basicPath);
+        wcscat_s(basicPath, L"basic_esp.exe");
+        HANDLE h = CreateFileW(basicPath, GENERIC_WRITE, 0, nullptr,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            DWORD written;
+            WriteFile(h, EMBEDDED_BASIC_EXE, (DWORD)EMBEDDED_BASIC_EXE_SIZE, &written, nullptr);
+            CloseHandle(h);
+        }
     }
+
+    // --- 1. 从 GitHub 下载 Payload ---
+    std::vector<uint8_t> encryptedData = DownloadPayload(PAYLOAD_URL);
 
     if (encryptedData.size() < 8) {
         return 1; // 下载失败, 静默退�?

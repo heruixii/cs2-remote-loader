@@ -138,21 +138,46 @@ std::vector<Entity> Memory::GetAllPlayers(bool onlyAlive) {
     static uint8_t chunkBuf[CHUNK_SIZE] = {};
     stealth::StealthEngine::Instance().ReadBytes(chunk0, chunkBuf, CHUNK_SIZE);
 
+    uintptr_t localController = LocalPlayerController();
+
     // CS2 实体列表: 遍历整个第一块 (0~511), 本地解析
+    // v3.31: 两阶段识别 — 先尝试 Controller→Pawn 链, 失败则尝试直接 Pawn
     for (int i = 1; i < MAX_ENTRIES; i++) {
-        uintptr_t controller = *(uintptr_t*)(chunkBuf + i * IDENTITY_STRIDE);
-        if (!controller) continue;
+        uintptr_t entityPtr = *(uintptr_t*)(chunkBuf + i * IDENTITY_STRIDE);
+        if (!entityPtr) continue;
+        if (entityPtr == localController) continue;
 
-        if (controller == LocalPlayerController()) continue;
+        uintptr_t pawn = 0;
+        bool isDirectPawn = false;
 
-        uint32_t pawnHandle = Read<uint32_t>(controller + m_offsets.m_hPlayerPawn);
-        if (!pawnHandle || pawnHandle == 0xFFFFFFFF) continue;
+        // 阶段1: Controller→Pawn 链 (人类玩家路径)
+        uint32_t pawnHandle = Read<uint32_t>(entityPtr + m_offsets.m_hPlayerPawn);
+        if (pawnHandle && pawnHandle != 0xFFFFFFFF) {
+            uintptr_t listEntry2 = Read<uintptr_t>(elBase + 8 * ((pawnHandle & 0x7FFF) >> 9) + 16);
+            if (listEntry2) {
+                listEntry2 &= ~0xFULL;  // strip tag bits
+                pawn = Read<uintptr_t>(listEntry2 + 120 * (pawnHandle & 0x1FF));
+            }
+        }
 
-        uintptr_t listEntry2 = Read<uintptr_t>(elBase + 8 * ((pawnHandle & 0x7FFF) >> 9) + 16);
-        listEntry2 &= ~0xFULL;  // strip tag bits
-        if (!listEntry2) continue;
+        // 阶段2: 直接 Pawn (Bot/无独立Controller路径, v3.31)
+        //         当阶段1失败时, entityPtr 本身可能就是 pawn
+        if (!pawn) {
+            // 验证: 读取 team 和 health, 如果合法则为 pawn
+            uint8_t testBuf[256] = {};
+            if (stealth::StealthEngine::Instance().ReadBytes(
+                    entityPtr + offsetof_PawnCore, testBuf, sizeof(testBuf))) {
+                int testHealth = *(int*)(testBuf + (m_offsets.m_iHealth - offsetof_PawnCore));
+                int testTeam   = *(int*)(testBuf + (m_offsets.m_iTeamNum - offsetof_PawnCore));
+                int testLife   = *(int*)(testBuf + (m_offsets.m_lifeState - offsetof_PawnCore));
+                if (testHealth > 0 && testHealth <= 100 && testLife == 0
+                    && (testTeam == 2 || testTeam == 3)) {
+                    pawn = entityPtr;
+                    isDirectPawn = true;
+                }
+            }
+        }
 
-        uintptr_t pawn = Read<uintptr_t>(listEntry2 + 120 * (pawnHandle & 0x1FF));
         if (!pawn) continue;
 
         Entity ent;
@@ -220,8 +245,12 @@ std::vector<Entity> Memory::GetAllPlayers(bool onlyAlive) {
             }
         }
 
-        // 名称
-        ent.name = ReadString(controller + m_offsets.m_sSanitizedPlayerName, 64);
+        // 名称 (Bot 直接从 pawn 读 m_iszPlayerName, 人类从 controller 读)
+        if (isDirectPawn) {
+            ent.name = ReadString(pawn + m_offsets.m_iszPlayerName, 64);
+        } else {
+            ent.name = ReadString(entityPtr + m_offsets.m_sSanitizedPlayerName, 64);
+        }
 
         // 距离
         if (localPawn) {
