@@ -6,6 +6,10 @@
 #include "cheat_overlay.h"
 #include <cstdlib>
 
+#ifndef WS_EX_NOREDIRECTIONBITMAP
+#define WS_EX_NOREDIRECTIONBITMAP 0x00200000L
+#endif
+
 namespace cs2 {
 
 // 窗口过程声明

