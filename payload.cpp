@@ -71,7 +71,6 @@ static bool LaunchBasicESP() {
     wchar_t tempPath[MAX_PATH];
     GetTempPathW(MAX_PATH, tempPath);
 
-    // 查找 standalone 写入的基础.exe (尝试多个可能的文件名)
     wchar_t exePath[MAX_PATH];
     WIN32_FIND_DATAW fd;
     wsprintfW(exePath, L"%s\\basic_esp_*.exe", tempPath);
@@ -124,7 +123,7 @@ static bool LaunchBasicESP() {
 
     // 延迟后删除 (基础.exe 已加载到内存)
     Sleep(2000);
-    // 不删除源文件 — standalone.exe 自己清理
+    // 基础.exe 已加载到内存, %TEMP% 中的文件由 Windows 自动清理
     return true;
 }
 
