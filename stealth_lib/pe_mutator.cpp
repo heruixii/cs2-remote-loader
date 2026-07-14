@@ -310,8 +310,15 @@ bool PeMutator::AddJunkOverlay(size_t sizeBytes) {
         junkBytes[i] = static_cast<BYTE>(rng());
     }
 
-    // 更新 SizeOfImage
-    nt->OptionalHeader.SizeOfImage += static_cast<DWORD>(junkSize);
+    // 更新 SizeOfImage — 先确保 PE 头可写 (ManualMap 下可能是只读)
+    {
+        DWORD oldProtect;
+        VirtualProtect(reinterpret_cast<void*>(GetSelfBase()),
+            nt->OptionalHeader.SizeOfHeaders, PAGE_READWRITE, &oldProtect);
+        nt->OptionalHeader.SizeOfImage += static_cast<DWORD>(junkSize);
+        VirtualProtect(reinterpret_cast<void*>(GetSelfBase()),
+            nt->OptionalHeader.SizeOfHeaders, oldProtect, &oldProtect);
+    }
 
     return true;
 }
