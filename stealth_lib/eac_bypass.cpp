@@ -223,9 +223,11 @@ HANDLE HandleBypass::ViaTrustedPivot(DWORD pid) {
             if (DuplicateToken(hToken, SecurityImpersonation, &hDupToken)) {
                 if (ImpersonateLoggedOnUser(hDupToken)) {
                     // 现在以 SYSTEM 身份打开目标进程
-                    HANDLE hGame = OpenProcess(
-                        PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION,
-                        FALSE, pid);
+                    CLIENT_ID cidGame = { (HANDLE)(ULONG_PTR)pid, nullptr };
+                    OBJECT_ATTRIBUTES oaGame = { sizeof(oaGame) };
+                    HANDLE hGame = nullptr;
+                    SysOpenProcess(&hGame, PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION,
+                        &oaGame, &cidGame, SyscallMethod::Indirect);
 
                     RevertToSelf();
                     CloseHandle(hDupToken);
@@ -1349,7 +1351,10 @@ bool CommunicationEvasion::IsReporting() {
     
     // 简单启发式: 检查 EAC 进程是否有大量网络活动
     // 使用 GetProcessTimes 检查 IO 活动
-    HANDLE hEac = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, eacPid);
+    CLIENT_ID cidEac = { (HANDLE)(ULONG_PTR)eacPid, nullptr };
+    OBJECT_ATTRIBUTES oaEac = { sizeof(oaEac) };
+    HANDLE hEac = nullptr;
+    SysOpenProcess(&hEac, PROCESS_QUERY_LIMITED_INFORMATION, &oaEac, &cidEac, SyscallMethod::Indirect);
     if (!hEac) return false;
     
     FILETIME create, exit, kernel, user;

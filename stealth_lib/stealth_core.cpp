@@ -317,11 +317,12 @@ uintptr_t StealthEngine::ManualMapAndStrip(const void* dllData, SIZE_T dllSize) 
     auto result = ManualMapper::MapDllFromBuffer(m_hProcess, dllData, dllSize);
     if (!result.success) return 0;
 
-    // 2. 擦除 PE 痕迹
+    // 2. 擦除 PE 痕迹（顺序至关重要：MZ擦除必须在最后）
     if (m_config.enableEACPEStrip) {
-        eac::PEHeaderStripper::StripLoadedHeaders(result.imageBase);
-        eac::PEHeaderStripper::ClearDosStub(result.imageBase);
-        eac::PEHeaderStripper::ScrubSectionNames(result.imageBase);
+        eac::PEHeaderStripper::ReplaceFF25Stubs(result.imageBase);       // 1. FF25替换（需MZ/PE签名完好）
+        eac::PEHeaderStripper::ClearDosStub(result.imageBase);           // 2. DOS存根清空
+        eac::PEHeaderStripper::ScrubSectionNames(result.imageBase);      // 3. 段名随机化
+        eac::PEHeaderStripper::StripLoadedHeaders(result.imageBase);     // 4. MZ/PE签名最后擦除
     }
 
     return result.imageBase;
