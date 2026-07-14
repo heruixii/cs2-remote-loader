@@ -73,9 +73,21 @@ namespace BYOVDDrivers {
     // 暴露: 任意物理/虚拟内存 R/W via IOCTL 0xC3502580 / 0xC3502588
     extern const BYOVDDriverInfo RTCore64;
 
-    // gdrv.sys — Gigabyte (备选)
+    // gdrv.sys — Gigabyte (备选1)
     // 暴露: 13 IOCTL, 包括内核 memcpy
     extern const BYOVDDriverInfo Gdrv;
+
+    // WinRing0x64.sys — OpenLibSys (备选2, 常见于硬件监控工具)
+    // 暴露: IOCTL 0x9C402580 物理内存映射
+    extern const BYOVDDriverInfo WinRing0;
+
+    // inpoutx64.sys — Logix4U (备选3, 并行端口驱动)
+    // 暴露: IOCTL 0x9C40A000 物理内存 R/W
+    extern const BYOVDDriverInfo InpOut;
+
+    // 获取所有可用驱动候选列表 (已排优先级)
+    const BYOVDDriverInfo* GetAllCandidates();
+    int GetCandidateCount();
 }
 
 // ============================================================
@@ -245,10 +257,30 @@ public:
         int  imageCallbacksRemoved = 0;
         int  threadCallbacksRemoved = 0;
         bool processHidden = false;
+        bool vadConcealed  = false;  // v3.34: VAD 节点伪装
     };
 
     static Result EnableAll();
     static void DisableAll();
+};
+
+// ============================================================
+// v3.34: VAD 节点伪装器
+//
+// 通过 BYOVD 内核 R/W 修改 cs2.exe 的 VAD 树,
+// 将注入区域的 MEM_PRIVATE 标记改为 MEM_MAPPED,
+// 使其看起来像正常模块映射, 绕过 EAC VAD 扫描
+// ============================================================
+class VADConcealer {
+public:
+    // 伪装指定进程中的内存区域
+    // pid: 目标进程 PID (cs2.exe)
+    // regionBase: 注入区域的基址
+    // regionSize: 注入区域大小
+    static bool ConcealRegion(DWORD pid, uintptr_t regionBase, SIZE_T regionSize);
+
+    // 批量伪装 (对 cleanedBases 中的所有区域)
+    static int ConcealAllRegions(DWORD pid, const uintptr_t* bases, int count);
 };
 
 } // namespace stealth

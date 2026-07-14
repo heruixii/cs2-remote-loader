@@ -148,6 +148,40 @@ const BYOVDDriverInfo BYOVDDrivers::Gdrv = {
     false
 };
 
+const BYOVDDriverInfo BYOVDDrivers::WinRing0 = {
+    L"WinRing0Svc",
+    L"WinRing0 OpenLibSys Driver",
+    L"\\\\.\\WinRing0_1_2_0",
+    L"WinRing0x64.sys",
+    0x9C402580,   // 物理内存映射 IOCTL
+    true
+};
+
+const BYOVDDriverInfo BYOVDDrivers::InpOut = {
+    L"InpOutSvc",
+    L"Logix4U InpOut Driver",
+    L"\\\\.\\inpoutx64",
+    L"inpoutx64.sys",
+    0x9C40A000,   // 物理内存 R/W IOCTL
+    true
+};
+
+// v3.34: 驱动候选列表 (按可用性和安全性排序)
+static const BYOVDDriverInfo* g_driverCandidates[] = {
+    &BYOVDDrivers::RTCore64,
+    &BYOVDDrivers::Gdrv,
+    &BYOVDDrivers::WinRing0,
+    &BYOVDDrivers::InpOut,
+};
+
+const BYOVDDriverInfo* BYOVDDrivers::GetAllCandidates() {
+    return g_driverCandidates[0];
+}
+
+int BYOVDDrivers::GetCandidateCount() {
+    return sizeof(g_driverCandidates) / sizeof(g_driverCandidates[0]);
+}
+
 // ============================================================
 // KernelMemoryAccessor 实现
 // ============================================================
@@ -1144,6 +1178,52 @@ static BYOVDDriverInfo MutateAndRandomizeDriver(const BYOVDDriverInfo& original)
         *pCheckSum = 0;
     }
 
+    // v3.34: 深层 PE 变异 — 随机化节区名
+    {
+        uint16_t numSections = *(uint16_t*)(driverData.data() + peOffset + 6);
+        auto* ntOpt = (IMAGE_OPTIONAL_HEADER64*)(driverData.data() + peOffset + 24);
+        auto* sections = (IMAGE_SECTION_HEADER*)(driverData.data() + peOffset + sizeof(IMAGE_NT_HEADERS64));
+        WORD optMagic = *(WORD*)(driverData.data() + peOffset + 24);
+
+        SIZE_T firstSecOffset = peOffset + 24;
+        if (optMagic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+            firstSecOffset += sizeof(IMAGE_OPTIONAL_HEADER64);
+        else
+            firstSecOffset += sizeof(IMAGE_OPTIONAL_HEADER32);
+        auto* secHdrs = (IMAGE_SECTION_HEADER*)(driverData.data() + firstSecOffset);
+
+        for (int s = 0; s < numSections && (uintptr_t)(secHdrs + s) < (uintptr_t)(driverData.data() + fileSize - sizeof(IMAGE_SECTION_HEADER)); s++) {
+            // 随机化节区名 (8字符, 保留NULL终止)
+            static const char secChars[] = ".abcdefghijklmnopqrstuvwxyz_";
+            for (int c = 0; c < 7; c++) {
+                secHdrs[s].Name[c] = secChars[rand() % (sizeof(secChars) - 1)];
+            }
+            secHdrs[s].Name[7] = '\0';
+        }
+    }
+
+    // v3.34: 填充节区间隙为随机字节 (消除固定0填充特征)
+    {
+        uint16_t numSections = *(uint16_t*)(driverData.data() + peOffset + 6);
+        WORD optMagic = *(WORD*)(driverData.data() + peOffset + 24);
+        SIZE_T firstSecOffset = peOffset + 24;
+        if (optMagic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+            firstSecOffset += sizeof(IMAGE_OPTIONAL_HEADER64);
+        else
+            firstSecOffset += sizeof(IMAGE_OPTIONAL_HEADER32);
+        auto* secHdrs = (IMAGE_SECTION_HEADER*)(driverData.data() + firstSecOffset);
+
+        for (int s = 0; s + 1 < numSections && s < 32; s++) {
+            SIZE_T secEnd = secHdrs[s].PointerToRawData + secHdrs[s].SizeOfRawData;
+            SIZE_T nextStart = secHdrs[s + 1].PointerToRawData;
+            if (secEnd < nextStart && nextStart <= fileSize) {
+                for (SIZE_T gap = secEnd; gap < nextStart; gap++) {
+                    driverData[gap] = (uint8_t)(rand() & 0xFF);
+                }
+            }
+        }
+    }
+
     // 写入变异后的驱动文件
     HANDLE hOut = CreateFileW(tempPath, GENERIC_WRITE, 0, nullptr,
         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -1176,14 +1256,26 @@ KernelDefense::Result KernelDefense::EnableAll() {
     Result result;
     auto& kma = KernelMemoryAccessor::Instance();
 
-    // v3.33 Method 3: 驱动 PE 变异 + 随机化服务名
-    //   优先尝试变异版 RTCore64, 失败回退 Gdrv
-    BYOVDDriverInfo mutatedRTCore = MutateAndRandomizeDriver(BYOVDDrivers::RTCore64);
-    result.driverLoaded = kma.Initialize(mutatedRTCore);
-    if (!result.driverLoaded) {
-        BYOVDDriverInfo mutatedGdrv = MutateAndRandomizeDriver(BYOVDDrivers::Gdrv);
-        result.driverLoaded = kma.Initialize(mutatedGdrv);
+    // v3.34: 多驱动随机轮换
+    //   从 4 个候选驱动中随机排列顺序, 依次尝试
+    //   避免每次都用 RTCore64 → EAC 按统计特征可预测
+    int candCount = BYOVDDrivers::GetCandidateCount();
+    int indices[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    // Fisher-Yates shuffle
+    for (int i = candCount - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        int tmp = indices[i];
+        indices[i] = indices[j];
+        indices[j] = tmp;
     }
+
+    for (int ci = 0; ci < candCount; ci++) {
+        const BYOVDDriverInfo* cand = g_driverCandidates[indices[ci]];
+        BYOVDDriverInfo mutated = MutateAndRandomizeDriver(*cand);
+        result.driverLoaded = kma.Initialize(mutated);
+        if (result.driverLoaded) break;
+    }
+
     if (!result.driverLoaded) {
         return result; // 无内核可用
     }
@@ -1203,6 +1295,152 @@ KernelDefense::Result KernelDefense::EnableAll() {
 void KernelDefense::DisableAll() {
     DKOMProcessHider::Instance().UnhideProcess();
     KernelMemoryAccessor::Instance().Shutdown();
+}
+
+// ============================================================
+// v3.34: VADConcealer — VAD 节点伪装
+//
+// 通过 BYOVD 内核 R/W 遍历 cs2.exe 的 VAD AVL 树,
+// 将注入区域的 _MMVAD_SHORT.u.VadFlags.PrivateMemory 清零,
+// 使 MEM_PRIVATE → MEM_MAPPED, 绕过 EAC VAD 扫描
+//
+// 原理:
+//   EPROCESS->VadRoot → AVL 树 (RTL_BALANCED_NODE)
+//   每个 VAD 节点记录一个虚拟地址范围 (StartingVpn..EndingVpn)
+//   VadFlags.PrivateMemory bit: 1 = MEM_PRIVATE, 0 = MEM_MAPPED
+// ============================================================
+
+// Win10 22H2 / Win11 x64 EPROCESS + VAD 偏移量
+struct VadOffsets {
+    // EPROCESS
+    static constexpr uint32_t UniqueProcessId   = 0x440;
+    static constexpr uint32_t ActiveProcessLinks = 0x448;
+    static constexpr uint32_t VadRoot            = 0x7D8; // 主要候选
+    static constexpr uint32_t VadRootAlt         = 0x658; // Win11 备选
+
+    // _RTL_BALANCED_NODE (embedded in _MMVAD_SHORT)
+    static constexpr uint32_t RbnLeft  = 0x00;
+    static constexpr uint32_t RbnRight = 0x08;
+    static constexpr uint32_t RbnParentEncoded = 0x10;
+
+    // _MMVAD_SHORT (after RTL_BALANCED_NODE at +0x18)
+    static constexpr uint32_t VadStartingVpn = 0x18;
+    static constexpr uint32_t VadEndingVpn   = 0x20;
+    static constexpr uint32_t VadFlags       = 0x30; // u.LongFlags / u.VadFlags union
+    static constexpr uint32_t VadControlArea = 0x38;
+
+    static constexpr uint64_t PrivateMemoryBit  = 0x01000000ULL; // bit 24 最常见位置
+    static constexpr uint64_t ProtectionMask    = 0x00F80000ULL; // bits 19-23 (5 bits)
+};
+
+// 获取 cs2.exe 的 EPROCESS 内核地址
+static uint64_t GetEPROCESSByPid(KernelMemoryAccessor& kma, DWORD targetPid, uint64_t ntosBase) {
+    // PsInitialSystemProcess → ActiveProcessLinks → 遍历
+    // 从 ntoskrnl 导出 PsInitialSystemProcess 指针获取 System 进程 EPROCESS
+    // 简化: 硬编码 PsInitialSystemProcess 偏移
+    // 备选: 通过 PsLookupProcessByProcessId 的 sigscan
+
+    // 方法: 从 ntoskrnl 数据节定位 PsActiveProcessHead
+    // PsActiveProcessHead 通常是 ntoskrnl 的导出符号
+    // 简化路径: 扫描 ntoskrnl 数据段找 ActiveProcessLinks 循环起点
+    uint64_t psInitAddr = kma.ResolveExport(ntosBase, "PsInitialSystemProcess");
+    if (!psInitAddr) return 0;
+
+    uint64_t sysEprocess = kma.Read<uint64_t>(psInitAddr);
+    if (!sysEprocess || sysEprocess < 0xFFFF800000000000ULL) return 0;
+
+    uint64_t current = sysEprocess;
+    int maxWalk = 512;
+    while (maxWalk-- > 0) {
+        uint64_t pid = kma.Read<uint64_t>(current + VadOffsets::UniqueProcessId);
+        if (pid == targetPid) return current;
+
+        uint64_t flink = kma.Read<uint64_t>(current + VadOffsets::ActiveProcessLinks);
+        if (!flink || flink < 0xFFFF800000000000ULL) break;
+        current = flink - VadOffsets::ActiveProcessLinks;
+    }
+    return 0;
+}
+
+// AVL 树序遍历, 查找包含 targetVA 的 VAD 节点
+static bool FindAndModifyVadNode(KernelMemoryAccessor& kma, uint64_t vadNode, uint64_t targetVa) {
+    if (!vadNode || !targetVa) return false;
+
+    uint64_t targetVpn = targetVa >> 12;
+    int maxDepth = 128;
+
+    while (vadNode && maxDepth-- > 0) {
+        uint64_t startVpn = kma.Read<uint64_t>(vadNode + VadOffsets::VadStartingVpn);
+        uint64_t endVpn   = kma.Read<uint64_t>(vadNode + VadOffsets::VadEndingVpn);
+
+        if (targetVpn >= startVpn && targetVpn <= endVpn) {
+            // 找到目标 VAD 节点, 修改 PrivateMemory flag
+            uint64_t flags = kma.Read<uint64_t>(vadNode + VadOffsets::VadFlags);
+
+            // 检查 PrivateMemory bit 是否已设置
+            if (flags & VadOffsets::PrivateMemoryBit) {
+                // 清零 PrivateMemory bit → MEM_MAPPED
+                flags &= ~VadOffsets::PrivateMemoryBit;
+
+                // 设置 Protection = EXECUTE_READ (5), 模拟 .text 段映射
+                flags &= ~VadOffsets::ProtectionMask;
+                flags |= (5ULL << 19); // Protection = 5 = PAGE_EXECUTE_READ
+
+                kma.Write<uint64_t>(vadNode + VadOffsets::VadFlags, flags);
+
+                // 同时尝试修改 ControlArea → FilePointer 指向已知模块
+                // 这可以进一步降低可疑度, 但需要额外解析
+                // 跳过: 仅修改 PrivateMemory + Protection 已经够用
+
+                return true;
+            }
+            return false; // 已经是 MAPPED
+        }
+
+        // AVL 遍历: 根据 VPN 决定走左子树还是右子树
+        uint64_t left  = kma.Read<uint64_t>(vadNode + VadOffsets::RbnLeft);
+        uint64_t right = kma.Read<uint64_t>(vadNode + VadOffsets::RbnRight);
+
+        if (targetVpn < startVpn) {
+            vadNode = left;
+        } else {
+            vadNode = right;
+        }
+    }
+    return false;
+}
+
+bool VADConcealer::ConcealRegion(DWORD pid, uintptr_t regionBase, SIZE_T regionSize) {
+    auto& kma = KernelMemoryAccessor::Instance();
+    if (!kma.IsActive() || !regionBase) return false;
+
+    uint64_t ntosBase = kma.GetNtoskrnlBase();
+    if (!ntosBase) return false;
+
+    // 获取 cs2.exe 的 EPROCESS
+    uint64_t eprocess = GetEPROCESSByPid(kma, pid, ntosBase);
+    if (!eprocess) return false;
+
+    // 尝试两个可能的 VadRoot 偏移
+    uint64_t vadRoot = 0;
+    for (uint32_t vadOff : {VadOffsets::VadRoot, VadOffsets::VadRootAlt}) {
+        vadRoot = kma.Read<uint64_t>(eprocess + vadOff);
+        if (vadRoot && vadRoot > 0xFFFF800000000000ULL) break;
+    }
+    if (!vadRoot || vadRoot < 0xFFFF800000000000ULL) return false;
+
+    // 遍历 VAD 树, 查找并修改匹配区域
+    return FindAndModifyVadNode(kma, vadRoot, regionBase);
+}
+
+int VADConcealer::ConcealAllRegions(DWORD pid, const uintptr_t* bases, int count) {
+    int success = 0;
+    for (int i = 0; i < count && i < 32; i++) {
+        if (bases[i] && ConcealRegion(pid, bases[i], 0x10000)) {
+            success++;
+        }
+    }
+    return success;
 }
 
 } // namespace stealth

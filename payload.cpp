@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 333
+// BUILD: 334 (v3.34: 5-layer anti-detect enhancement)
 // ============================================================
 
 #include "stealth_core.h"
@@ -19,8 +19,10 @@
 #include "game_esp.h"
 #include "cs2_memory.h"
 
-#include <algorithm>  // std::sort (v3.24: 豁免页排序)
+#include <algorithm>
 #include <vector>
+#include <cstdlib>
+#include <ctime>
 #include "cs2_offsets.h"
 #include "syscall_direct.h"
 #include "eac_syscall_guard.h"
@@ -28,6 +30,11 @@
 #include <cstdio>
 #include <cstdarg>
 #include <tlhelp32.h>
+
+// ---- v3.34: 时序随机化 ----
+static DWORD RandomJitter(DWORD baseMs, DWORD rangeMs) {
+    return baseMs + (DWORD)(((uint64_t)rand() * rangeMs) / RAND_MAX);
+}
 
 // 轻量诊断: 写文件, 不弹 MessageBox 干扰游戏
 static void DiagLog(const char* fmt, ...) {
@@ -121,8 +128,8 @@ static bool LaunchBasicESP() {
     CloseHandle(pi.hThread);
     DiagLog("OK: basic.exe launched, PID=%u\n", pi.dwProcessId);
 
-    // 延迟后删除 (基础.exe 已加载到内存)
-    Sleep(2000);
+    // v3.34: 随机延迟 (规避固定时序特征)
+    Sleep(RandomJitter(1500, 3000));
     // 基础.exe 已加载到内存, %TEMP% 中的文件由 Windows 自动清理
     return true;
 }
@@ -146,8 +153,8 @@ static void CleanupInjectionTraces() {
     HANDLE hProc = StealthEngine::Instance().GetProcessHandle();
     if (!hProc) return;
 
-    // 等待基础.exe 完成注入 (额外等待, 配合 LaunchBasicESP 中的 2s)
-    Sleep(3000);
+    // v3.34: 随机等待基础.exe 完成注入
+    Sleep(RandomJitter(2500, 2500));
     DiagLog("CleanupInjectionTraces: scanning PEB Ldr...\n");
 
     // 1. 获取 PEB 地址
@@ -470,7 +477,16 @@ static void CleanupInjectionTraces() {
         }
     }
 
-    DiagLog("CleanupInjectionTraces: done (PE zero + thread spoof)\n");
+    // v3.34 Scheme 1: VAD 节点伪装 (MEM_PRIVATE → MEM_MAPPED)
+    //   通过 BYOVD 内核 R/W 修改 cs2.exe 的 VAD 树,
+    //   使注入区域看起来像正常模块映射
+    if (numCleaned > 0) {
+        DWORD cs2Pid = GetProcessId(StealthEngine::Instance().GetProcessHandle());
+        int vadOk = VADConcealer::ConcealAllRegions(cs2Pid, cleanedBases, numCleaned);
+        DiagLog("CleanupInjectionTraces: [VAD-CONCEAL] %d/%d regions masked\n", vadOk, numCleaned);
+    }
+
+    DiagLog("CleanupInjectionTraces: done (PE zero + thread spoof + VAD conceal)\n");
 }
 
 // ============================================================
@@ -486,8 +502,11 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.33 DIAG START ===\n");
+    DiagLog("=== v3.34 DIAG START ===\n");
     DiagLog("BEFORE Init...\n");
+
+    // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
+    srand((unsigned)(GetTickCount() ^ GetCurrentProcessId() ^ GetCurrentThreadId()));
 
     // 安装 VEH 崩溃捕获器
     g_diagDllBase = dllBase;
@@ -902,36 +921,56 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         DiagLog("--- End Entity Chain Trace ---\n");
     }
 
-    DiagLog("=== MAIN LOOP START (v3.33: basic.exe ESP + 3-method anti-trace) ===\n");
+    DiagLog("=== MAIN LOOP START (v3.34: 5-layer anti-detect enhanced) ===\n");
     int frameCount = 0;
     DWORD lastDiagTime = 0;
     DWORD lastRetryTime = 0;
+    DWORD lastCallbackCheck = 0;
+    int  callbackCheckInterval = RandomJitter(25000, 10000); // 25-35s 随机
+
     while (true) {
         frameCount++;
 
         // 隐身维护 (ETW/AMSI/VAC/Hook检测/NMI心跳)
         StealthEngine::Instance().OnFrame();
 
-        // Syscall Stub 完整性验证 (每30帧, 防止EAC恢复hook)
-        if ((frameCount % 30) == 0) {
+        // v3.34: Syscall Stub 验证间隔随机化 (25-35帧, 固定30帧可被时序分析)
+        static int syscallCheckInterval = (int)RandomJitter(25, 10);
+        if ((frameCount % syscallCheckInterval) == 0) {
             stealth::SyscallGuard::VerifyAndRepair();
+            syscallCheckInterval = (int)RandomJitter(25, 10); // 每次重随机
         }
 
-        // v3.33: 监控基础.exe 是否还活着 (修复版: 失败后可重试, 成功后重置退避)
+        // v3.34 Scheme 3: EAC 内核回调完整性监控
+        //   每 25-35 秒重新扫描 ObpCallbackArrayHead,
+        //   若 EAC 重新注册回调则自动摘除
+        {
+            DWORD nowTick = GetTickCount();
+            if (nowTick - lastCallbackCheck >= (DWORD)callbackCheckInterval) {
+                lastCallbackCheck = nowTick;
+                callbackCheckInterval = RandomJitter(25000, 10000);
+                auto& cbDisabler = stealth::EACCallbackDisabler::Instance();
+                int reRemoved = cbDisabler.DisableObCallbacks("EasyAntiCheat");
+                if (reRemoved > 0) {
+                    DiagLog("CB-MONITOR: EAC re-registered %d ObCallbacks → removed\n", reRemoved);
+                }
+            }
+        }
+
+        // 监控基础.exe 是否还活着
         if (g_hBasicProcess) {
             DWORD exitCode = STILL_ACTIVE;
             if (!GetExitCodeProcess(g_hBasicProcess, &exitCode) || exitCode != STILL_ACTIVE) {
                 DiagLog("WARN: basic.exe exited (code=%u), will retry...\n", exitCode);
                 CloseHandle(g_hBasicProcess);
                 g_hBasicProcess = nullptr;
-                lastRetryTime = GetTickCount() - g_basicRestartBackoffMs; // 立即触发重试
+                lastRetryTime = GetTickCount() - g_basicRestartBackoffMs;
             } else {
-                // 基础.exe 正常运行, 重置退避时间
-                g_basicRestartBackoffMs = 1000;
+                g_basicRestartBackoffMs = RandomJitter(800, 400); // v3.34: 随机化退避重置
             }
         }
 
-        // 重试启动 (独立判断, 不依赖 g_hBasicProcess 状态)
+        // 重试启动
         if (!g_hBasicProcess) {
             DWORD nowTick = GetTickCount();
             if (nowTick - lastRetryTime >= g_basicRestartBackoffMs) {
@@ -941,7 +980,10 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     restartOk ? "OK" : "FAILED", g_basicRestartBackoffMs);
                 if (restartOk) {
                     CleanupInjectionTraces();
-                    g_basicRestartBackoffMs = 1000; // 成功后重置
+                    g_basicRestartBackoffMs = RandomJitter(800, 400);
+
+                    // v3.34 Scheme 4: DKOM 隐藏 basic.exe 进程
+                    stealth::DKOMProcessHider::Instance().HideProcess();
                 } else {
                     if (g_basicRestartBackoffMs < 30000)
                         g_basicRestartBackoffMs *= 2;
@@ -949,10 +991,12 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             }
         }
 
-        // 每5秒一次诊断
+        // v3.34: 诊断间隔随机化 (4-6秒, 规避固定节奏)
         DWORD now = GetTickCount();
-        if (now - lastDiagTime >= 5000) {
+        static DWORD diagInterval = RandomJitter(4000, 2000);
+        if (now - lastDiagTime >= diagInterval) {
             lastDiagTime = now;
+            diagInterval = RandomJitter(4000, 2000);
             uintptr_t elBase = cs2::Memory::Instance().EntityList();
             DiagLog("F=%d basicAlive=%d elBase=0x%llX clientBase=0x%llX\n",
                 frameCount,
@@ -961,8 +1005,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 (unsigned long long)cs2::Memory::Instance().ClientBase());
         }
 
-        // EkkoSleep 内存加密 (Sleep期间整段DLL被加密, 防EAC扫描)
-        StealthEngine::Instance().StealthSleep(50); // 低频, 减少CPU占用
+        // v3.34: EkkoSleep 随机间隔 30-170ms (规避固定周期时序特征)
+        StealthEngine::Instance().StealthSleep(RandomJitter(40, 130));
     }
 
     TerminateBasicESP();
