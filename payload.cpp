@@ -95,34 +95,47 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         StealthEngine::Instance().GetProcessId(),
         StealthEngine::Instance().GetProcessHandle());
 
-    // 诊断: 直接测试 SysQueryInformationProcess
     {
         HANDLE hProc = StealthEngine::Instance().GetProcessHandle();
+
+        // 1. Query PEB
         PROCESS_BASIC_INFORMATION pbi = {};
         ULONG rl = 0;
         NTSTATUS st = SysQueryInformationProcess(hProc, 0, &pbi, sizeof(pbi), &rl, SyscallMethod::Indirect);
-        DiagLog("SysQueryInfo: status=0x%08X PEB=0x%llX returnLen=%u NT_SUCCESS=%d\n",
-            (unsigned)st, (unsigned long long)pbi.PebBaseAddress, rl, (int)NT_SUCCESS(st));
+        DiagLog("PEB: status=0x%08X peb=0x%llX\n", (unsigned)st, (unsigned long long)pbi.PebBaseAddress);
 
-        // 测试 fallback
-        DWORD pid = GetProcessId(hProc);
-        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
-        DiagLog("Snapshot: PID=%u hSnap=%p INVALID=%d\n",
-            pid, (void*)hSnap, (int)(hSnap == INVALID_HANDLE_VALUE));
-        if (hSnap != INVALID_HANDLE_VALUE) {
-            MODULEENTRY32W me = { sizeof(me) };
-            if (Module32FirstW(hSnap, &me)) {
-                int count = 0;
-                do {
-                    count++;
-                    if (wcsstr(me.szModule, L"client") || wcsstr(me.szModule, L"engine"))
-                        DiagLog("  [snap] %ls @ 0x%llX\n", me.szModule, (unsigned long long)me.modBaseAddr);
-                } while (Module32NextW(hSnap, &me) && count < 16);
-                DiagLog("  [snap] total first 16: %d modules\n", count);
-            } else {
-                DiagLog("  [snap] Module32First FAILED err=%u\n", (unsigned)GetLastError());
+        // 2. Read PEB to get Ldr
+        BYTE pebBuf[0x100] = {};
+        SIZE_T br = 0;
+        st = SysReadVirtualMemory(hProc, pbi.PebBaseAddress, pebBuf, sizeof(pebBuf), &br, SyscallMethod::Indirect);
+        DiagLog("ReadPEB: status=0x%08X bytes=%zu\n", (unsigned)st, br);
+        if (NT_SUCCESS(st) && br >= 0x20) {
+            uintptr_t ldrAddr = *(uintptr_t*)(pebBuf + 0x18);
+            DiagLog("LDR: addr=0x%llX\n", (unsigned long long)ldrAddr);
+
+            // 3. Read LDR data (PEB_LDR_DATA)
+            BYTE ldrBuf[0x100] = {};
+            st = SysReadVirtualMemory(hProc, (PVOID)ldrAddr, ldrBuf, sizeof(ldrBuf), &br, SyscallMethod::Indirect);
+            DiagLog("ReadLDR: status=0x%08X bytes=%zu\n", (unsigned)st, br);
+
+            // 4. Read InLoadOrderModuleList head
+            uintptr_t listHead = ldrAddr + 0x10;
+            BYTE listBuf[0x20] = {};
+            st = SysReadVirtualMemory(hProc, (PVOID)listHead, listBuf, sizeof(listBuf), &br, SyscallMethod::Indirect);
+            DiagLog("ReadList: status=0x%08X bytes=%zu flink=0x%llX\n",
+                (unsigned)st, br, (unsigned long long)*(uintptr_t*)listBuf);
+
+            // 5. Walk first entry
+            uintptr_t flink = *(uintptr_t*)listBuf;
+            if (flink) {
+                BYTE modBuf[0x400] = {};
+                st = SysReadVirtualMemory(hProc, (PVOID)flink, modBuf, sizeof(modBuf), &br, SyscallMethod::Indirect);
+                DiagLog("ReadMod: status=0x%08X bytes=%zu base=0x%llX\n",
+                    (unsigned)st, br, (unsigned long long)*(uintptr_t*)(modBuf + 0x30));
+                // FullName
+                uintptr_t fname = *(uintptr_t*)(modBuf + 0x48);
+                DiagLog("FullNameVA=0x%llX\n", (unsigned long long)fname);
             }
-            CloseHandle(hSnap);
         }
     }
 
