@@ -14,6 +14,7 @@
 #include "game_esp.h"
 #include "cs2_memory.h"
 #include "cs2_offsets.h"
+#include "syscall_direct.h"
 #include <cstdio>
 #include <cstdarg>
 
@@ -134,27 +135,48 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     cs2::ESP::Instance().SetConfig(espCfg);
 
     // --- 阶段7: 主循环 (ESP 渲染) ---
-    // ---- 预检查: 测试内存读取是否能读到正确数据 ----
+    // ---- 预检查: 直接用每种syscall方法读取clientBase的PE magic ----
     {
+        HANDLE hProc = StealthEngine::Instance().GetProcessHandle();
         uintptr_t cb = cs2::Memory::Instance().ClientBase();
-        uintptr_t elAddr = cb + offsets.dwEntityList;
-        uintptr_t lpAddr = cb + offsets.dwLocalPlayerPawn;
 
-        // 用普通路径读
-        uintptr_t elVal = cs2::Memory::Instance().Read<uintptr_t>(elAddr);
-        uintptr_t lpVal = cs2::Memory::Instance().Read<uintptr_t>(lpAddr);
+        // 方法1: TartarusGate (Direct Syscall)
+        {
+            uint16_t magic = 0;
+            SIZE_T bytesRead = 0;
+            NTSTATUS st = SysReadVirtualMemory(hProc, (PVOID)cb, &magic, 2, &bytesRead, SyscallMethod::Direct);
+            DiagLog("TARTARUS: magic=0x%04X bytesRead=%zu status=0x%08X NT_SUCCESS=%d\n",
+                magic, bytesRead, (unsigned)st, (int)NT_SUCCESS(st));
+        }
 
-        // 读 clientBase 前2字节验证 (应为 "MZ" = 0x5A4D)
-        uint16_t magic = cs2::Memory::Instance().Read<uint16_t>(cb);
+        // 方法2: Indirect Syscall (跳转ntdll syscall;ret gadget)
+        {
+            uint16_t magic = 0;
+            SIZE_T bytesRead = 0;
+            NTSTATUS st = SysReadVirtualMemory(hProc, (PVOID)cb, &magic, 2, &bytesRead, SyscallMethod::Indirect);
+            DiagLog("INDIRECT: magic=0x%04X bytesRead=%zu status=0x%08X NT_SUCCESS=%d\n",
+                magic, bytesRead, (unsigned)st, (int)NT_SUCCESS(st));
+        }
 
-        DiagLog("PRE-CHECK: cb=0x%llX elAddr=0x%llX elVal=0x%llX lpAddr=0x%llX lpVal=0x%llX magic=0x%04X(%s)\n",
-            (unsigned long long)cb,
-            (unsigned long long)elAddr,
-            (unsigned long long)elVal,
-            (unsigned long long)lpAddr,
-            (unsigned long long)lpVal,
-            magic,
-            (magic == 0x5A4D) ? "OK_MZ" : "BAD");
+        // 方法3: StackSpoof (深度栈伪造)
+        {
+            uint16_t magic = 0;
+            SIZE_T bytesRead = 0;
+            NTSTATUS st = SysReadVirtualMemory(hProc, (PVOID)cb, &magic, 2, &bytesRead, SyscallMethod::StackSpoof);
+            DiagLog("SPOOF:   magic=0x%04X bytesRead=%zu status=0x%08X NT_SUCCESS=%d\n",
+                magic, bytesRead, (unsigned)st, (int)NT_SUCCESS(st));
+        }
+
+        // 方法4: GetProcAddress fallback
+        {
+            using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
+            auto fn = (Fn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtReadVirtualMemory");
+            uint16_t magic = 0;
+            SIZE_T bytesRead = 0;
+            NTSTATUS st = fn ? fn(hProc, (PVOID)cb, &magic, 2, &bytesRead) : (NTSTATUS)0xC0000002;
+            DiagLog("GPA:      magic=0x%04X bytesRead=%zu status=0x%08X NT_SUCCESS=%d fn=%p\n",
+                magic, bytesRead, (unsigned)st, (int)NT_SUCCESS(st), (void*)fn);
+        }
     }
 
     DiagLog("=== MAIN LOOP START ===\n");
