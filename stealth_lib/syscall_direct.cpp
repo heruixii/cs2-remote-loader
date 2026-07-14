@@ -656,16 +656,17 @@ SyscallMethod DecideMethod(SyscallMethod requested) {
         return SyscallMethod::Indirect;
     }
 
-    // v3.24: StackSpoof 已修复 — 改用 sub rsp + mov + arg5重定位
-    // 修复前: push 导致 rsp 偏移, ≥5参数 syscall 的 arg5 错位到只读区 → ACCESS_VIOLATION
-    // 修复后: sub rsp 统一分配空间 + 重定位 arg5 到 [rsp+0x28]
-    if (resolver.GetSyscallRetGadget() && resolver.IsStackSpoofReady()) {
-        return SyscallMethod::StackSpoof;
-    }
-
-    // 非 StackSpoof 环境: 使用间接 syscall
+    // v3.30: 优先间接 syscall (最稳定, 已验证在多种环境下工作)
+    // StackSpoof 尽管 IsStackSpoofReady() 可能返回 true, 但在某些环境下
+    // ≥5参数 syscall (如NtReadVirtualMemory) 仍会产生 ACCESS_VIOLATION.
+    // 间接 syscall 是经过实战验证的最可靠方案, 优先使用.
     if (resolver.GetSyscallRetGadget()) {
         return SyscallMethod::Indirect;
+    }
+
+    // StackSpoof 仅在间接 syscall 不可用时回退尝试
+    if (resolver.IsStackSpoofReady()) {
+        return SyscallMethod::StackSpoof;
     }
 
     // 降级到直接 syscall
