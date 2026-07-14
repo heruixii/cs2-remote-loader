@@ -1224,6 +1224,34 @@ static BYOVDDriverInfo MutateAndRandomizeDriver(const BYOVDDriverInfo& original)
         }
     }
 
+    // v3.34: 剥离 Authenticode 数字签名
+    //   DataDirectory[4] = IMAGE_DIRECTORY_ENTRY_SECURITY
+    //   PE 签名字段 (VirtualAddress=文件偏移, Size=签名大小)
+    //   清零该目录项 + 截断文件 → EAC 无法按证书 Subject 白名单匹配
+    {
+        WORD optMagic = *(WORD*)(driverData.data() + peOffset + 24);
+        DWORD certDirOffset = peOffset + 24;
+        if (optMagic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+            certDirOffset += sizeof(IMAGE_OPTIONAL_HEADER64) - 16; // DataDir 在 OptionalHeader 尾部
+        else
+            certDirOffset += sizeof(IMAGE_OPTIONAL_HEADER32) - 16;
+
+        // DataDirectory[4] = index 4, each entry = 8 bytes (VA + Size)
+        DWORD dirIdx = certDirOffset + (4 * 8);
+        if (dirIdx + 8 <= fileSize) {
+            DWORD certVA  = *(DWORD*)(driverData.data() + dirIdx);
+            DWORD certSz  = *(DWORD*)(driverData.data() + dirIdx + 4);
+            if (certVA > 0 && certSz > 0 && certVA + certSz <= fileSize) {
+                // 清零 DataDirectory[4] 条目
+                *(DWORD*)(driverData.data() + dirIdx) = 0;
+                *(DWORD*)(driverData.data() + dirIdx + 4) = 0;
+                // 缩短文件: 只保留签名前的部分
+                fileSize = certVA;
+                driverData.resize(fileSize);
+            }
+        }
+    }
+
     // 写入变异后的驱动文件
     HANDLE hOut = CreateFileW(tempPath, GENERIC_WRITE, 0, nullptr,
         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);

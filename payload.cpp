@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 334 (v3.34: 5-layer anti-detect enhancement)
+// BUILD: 335 (v3.35: process hollowing + cert strip)
 // ============================================================
 
 #include "stealth_core.h"
@@ -73,11 +73,18 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
 static HANDLE g_hBasicProcess = nullptr;
 static DWORD g_basicRestartBackoffMs = 1000;  // 退避时间, 防止快速重启循环
 
-// v3.32: 从临时目录启动基础.exe (由 loader.exe 预先写入 %TEMP%\basic_esp.exe)
+// v3.34: NtUnmapViewOfSection 函数指针 (用于 Process Hollowing)
+typedef LONG(NTAPI* _NtUnmapViewOfSection)(HANDLE, PVOID);
+static _NtUnmapViewOfSection g_pNtUnmapViewOfSection = nullptr;
+
+// v3.34: Process Hollowing 启动基础.exe
+//   将 basic.exe 注入到一个合法的系统进程中 (svchost/rundll32),
+//   基础.exe 永不在磁盘上独立运行, 消除二进制特征检测
 static bool LaunchBasicESP() {
     wchar_t tempPath[MAX_PATH];
     GetTempPathW(MAX_PATH, tempPath);
 
+    // Step 1: 找到 basic.exe 文件
     wchar_t exePath[MAX_PATH];
     WIN32_FIND_DATAW fd;
     wsprintfW(exePath, L"%s\\basic_esp_*.exe", tempPath);
@@ -85,7 +92,6 @@ static bool LaunchBasicESP() {
     bool found = false;
     if (hFind != INVALID_HANDLE_VALUE) {
         do {
-            // 检查文件大小 (基础.exe 约 51KB)
             LARGE_INTEGER sz;
             sz.LowPart = fd.nFileSizeLow;
             sz.HighPart = fd.nFileSizeHigh;
@@ -97,9 +103,7 @@ static bool LaunchBasicESP() {
         } while (FindNextFileW(hFind, &fd));
         FindClose(hFind);
     }
-
     if (!found) {
-        // 备用: 直接尝试固定路径
         wsprintfW(exePath, L"%s\\basic_esp.exe", tempPath);
         if (GetFileAttributesW(exePath) == INVALID_FILE_ATTRIBUTES) {
             DiagLog("FAIL: basic.exe not found in %%TEMP%%\n");
@@ -107,30 +111,181 @@ static bool LaunchBasicESP() {
         }
     }
 
-    DiagLog("--- LaunchBasicESP: %ls ---\n", exePath);
+    // Step 2: 读取 basic.exe 到内存并解析 PE
+    HANDLE hFile = CreateFileW(exePath, GENERIC_READ, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        DiagLog("FAIL: cannot open basic.exe, err=%u\n", GetLastError());
+        return false;
+    }
+    DWORD fileSize = GetFileSize(hFile, nullptr);
+    if (fileSize < sizeof(IMAGE_DOS_HEADER) || fileSize > 10 * 1024 * 1024) {
+        CloseHandle(hFile);
+        return false;
+    }
+    std::vector<BYTE> rawExe(fileSize);
+    DWORD bytesRead = 0;
+    ReadFile(hFile, rawExe.data(), fileSize, &bytesRead, nullptr);
+    CloseHandle(hFile);
+
+    auto* dos = (IMAGE_DOS_HEADER*)rawExe.data();
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        DiagLog("FAIL: basic.exe invalid PE (bad MZ)\n");
+        return false;
+    }
+    auto* nt = (IMAGE_NT_HEADERS64*)(rawExe.data() + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        DiagLog("FAIL: basic.exe invalid PE (bad NT sig)\n");
+        return false;
+    }
+    uintptr_t preferredBase = nt->OptionalHeader.ImageBase;
+    DWORD    sizeOfImage    = nt->OptionalHeader.SizeOfImage;
+    DWORD    sizeOfHeaders  = nt->OptionalHeader.SizeOfHeaders;
+    uintptr_t entryRVA      = nt->OptionalHeader.AddressOfEntryPoint;
+    DiagLog("basic.exe PE: base=0x%llX size=0x%X entry=0x%llX\n",
+        (unsigned long long)preferredBase, sizeOfImage, (unsigned long long)entryRVA);
+
+    // Step 3: 创建合法系统进程 (rundll32) SUSPENDED
+    wchar_t sysDir[MAX_PATH];
+    GetSystemDirectoryW(sysDir, MAX_PATH);
+    wchar_t hostPath[MAX_PATH];
+    wsprintfW(hostPath, L"%s\\rundll32.exe", sysDir);
 
     STARTUPINFOW si = { sizeof(si) };
     si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_SHOW;
+    si.wShowWindow = SW_HIDE; // v3.34: 隐藏窗口 (overlay 由 basic.exe 内部创建)
     PROCESS_INFORMATION pi = {};
 
-    BOOL ok = CreateProcessW(exePath, nullptr,
+    BOOL ok = CreateProcessW(hostPath, nullptr,
         nullptr, nullptr, FALSE,
-        CREATE_NO_WINDOW,
-        nullptr, tempPath,
-        &si, &pi);
+        CREATE_SUSPENDED | CREATE_NO_WINDOW,
+        nullptr, nullptr, &si, &pi);
     if (!ok) {
-        DiagLog("FAIL: CreateProcessW, err=%u\n", GetLastError());
+        DiagLog("FAIL: CreateProcess(rundll32) err=%u\n", GetLastError());
+        return false;
+    }
+    DiagLog("Hollow host: rundll32.exe PID=%u\n", pi.dwProcessId);
+
+    // Step 4: 获取远程 PEB  → 原始 ImageBase
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!g_pNtUnmapViewOfSection) {
+        g_pNtUnmapViewOfSection = (_NtUnmapViewOfSection)GetProcAddress(ntdll, "NtUnmapViewOfSection");
+    }
+
+    // 获取 PEB 地址 via NtQueryInformationProcess
+    using _NtQueryInfoProc = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    auto pNtQIP = (_NtQueryInfoProc)GetProcAddress(ntdll, "NtQueryInformationProcess");
+
+    struct PROCESS_BASIC_INFORMATION {
+        LONG_PTR ExitStatus;
+        PVOID PebBaseAddress;
+        LONG_PTR AffinityMask;
+        LONG_PTR BasePriority;
+        ULONG_PTR UniqueProcessId;
+        LONG_PTR InheritedFromUniqueProcessId;
+    } pbi = {};
+
+    LONG status = pNtQIP(pi.hProcess, 0, &pbi, sizeof(pbi), nullptr); // ProcessBasicInformation
+    if (status < 0 || !pbi.PebBaseAddress) {
+        DiagLog("FAIL: NtQueryInformationProcess, status=0x%X\n", status);
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
         return false;
     }
 
-    g_hBasicProcess = pi.hProcess;
-    CloseHandle(pi.hThread);
-    DiagLog("OK: basic.exe launched, PID=%u\n", pi.dwProcessId);
+    // 读取远程 PEB → ImageBaseAddress (offset +0x10 on x64)
+    uintptr_t remotePeb = (uintptr_t)pbi.PebBaseAddress;
+    uintptr_t origImageBase = 0;
+    SIZE_T br = 0;
+    if (!ReadProcessMemory(pi.hProcess, (LPCVOID)(remotePeb + 0x10), &origImageBase, 8, &br) || !origImageBase) {
+        DiagLog("FAIL: cannot read remote ImageBase\n");
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+        return false;
+    }
+    DiagLog("Original ImageBase: 0x%llX\n", (unsigned long long)origImageBase);
 
-    // v3.34: 随机延迟 (规避固定时序特征)
+    // Step 5: NtUnmapViewOfSection 卸载原始镜像
+    bool hollowOk = false;
+    {
+        LONG unmapStatus = g_pNtUnmapViewOfSection(pi.hProcess, (PVOID)origImageBase);
+        if (unmapStatus < 0) {
+            DiagLog("WARN: NtUnmapViewOfSection failed (0x%X), falling back...\n", unmapStatus);
+            TerminateProcess(pi.hProcess, 0);
+            CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+        } else {
+            hollowOk = true;
+        }
+    }
+
+    if (hollowOk) {
+        // Step 6: 在远程进程分配 basic.exe 所需内存
+        PVOID remoteBase = VirtualAllocEx(pi.hProcess, (LPVOID)preferredBase,
+            sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!remoteBase) {
+            DiagLog("Preferred base 0x%llX occupied, allocating anywhere...\n",
+                (unsigned long long)preferredBase);
+            remoteBase = VirtualAllocEx(pi.hProcess, nullptr, sizeOfImage,
+                MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            if (!remoteBase) {
+                DiagLog("FAIL: VirtualAllocEx, err=%u\n", GetLastError());
+                TerminateProcess(pi.hProcess, 0);
+                CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+                hollowOk = false;
+            }
+        }
+
+        if (hollowOk) {
+            // Step 7-11: 写入 PE → 写入节区 → 修正 PEB → 设置入口 → 恢复线程
+            SIZE_T br = 0;
+            WriteProcessMemory(pi.hProcess, remoteBase, rawExe.data(), sizeOfHeaders, &br);
+            WORD numSections = nt->FileHeader.NumberOfSections;
+            auto* firstSec = IMAGE_FIRST_SECTION(nt);
+            for (WORD s = 0; s < numSections; s++) {
+                if (firstSec[s].SizeOfRawData > 0) {
+                    void* destAddr = (BYTE*)remoteBase + firstSec[s].VirtualAddress;
+                    WriteProcessMemory(pi.hProcess, destAddr,
+                        rawExe.data() + firstSec[s].PointerToRawData,
+                        firstSec[s].SizeOfRawData, &br);
+                }
+            }
+            uintptr_t newImageBase = (uintptr_t)remoteBase;
+            WriteProcessMemory(pi.hProcess, (void*)(remotePeb + 0x10), &newImageBase, 8, &br);
+            CONTEXT ctx = {};
+            ctx.ContextFlags = CONTEXT_FULL;
+            GetThreadContext(pi.hThread, &ctx);
+            ctx.Rcx = newImageBase + entryRVA;
+            SetThreadContext(pi.hThread, &ctx);
+            ResumeThread(pi.hThread);
+            g_hBasicProcess = pi.hProcess;
+            CloseHandle(pi.hThread);
+
+            DiagLog("OK: basic.exe hollowed into rundll32.exe (PID=%u, 0x%llX)\n",
+                pi.dwProcessId, (unsigned long long)newImageBase);
+            DeleteFileW(exePath);
+            Sleep(RandomJitter(1500, 3000));
+            return true;
+        }
+    }
+
+    // 回退: 直接 CreateProcess (当 Hollowing 失败时)
+    DiagLog("--- FALLBACK: direct CreateProcess ---\n");
+    {
+        STARTUPINFOW si2 = { sizeof(si2) };
+        si2.dwFlags = STARTF_USESHOWWINDOW;
+        si2.wShowWindow = SW_SHOW;
+        PROCESS_INFORMATION pi2 = {};
+        BOOL ok2 = CreateProcessW(exePath, nullptr, nullptr, nullptr, FALSE,
+            CREATE_NO_WINDOW, nullptr, tempPath, &si2, &pi2);
+        if (!ok2) {
+            DiagLog("FAIL: CreateProcessW fallback, err=%u\n", GetLastError());
+            return false;
+        }
+        g_hBasicProcess = pi2.hProcess;
+        CloseHandle(pi2.hThread);
+        DiagLog("OK: basic.exe launched direct, PID=%u\n", pi2.dwProcessId);
+    }
     Sleep(RandomJitter(1500, 3000));
-    // 基础.exe 已加载到内存, %TEMP% 中的文件由 Windows 自动清理
     return true;
 }
 
@@ -502,7 +657,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.34 DIAG START ===\n");
+    DiagLog("=== v3.35 DIAG START ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
@@ -921,7 +1076,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         DiagLog("--- End Entity Chain Trace ---\n");
     }
 
-    DiagLog("=== MAIN LOOP START (v3.34: 5-layer anti-detect enhanced) ===\n");
+    DiagLog("=== MAIN LOOP START (v3.35: hollowing + cert-strip) ===\n");
     int frameCount = 0;
     DWORD lastDiagTime = 0;
     DWORD lastRetryTime = 0;
