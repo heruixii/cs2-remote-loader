@@ -297,45 +297,37 @@ StealthProcess::GetProcessModules(HANDLE hProcess) {
         }
         CloseHandle(hSnap);
     } else {
-        // 通过远程 PEB 读取模块列表（使用 LDR_DATA_TABLE_ENTRY_FULL）
         PEB remotePeb = {};
         SIZE_T bytesRead = 0;
-        if (SysReadVirtualMemory(hProcess, pbi.PebBaseAddress,
-            &remotePeb, sizeof(PEB), &bytesRead, SyscallMethod::Indirect) &&
+        if (NT_SUCCESS(SysReadVirtualMemory(hProcess, pbi.PebBaseAddress,
+            &remotePeb, sizeof(PEB), &bytesRead, SyscallMethod::Indirect)) &&
             bytesRead == sizeof(PEB) && remotePeb.Ldr) {
 
-            // PEB_LDR_DATA 的 InLoadOrderModuleList 在偏移 0x10
-            // 只读足够大的区域以覆盖链表头
             BYTE ldrBuf[0x40] = {};
-            if (!SysReadVirtualMemory(hProcess, remotePeb.Ldr,
-                ldrBuf, sizeof(ldrBuf), &bytesRead, SyscallMethod::Indirect))
+            if (!NT_SUCCESS(SysReadVirtualMemory(hProcess, remotePeb.Ldr,
+                ldrBuf, sizeof(ldrBuf), &bytesRead, SyscallMethod::Indirect)))
                 return results;
 
-            // InLoadOrderModuleList 在 LDR 结构偏移 0x10 处
             auto* headInLdr = reinterpret_cast<PLIST_ENTRY>(
                 reinterpret_cast<uintptr_t>(remotePeb.Ldr) + 0x10);
 
-            // 读取链表表头
             LIST_ENTRY headEntry = {};
-            if (!SysReadVirtualMemory(hProcess, headInLdr,
-                &headEntry, sizeof(LIST_ENTRY), &bytesRead, SyscallMethod::Indirect))
+            if (!NT_SUCCESS(SysReadVirtualMemory(hProcess, headInLdr,
+                &headEntry, sizeof(LIST_ENTRY), &bytesRead, SyscallMethod::Indirect)))
                 return results;
 
-            // 遍历链表 (InLoadOrderLinks 是 LDR_DATA_TABLE_ENTRY_FULL 的第一个字段, 偏移 0)
             LIST_ENTRY next = headEntry;
             int safety = 0;
             while (safety++ < 512) {
-                // Flink 直接指向下一个 LDR_DATA_TABLE_ENTRY_FULL (InLoadOrderLinks 在偏移 0)
                 auto entryAddr = reinterpret_cast<uintptr_t>(next.Flink);
                 
-                // 检查是否回绕到 LDR 表头
                 if (entryAddr == reinterpret_cast<uintptr_t>(headInLdr))
                     break;
 
                 LDR_DATA_TABLE_ENTRY_FULL entry = {};
-                if (!SysReadVirtualMemory(hProcess,
+                if (!NT_SUCCESS(SysReadVirtualMemory(hProcess,
                     reinterpret_cast<PVOID>(entryAddr),
-                    &entry, sizeof(entry), &bytesRead, SyscallMethod::Indirect))
+                    &entry, sizeof(entry), &bytesRead, SyscallMethod::Indirect)))
                     break;
 
                 if (entry.DllBase && entry.SizeOfImage) {
@@ -343,22 +335,20 @@ StealthProcess::GetProcessModules(HANDLE hProcess) {
                     info.baseAddress = reinterpret_cast<uintptr_t>(entry.DllBase);
                     info.size = entry.SizeOfImage;
 
-                    // 读取模块名
                     if (entry.BaseDllName.Buffer && entry.BaseDllName.Length > 0 &&
                         entry.BaseDllName.Length < MAX_PATH * 2) {
                         std::vector<WCHAR> nameBuf(entry.BaseDllName.Length / 2 + 1);
-                        if (SysReadVirtualMemory(hProcess, entry.BaseDllName.Buffer,
+                        if (NT_SUCCESS(SysReadVirtualMemory(hProcess, entry.BaseDllName.Buffer,
                             nameBuf.data(), entry.BaseDllName.Length, &bytesRead,
-                            SyscallMethod::Indirect)) {
+                            SyscallMethod::Indirect))) {
                             info.name = nameBuf.data();
                         }
                     }
                     results.push_back(info);
                 }
 
-                // 读取下一个链表项
-                if (!SysReadVirtualMemory(hProcess, next.Flink,
-                    &next, sizeof(LIST_ENTRY), &bytesRead, SyscallMethod::Indirect))
+                if (!NT_SUCCESS(SysReadVirtualMemory(hProcess, next.Flink,
+                    &next, sizeof(LIST_ENTRY), &bytesRead, SyscallMethod::Indirect)))
                     break;
             }
         }
