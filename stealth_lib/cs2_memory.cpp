@@ -190,8 +190,11 @@ std::vector<Entity> Memory::GetAllPlayers(bool onlyAlive) {
         // 由于 ESP 渲染使用硬编码高度 (+72) 做头部投影, 不依赖 viewOffset, 此处跳过
         ent.headPos = {ent.origin.x, ent.origin.y, ent.origin.z + 72.0f};
 
-        // 休眠/武器/盔甲状态 (非连续字段, 分别读取)
-        ent.isDormant  = Read<uint8_t>(pawn + m_offsets.m_bDormant) != 0;
+        // v3.29: Dormant 标志在 CGameSceneNode 内 (偏移 0xE7), 不是 pawn 实体自身
+        //         之前错误地从 pawn + 0xE7 读取, 实际上读到了 pawn 的无关字段
+        if (gameSceneNode) {
+            ent.isDormant = Read<uint8_t>(gameSceneNode + m_offsets.m_bDormant) != 0;
+        }
         ent.isScoped   = Read<uint8_t>(pawn + m_offsets.m_bIsScoped) != 0;
 
         // v3.28: Dormant 检查前置到屏幕投影之前, 避免浪费投影计算
@@ -243,8 +246,9 @@ std::vector<Entity> Memory::GetAllPlayers(bool onlyAlive) {
         ent.boxWidth  = ent.boxHeight * 0.4f;
         if (ent.boxWidth  < 2.0f) ent.boxWidth  = 2.0f;
 
-        WorldToScreen(ent.origin, ent.screenPos);
-
+        // v3.29: 移除冗余 WorldToScreen(ent.origin, ent.screenPos)
+        //       feetWorld==origin, ent.screenFeet 已包含脚部屏幕坐标
+        //       ent.screenPos 在 ESP 渲染中从未被引用 — 纯死数据
         result.push_back(ent);
     }
 
