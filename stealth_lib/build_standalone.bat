@@ -33,6 +33,7 @@ echo ============================================
     string_obfuscator.cpp ^
     cheat_overlay.cpp ^
     game_esp.cpp ^
+    byovd_kernel.cpp ^
     -lwinhttp -lws2_32 -lntdll -ldwmapi -lgdi32 -luser32 -lshell32
 
 if %ERRORLEVEL% neq 0 (

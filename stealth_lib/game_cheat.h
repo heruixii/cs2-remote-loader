@@ -10,6 +10,7 @@
 #include "cheat_overlay.h"
 #include "game_esp.h"
 #include "eac_syscall_guard.h"
+#include "byovd_kernel.h"
 #include <thread>
 #include <chrono>
 #include <random>
@@ -84,6 +85,11 @@ public:
         if (!cs2::CheatOverlay::Instance().Create(overlayCfg)) {
             return false;
         }
+
+        // Step 6.5: BYOVD 内核防御 — 摘除 EAC 内核回调 (Ring-0)
+        // 成功后 EAC 的 ObRegisterCallbacks/ProcessNotify/ImageNotify 全部失效
+        auto kernelResult = stealth::KernelDefense::EnableAll();
+        (void)kernelResult; // 非致命: 内核模块失败不阻塞外挂加载
 
         // Step 7: 配置 ESP
         cs2::ESPConfig espCfg;
@@ -173,6 +179,7 @@ public:
     void Shutdown() {
         g_cheat_running = false;
         cs2::CheatOverlay::Instance().Destroy();
+        stealth::KernelDefense::DisableAll();
         stealth::StealthEngine::Instance().Shutdown();
     }
 
