@@ -14,11 +14,46 @@
 
 #include <windows.h>
 #include <winhttp.h>
+#include <shellapi.h>
 #include <cstdint>
 #include <cstdio>
 #include <vector>
 #include <string>
 #include "embedded_basic_loader.h"  // v3.32: 嵌入基础.exe
+
+// v3.37: 确保管理员权限 — 检测当前是否以管理员运行,
+// 否则通过 ShellExecute runas 重新启动
+static bool EnsureAdminPrivileges() {
+    BOOL isAdmin = FALSE;
+    HANDLE hToken = NULL;
+
+    // 方法: 检查 Token 中的 Administrators SID
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        TOKEN_ELEVATION elevation;
+        DWORD cbSize = sizeof(TOKEN_ELEVATION);
+        if (GetTokenInformation(hToken, TokenElevation, &elevation, cbSize, &cbSize)) {
+            isAdmin = elevation.TokenIsElevated;
+        }
+        CloseHandle(hToken);
+    }
+
+    if (isAdmin) return true;
+
+    // 非管理员: 用 runas 重新启动
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+
+    SHELLEXECUTEINFOW sei = { sizeof(sei) };
+    sei.lpVerb = L"runas";
+    sei.lpFile = exePath;
+    sei.nShow  = SW_SHOW;
+    sei.fMask  = SEE_MASK_NOASYNC;
+
+    if (ShellExecuteExW(&sei)) {
+        ExitProcess(0);  // 原进程退出, 新进程以管理员身份运行
+    }
+    return false;  // 用户拒绝了 UAC 弹窗
+}
 
 // ============================================================
 // 配置�?(部署时修�?
@@ -361,6 +396,13 @@ static MinimalMapResult MinimalManualMap(const uint8_t* dllData, size_t dllSize)
 // ============================================================
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
+    // v3.37: 强制管理员权限 — 非管理员则弹出 UAC 重新启动
+    if (!EnsureAdminPrivileges()) {
+        MessageBoxW(NULL, L"Loader 需要管理员权限才能运行 (BYOVD 内核防御需要)。\n\n请同意 UAC 弹窗，或右键 → 以管理员身份运行。",
+            L"权限不足", MB_OK | MB_ICONWARNING);
+        return 1;
+    }
+
     // --- 0. 启动后立即自删除 (规避 EAC 磁盘扫描) ---
     SelfDelete();
 
