@@ -14,13 +14,15 @@
 
 #include "byovd_kernel.h"
 #include <winreg.h>
-#include <winternl.h>   // PUNICODE_STRING, UNICODE_STRING, NT_SUCCESS, NtQuerySystemInformation
+#include <winternl.h>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
 #include <fstream>
+#include <random>
+#include <ctime>
 #ifdef _MSC_VER
-#include <intrin.h>     // __readcr3() for MSVC
+#include <intrin.h>
 #endif
 
 // BYOVD 驱动嵌入支持: 将 RTCore64.sys 编译进 payload
@@ -1067,14 +1069,120 @@ bool DKOMProcessHider::UnhideProcess() {
 // KernelDefense — 一体化编排
 // ============================================================
 
+// ============================================================
+// v3.33 Method 3: 驱动 PE 头变异 + 随机化服务名
+//
+// RTCore64.sys 的 SHA256 被 EAC 黑名单收录,
+// 直接加载会被驱动签名/哈希扫描检测
+//
+// 策略:
+//   1. 复制驱动到 %TEMP%\XXXX.sys (随机名)
+//   2. 修改 PE 头: Timestamp 随机化 + CheckSum 重算
+//   3. 注册为随机服务名 "SysMonXXXX"
+//
+// 效果: 每次运行驱动文件名+服务名+PE header 均不同,
+//       EAC 黑名单按固定签名/哈希匹配 → 失效
+// ============================================================
+static BYOVDDriverInfo MutateAndRandomizeDriver(const BYOVDDriverInfo& original) {
+    // 生成 4 位随机 hex 标识符
+    WORD seed = (WORD)(GetTickCount() ^ (GetCurrentProcessId() & 0xFFFF) ^ GetCurrentThreadId());
+    wchar_t randomHex[16] = {};
+    wsprintfW(randomHex, L"%04X", seed);
+
+    // 生成随机文件名: SysDrv_XXXX.sys
+    wchar_t randomName[64] = {};
+    wsprintfW(randomName, L"SysDrv_%s.sys", randomHex);
+
+    wchar_t tempPath[MAX_PATH];
+    GetTempPathW(MAX_PATH, tempPath);
+    wcscat_s(tempPath, randomName);
+
+    // 复制原始驱动文件到临时目录
+    std::wstring srcPath;
+    {
+        wchar_t sysDir[MAX_PATH];
+        GetSystemDirectoryW(sysDir, MAX_PATH);
+        wcscat_s(sysDir, L"\\drivers\\");
+        wcscat_s(sysDir, original.driverPath.c_str());
+
+        // 检查源文件是否存在
+        if (GetFileAttributesW(sysDir) == INVALID_FILE_ATTRIBUTES) {
+            // 回退: 用原始路径 (可能是嵌入提取的路径)
+            srcPath = original.driverPath;
+        } else {
+            srcPath = sysDir;
+        }
+    }
+
+    // 读入整个源驱动到内存 (使用 Win32 API, Unicode 路径兼容)
+    HANDLE hSrc = CreateFileW(srcPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hSrc == INVALID_HANDLE_VALUE) return original;
+    DWORD fileSize = GetFileSize(hSrc, nullptr);
+    if (fileSize < 0x200 || fileSize > 100 * 1024 * 1024) { CloseHandle(hSrc); return original; }
+    std::vector<uint8_t> driverData(fileSize);
+    DWORD bytesRead = 0;
+    ReadFile(hSrc, driverData.data(), fileSize, &bytesRead, nullptr);
+    CloseHandle(hSrc);
+    if (bytesRead != fileSize) return original;
+
+    if (driverData[0] != 'M' || driverData[1] != 'Z') return original; // 不是有效 PE
+
+    // PE 头变异: 修改 Timestamp (偏移 3C→PE sig→offset+8)
+    uint32_t peOffset = *(uint32_t*)(driverData.data() + 0x3C);
+    if (peOffset + 8 + 4 <= fileSize) {
+        // Timestamp 在 PE signature + 8 处
+        uint32_t* pTimestamp = (uint32_t*)(driverData.data() + peOffset + 8);
+        // 随机化为 2024-2025 之间的时间戳
+        *pTimestamp = 0x66000000 | (rand() & 0xFFFFFF);
+    }
+
+    // CheckSum 清零 (在 Optional Header 中, 位置因 PE32/PE32+ 而异)
+    // 为简化, 直接清零 PE signature+88 (CheckSum 对 PE32+ 的位置)
+    if (peOffset + 88 + 4 <= fileSize) {
+        uint32_t* pCheckSum = (uint32_t*)(driverData.data() + peOffset + 88);
+        *pCheckSum = 0;
+    }
+
+    // 写入变异后的驱动文件
+    HANDLE hOut = CreateFileW(tempPath, GENERIC_WRITE, 0, nullptr,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hOut == INVALID_HANDLE_VALUE) return original;
+    DWORD bytesWritten = 0;
+    WriteFile(hOut, driverData.data(), fileSize, &bytesWritten, nullptr);
+    CloseHandle(hOut);
+    if (bytesWritten != fileSize) return original;
+
+    if (GetFileAttributesW(tempPath) == INVALID_FILE_ATTRIBUTES) return original;
+
+    // 构建随机化的驱动信息
+    BYOVDDriverInfo mutated;
+    mutated.devicePath = original.devicePath; // 设备路径不变 (驱动内部创建)
+    wchar_t svcName[64] = {};
+    wsprintfW(svcName, L"SysMon%s", randomHex);
+    mutated.serviceName = svcName;
+    wchar_t dspName[64] = {};
+    wsprintfW(dspName, L"System Monitor %s", randomHex);
+    mutated.displayName = dspName;
+    mutated.driverPath = tempPath;         // 使用变异后的临时文件
+    mutated.ioctlCode = original.ioctlCode;
+    mutated.needsMemoryMap = original.needsMemoryMap;
+
+    return mutated;
+}
+
+// ============================================================
 KernelDefense::Result KernelDefense::EnableAll() {
     Result result;
     auto& kma = KernelMemoryAccessor::Instance();
 
-    // 1. 加载 BYOVD 驱动
-    result.driverLoaded = kma.Initialize(BYOVDDrivers::RTCore64);
+    // v3.33 Method 3: 驱动 PE 变异 + 随机化服务名
+    //   优先尝试变异版 RTCore64, 失败回退 Gdrv
+    BYOVDDriverInfo mutatedRTCore = MutateAndRandomizeDriver(BYOVDDrivers::RTCore64);
+    result.driverLoaded = kma.Initialize(mutatedRTCore);
     if (!result.driverLoaded) {
-        result.driverLoaded = kma.Initialize(BYOVDDrivers::Gdrv);
+        BYOVDDriverInfo mutatedGdrv = MutateAndRandomizeDriver(BYOVDDrivers::Gdrv);
+        result.driverLoaded = kma.Initialize(mutatedGdrv);
     }
     if (!result.driverLoaded) {
         return result; // 无内核可用

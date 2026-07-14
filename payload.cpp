@@ -139,7 +139,8 @@ static void TerminateBasicESP() {
 
 // v3.32-plus: 注入痕迹清理 — 基础.exe 注入到 cs2.exe 后, 从外部通过 handles
 // 清除 PEB Ldr 链表中的注入模块条目, 防止 EAC 用户态模块枚举检测
-// 同时清理注入线程的 TEB 痕迹
+// 同时清理 VAD PE 头部 + 注入线程的 TEB Win32StartAddress
+// v3.33: 新增 VAD PE 头清零 (Method 1) + 线程 StartAddress 欺骗 (Method 2)
 static void CleanupInjectionTraces() {
     using namespace stealth;
     HANDLE hProc = StealthEngine::Instance().GetProcessHandle();
@@ -213,11 +214,15 @@ static void CleanupInjectionTraces() {
     };
 
     // 3. 同时清理两个模块链表: InLoadOrder (Ldr+0x10) 和 InMemoryOrder (Ldr+0x20)
+    // v3.33: 记录被摘除模块的 dllBase, 后续做 PE 头清零 + 线程欺骗
     struct ListCleanup { uintptr_t headAddr; const char* desc; };
     ListCleanup lists[] = {
         { ldr + 0x10, "InLoadOrder" },
         { ldr + 0x20, "InMemoryOrder" },
     };
+
+    uintptr_t cleanedBases[32] = {};  // v3.33: 记录摘除的模块基址
+    int numCleaned = 0;
 
     int totalCleaned = 0;
     for (auto& list : lists) {
@@ -247,20 +252,26 @@ static void CleanupInjectionTraces() {
             }
 
             if (!isKnownModule(modName) && dllBase) {
-                DiagLog("CleanupInjectionTraces: [%s] UNLINK %ls (base=0x%llX, flink=0x%llX)\n",
-                    list.desc, modName, (unsigned long long)dllBase, (unsigned long long)cur);
+                DiagLog("CleanupInjectionTraces: [%s] UNLINK %ls (base=0x%llX)\n",
+                    list.desc, modName, (unsigned long long)dllBase);
+
+                // 记录基址用于后续 PE 头清零 + 线程欺骗
+                bool alreadyRecorded = false;
+                for (int k = 0; k < numCleaned; k++) {
+                    if (cleanedBases[k] == dllBase) { alreadyRecorded = true; break; }
+                }
+                if (!alreadyRecorded && numCleaned < 32) {
+                    cleanedBases[numCleaned++] = dllBase;
+                }
 
                 // 读取当前节点的 LIST_ENTRY
                 uintptr_t nodeFlink = *(uintptr_t*)(modBuf + 0);
                 uintptr_t nodeBlink = *(uintptr_t*)(modBuf + 8);
 
                 if (nodeFlink && nodeBlink) {
-                    // nodeBlink->FLink = nodeFlink
                     SIZE_T wb = 0;
                     SysWriteVirtualMemory(hProc, (PVOID)nodeBlink, &nodeFlink, 8, &wb, SyscallMethod::Indirect);
-                    // nodeFlink->BLink = nodeBlink
                     SysWriteVirtualMemory(hProc, (PVOID)(nodeFlink + 8), &nodeBlink, 8, &wb, SyscallMethod::Indirect);
-                    // 清理当前节点的链接 (预防性措施)
                     SysWriteVirtualMemory(hProc, (PVOID)(cur + 0), &cur, 8, &wb, SyscallMethod::Indirect);
                     SysWriteVirtualMemory(hProc, (PVOID)(cur + 8), &cur, 8, &wb, SyscallMethod::Indirect);
                     totalCleaned++;
@@ -271,7 +282,195 @@ static void CleanupInjectionTraces() {
         }
     }
 
-    DiagLog("CleanupInjectionTraces: done, cleaned %d entries\n", totalCleaned);
+    DiagLog("CleanupInjectionTraces: Ldr done, cleaned %d entries, %d unique bases\n",
+        totalCleaned, numCleaned);
+
+    // ============================================================
+    // v3.33 Method 1: VAD 区域 PE 头清零
+    // 即使 EAC 绕过 PEB Ldr 直接扫描 MEM_PRIVATE 可执行页,
+    // 也找不到 PE 头 (MZ/PE 签名), 无法确认为注入 DLL
+    // ============================================================
+    for (int i = 0; i < numCleaned; i++) {
+        uintptr_t base = cleanedBases[i];
+        if (!base || base < 0x10000) continue;
+
+        // 读取 DLL 基址的 PE 头验证
+        BYTE peSig[0x1000] = {};
+        SIZE_T rbytes = 0;
+        NTSTATUS st = SysReadVirtualMemory(hProc, (PVOID)base, peSig, sizeof(peSig), &rbytes, SyscallMethod::Indirect);
+
+        if (NT_SUCCESS(st) && rbytes >= 0x200) {
+            // 验证 MZ 签名 (前2字节 = "MZ")
+            if (peSig[0] == 'M' && peSig[1] == 'Z') {
+                DiagLog("CleanupInjectionTraces: [PE-ZERO] base=0x%llX, zeroing PE header (0x1000 bytes)\n",
+                    (unsigned long long)base);
+
+                // 清零 PE 头 (前 0x1000 字节: DOS头 + PE签名 + Optional Header + Section Headers)
+                BYTE zeros[0x1000] = {};
+                SIZE_T wb = 0;
+                NTSTATUS ws = SysWriteVirtualMemory(hProc, (PVOID)base, zeros, 0x1000, &wb, SyscallMethod::Indirect);
+                DiagLog("CleanupInjectionTraces: [PE-ZERO] write status=0x%08X bytes=%zu\n",
+                    (unsigned)ws, wb);
+
+                // 改保护: MEM_PRIVATE 可执行页 → EXECUTE_READ (模拟 mapped image 的 .text 段)
+                // EAC VAD 扫描: mapped image = MEM_MAPPED + EXECUTE_READ; injected = MEM_PRIVATE + EXECUTE_READWRITE
+                // 我们无法改 MEM 类型, 但把 protection 改成 EXECUTE_READ 降低可疑程度
+                ULONG oldProt = 0;
+                SIZE_T regionSize = 0x1000;
+                PVOID protAddr = (PVOID)base;
+                SysProtectVirtualMemory(hProc, &protAddr, &regionSize, PAGE_EXECUTE_READ, &oldProt,
+                    SyscallMethod::Indirect);
+            } else {
+                DiagLog("CleanupInjectionTraces: [PE-ZERO] base=0x%llX SKIP (no MZ signature)\n",
+                    (unsigned long long)base);
+            }
+        } else {
+            DiagLog("CleanupInjectionTraces: [PE-ZERO] base=0x%llX read failed status=0x%08X\n",
+                (unsigned long long)base, (unsigned)st);
+        }
+    }
+
+    // ============================================================
+    // v3.33 Method 2: 线程 StartAddress 欺骗
+    // 基础.exe 注入后在 cs2.exe 中有额外线程,
+    // EAC 可通过 NtQueryInformationThread → Win32StartAddress 发现
+    // 未知范围内的线程 → 判定为注入线程
+    // 策略: 将注入线程的 Win32StartAddress 改写为 ntdll!RtlUserThreadStart
+    // ============================================================
+    if (numCleaned > 0) {
+        // 获取 ntdll.dll 在 cs2.exe 中的基址 (从 PEB→Ldr 读取)
+        // 使用 RtlUserThreadStart 作为合法启动地址
+        // 偏移: ntdll.dll + RtlUserThreadStart offset
+        // RtlUserThreadStart 是已知偏移: Win10=0x1E150, Win11=0x21C50 附近
+        // 使用更通用的方法: 从我们的 ntdll 获取 RtlUserThreadStart 地址,
+        // 再计算 RVA
+
+        // 获取本地 ntdll 的 RtlUserThreadStart 地址
+        HMODULE hLocalNtdll = GetModuleHandleW(L"ntdll.dll");
+        uint64_t localRtlUserThreadStart = 0;
+        if (hLocalNtdll) {
+            localRtlUserThreadStart = (uint64_t)GetProcAddress(hLocalNtdll, "RtlUserThreadStart");
+        }
+
+        // 从 cs2.exe 的 PEB 获取 ntdll.dll 基址
+        uint64_t remoteNtdllBase = 0;
+        {
+            BYTE headBuf2[16] = {};
+            if (NT_SUCCESS(SysReadVirtualMemory(hProc, (PVOID)(ldr + 0x10), headBuf2, 16, &br, SyscallMethod::Indirect))) {
+                uintptr_t cur2 = *(uintptr_t*)(headBuf2 + 0);
+                int w2 = 0;
+                while (cur2 && cur2 != (ldr + 0x10) && w2 < 256) {
+                    w2++;
+                    BYTE modBuf2[0x200] = {};
+                    if (!NT_SUCCESS(SysReadVirtualMemory(hProc, (PVOID)cur2, modBuf2, sizeof(modBuf2), &br, SyscallMethod::Indirect)))
+                        break;
+                    uintptr_t fl2 = *(uintptr_t*)(modBuf2 + 0);
+                    uintptr_t db2 = *(uintptr_t*)(modBuf2 + 0x30);
+                    uintptr_t nm = *(uintptr_t*)(modBuf2 + 0x48);
+                    USHORT nl = *(USHORT*)(modBuf2 + 0x50);
+                    wchar_t mname[64] = {};
+                    if (nm && nl > 0 && nl < 128) {
+                        SysReadVirtualMemory(hProc, (PVOID)nm, mname, nl, &br, SyscallMethod::Indirect);
+                    }
+                    if (wcsstr(mname, L"ntdll") || wcsstr(mname, L"NTDLL")) {
+                        remoteNtdllBase = db2;
+                        break;
+                    }
+                    cur2 = fl2;
+                }
+            }
+        }
+        DiagLog("CleanupInjectionTraces: remote ntdll=0x%llX\n", (unsigned long long)remoteNtdllBase);
+
+        // 计算 RtlUserThreadStart 在远程 ntdll 中的地址
+        uint64_t localNtdllBase = 0;
+        if (hLocalNtdll) {
+            localNtdllBase = (uint64_t)hLocalNtdll;
+        }
+        uint64_t rvaRtlUserStart = localRtlUserThreadStart - localNtdllBase;
+        uint64_t remoteRtlUserThreadStart = remoteNtdllBase ? (remoteNtdllBase + rvaRtlUserStart) : 0;
+
+        DiagLog("CleanupInjectionTraces: local ntdll=0x%llX RtlUserThreadStart=0x%llX rva=0x%llX remote=0x%llX\n",
+            (unsigned long long)localNtdllBase, (unsigned long long)localRtlUserThreadStart,
+            (unsigned long long)rvaRtlUserStart, (unsigned long long)remoteRtlUserThreadStart);
+
+        // 枚举 cs2.exe 的所有线程
+        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (hSnap != INVALID_HANDLE_VALUE) {
+            DWORD cs2Pid = GetProcessId(hProc);
+            THREADENTRY32 te = { sizeof(te) };
+
+            if (Thread32First(hSnap, &te)) {
+                do {
+                    if (te.th32OwnerProcessID != cs2Pid) continue;
+
+                    HANDLE hTh = OpenThread(THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT, FALSE, te.th32ThreadID);
+                    if (!hTh) continue;
+
+                    // 查询 Win32StartAddress (class 9)
+                    PVOID startAddr = nullptr;
+                    ULONG ql = 0;
+                    HMODULE localNtdll2 = GetModuleHandleW(L"ntdll.dll");
+                    if (localNtdll2) {
+                        using NtQIT_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+                        auto pNtQIT = (NtQIT_t)GetProcAddress(localNtdll2, "NtQueryInformationThread");
+                        if (pNtQIT) {
+                            pNtQIT(hTh, 9, &startAddr, sizeof(startAddr), &ql);
+                        }
+                    }
+
+                    // 检查 startAddr 是否在注入模块范围内
+                    bool isInjected = false;
+                    if (startAddr) {
+                        uint64_t sa = (uint64_t)startAddr;
+                        // 排除 ntdll.dll 和 cs2.exe 自己
+                        if (remoteNtdllBase && sa >= remoteNtdllBase && sa < remoteNtdllBase + 0x300000) {
+                            // 在 ntdll 范围内 → 合法线程
+                        } else {
+                            for (int k = 0; k < numCleaned; k++) {
+                                if (sa >= cleanedBases[k] && sa < cleanedBases[k] + 0x2000000) {
+                                    isInjected = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if (isInjected && remoteRtlUserThreadStart) {
+                        DiagLog("CleanupInjectionTraces: [THREAD] TID=%lu StartAddr=0x%llX → spoof=0x%llX\n",
+                            te.th32ThreadID, (unsigned long long)startAddr,
+                            (unsigned long long)remoteRtlUserThreadStart);
+
+                        // 写入 TEB->Win32StartAddress (偏移 0x1C8 in TEB)
+                        // 需要先获取线程的 TEB 地址
+                        // TEB 地址 = NtQueryInformationThread(ThreadBasicInformation) → TebBaseAddress
+                        THREAD_BASIC_INFORMATION tbi = {};
+                        ULONG tbiLen = 0;
+                        HMODULE localNtdll3 = GetModuleHandleW(L"ntdll.dll");
+                        if (localNtdll3) {
+                            using NtQIT_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+                            auto pNtQIT2 = (NtQIT_t)GetProcAddress(localNtdll3, "NtQueryInformationThread");
+                            if (pNtQIT2) {
+                                NTSTATUS tbiSt = pNtQIT2(hTh, 0, &tbi, sizeof(tbi), &tbiLen);
+                                if (NT_SUCCESS(tbiSt) && tbi.TebBaseAddress) {
+                                    SIZE_T wt = 0;
+                                    uintptr_t tebWin32StartAddr = (uintptr_t)tbi.TebBaseAddress + 0x1C8;
+                                    SysWriteVirtualMemory(hProc, (PVOID)tebWin32StartAddr,
+                                        &remoteRtlUserThreadStart, 8, &wt, SyscallMethod::Indirect);
+                                }
+                            }
+                        }
+                    }
+
+                    CloseHandle(hTh);
+                } while (Thread32Next(hSnap, &te));
+            }
+
+            CloseHandle(hSnap);
+        }
+    }
+
+    DiagLog("CleanupInjectionTraces: done (PE zero + thread spoof)\n");
 }
 
 // ============================================================
