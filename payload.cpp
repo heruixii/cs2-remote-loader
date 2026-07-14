@@ -4,9 +4,11 @@
 // 编译为 DLL, 经 XTEA 加密后托管在 HTTP 服务器上,
 // 由 loader.exe 下载 → 解密 → ManualMap 到内存中执行,
 // 全程不落盘, 规避 EAC minifilter 文件扫描。
+// v3.30: DecideMethod优先Indirect, 规避StackSpoof >=5参数AV崩溃
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
+// BUILD: 330
 // ============================================================
 
 #include "stealth_core.h"
