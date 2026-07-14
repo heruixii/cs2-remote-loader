@@ -160,13 +160,15 @@ static bool LaunchBasicESP() {
         nullptr, nullptr, FALSE,
         CREATE_SUSPENDED | CREATE_NO_WINDOW,
         nullptr, nullptr, &si, &pi);
+    bool canHollow = ok;
     if (!ok) {
-        DiagLog("FAIL: CreateProcess(rundll32) err=%u\n", GetLastError());
-        return false;
+        DiagLog("WARN: CreateProcess(rundll32) err=%u, fallback to direct launch\n", GetLastError());
+    } else {
+        DiagLog("Hollow host: rundll32.exe PID=%u\n", pi.dwProcessId);
     }
-    DiagLog("Hollow host: rundll32.exe PID=%u\n", pi.dwProcessId);
 
     // Step 4: 获取远程 PEB  → 原始 ImageBase
+    if (canHollow) {
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (!g_pNtUnmapViewOfSection) {
         g_pNtUnmapViewOfSection = (_NtUnmapViewOfSection)GetProcAddress(ntdll, "NtUnmapViewOfSection");
@@ -190,7 +192,7 @@ static bool LaunchBasicESP() {
         DiagLog("FAIL: NtQueryInformationProcess, status=0x%X\n", status);
         TerminateProcess(pi.hProcess, 0);
         CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-        return false;
+        canHollow = false;
     }
 
     // 读取远程 PEB → ImageBaseAddress (offset +0x10 on x64)
@@ -201,13 +203,13 @@ static bool LaunchBasicESP() {
         DiagLog("FAIL: cannot read remote ImageBase\n");
         TerminateProcess(pi.hProcess, 0);
         CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-        return false;
+        canHollow = false;
     }
     DiagLog("Original ImageBase: 0x%llX\n", (unsigned long long)origImageBase);
 
     // Step 5: NtUnmapViewOfSection 卸载原始镜像
     bool hollowOk = false;
-    {
+    if (canHollow) {
         LONG unmapStatus = g_pNtUnmapViewOfSection(pi.hProcess, (PVOID)origImageBase);
         if (unmapStatus < 0) {
             DiagLog("WARN: NtUnmapViewOfSection failed (0x%X), falling back...\n", unmapStatus);
@@ -254,7 +256,7 @@ static bool LaunchBasicESP() {
             CONTEXT ctx = {};
             ctx.ContextFlags = CONTEXT_FULL;
             GetThreadContext(pi.hThread, &ctx);
-            ctx.Rcx = newImageBase + entryRVA;
+            ctx.Rip = newImageBase + entryRVA;
             SetThreadContext(pi.hThread, &ctx);
             ResumeThread(pi.hThread);
             g_hBasicProcess = pi.hProcess;
@@ -267,8 +269,9 @@ static bool LaunchBasicESP() {
             return true;
         }
     }
+    } // end if (canHollow)
 
-    // 回退: 直接 CreateProcess (当 Hollowing 失败时)
+    // 回退: 直接 CreateProcess (当 Hollowing 失败或不能时)
     DiagLog("--- FALLBACK: direct CreateProcess ---\n");
     {
         STARTUPINFOW si2 = { sizeof(si2) };

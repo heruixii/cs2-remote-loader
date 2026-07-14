@@ -1231,10 +1231,13 @@ static BYOVDDriverInfo MutateAndRandomizeDriver(const BYOVDDriverInfo& original)
     {
         WORD optMagic = *(WORD*)(driverData.data() + peOffset + 24);
         DWORD certDirOffset = peOffset + 24;
+        // DataDirectory 在 OptionalHeader 最后 128 字节 (16×8)
+        // PE32+: OptionalHeader=240, DataDir起始偏移=240-128=112
+        // PE32:  OptionalHeader=224, DataDir起始偏移=224-128=96
         if (optMagic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
-            certDirOffset += sizeof(IMAGE_OPTIONAL_HEADER64) - 16; // DataDir 在 OptionalHeader 尾部
+            certDirOffset += sizeof(IMAGE_OPTIONAL_HEADER64) - 128;
         else
-            certDirOffset += sizeof(IMAGE_OPTIONAL_HEADER32) - 16;
+            certDirOffset += sizeof(IMAGE_OPTIONAL_HEADER32) - 128;
 
         // DataDirectory[4] = index 4, each entry = 8 bytes (VA + Size)
         DWORD dirIdx = certDirOffset + (4 * 8);
