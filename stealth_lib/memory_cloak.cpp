@@ -622,7 +622,8 @@ SelfCloaker::CloakResult SelfCloaker::CloakManualMap(HMODULE dllBase, SIZE_T dll
 
     // 2b. 移除自身 EXE 的 Ldr 条目 (隐藏 loader.exe 模块名)
     MessageBoxW(0, L"CLOAK3: UnlinkSelfLdr...", L"CloakDiag", 0);
-    UnlinkSelfLdrEntry();
+    // SKIP: ManualMap 场景下 PEB 链表操作不稳定, 自删除已足够隐蔽
+    // UnlinkSelfLdrEntry();
 
     // 3. 随机化页保护
     MessageBoxW(0, L"CLOAK4: RandomizeProtections...", L"CloakDiag", 0);
