@@ -221,7 +221,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         // Dump entity system raw memory to understand structure
         DiagLog("  -- entity system dump (first 512 bytes) --\n");
         {
-            uintptr_t elBase = *(uintptr_t*)((BYTE*)nullptr + 0); // placeholder, we read from entity list offset
+            uintptr_t elBase = 0;
             SIZE_T br = 0;
             SysReadVirtualMemory(hProc, (PVOID)(cb + off.dwEntityList), &elBase, 8, &br, SyscallMethod::Indirect);
             if (elBase) {
