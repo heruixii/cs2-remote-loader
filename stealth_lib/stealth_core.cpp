@@ -133,33 +133,40 @@ bool StealthEngine::Initialize(const StealthConfig& config) {
 }
 
 bool StealthEngine::AttachToProcess(const wchar_t* processName) {
-    if (!m_initialized) return false;
+    if (!m_initialized) {
+        MessageBoxW(0, L"ATP: !initialized", L"DBG", 0);
+        return false;
+    }
 
+    MessageBoxW(0, L"ATP: EnumerateProcesses...", L"DBG", 0);
     auto processes = StealthProcess::EnumerateProcesses(processName);
-    if (processes.empty()) return false;
+    if (processes.empty()) {
+        MessageBoxW(0, L"ATP: no cs2 found", L"DBG", 0);
+        return false;
+    }
 
     auto& target = processes[0];
     m_pid = target.pid;
 
-    // ★ 策略优先级 (按隐蔽性排序):
-    //    1. ViaExistingHandle — 借用已有句柄 → 零 ObRegisterCallbacks 触发
-    //    2. OpenProcessStealth — 使用 SysOpenProcess 直接调用
-    //    3. DuplicateHandleFromLowRisk — 从受信进程复制句柄
-    //    4. OpenProcessMinimal — 最小权限回退
+    wchar_t pidMsg[64];
+    _snwprintf_s(pidMsg, 64, _TRUNCATE, L"ATP: PID=%lu, ViaExistingHandle...", m_pid);
+    MessageBoxW(0, pidMsg, L"DBG", 0);
 
-    // 策略1: 借用已有句柄 (最隐蔽, 不触发 EAC ObRegisterCallbacks)
+    // Strategy 1: ViaExistingHandle
     m_hProcess = eac::HandleBypass::ViaExistingHandle(m_pid);
     if (m_hProcess) return true;
 
-    // 策略2: SysOpenProcess 绕过 Win32 API Hook
+    // Strategy 2: SysOpenProcess
+    MessageBoxW(0, L"ATP: ViaExistingHandle FAIL, OpenProcessStealth...", L"DBG", 0);
     if (m_config.minimalProcessHandle) {
         m_hProcess = StealthProcess::OpenProcessStealth(m_pid);
     } else {
         m_hProcess = StealthProcess::DuplicateHandleFromLowRisk(m_pid);
     }
 
-    // 策略3: 最小权限 NtOpenProcess
+    // Strategy 3: OpenProcessMinimal
     if (!m_hProcess) {
+        MessageBoxW(0, L"ATP: Stealth FAIL, OpenProcessMinimal...", L"DBG", 0);
         m_hProcess = StealthProcess::OpenProcessMinimal(m_pid);
     }
 

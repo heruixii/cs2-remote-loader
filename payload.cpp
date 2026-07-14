@@ -34,10 +34,13 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     }
 
     // --- 阶段3: 附加到 CS2 进程 ---
+    MessageBoxW(0, L"DBG3: AttachToProcess START...", L"DBG", 0);
     if (!StealthEngine::Instance().AttachToProcess(L"cs2.exe")) {
+        MessageBoxW(0, L"FAIL: AttachToProcess", L"DBG", 0);
         StealthEngine::Instance().Shutdown();
         return 2;
     }
+    MessageBoxW(0, L"DBG4: AttachToProcess OK", L"DBG", 0);
 
     // --- 阶段4: 初始化 CS2 内存读取 ---
     cs2::Offsets offsets;
