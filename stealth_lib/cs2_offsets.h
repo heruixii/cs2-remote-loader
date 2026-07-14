@@ -15,12 +15,12 @@ namespace cs2 {
 // 运行 cs2-dumper 或更新此结构后同步
 // ============================================================
 struct Offsets {
-    // 引擎层
-    uintptr_t dwViewMatrix       = 0x1A93D0;
-    uintptr_t dwViewAngles       = 0x1A93B0;
-    uintptr_t dwLocalPlayerPawn  = 0x188CFC0;
-    uintptr_t dwEntityList       = 0x1A2ABE0;
-    uintptr_t dwGameRules        = 0x1A91A98;
+    // 引擎层 — 来自 a2x/cs2-dumper 2026-04-03
+    uintptr_t dwViewMatrix       = 0x2313F10;
+    uintptr_t dwViewAngles       = 0x231E9B8;
+    uintptr_t dwLocalPlayerPawn  = 0x206D9E0;
+    uintptr_t dwEntityList       = 0x24B3268;
+    uintptr_t dwGameRules        = 0x2311ED0;
 
     // 实体属性 (C_BaseEntity)
     uintptr_t m_iTeamNum         = 0x3BF;
