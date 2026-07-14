@@ -50,12 +50,16 @@ echo ============================================
     %STEALTH_LIB%/anti_debug.cpp ^
     %STEALTH_LIB%/eac_bypass.cpp ^
     %STEALTH_LIB%/eac_vm_evasion.cpp ^
+    %STEALTH_LIB%/eac_syscall_guard.cpp ^
     %STEALTH_LIB%/memory_cloak.cpp ^
     %STEALTH_LIB%/pe_mutator.cpp ^
     %STEALTH_LIB%/stealth_process.cpp ^
     %STEALTH_LIB%/stealth_injection.cpp ^
     %STEALTH_LIB%/string_obfuscator.cpp ^
-    -lwinhttp -lws2_32 -lntdll
+    %STEALTH_LIB%/cs2_memory.cpp ^
+    %STEALTH_LIB%/cheat_overlay.cpp ^
+    %STEALTH_LIB%/game_esp.cpp ^
+    -lwinhttp -lws2_32 -lntdll -ldwmapi -lgdi32
 if %ERRORLEVEL% neq 0 (
     echo [ERROR] payload.dll 编译失败!
     pause & exit /b 1

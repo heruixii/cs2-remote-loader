@@ -1,6 +1,6 @@
 ================================================================
   远程加载链 — 使用说明书
-  版本: 1.0 | 日期: 2026-07-14
+  版本: 2.0 | 日期: 2026-07-14 (双轮深度审计修订版)
 ================================================================
 
 目录:
@@ -26,18 +26,24 @@
 工作流程:
   HTTP服务器(payload.dat) → loader.exe(WinHTTP下载) → 内存XTEA解密
   → MinimalManualMap(PE解析+重定位+导入表) → DllMain(启动主循环)
-  → 9层规避引擎初始化 → 附加cs2.exe → 主循环
+  → 规避引擎初始化 → 附加cs2.exe → ESP透视主循环
+
+当前功能:
+  - 外部Overlay窗口透视 (ESP)
+  - 方框 / 血条 / 名字 / 距离 / 武器 / 头部圆点 / 十字准星
+  - 纯透视, 无自瞄(Aimbot)/无鼠标模拟
+  - 适用于 CS2 官匹 (EAC + VAC)
 
 防检测层次:
-  [1] 系统调用层   — Hell's Gate / Halo's Gate SSN提取
+  [1] 系统调用层   — Hell's Gate / Halo's Gate SSN提取 / Indirect Syscall
   [2] PE变异层     — Rich头擦除 / 时间戳随机化 / Debug清除
   [3] 完整性保护   — .text段备份恢复 (VAC对抗)
-  [4] ETW/AMSI静默 — 事件追踪+反恶意软件扫描接口补丁
-  [5] VACNet对抗   — 瞄准人性化 / 角度验证
-  [6] 反调试层     — 17项检测 (PEB/调试寄存器/句柄/INT3等)
-  [7] EAC深栈伪造  — 32帧合法调用链伪装
-  [8] EAC VM规避   — INT1/INT3门控绕过 / VEH链清理 / PEB脱链
-  [9] 内存隐身     — Ekko风格Sleep加密 + ETW/AMSI自修复
+  [4] ETW/AMSI静默 — EtwEventWrite/AMSI Patch
+  [5] 反调试层     — 17项检测 (PEB/调试寄存器/句柄/INT3等)
+  [6] EAC深栈伪造  — 32帧合法调用链伪装 / CallStackSpoofer
+  [7] EAC VM规避   — INT1/INT3门控绕过 / VEH链清理 / PEB脱链
+  [8] 内存隐身     — Ekko风格Sleep加密 + 句柄ACL封锁
+  [9] Syscall保护  — Stub完整性验证 + Halo's Gate自动恢复
 
 ================================================================
 二、文件清单
@@ -70,7 +76,7 @@
   要求:
   - 支持直接文件下载 (不需要PHP/后端)
   - 建议 HTTPS (loader 会自动协商)
-  - payload.dat 仅 172KB, 带宽消耗极低
+  - payload.dat 仅 232KB, 带宽消耗极低
 
 步骤 2: 修改配置
 
@@ -126,7 +132,7 @@
 
 前置条件:
   - Windows 10/11 64位
-  - 稳定的网络连接 (需要下载 172KB)
+  - 稳定的网络连接 (需要下载 ~232KB)
   - 游戏已安装 (CS2)
 
 操作步骤:
@@ -290,8 +296,7 @@ Steam 直接启动:
   - StealthMemory::Read<T>(hProcess, address)
   - StealthMemory::Write<T>(hProcess, address, value)
   - StealthMemory::Protect(hProcess, address, size, protect)
-  - StealthEngine::Instance().HumanizeAim(x, y)
-  - StealthEngine::Instance().IsAngleChangeSafe(old, new)
+  - StealthEngine::Instance().StealthSleep(1)
 
 修改后需要:
   1. 重新运行 build.bat 编译
@@ -329,7 +334,7 @@ Steam 直接启动:
 │                      │ → 添加白名单 / 关闭实时防护       │
 │                      │ → 建议每次发布前重新编译换签名    │
 ├──────────────────────┼─────────────────────────────────┤
-│ 服务器流量异常大       │ payload.dat 应只有 172KB        │
+│ 服务器流量异常大       │ payload.dat 应只有 ~232KB     │
 │                      │ → 检查是否被恶意反复下载          │
 │                      │ → 建议加 CDN / 限速              │
 └──────────────────────┴─────────────────────────────────┘
