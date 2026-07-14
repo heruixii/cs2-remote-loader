@@ -52,6 +52,7 @@ uintptr_t Memory::LocalPlayerPawn() {
     if (!pawnHandle || pawnHandle == 0xFFFFFFFF) return 0;
 
     uintptr_t listEntry = Read<uintptr_t>(EntityList() + 8 * ((pawnHandle & 0x7FFF) >> 9) + 16);
+    listEntry &= ~0xFULL;  // strip tag bits from entity identity pointer
     if (!listEntry) return 0;
     return Read<uintptr_t>(listEntry + 120 * (pawnHandle & 0x1FF));
 }
@@ -128,6 +129,7 @@ std::vector<Entity> Memory::GetAllPlayers(bool onlyAlive) {
     // CS2 实体列表: 最大64实体
     for (int i = 1; i < 64; i++) {
         uintptr_t listEntry = Read<uintptr_t>(elBase + 8 * ((i & 0x7FFF) >> 9) + 16);
+        listEntry &= ~0xFULL;  // strip tag bits
         if (!listEntry) continue;
 
         uintptr_t controller = Read<uintptr_t>(listEntry + 120 * (i & 0x1FF));
@@ -139,6 +141,7 @@ std::vector<Entity> Memory::GetAllPlayers(bool onlyAlive) {
         if (!pawnHandle || pawnHandle == 0xFFFFFFFF) continue;
 
         uintptr_t listEntry2 = Read<uintptr_t>(elBase + 8 * ((pawnHandle & 0x7FFF) >> 9) + 16);
+        listEntry2 &= ~0xFULL;  // strip tag bits
         if (!listEntry2) continue;
 
         uintptr_t pawn = Read<uintptr_t>(listEntry2 + 120 * (pawnHandle & 0x1FF));
