@@ -36,6 +36,18 @@ static void DiagLog(const char* fmt, ...) {
     }
 }
 
+// 崩溃捕获 — 帮助定位 Init 期间的 crash
+static HMODULE g_diagDllBase;
+static SIZE_T g_diagDllSize;
+static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
+    uint64_t crashAddr = (uint64_t)ep->ExceptionRecord->ExceptionAddress;
+    uint64_t dllBase   = (uint64_t)g_diagDllBase;
+    uint64_t offset    = (dllBase && crashAddr >= dllBase) ? (crashAddr - dllBase) : 0;
+    DiagLog("CRASH: code=0x%08X addr=0x%llX off=%llX\n",
+        ep->ExceptionRecord->ExceptionCode, crashAddr, offset);
+    return EXCEPTION_CONTINUE_SEARCH; // 让进程崩溃
+}
+
 // ============================================================
 // 作弊主循环
 // 直接在 DllMain 的调用线程上运行，不创建新线程
@@ -51,6 +63,13 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     DeleteFileW(logPath);
     DiagLog("=== v3.8-e9ff50d DIAG START ===\n");
     DiagLog("BEFORE Init...\n");
+
+    // 安装 VEH 崩溃捕获器
+    g_diagDllBase = dllBase;
+    g_diagDllSize = dllSize;
+    PVOID vehHandle = AddVectoredExceptionHandler(1, DiagVehHandler);
+    DiagLog("VEH registered, dllBase=0x%llX dllSize=%llu\n",
+        (unsigned long long)dllBase, (unsigned long long)dllSize);
 
     // --- 阶段1: 初始化规避引擎 (9层) ---
     if (!StealthEngine::Instance().Initialize()) {
