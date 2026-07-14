@@ -1088,31 +1088,10 @@ NTSTATUS SysReadVirtualMemory(
     HANDLE hProcess, PVOID baseAddr, PVOID buffer,
     SIZE_T bytesToRead, PSIZE_T bytesRead, SyscallMethod method)
 {
-    auto& resolver = SyscallResolver::Instance();
-    DWORD ssn = resolver.GetNumbers().NtReadVirtualMemory;
-    if (!ssn) { resolver.InitializeHaloGate(); ssn = resolver.GetNumbers().NtReadVirtualMemory; }
-
-    SyscallMethod m = DecideMethod(method);
-    void* stub = nullptr;
-    if (m == SyscallMethod::StackSpoof) {
-        uintptr_t gadget = resolver.GetSyscallRetGadget();
-        auto retGadgets = GetRetGadgets(32);
-        auto spoofCtx = CallStackSpoofer::Instance().GetRandomSpoofContext();
-        if (gadget && !retGadgets.empty()) {
-            stub = GenerateDeepSpoofStub(ssn, gadget, retGadgets, spoofCtx);
-        }
-    }
-    if (!stub && m == SyscallMethod::Indirect) {
-        stub = GenerateIndirectSyscallStub(ssn, resolver.GetSyscallRetGadget());
-    }
-    if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
-    if (!stub) {
-        using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
-        auto fn = reinterpret_cast<Fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtReadVirtualMemory"));
-        return fn ? fn(hProcess, baseAddr, buffer, bytesToRead, bytesRead) : STATUS_NOT_SUPPORTED;
-    }
+    // ManualMap 下 syscall stub 生成不稳定, 直接走 GetProcAddress 回退路径
     using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
-    return reinterpret_cast<Fn>(stub)(hProcess, baseAddr, buffer, bytesToRead, bytesRead);
+    auto fn = reinterpret_cast<Fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtReadVirtualMemory"));
+    return fn ? fn(hProcess, baseAddr, buffer, bytesToRead, bytesRead) : STATUS_NOT_SUPPORTED;
 }
 
 // ---- SysOpenProcess ----
