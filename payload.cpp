@@ -168,45 +168,55 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         HANDLE hProc = StealthEngine::Instance().GetProcessHandle();
         auto& off = cs2::Memory::Instance().GetOffsets();
 
-        // 诊断: 直接读取偏移位置的内存, 看是不是有效指针
+        // 获取 client.dll 大小
+        uintptr_t clientSize = 0;
+        for (auto& mod : stealth::StealthProcess::GetProcessModules(hProc)) {
+            if (mod.name == L"client.dll") {
+                clientSize = mod.size;
+                break;
+            }
+        }
+        DiagLog("client.dll: base=0x%llX size=0x%llX (%lld MB) end=0x%llX\n",
+            (unsigned long long)cb, (unsigned long long)clientSize,
+            (long long)(clientSize / 1048576), (unsigned long long)(cb + clientSize));
+
         auto diagRead = [&](const char* name, uintptr_t addr) {
             uintptr_t val = 0;
             SIZE_T br = 0;
             SysReadVirtualMemory(hProc, (PVOID)addr, &val, 8, &br, SyscallMethod::Indirect);
-            // 同时读取周围16字节
             BYTE raw[32] = {};
             SIZE_T br2 = 0;
             SysReadVirtualMemory(hProc, (PVOID)(addr - 8), raw, 32, &br2, SyscallMethod::Indirect);
             DiagLog("  %s(off=0x%llX) addr=0x%llX val=0x%llX [hex:", name,
                 (unsigned long long)(addr - cb), (unsigned long long)addr, (unsigned long long)val);
             if (br2 >= 8) {
-                for (int i = 0; i < 24; i++) {
-                    DiagLog("%02X ", raw[i]);
-                }
+                for (int i = 0; i < 24; i++) DiagLog("%02X ", raw[i]);
             }
-            DiagLog("]\n");
+            DiagLog("]");
+            if (addr >= cb + clientSize) DiagLog(" *** OUT OF BOUNDS!");
+            DiagLog("\n");
             return val;
         };
 
-        diagRead("dwLocalPlayerPawn ", cb + off.dwLocalPlayerPawn);
-        diagRead("dwEntityList     ", cb + off.dwEntityList);
-        diagRead("dwViewMatrix     ", cb + off.dwViewMatrix);
+        diagRead("dwLocalPlayerCtl", cb + off.dwLocalPlayerController);
+        diagRead("dwEntityList    ", cb + off.dwEntityList);
+        diagRead("dwViewMatrix    ", cb + off.dwViewMatrix);
 
-        // 宽范围扫描 entity list 偏移附近
-        DiagLog("  -- wide scan entity list candidates --\n");
+        // 宽扫: 从 viewMatrix 偏移到 entityList 偏移范围
+        DiagLog("  -- scan for valid pointers in range 0x2300000..0x2600000 --\n");
         int found = 0;
-        for (int step = -200; step <= 200 && found < 20; step++) {
-            uintptr_t offAdj = off.dwEntityList + step * 8;
+        for (uintptr_t scanOff = 0x2300000; scanOff < 0x2600000 && found < 30; scanOff += 8) {
+            if (cb + scanOff >= cb + clientSize) break; // 超出模块
             uintptr_t val = 0;
             SIZE_T br = 0;
-            SysReadVirtualMemory(hProc, (PVOID)(cb + offAdj), &val, 8, &br, SyscallMethod::Indirect);
-            if (cb > 0 && val > cb && val < (cb + 0x20000000)) {
-                DiagLog("  ENT: off=0x%llX val=0x%llX step=%+d (%+d bytes)\n",
-                    (unsigned long long)offAdj, (unsigned long long)val, step, step * 8);
+            SysReadVirtualMemory(hProc, (PVOID)(cb + scanOff), &val, 8, &br, SyscallMethod::Indirect);
+            if (val > cb && val < (cb + 0x20000000)) {
+                DiagLog("  PTR: off=0x%llX val=0x%llX\n",
+                    (unsigned long long)scanOff, (unsigned long long)val);
                 found++;
             }
         }
-        if (found == 0) DiagLog("  ENT: no candidates in ±1600 bytes\n");
+        DiagLog("  -- found %d valid ptrs in range --\n", found);
     }
     HWND cs2Hwnd = FindWindowW(nullptr, nullptr);
     while (cs2Hwnd) {
