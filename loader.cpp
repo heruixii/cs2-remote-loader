@@ -1,4 +1,4 @@
-// ============================================================
+﻿// ============================================================
 // loader.cpp �?远程加载 Stager
 //
 // 架构:
@@ -26,7 +26,7 @@
 // Payload 下载地址 �?部署时替换为你的服务�?URL
 // �?CDN 备�?(国内网络可能无法直连 raw.githubusercontent.com)
 static const wchar_t* PAYLOAD_URLS[] = {
-    L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/aebfc6e/payload.dat",
+    L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/f07bcb4/payload.dat",
 };
 static const int PAYLOAD_URL_COUNT = sizeof(PAYLOAD_URLS) / sizeof(PAYLOAD_URLS[0]);
 

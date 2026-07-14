@@ -15,6 +15,8 @@
 #include "cs2_memory.h"
 #include "cs2_offsets.h"
 #include "syscall_direct.h"
+#include "eac_syscall_guard.h"
+#include "byovd_kernel.h"
 #include <cstdio>
 #include <cstdarg>
 #include <tlhelp32.h>
@@ -88,12 +90,35 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     // --- 阶段3: 附加到 CS2 进程 ---
     if (!StealthEngine::Instance().AttachToProcess(L"cs2.exe")) {
         DiagLog("FAIL: AttachToProcess\n");
+        stealth::KernelDefense::DisableAll();
         StealthEngine::Instance().Shutdown();
         return 2;
     }
     DiagLog("OK: AttachToProcess, PID=%u HANDLE=%p\n",
         StealthEngine::Instance().GetProcessId(),
         StealthEngine::Instance().GetProcessHandle());
+
+    // 封锁进程句柄 (DACL → 仅允许自身访问, 阻止EAC通过NtQuerySystemInformation枚举)
+    {
+        HANDLE hGame = StealthEngine::Instance().GetProcessHandle();
+        if (hGame) {
+            stealth::HandleACLGuard::LockHandle(hGame);
+            DiagLog("OK: HandleACLGuard locked\n");
+        } else {
+            DiagLog("WARN: HandleACLGuard skipped (no handle)\n");
+        }
+    }
+
+    // BYOVD 内核防御 — 加载漏洞驱动 + 摘除 EAC 内核回调 (Ring-0)
+    // ObRegisterCallbacks/ProcessNotify/ImageNotify → 全部失效
+    {
+        auto kernelResult = stealth::KernelDefense::EnableAll();
+        DiagLog("OK: BYOVD driver=%d ob=%d proc=%d img=%d\n",
+            (int)kernelResult.driverLoaded,
+            kernelResult.obCallbacksRemoved,
+            kernelResult.processCallbacksRemoved,
+            kernelResult.imageCallbacksRemoved);
+    }
 
     {
         HANDLE hProc = StealthEngine::Instance().GetProcessHandle();
@@ -156,6 +181,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     cs2::Offsets offsets;
     if (!cs2::Memory::Instance().Initialize(offsets)) {
         DiagLog("FAIL: Memory::Initialize (client.dll not found?)\n");
+        stealth::KernelDefense::DisableAll();
         StealthEngine::Instance().Shutdown();
         return 3;
     }
@@ -278,6 +304,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     HWND cs2Hwnd = ctx.hwnd;
     if (!cs2Hwnd) {
         DiagLog("FAIL: FindWindow (cs2Hwnd)\n");
+        stealth::KernelDefense::DisableAll();
         StealthEngine::Instance().Shutdown();
         return 4;
     }
@@ -301,6 +328,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
 
     if (!cs2::CheatOverlay::Instance().Create(overlayCfg)) {
         DiagLog("FAIL: CheatOverlay::Create\n");
+        stealth::KernelDefense::DisableAll();
         StealthEngine::Instance().Shutdown();
         return 5;
     }
@@ -455,6 +483,11 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         // 隐身维护 (ETW/AMSI/VAC/Hook检测/NMI心跳)
         StealthEngine::Instance().OnFrame();
 
+        // Syscall Stub 完整性验证 (每30帧, 防止EAC恢复hook)
+        if ((frameCount % 30) == 0) {
+            stealth::SyscallGuard::VerifyAndRepair();
+        }
+
         // 读取玩家数据 (一次调用, 渲染+诊断复用)
         auto local   = cs2::Memory::Instance().GetLocalPlayer();
         auto players = cs2::Memory::Instance().GetAllPlayers(true);
@@ -498,6 +531,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         StealthEngine::Instance().StealthSleep(5); // ~200FPS cap, 避免EkkoSleep高频加密
     }
 
+    stealth::KernelDefense::DisableAll();
     StealthEngine::Instance().Shutdown();
     return 0;
 }
