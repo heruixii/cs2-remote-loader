@@ -94,6 +94,19 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         StealthEngine::Instance().GetProcessId(),
         StealthEngine::Instance().GetProcessHandle());
 
+    // 诊断: 列出 CS2 进程模块
+    {
+        auto modules = StealthProcess::GetProcessModules(
+            StealthEngine::Instance().GetProcessHandle());
+        DiagLog("GetProcessModules: %zu modules found\n", modules.size());
+        for (auto& m : modules) {
+            wchar_t buf[64];
+            wcsncpy_s(buf, m.name.c_str(), 63);
+            if (wcsstr(m.name.c_str(), L"client") || wcsstr(m.name.c_str(), L"engine"))
+                DiagLog("  %ls @ 0x%llX\n", buf, (unsigned long long)m.baseAddress);
+        }
+    }
+
     // --- 阶段4: 初始化 CS2 内存读取 ---
     cs2::Offsets offsets;
     if (!cs2::Memory::Instance().Initialize(offsets)) {
