@@ -133,34 +133,19 @@ bool StealthEngine::Initialize(const StealthConfig& config) {
 }
 
 bool StealthEngine::AttachToProcess(const wchar_t* processName) {
-    if (!m_initialized) {
-        MessageBoxW(0, L"ATP: !initialized", L"DBG", 0);
-        return false;
-    }
+    if (!m_initialized) return false;
 
-    MessageBoxW(0, L"ATP: EnumerateProcesses...", L"DBG", 0);
     auto processes = StealthProcess::EnumerateProcesses(processName);
-    if (processes.empty()) {
-        MessageBoxW(0, L"ATP: no cs2 found", L"DBG", 0);
-        return false;
-    }
+    if (processes.empty()) return false;
 
     auto& target = processes[0];
     m_pid = target.pid;
 
-    wchar_t pidMsg[64];
-    _snwprintf_s(pidMsg, 64, _TRUNCATE, L"ATP: PID=%lu, ViaExistingHandle...", m_pid);
-    MessageBoxW(0, pidMsg, L"DBG", 0);
-
     // Strategy 1: ViaExistingHandle
     m_hProcess = eac::HandleBypass::ViaExistingHandle(m_pid);
-    if (m_hProcess) {
-        MessageBoxW(0, L"ATP: ViaExistingHandle OK", L"DBG", 0);
-        return true;
-    }
+    if (m_hProcess) return true;
 
     // Strategy 2: OpenProcessStealth → SysOpenProcess (GetProcAddress NtOpenProcess 走ntdll原生, 不触发ObCallbacks)
-    MessageBoxW(0, L"ATP: ViaExistingHandle FAIL, OpenProcessStealth...", L"DBG", 0);
     if (m_config.minimalProcessHandle) {
         m_hProcess = StealthProcess::OpenProcessStealth(m_pid);
     } else {
@@ -169,7 +154,6 @@ bool StealthEngine::AttachToProcess(const wchar_t* processName) {
 
     // Strategy 3: OpenProcessMinimal
     if (!m_hProcess) {
-        MessageBoxW(0, L"ATP: Stealth FAIL, OpenProcessMinimal...", L"DBG", 0);
         m_hProcess = StealthProcess::OpenProcessMinimal(m_pid);
     }
 

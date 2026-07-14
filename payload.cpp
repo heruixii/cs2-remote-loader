@@ -34,22 +34,17 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     }
 
     // --- 阶段3: 附加到 CS2 进程 ---
-    MessageBoxW(0, L"DBG3: AttachToProcess START...", L"DBG", 0);
     if (!StealthEngine::Instance().AttachToProcess(L"cs2.exe")) {
-        MessageBoxW(0, L"FAIL: AttachToProcess", L"DBG", 0);
         StealthEngine::Instance().Shutdown();
         return 2;
     }
-    MessageBoxW(0, L"DBG4: AttachToProcess OK", L"DBG", 0);
 
     // --- 阶段4: 初始化 CS2 内存读取 ---
     cs2::Offsets offsets;
     if (!cs2::Memory::Instance().Initialize(offsets)) {
-        MessageBoxW(0, L"FAIL: MemoryInit", L"DBG", 0);
         StealthEngine::Instance().Shutdown();
         return 3;
     }
-    MessageBoxW(0, L"MEM OK", L"DBG", 0);
 
     // --- 阶段5: 查找 CS2 窗口并创建 Overlay ---
     HWND cs2Hwnd = FindWindowW(nullptr, nullptr);
@@ -62,15 +57,11 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         cs2Hwnd = FindWindowExW(nullptr, cs2Hwnd, nullptr, nullptr);
     }
     if (!cs2Hwnd) {
-        MessageBoxW(0, L"FAIL: FindWindow", L"DBG", 0);
         StealthEngine::Instance().Shutdown();
         return 4;
     }
     RECT cs2Rect = {};
     GetWindowRect(cs2Hwnd, &cs2Rect);
-    wchar_t wmsg[128];
-    _snwprintf_s(wmsg, 128, _TRUNCATE, L"CS2 HWND=%p RECT=%d,%d-%d,%d", cs2Hwnd, cs2Rect.left, cs2Rect.top, cs2Rect.right, cs2Rect.bottom);
-    MessageBoxW(0, wmsg, L"DBG", 0);
 
     cs2::OverlayConfig overlayCfg;
     overlayCfg.width   = cs2Rect.right - cs2Rect.left;
@@ -79,11 +70,9 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     overlayCfg.screenY = cs2Rect.top;
 
     if (!cs2::CheatOverlay::Instance().Create(overlayCfg)) {
-        MessageBoxW(0, L"FAIL: OverlayCreate", L"DBG", 0);
         StealthEngine::Instance().Shutdown();
         return 5;
     }
-    MessageBoxW(0, L"OVERLAY OK. Starting ESP loop...", L"DBG", 0);
 
     // --- 阶段6: 配置 ESP ---
     cs2::ESPConfig espCfg;
