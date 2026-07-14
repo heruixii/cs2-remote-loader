@@ -57,7 +57,12 @@ struct StealthConfig {
     bool useSystemInfoEnum      = true;
 
     // === 完整性检测规避 ===
-    bool enableVACSafety        = true;
+    // v3.26: enableVACSafety 默认 false — InstallVACSafetyHook 仅备份
+    //   payload 自身 .text (无实际补丁需要保护), 且 VAC 扫描目标是
+    //   cs2.exe/engine.dll/ntdll.dll 而非 payload 本身.
+    //   真正的 VAC 保护由 StealthSleep 的 ETW/AMSI toggle + EkkoSleep
+    //   加密 + VerifyAndRepairAll 自愈 (每5s) 提供.
+    bool enableVACSafety        = false;
     bool backupTextSection      = true;
     bool validateVTablePtrs     = true;
 

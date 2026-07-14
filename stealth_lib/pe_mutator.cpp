@@ -551,13 +551,19 @@ bool IntegrityBypass::IsVACScanning() {
 }
 
 bool IntegrityBypass::InstallVACSafetyHook() {
-    // 安装 VAC 扫描周期保护:
-    // 在每次预期扫描前自动恢复 .text 段
-    // 扫描后再重新应用补丁
-
-    // 使用定时器或线程循环检测
-    // 此处提供框架, 实际集成时在主循环中调用
-
+    // v3.26: 此函数仅做 .text 段备份, 不安装定时器/线程.
+    //   备份目标是 payload 自身的 .text 段 (ManualMap 区域),
+    //   但 payload .text 无实际补丁 (patchedBytes==originalBytes),
+    //   因此 RestoreTextSection+ReapplyTextPatches 实际是空操作.
+    //
+    //   VAC 扫描的是 cs2.exe/engine.dll/ntdll.dll 而非 payload 自身,
+    //   真正的 VAC 保护由以下机制提供:
+    //   - StealthSleep: RestoreAll (清除 ETW/AMSI patch) → EkkoSleep
+    //     (加密 payload 内存) → SilenceAll (恢复 patch)
+    //   - VerifyAndRepairAll (每5s): ETW/AMSI 自愈
+    //   - StackSpoof: 所有 syscall 调用栈指向 ntdll gadget
+    //
+    //   保留此函数仅为 API 兼容性, enableVACSafety 默认已改为 false.
     static bool initialized = false;
     if (!initialized) {
         BackupTextSection();

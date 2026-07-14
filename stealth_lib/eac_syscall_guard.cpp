@@ -187,6 +187,17 @@ int SyscallGuard::RestoreFromDisk() {
 }
 
 bool SyscallGuard::VerifyAndRepair() {
+    // v3.26: 此函数仅检测 stub 是否被篡改, 不做实际修复.
+    //   原因: 向 ntdll .text 写入 (RWX+memcpy) 本身会触发 EAC 完整性扫描.
+    //
+    //   实际修复机制在 syscall_direct 层:
+    //   - Halo's Gate (每5s): 从 disk ntdll 恢复 SSN 值
+    //   - TartarusGate: 在自己的 VirtualAlloc 内存中生成独立 stub,
+    //     不依赖被 hook 的 ntdll stub
+    //   - StealthSleep toggle: RestoreAll→EkkoSleep→SilenceAll 清除 ETW/AMSI
+    //
+    //   因此即使 ntdll stub 被 hook, Indirect+StackSpoof 路径依然通过
+    //   自生成 stub 正常工作. 本函数只是监控/告警.
     int tampered = VerifyKeyStubs();
     if (tampered > 0) {
         RestoreFromDisk();
