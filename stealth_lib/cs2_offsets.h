@@ -40,7 +40,7 @@ struct Offsets {
     uintptr_t m_bHasHelmet       = 0x15C2;
 
     // CCSPlayerController
-    uintptr_t m_hPlayerPawn      = 0x7EC;
+    uintptr_t m_hPlayerPawn      = 0x784;  // 实际偏移, 非cs2-dumper的0x7EC
     uintptr_t m_sSanitizedPlayerName = 0x760;
     uintptr_t m_bPawnIsAlive     = 0x818;
 
