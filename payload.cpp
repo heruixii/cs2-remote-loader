@@ -62,7 +62,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.16 DIAG START ===\n");
+    DiagLog("=== v3.20 DIAG START ===\n");
     DiagLog("BEFORE Init...\n");
 
     // 安装 VEH 崩溃捕获器
@@ -265,15 +265,17 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             }
         }
     }
-    HWND cs2Hwnd = FindWindowW(nullptr, nullptr);
-    while (cs2Hwnd) {
+    // 通过进程ID查找 CS2 窗口 (避免 FindWindowW(nullptr,nullptr) 全窗口枚举)
+    struct FindCtx { DWORD pid; HWND hwnd; };
+    FindCtx ctx = { StealthEngine::Instance().GetProcessId(), nullptr };
+    EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+        auto* c = (FindCtx*)lp;
         DWORD pid = 0;
-        GetWindowThreadProcessId(cs2Hwnd, &pid);
-        if (pid == StealthEngine::Instance().GetProcessId()) {
-            break;
-        }
-        cs2Hwnd = FindWindowExW(nullptr, cs2Hwnd, nullptr, nullptr);
-    }
+        GetWindowThreadProcessId(h, &pid);
+        if (pid == c->pid) { c->hwnd = h; return FALSE; }
+        return TRUE;
+    }, (LPARAM)&ctx);
+    HWND cs2Hwnd = ctx.hwnd;
     if (!cs2Hwnd) {
         DiagLog("FAIL: FindWindow (cs2Hwnd)\n");
         StealthEngine::Instance().Shutdown();
@@ -281,14 +283,19 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     }
     RECT cs2Rect = {};
     GetWindowRect(cs2Hwnd, &cs2Rect);
-    DiagLog("OK: CS2 HWND=%p, RECT=(%d,%d %dx%d)\n",
+    int w = cs2Rect.right - cs2Rect.left;
+    int h = cs2Rect.bottom - cs2Rect.top;
+    // 如果窗口最小化或尺寸为0, 回退到屏幕尺寸
+    if (w <= 0) w = GetSystemMetrics(SM_CXSCREEN);
+    if (h <= 0) h = GetSystemMetrics(SM_CYSCREEN);
+    DiagLog("OK: CS2 HWND=%p, RECT=(%d,%d %dx%d) final=%dx%d\n",
         cs2Hwnd, cs2Rect.left, cs2Rect.top,
         cs2Rect.right - cs2Rect.left,
-        cs2Rect.bottom - cs2Rect.top);
+        cs2Rect.bottom - cs2Rect.top, w, h);
 
     cs2::OverlayConfig overlayCfg;
-    overlayCfg.width   = cs2Rect.right - cs2Rect.left;
-    overlayCfg.height  = cs2Rect.bottom - cs2Rect.top;
+    overlayCfg.width   = w;
+    overlayCfg.height  = h;
     overlayCfg.screenX = cs2Rect.left;
     overlayCfg.screenY = cs2Rect.top;
 
@@ -300,6 +307,9 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     DiagLog("OK: Overlay created %dx%d at (%d,%d)\n",
         overlayCfg.width, overlayCfg.height,
         overlayCfg.screenX, overlayCfg.screenY);
+
+    // 设置屏幕尺寸 (供 WorldToScreen 投影使用)
+    cs2::Memory::Instance().SetScreenSize(w, h);
 
     // --- 阶段6: 配置 ESP ---
     cs2::ESPConfig espCfg;
@@ -410,8 +420,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 }
             }
         }
-        DiagLog("--- Entity Iteration (i=0..63) ---\n");
-        for (int i = 0; i < 64; i++) {
+        DiagLog("--- Entity Iteration (i=0..511) ---\n");
+        for (int i = 0; i < 512; i++) {
             uintptr_t le; SIZE_T br2;
             st = SysReadVirtualMemory(hProcDiag, (PVOID)(elBase + 8 * ((i & 0x7FFF) >> 9) + 16), &le, 8, &br2, SyscallMethod::Indirect);
             le &= ~0xFULL;
@@ -441,13 +451,18 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     DWORD lastDiagTime = 0;
     while (true) {
         frameCount++;
-        DWORD now = GetTickCount();
 
-        // 每秒一次诊断
+        // 隐身维护 (ETW/AMSI/VAC/Hook检测/NMI心跳)
+        StealthEngine::Instance().OnFrame();
+
+        // 读取玩家数据 (一次调用, 渲染+诊断复用)
+        auto local   = cs2::Memory::Instance().GetLocalPlayer();
+        auto players = cs2::Memory::Instance().GetAllPlayers(true);
+
+        // 每秒一次诊断 (复用上面的 players)
+        DWORD now = GetTickCount();
         if (now - lastDiagTime >= 1000) {
             lastDiagTime = now;
-            auto local = cs2::Memory::Instance().GetLocalPlayer();
-            auto players = cs2::Memory::Instance().GetAllPlayers(true);
             uintptr_t elBase = cs2::Memory::Instance().EntityList();
             DiagLog("F=%d localPawn=0x%llX players=%zu elBase=0x%llX clientBase=0x%llX\n",
                 frameCount,
@@ -463,13 +478,6 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     p.screenHead.x, p.screenHead.y, p.boxHeight);
             }
         }
-
-        // 隐身维护 (ETW/AMSI/VAC/Hook检测/NMI心跳)
-        StealthEngine::Instance().OnFrame();
-
-        // 读取玩家数据
-        auto local   = cs2::Memory::Instance().GetLocalPlayer();
-        auto players = cs2::Memory::Instance().GetAllPlayers(true);
 
         // 渲染 ESP
         {
@@ -487,7 +495,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         // 消息泵 (防止窗口卡死)
         cs2::CheatOverlay::Instance().PumpMessages();
 
-        StealthEngine::Instance().StealthSleep(1);
+        StealthEngine::Instance().StealthSleep(5); // ~200FPS cap, 避免EkkoSleep高频加密
     }
 
     StealthEngine::Instance().Shutdown();

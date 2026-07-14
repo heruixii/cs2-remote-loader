@@ -81,9 +81,9 @@ bool Memory::WorldToScreen(const Vector3& world, Vector2& screen) {
     float x = vm.m[0][0] * world.x + vm.m[0][1] * world.y + vm.m[0][2] * world.z + vm.m[0][3];
     float y = vm.m[1][0] * world.x + vm.m[1][1] * world.y + vm.m[1][2] * world.z + vm.m[1][3];
 
-    // 获取屏幕大小
-    int screenWidth  = GetSystemMetrics(SM_CXSCREEN);
-    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+    // 获取屏幕大小 (优先使用 overlay 实际尺寸)
+    int screenWidth  = (m_screenWidth  > 0) ? m_screenWidth  : GetSystemMetrics(SM_CXSCREEN);
+    int screenHeight = (m_screenHeight > 0) ? m_screenHeight : GetSystemMetrics(SM_CYSCREEN);
 
     screen.x = (screenWidth  / 2.0f) + (screenWidth  / 2.0f) * x * invW;
     screen.y = (screenHeight / 2.0f) - (screenHeight / 2.0f) * y * invW;
@@ -95,8 +95,10 @@ bool Memory::WorldToScreen(const Vector3& world, Vector2& screen) {
 Vector3 Memory::GetBonePosition(uintptr_t pawn, BoneIndex bone) {
     // 简化版: 使用 viewOffset + 高度估算骨骼位置
     // 完整骨骼系统需要读取 bone matrix, 这里用近似值
-    Vector3 origin = Read<Vector3>(pawn + 0x1224); // m_vOldOrigin
-    int health = Read<int>(pawn + m_offsets.m_iHealth);
+    uintptr_t gameSceneNode = Read<uintptr_t>(pawn + m_offsets.m_pGameSceneNode);
+    Vector3 origin = {0, 0, 0};
+    if (gameSceneNode)
+        origin = Read<Vector3>(gameSceneNode + m_offsets.m_vecOrigin);
 
     // 玩家模型高度约 72 单位; 头部在 origin + viewOffset + (0,0,~10)
     Vector3 headOffset;
@@ -120,19 +122,25 @@ std::vector<Entity> Memory::GetAllPlayers(bool onlyAlive) {
         localTeam = Read<int>(localPawn + m_offsets.m_iTeamNum);
     }
 
-    ViewMatrix vm = GetViewMatrix();
-
-    // 获取实体列表 (单次批量读取链表头部以减少 syscall 数量)
+    // 获取实体列表
     uintptr_t elBase = EntityList();
     if (!elBase) return result;
 
-    // CS2 实体列表: 最大64实体
-    for (int i = 1; i < 64; i++) {
-        uintptr_t listEntry = Read<uintptr_t>(elBase + 8 * ((i & 0x7FFF) >> 9) + 16);
-        listEntry &= ~0xFULL;  // strip tag bits
-        if (!listEntry) continue;
+    // 缓存 chunk 0 指针
+    uintptr_t chunk0 = Read<uintptr_t>(elBase + 16) & ~0xFULL;
+    if (!chunk0) return result;
 
-        uintptr_t controller = Read<uintptr_t>(listEntry + 120 * (i & 0x1FF));
+    constexpr int MAX_ENTRIES = 512;
+    constexpr int IDENTITY_STRIDE = 120; // CEntityIdentity size
+    constexpr int CHUNK_SIZE = MAX_ENTRIES * IDENTITY_STRIDE; // 61440 bytes
+
+    // 批量读取整个 identity chunk (1次 syscall, 消除每实体独立读取)
+    static uint8_t chunkBuf[CHUNK_SIZE] = {};
+    stealth::StealthEngine::Instance().ReadBytes(chunk0, chunkBuf, CHUNK_SIZE);
+
+    // CS2 实体列表: 遍历整个第一块 (0~511), 本地解析
+    for (int i = 1; i < MAX_ENTRIES; i++) {
+        uintptr_t controller = *(uintptr_t*)(chunkBuf + i * IDENTITY_STRIDE);
         if (!controller) continue;
 
         if (controller == LocalPlayerController()) continue;
@@ -169,10 +177,14 @@ std::vector<Entity> Memory::GetAllPlayers(bool onlyAlive) {
         if (onlyAlive && localTeam >= 0 && ent.team == localTeam) continue;
 
         // === 读取位置数据 ===
-        // m_vecOrigin 位于 pawn+0x1224 (CGameSceneNode), 12 bytes
-        Vector3 originRaw;
-        stealth::StealthEngine::Instance().ReadBytes(pawn + m_offsets.m_vecOrigin, &originRaw, sizeof(originRaw));
-        ent.origin = originRaw;
+        // m_vecOrigin=0x1224 是 CGameSceneNode 内部的偏移,
+        // 必须先解引用 pawn+0x310 获取 gameSceneNode 指针
+        uintptr_t gameSceneNode = *(uintptr_t*)(pawnBuf + 0); // pawn+0x310=m_pGameSceneNode
+        ent.origin = {0, 0, 0};
+        if (gameSceneNode) {
+            stealth::StealthEngine::Instance().ReadBytes(gameSceneNode + m_offsets.m_vecOrigin,
+                                                          &ent.origin, sizeof(ent.origin));
+        }
 
         // viewOffset 不在此区域 (它位于 pawn+0xC50, 与 origin 间隔 ~0xBD4 字节)
         // 由于 ESP 渲染使用硬编码高度 (+72) 做头部投影, 不依赖 viewOffset, 此处跳过
@@ -205,7 +217,10 @@ std::vector<Entity> Memory::GetAllPlayers(bool onlyAlive) {
 
         // 距离
         if (localPawn) {
-            Vector3 localOrigin = Read<Vector3>(localPawn + m_offsets.m_vecOrigin);
+            uintptr_t localSceneNode = Read<uintptr_t>(localPawn + m_offsets.m_pGameSceneNode);
+            Vector3 localOrigin = {0, 0, 0};
+            if (localSceneNode)
+                localOrigin = Read<Vector3>(localSceneNode + m_offsets.m_vecOrigin);
             ent.distance = ent.origin.Distance(localOrigin) * 0.0254f;
         }
 
@@ -239,7 +254,12 @@ Entity Memory::GetLocalPlayer() {
     local.address  = pawn;
     local.team     = Read<int>(pawn + m_offsets.m_iTeamNum);
     local.health   = Read<int>(pawn + m_offsets.m_iHealth);
-    local.origin   = Read<Vector3>(pawn + m_offsets.m_vecOrigin);
+    // m_vecOrigin 位于 CGameSceneNode, 需先解引用
+    {
+        uintptr_t localGameScene = Read<uintptr_t>(pawn + m_offsets.m_pGameSceneNode);
+        if (localGameScene)
+            local.origin = Read<Vector3>(localGameScene + m_offsets.m_vecOrigin);
+    }
     local.viewOffset = Read<Vector3>(pawn + m_offsets.m_vecViewOffset);
     local.isAlive  = (local.health > 0);
     local.armor    = Read<int>(pawn + m_offsets.m_ArmorValue);

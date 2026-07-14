@@ -94,6 +94,7 @@ public:
 
     // 配置
     const Offsets& GetOffsets() const { return m_offsets; }
+    void SetScreenSize(int w, int h) { m_screenWidth = w; m_screenHeight = h; }
 
 private:
     Memory() = default;
@@ -107,6 +108,8 @@ private:
     // 缓存
     ViewMatrix          m_viewMatrix;
     DWORD               m_lastMatrixUpdate = 0;
+    int                 m_screenWidth  = 0;
+    int                 m_screenHeight = 0;
 
     bool ResolveModules();
 };

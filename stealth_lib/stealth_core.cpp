@@ -231,14 +231,21 @@ void StealthEngine::OnFrame() {
 
 void StealthEngine::StealthSleep(DWORD milliseconds) {
     if (m_config.enableSleepObfuscation) {
-        // === 缺口修复: 睡眠前恢复 ntdll 补丁, 防止 EAC 哈希检测 ===
-        // EAC 常在 idle 期间扫描 ntdll .text 段完整性
-        TelemetrySilencer::RestoreAll();
+        // ETW/AMSI 恢复/重补频率降低到每500ms一次, 避免每帧高频VirtualProtect
+        static DWORD lastCloakToggle = 0;
+        DWORD now = GetTickCount();
+        bool shouldToggleETW = (now - lastCloakToggle >= 500);
+
+        if (shouldToggleETW) {
+            TelemetrySilencer::RestoreAll();
+            lastCloakToggle = now;
+        }
 
         SleepObfuscator::Instance().EkkoSleep(milliseconds);
 
-        // 睡眠后重新 Patch
-        TelemetrySilencer::SilenceAll();
+        if (shouldToggleETW) {
+            TelemetrySilencer::SilenceAll();
+        }
     } else {
         Sleep(milliseconds);
     }

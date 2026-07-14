@@ -613,20 +613,16 @@ SelfCloaker::CloakResult SelfCloaker::CloakManualMap(HMODULE dllBase, SIZE_T dll
     if (!dllBase || dllSize < 0x1000) return result;
 
     // 1. 擦除 PE 头
-    MessageBoxW(0, L"CLOAK1: StripPEHeaders...", L"CloakDiag", 0);
     result.peStripped = StripPEHeaders(dllBase);
 
     // 2. 添加假 PEB Ldr 条目
-    MessageBoxW(0, L"CLOAK2: AddFakeLdrEntry...", L"CloakDiag", 0);
     result.ldrCloaked = AddFakeLdrEntry(dllBase, dllSize, L"dxgi_adapter_cache.dll");
 
     // 2b. 移除自身 EXE 的 Ldr 条目 (隐藏 loader.exe 模块名)
-    MessageBoxW(0, L"CLOAK3: UnlinkSelfLdr...", L"CloakDiag", 0);
     // SKIP: ManualMap 场景下 PEB 链表操作不稳定, 自删除已足够隐蔽
     // UnlinkSelfLdrEntry();
 
     // 3. 随机化页保护
-    MessageBoxW(0, L"CLOAK4: RandomizeProtections...", L"CloakDiag", 0);
     // SKIP: ManualMap 场景下 RandomizeProtections 不稳定
     result.protectionMixed = true;
     // result.protectionMixed = RandomizeProtections(dllBase, dllSize);

@@ -80,6 +80,7 @@ private:
     bool          m_running     = false;
     bool          m_cloaked     = false;
     int           m_frameIndex  = 0;
+    int           m_cloakCounter = 0; // 降低 CloakStyle 频率
     int           m_jitterSeed = 0;  // 随机抖动种子, 初始化时生成
     OverlayConfig m_config;
     std::wstring  m_className;

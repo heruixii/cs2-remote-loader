@@ -169,6 +169,9 @@ LONG CheatOverlay::GetRenderExStyle() const {
 
 void CheatOverlay::CloakStyle() {
     if (!m_hwnd || m_cloaked) return;
+    // 仅在非渲染帧间随机执行, 降低可预测模式
+    if (++m_cloakCounter < (10 + (rand() % 20))) return;
+    m_cloakCounter = 0;
     SetWindowLongPtrW(m_hwnd, GWL_EXSTYLE, GetCloakedExStyle());
     m_cloaked = true;
 }
