@@ -410,8 +410,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 }
             }
         }
-        DiagLog("--- Entity Iteration (i=0..15) ---\n");
-        for (int i = 0; i < 16; i++) {
+        DiagLog("--- Entity Iteration (i=0..63) ---\n");
+        for (int i = 0; i < 64; i++) {
             uintptr_t le; SIZE_T br2;
             st = SysReadVirtualMemory(hProcDiag, (PVOID)(elBase + 8 * ((i & 0x7FFF) >> 9) + 16), &le, 8, &br2, SyscallMethod::Indirect);
             le &= ~0xFULL;
