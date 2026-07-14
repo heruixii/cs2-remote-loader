@@ -62,10 +62,53 @@ loader.exe                          payload.dll (注入CS2进程)
 | `aggressiveAntiDebug` | ThreadHideFromDebugger 触发 EAC 检测 |
 | 队友渲染 | onlyAlive 模式仅显示敌人 |
 
+## 使用方法（测试前必读）
+
+### 前提
+
+- **管理员权限运行** — BYOVD 内核驱动需要，右键 `以管理员身份运行`
+- **关闭杀毒软件** 或添加白名单，否则 loader 可能被杀
+- 需要联网（从 GitHub 下载 payload.dat）
+
+### 正确步骤
+
+```
+ 第1步 → 先启动 CS2，进入任意地图/对局（不要在大厅！）
+ 第2步 → 右键 loader.exe → 以管理员身份运行
+ 第3步 → 等待 2~3 秒，控制台消失后进入游戏即可看到 ESP
+ 第4步 → 关闭 CS2 时 payload 自动退出，无需手动操作
+```
+
+**一句话：先进地图，再右键管理员运行 loader。**
+
+### 错误时机及风险
+
+| 错误的启动时机 | 后果 | 风险等级 |
+|---------------|------|----------|
+| **CS2 还没开** | 找不到 cs2.exe，loader 静默退出。payload 白下载一次 | 低 |
+| **CS2 开着但在大厅** | 注入成功，但没有 EntityList 数据，ESP 空白不显示。payload 空转期间可能被 EAC 空闲扫描命中 | **高** |
+| **先开 loader，后开 CS2** | loader 启动时找不到进程，直接退出。需要重新运行 | 低 |
+| **没开管理员** | BYOVD 驱动加载失败，EAC 内核回调摘除不生效。**封号风险极高** | **极高** |
+| **开着其他反作弊游戏** | EkkoSleep 内存加密 + ETW patch 可能被别的 AC 检测 | **高** |
+| **VPN/代理断开** | 无法从 GitHub 下载 payload.dat，loader 卡住后退出 | 低 |
+
+### 如何确认生效
+
+1. 游戏中应看到 **绿色十字准星** 在屏幕中央（无论有没有敌人都会显示）
+2. 敌人身上出现 **红色方框 + 血条 + 名字 + 距离 + 武器名**
+3. 如果没有：检查 `%TEMP%\stealth_diag.log`，看报错信息
+
+### 注意事项
+
+- loader.exe 运行后会自动删除自身，如需再次使用请保留备份
+- payload 在当前 CS2 进程中存活，关闭 CS2 即自动清理
+- 窗口最小化后 overlay 可能仍浮在桌面上，切回游戏即正常
+- 改变游戏分辨率后 overlay 不会自动适配，需重启
+
 ## 编译
 
 ```bash
-# Windowns + MinGW-w64 (g++ 15.x)
+# Windows + MinGW-w64 (g++ 15.x)
 build.bat
 ```
 
@@ -73,19 +116,6 @@ build.bat
 - `payload.dll` — 注入负载
 - `payload.dat` — XTEA 加密 (托管到 HTTP)
 - `loader.exe` — 下载解密注入器
-
-## 使用
-
-```powershell
-# 管理员权限运行
-.\loader.exe
-```
-
-1. 启动 CS2 进入游戏
-2. 以管理员运行 loader.exe（BYOVD 驱动需要）
-3. loader 自删除 → 下载 payload.dat → 解密 → ManualMap 注入
-4. Overlay 自动附着到 CS2 窗口，开始 ESP 渲染
-5. 关闭 CS2 时 payload 自动退出并清理
 
 ## 文件结构
 
