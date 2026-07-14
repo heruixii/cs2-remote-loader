@@ -10,6 +10,10 @@
 // ============================================================
 
 #include "stealth_core.h"
+#include "cheat_overlay.h"
+#include "game_esp.h"
+#include "cs2_memory.h"
+#include "cs2_offsets.h"
 
 // ============================================================
 // 作弊主循环
@@ -19,35 +23,101 @@
 static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     using namespace stealth;
 
-    MessageBoxW(0, L"DBG1: Entering Initialize...", L"Payload Diag", 0);
-
-    // 初始化规避引擎 (全部9层)
+    // --- 阶段1: 初始化规避引擎 (9层) ---
     if (!StealthEngine::Instance().Initialize()) {
-        MessageBoxW(0, L"FAIL: StealthEngine::Initialize()", L"Payload Diag", MB_ICONERROR);
         return 1;
     }
 
-    MessageBoxW(0, L"DBG2: Initialize OK. SelfCloak...", L"Payload Diag", 0);
-
-    // === 自身内存隐身: PE头擦除 + 假Ldr条目 + 自断链 + 页保护随机化 ===
+    // --- 阶段2: 自身内存隐身 (跳过 UnlinkSelfLdr + RandomizeProtections, ManualMap 下不稳定) ---
     if (dllBase && dllSize > 0) {
         SelfCloaker::CloakManualMap(dllBase, dllSize);
     }
 
-    MessageBoxW(0, L"DBG3: SelfCloak OK. AttachToProcess...", L"Payload Diag", 0);
-
-    // 附加到游戏进程
+    // --- 阶段3: 附加到 CS2 进程 ---
     if (!StealthEngine::Instance().AttachToProcess(L"cs2.exe")) {
-        MessageBoxW(0, L"FAIL: AttachToProcess (cs2.exe not found or access denied)", L"Payload Diag", MB_ICONERROR);
         StealthEngine::Instance().Shutdown();
         return 2;
     }
 
-    MessageBoxW(0, L"DBG4: Attach OK. Starting main loop...", L"Payload Diag", 0);
+    // --- 阶段4: 初始化 CS2 内存读取 ---
+    cs2::Offsets offsets; // 使用默认偏移
+    if (!cs2::Memory::Instance().Initialize(offsets)) {
+        StealthEngine::Instance().Shutdown();
+        return 3;
+    }
 
-    // 主循环
+    // --- 阶段5: 查找 CS2 窗口并创建 Overlay ---
+    HWND cs2Hwnd = FindWindowW(nullptr, nullptr);
+    // 遍历顶层窗口找到 CS2
+    while (cs2Hwnd) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(cs2Hwnd, &pid);
+        if (pid == StealthEngine::Instance().GetProcessId()) {
+            break;
+        }
+        cs2Hwnd = FindWindowExW(nullptr, cs2Hwnd, nullptr, nullptr);
+    }
+    if (!cs2Hwnd) {
+        StealthEngine::Instance().Shutdown();
+        return 4;
+    }
+
+    // 获取 CS2 窗口尺寸
+    RECT cs2Rect = {};
+    GetWindowRect(cs2Hwnd, &cs2Rect);
+
+    cs2::OverlayConfig overlayCfg;
+    overlayCfg.width   = cs2Rect.right - cs2Rect.left;
+    overlayCfg.height  = cs2Rect.bottom - cs2Rect.top;
+    overlayCfg.screenX = cs2Rect.left;
+    overlayCfg.screenY = cs2Rect.top;
+
+    if (!cs2::CheatOverlay::Instance().Create(overlayCfg)) {
+        StealthEngine::Instance().Shutdown();
+        return 5;
+    }
+
+    // --- 阶段6: 配置 ESP ---
+    cs2::ESPConfig espCfg;
+    espCfg.drawBox       = true;
+    espCfg.drawHealth    = true;
+    espCfg.drawName      = true;
+    espCfg.drawDistance  = true;
+    espCfg.drawWeapon    = true;
+    espCfg.drawSnaplines = false;
+    espCfg.drawHeadDot   = true;
+    espCfg.drawInfo      = true;
+    espCfg.drawCrosshair = true;
+    cs2::ESP::Instance().SetConfig(espCfg);
+
+    // --- 阶段7: 主循环 (ESP 渲染) ---
     while (true) {
+        // 隐身维护 (ETW/AMSI/VAC/Hook检测/NMI心跳)
         StealthEngine::Instance().OnFrame();
+
+        // 读取玩家数据
+        auto local   = cs2::Memory::Instance().GetLocalPlayer();
+        auto players = cs2::Memory::Instance().GetAllPlayers(true);
+
+        // 渲染 ESP
+        {
+            auto& overlay = cs2::CheatOverlay::Instance();
+            overlay.BringToTop();
+            overlay.CloakStyle();
+            HDC dc = overlay.BeginDraw();
+            if (dc) {
+                // 清屏 (黑色透明)
+                RECT r = {0, 0, overlay.Width(), overlay.Height()};
+                FillRect(dc, &r, (HBRUSH)GetStockObject(BLACK_BRUSH));
+
+                cs2::ESP::Instance().Render(local, players);
+            }
+            overlay.RestoreStyle();
+            overlay.EndDraw();
+        }
+
+        // 消息泵 (防止窗口卡死)
+        cs2::CheatOverlay::Instance().PumpMessages();
 
         StealthEngine::Instance().StealthSleep(1);
     }
@@ -58,21 +128,15 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
 
 // ============================================================
 // DLL 入口点
-//
 // ManualMap 完成后由 loader 在主线程上调用。
-// 直接在当前线程运行主循环, 不创建新线程,
-// - 规避 EAC PsSetCreateThreadNotifyRoutine 内核线程创建回调
-// - 规避 EAC PsGetNextProcessThread 线程枚举
 // ============================================================
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
     if (fdwReason != DLL_PROCESS_ATTACH)
         return TRUE;
 
-    // 禁用 DLL_THREAD_ATTACH/DETACH 通知
     DisableThreadLibraryCalls(hinstDLL);
 
-    // 读取 DLL 的 SizeOfImage
     SIZE_T dllSize = 0;
     {
         auto* image = reinterpret_cast<BYTE*>(hinstDLL);
@@ -86,7 +150,5 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
         }
     }
 
-    // 直接在当前线程运行主循环 (不创建新线程)
-    // 手动映射的 DLL 无 Loader Lock 限制, 可以安全地在 DllMain 中运行长期循环
     return (CheatMainLoop(hinstDLL, dllSize) == 0) ? TRUE : FALSE;
 }
