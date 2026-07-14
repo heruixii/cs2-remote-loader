@@ -442,6 +442,29 @@ void StealthEngine::CleanSelfTraces() {
     // 清除痕迹
 }
 
+void StealthEngine::SelfCloak() {
+    if (!m_config.enableSelfCloaking) return;
+
+    // 获取当前模块基址和大小
+    HMODULE base = GetModuleHandleW(nullptr);
+    if (!base) return;
+
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery(base, &mbi, sizeof(mbi))) return;
+
+    // 从PE头读取 SizeOfImage
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(
+        reinterpret_cast<uint8_t*>(base) + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+
+    SIZE_T dllSize = nt->OptionalHeader.SizeOfImage;
+
+    // 执行自隐藏: PE头擦除 + 假Ldr条目 + 页保护随机化
+    SelfCloaker::CloakManualMap(base, dllSize);
+}
+
 void StealthEngine::Shutdown() {
     // 1. 恢复 .text 段
     if (m_config.backupTextSection) {

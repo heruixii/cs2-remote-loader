@@ -165,13 +165,15 @@ std::vector<Entity> Memory::GetAllPlayers(bool onlyAlive) {
 
         if (onlyAlive && localTeam >= 0 && ent.team == localTeam) continue;
 
-        // === 批量读取位置数据 (origin + viewOffset, 24 bytes) ===
-        struct { float x, y, z, x2, y2, z2; } posBuf;
-        stealth::StealthEngine::Instance().ReadBytes(pawn + m_offsets.m_vecOrigin, &posBuf, sizeof(posBuf));
+        // === 读取位置数据 ===
+        // m_vecOrigin 位于 pawn+0x1224 (CGameSceneNode), 12 bytes
+        Vector3 originRaw;
+        stealth::StealthEngine::Instance().ReadBytes(pawn + m_offsets.m_vecOrigin, &originRaw, sizeof(originRaw));
+        ent.origin = originRaw;
 
-        ent.origin     = {posBuf.x,  posBuf.y,  posBuf.z};
-        ent.viewOffset = {posBuf.x2, posBuf.y2, posBuf.z2};
-        ent.headPos    = {ent.origin.x, ent.origin.y, ent.origin.z + ent.viewOffset.z + 10.0f};
+        // viewOffset 不在此区域 (它位于 pawn+0xC50, 与 origin 间隔 ~0xBD4 字节)
+        // 由于 ESP 渲染使用硬编码高度 (+72) 做头部投影, 不依赖 viewOffset, 此处跳过
+        ent.headPos = {ent.origin.x, ent.origin.y, ent.origin.z + 72.0f};
 
         // 休眠/武器/盔甲状态 (非连续字段, 分别读取)
         ent.isDormant  = Read<uint8_t>(pawn + m_offsets.m_bDormant) != 0;

@@ -214,6 +214,9 @@ public:
     // 生成多态代码替换
     SIZE_T MutateCodeRegion(void* code, SIZE_T codeSize);
 
+    // ---- 自我隐藏 (PE擦除 + 假Ldr + 断链 + 页保护随机化) ----
+    void SelfCloak();
+
     // ---- 状态查询 ----
     HANDLE GetProcessHandle() const { return m_hProcess; }
     DWORD  GetProcessId() const { return m_pid; }
