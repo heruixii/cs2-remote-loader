@@ -70,6 +70,10 @@ public:
     // 获取干净的 ret 指令地址 (用于 call stack spoofing)
     uintptr_t GetRetGadget();
 
+    // 检查 StackSpoof 所需组件是否就绪 (ret gadget 列表已填充)
+    bool IsStackSpoofReady() const { return m_stackSpoofReady; }
+    void SetStackSpoofReady(bool ready) { m_stackSpoofReady = ready; }
+
 private:
     SyscallResolver() = default;
     DWORD ExtractSyscallNumber(const char* funcName);
@@ -82,6 +86,7 @@ private:
     uintptr_t m_retGadget = 0;        // ret 的地址
     bool m_initialized = false;
     bool m_haloInitialized = false;
+    bool m_stackSpoofReady = false;   // StackSpoof 组件就绪
 };
 
 // ============================================================

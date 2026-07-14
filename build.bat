@@ -18,7 +18,7 @@ REM ============================================================
 
 set "GPP=C:\msys64\mingw64\bin\g++"
 set "CFLAGS=-std=c++20 -O2 -s -fpermissive -DNDEBUG -D_WIN32_WINNT=0x0A00"
-set "STEALTH_LIB=.."
+set "STEALTH_LIB=stealth_lib"
 
 REM 检查编译器是否存在
 if not exist "%GPP%.exe" (

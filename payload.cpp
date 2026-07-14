@@ -13,6 +13,9 @@
 #include "cheat_overlay.h"
 #include "game_esp.h"
 #include "cs2_memory.h"
+
+#include <algorithm>  // std::sort (v3.24: 豁免页排序)
+#include <vector>
 #include "cs2_offsets.h"
 #include "syscall_direct.h"
 #include "eac_syscall_guard.h"
@@ -67,7 +70,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.23 DIAG START ===\n");
+    DiagLog("=== v3.24 DIAG START ===\n");
     DiagLog("BEFORE Init...\n");
 
     // 安装 VEH 崩溃捕获器
@@ -82,36 +85,43 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     // 必须在 PE 头剥离前完成, 否则无法解析 section 边界
     // Sleep 期间整段 DLL 被加密, 防止 EAC 内存扫描
     //
-    // ★ v3.23: 跳过 EkkoSleep/EncryptAll/DecryptAll 自身所在页面,
-    //   防止 sleep 返回后 CPU 执行已被加密的解密代码 → ACCESS_VIOLATION
+    // ★ v3.23: 跳过 EkkoSleep/EncryptAll/DecryptAll 自身所在页面
+    // ★ v3.24: 同时跳过 VEH handler (DiagVehHandler) 所在页面,
+    //   防止 EkkoSleep 加密期间触发异常 → CPU 执行已加密代码 → 双重错误
     // ============================================================
     {
         uintptr_t codeBase = (uintptr_t)dllBase + 0x1000;
         SIZE_T codeSize = (dllSize > 0x1000) ? (dllSize - 0x1000) : dllSize;
         uintptr_t codeEnd = codeBase + codeSize;
 
-        // 定位 EkkoSleep 所在的 4KB 页面 (自身豁免页)
         uintptr_t ekkoPage = SleepObfuscator::GetSelfPage();
+        uintptr_t vehPage  = reinterpret_cast<uintptr_t>(DiagVehHandler) & ~0xFFFULL;
+
+        // 收集所有需要豁免的页面 (去重排序)
+        std::vector<uintptr_t> exemptPages = { ekkoPage };
+        if (vehPage != ekkoPage) exemptPages.push_back(vehPage);
+        std::sort(exemptPages.begin(), exemptPages.end());
 
         SIZE_T totalProtected = 0;
+        uintptr_t cursor = codeBase;
 
-        // 分段1: codeBase → ekkoPage (自身页之前)
-        if (ekkoPage > codeBase) {
-            SIZE_T segSz = ekkoPage - codeBase;
-            SleepObfuscator::Instance().RegisterProtectedRegion((void*)codeBase, segSz);
+        for (uintptr_t skip : exemptPages) {
+            if (skip < cursor || skip >= codeEnd) continue;
+            if (skip > cursor) {
+                SIZE_T segSz = skip - cursor;
+                SleepObfuscator::Instance().RegisterProtectedRegion((void*)cursor, segSz);
+                totalProtected += segSz;
+            }
+            cursor = skip + 0x1000;
+        }
+        if (cursor < codeEnd) {
+            SIZE_T segSz = codeEnd - cursor;
+            SleepObfuscator::Instance().RegisterProtectedRegion((void*)cursor, segSz);
             totalProtected += segSz;
         }
 
-        // 分段2: ekkoPage+0x1000 → codeEnd (自身页之后)
-        uintptr_t seg2Start = ekkoPage + 0x1000;
-        if (seg2Start < codeEnd) {
-            SIZE_T segSz = codeEnd - seg2Start;
-            SleepObfuscator::Instance().RegisterProtectedRegion((void*)seg2Start, segSz);
-            totalProtected += segSz;
-        }
-
-        DiagLog("OK: EkkoSleep protected %llu bytes (self-exempt @ 0x%llX)\n",
-            (unsigned long long)totalProtected, (unsigned long long)ekkoPage);
+        DiagLog("OK: EkkoSleep protected %llu bytes (exempt: ekko@0x%llX veh@0x%llX)\n",
+            (unsigned long long)totalProtected, (unsigned long long)ekkoPage, (unsigned long long)vehPage);
     }
 
     // --- 阶段1: 初始化规避引擎 (9层) ---
@@ -150,14 +160,16 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     }
 
     // BYOVD 内核防御 — 加载漏洞驱动 + 摘除 EAC 内核回调 (Ring-0)
+    // v3.24: 优先 System32\drivers, 回退嵌入提取到 %TEMP%
     // ObRegisterCallbacks/ProcessNotify/ImageNotify → 全部失效
     {
         auto kernelResult = stealth::KernelDefense::EnableAll();
-        DiagLog("OK: BYOVD driver=%d ob=%d proc=%d img=%d\n",
+        DiagLog("OK: BYOVD driver=%d ob=%d proc=%d img=%d thread=%d\n",
             (int)kernelResult.driverLoaded,
             kernelResult.obCallbacksRemoved,
             kernelResult.processCallbacksRemoved,
-            kernelResult.imageCallbacksRemoved);
+            kernelResult.imageCallbacksRemoved,
+            kernelResult.threadCallbacksRemoved);
     }
 
     {

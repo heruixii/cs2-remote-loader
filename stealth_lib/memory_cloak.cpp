@@ -89,13 +89,18 @@ void SleepObfuscator::EncryptAll() {
         if (region.isCode) {
             DWORD oldProtect;
             if (!VirtualProtect(region.addr, region.size, PAGE_READWRITE, &oldProtect)) {
-                continue; // 无法修改保护, 跳过此区域
+                continue;
             }
             XorCrypt(region.addr, region.size, region.xorKey);
             VirtualProtect(region.addr, region.size, oldProtect, &oldProtect);
             FlushInstructionCache(GetCurrentProcess(), region.addr, region.size);
         } else {
+            // v3.24: 非代码区域可能仍包含可执行页 (如 RegisterProtectedRegion 混合注册)
+            // 必须先改为可写再加密，否则对 PAGE_EXECUTE_READ 页直接 XorCrypt → ACCESS_VIOLATION
+            DWORD oldProtect = PAGE_READWRITE;
+            VirtualProtect(region.addr, region.size, PAGE_READWRITE, &oldProtect);
             XorCrypt(region.addr, region.size, region.xorKey);
+            VirtualProtect(region.addr, region.size, oldProtect, &oldProtect);
         }
     }
 }
@@ -111,7 +116,11 @@ void SleepObfuscator::DecryptAll() {
             VirtualProtect(region.addr, region.size, PAGE_EXECUTE_READ, &oldProtect);
             FlushInstructionCache(GetCurrentProcess(), region.addr, region.size);
         } else {
+            // v3.24: 非代码区域同样先改保护再解密
+            DWORD oldProtect = PAGE_READWRITE;
+            VirtualProtect(region.addr, region.size, PAGE_READWRITE, &oldProtect);
             XorCrypt(region.addr, region.size, region.xorKey);
+            VirtualProtect(region.addr, region.size, oldProtect, &oldProtect);
         }
     }
 }

