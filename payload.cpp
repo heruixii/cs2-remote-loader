@@ -159,10 +159,52 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         StealthEngine::Instance().Shutdown();
         return 3;
     }
-    DiagLog("OK: Memory::Initialize, clientBase=0x%llX\n",
-        (unsigned long long)cs2::Memory::Instance().ClientBase());
+    DiagLog("OK: Memory::Initialize, clientBase=0x%llX engineBase=0x%llX\n",
+        (unsigned long long)cs2::Memory::Instance().ClientBase(),
+        (unsigned long long)cs2::Memory::Instance().EngineBase());
 
-    // --- 阶段5: 查找 CS2 窗口并创建 Overlay ---
+    {
+        uintptr_t cb = cs2::Memory::Instance().ClientBase();
+        HANDLE hProc = StealthEngine::Instance().GetProcessHandle();
+        auto& off = cs2::Memory::Instance().GetOffsets();
+
+        // 诊断: 直接读取偏移位置的内存, 看是不是有效指针
+        auto diagRead = [&](const char* name, uintptr_t addr) {
+            uintptr_t val = 0;
+            SIZE_T br = 0;
+            SysReadVirtualMemory(hProc, (PVOID)addr, &val, 8, &br, SyscallMethod::Indirect);
+            // 同时读取周围16字节
+            BYTE raw[32] = {};
+            SIZE_T br2 = 0;
+            SysReadVirtualMemory(hProc, (PVOID)(addr - 8), raw, 32, &br2, SyscallMethod::Indirect);
+            DiagLog("  %s(off=0x%llX) addr=0x%llX val=0x%llX [hex:", name,
+                (unsigned long long)(addr - cb), (unsigned long long)addr, (unsigned long long)val);
+            if (br2 >= 8) {
+                for (int i = 0; i < 24; i++) {
+                    DiagLog("%02X ", raw[i]);
+                }
+            }
+            DiagLog("]\n");
+            return val;
+        };
+
+        diagRead("dwLocalPlayerPawn ", cb + off.dwLocalPlayerPawn);
+        diagRead("dwEntityList     ", cb + off.dwEntityList);
+        diagRead("dwViewMatrix     ", cb + off.dwViewMatrix);
+
+        // 尝试 entity list 基地址附近的常见偏移
+        DiagLog("  -- scanning nearby entity list patterns --\n");
+        for (int step = -10; step <= 10; step++) {
+            uintptr_t offAdj = off.dwEntityList + step * 8;
+            uintptr_t val = 0;
+            SIZE_T br = 0;
+            SysReadVirtualMemory(hProc, (PVOID)(cb + offAdj), &val, 8, &br, SyscallMethod::Indirect);
+            if (cb > 0 && val > cb && val < (cb + 0x20000000)) {
+                DiagLog("  ENTITY_CANDIDATE: off=0x%llX val=0x%llX delta=%+lld*8\n",
+                    (unsigned long long)offAdj, (unsigned long long)val, (long long)step);
+            }
+        }
+    }
     HWND cs2Hwnd = FindWindowW(nullptr, nullptr);
     while (cs2Hwnd) {
         DWORD pid = 0;
