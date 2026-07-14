@@ -652,11 +652,11 @@ SyscallMethod DecideMethod(SyscallMethod requested) {
         return SyscallMethod::Indirect;
     }
 
-    // 优先使用 StackSpoof: 当 Fat Frame 或 Ret Gadgets 可用, 且有 syscall;ret gadget
+    // 优先使用 StackSpoof: 仅当 Fat Frame 可用
+    // 注意: ret-sled spoof 会偏移栈导致 >=5 参数的 syscall 失败
     bool hasFatFrames = (CallStackSpoofer::Instance().GetFatFrameCount() > 0) ||
                          CallStackSpoofer::Instance().FindFatFrames();
-    bool hasRetGadgets = !GetRetGadgets().empty();
-    if ((hasFatFrames || hasRetGadgets) && resolver.GetSyscallRetGadget()) {
+    if (hasFatFrames && resolver.GetSyscallRetGadget()) {
         return SyscallMethod::StackSpoof;
     }
 
