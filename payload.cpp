@@ -239,6 +239,29 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     SysReadVirtualMemory(hProc, (PVOID)(elBase + offTry), &hi, 4, &br2, SyscallMethod::Indirect);
                     DiagLog("  highestIdx@+0x%X = %d\n", offTry, hi);
                 }
+
+                // Try: read identity list pointer at +0x10, mask tag, iterate
+                uintptr_t idListTagged = 0;
+                SysReadVirtualMemory(hProc, (PVOID)(elBase + 0x10), &idListTagged, 8, &br2, SyscallMethod::Indirect);
+                uintptr_t idList = idListTagged & ~0xFULL; // strip tag
+                DiagLog("  idList: tagged=0x%llX cleaned=0x%llX\n",
+                    (unsigned long long)idListTagged, (unsigned long long)idList);
+
+                // Try dumping first few entries at idList with various step sizes
+                for (int stepSize : {0x78, 0x80, 0x88, 0x90, 0x120}) {
+                    DiagLog("  -- iter with step=0x%X --\n", stepSize);
+                    int valid = 0;
+                    for (int i = 0; i < 5 && i <= 13; i++) {
+                        uintptr_t addr = idList + i * stepSize;
+                        uintptr_t val = 0;
+                        SysReadVirtualMemory(hProc, (PVOID)addr, &val, 8, &br2, SyscallMethod::Indirect);
+                        if (val > 0x10000) {
+                            DiagLog("    [%d] @+0x%X val=0x%llX\n", i, i * stepSize, (unsigned long long)val);
+                            valid++;
+                        }
+                    }
+                    if (valid == 0) DiagLog("    (all zero)\n");
+                }
             }
         }
     }
