@@ -1121,6 +1121,7 @@ NTSTATUS SysOpenProcess(
     POBJECT_ATTRIBUTES objAttr, PCLIENT_ID clientId, SyscallMethod method)
 {
     // ManualMap 下 syscall stub 生成不稳定, 直接走 GetProcAddress 回退路径
+    MessageBoxW(0, L"SysOP: GetProcAddress NtOpenProcess (FIXED-STUBLESS)", L"DBG", 0);
     using Fn = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID);
     auto fn = reinterpret_cast<Fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtOpenProcess"));
     return fn ? fn(hProcess, desiredAccess, objAttr, clientId) : STATUS_NOT_SUPPORTED;
