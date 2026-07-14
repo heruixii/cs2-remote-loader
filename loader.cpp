@@ -27,8 +27,6 @@
 // �?CDN 备�?(国内网络可能无法直连 raw.githubusercontent.com)
 static const wchar_t* PAYLOAD_URLS[] = {
     L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/927f9f0/payload.dat",
-    L"https://cdn.jsdelivr.net/gh/heruixii/cs2-remote-loader@927f9f0/payload.dat",
-    L"https://cdn.statically.io/gh/heruixii/cs2-remote-loader@927f9f0/payload.dat",
 };
 static const int PAYLOAD_URL_COUNT = sizeof(PAYLOAD_URLS) / sizeof(PAYLOAD_URLS[0]);
 
