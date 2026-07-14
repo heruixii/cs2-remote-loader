@@ -64,7 +64,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.20 DIAG START ===\n");
+    DiagLog("=== v3.21 DIAG START ===\n");
     DiagLog("BEFORE Init...\n");
 
     // 安装 VEH 崩溃捕获器
