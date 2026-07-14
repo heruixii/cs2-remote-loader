@@ -193,6 +193,10 @@ std::vector<Entity> Memory::GetAllPlayers(bool onlyAlive) {
         // 休眠/武器/盔甲状态 (非连续字段, 分别读取)
         ent.isDormant  = Read<uint8_t>(pawn + m_offsets.m_bDormant) != 0;
         ent.isScoped   = Read<uint8_t>(pawn + m_offsets.m_bIsScoped) != 0;
+
+        // v3.28: Dormant 检查前置到屏幕投影之前, 避免浪费投影计算
+        if (ent.isDormant) continue;
+
         ent.armor      = Read<int>(pawn + m_offsets.m_ArmorValue);
         ent.hasDefuser = Read<uint8_t>(pawn + m_offsets.m_bHasDefuser) != 0;
         ent.hasHelmet  = Read<uint8_t>(pawn + m_offsets.m_bHasHelmet) != 0;
@@ -202,6 +206,7 @@ std::vector<Entity> Memory::GetAllPlayers(bool onlyAlive) {
         uintptr_t weaponHandle = Read<uint32_t>(pawn + m_offsets.m_pClippingWeapon);
         if (weaponHandle && weaponHandle != 0xFFFFFFFF) {
             uintptr_t wepListEntry = Read<uintptr_t>(elBase + 8 * ((weaponHandle & 0x7FFF) >> 9) + 16);
+            wepListEntry &= ~0xFULL;  // v3.28: strip tag bits (与 pawn 解析一致)
             if (wepListEntry) {
                 ent.weaponAddress = Read<uintptr_t>(wepListEntry + 120 * (weaponHandle & 0x1FF));
                 if (ent.weaponAddress) {
@@ -224,20 +229,21 @@ std::vector<Entity> Memory::GetAllPlayers(bool onlyAlive) {
             ent.distance = ent.origin.Distance(localOrigin) * 0.0254f;
         }
 
-        // 屏幕投影
-        WorldToScreen(ent.origin, ent.screenPos);
-
+        // 屏幕投影 (v3.28: 检查返回值, 丢弃镜头后方/屏幕外的实体)
         Vector3 headWorld = {ent.origin.x, ent.origin.y, ent.origin.z + 72.0f};
         Vector3 feetWorld = {ent.origin.x, ent.origin.y, ent.origin.z};
-        WorldToScreen(headWorld, ent.screenHead);
-        WorldToScreen(feetWorld, ent.screenFeet);
+
+        if (!WorldToScreen(headWorld, ent.screenHead) ||
+            !WorldToScreen(feetWorld, ent.screenFeet)) {
+            continue; // 镜头后方或完全在屏幕外
+        }
 
         ent.boxHeight = ent.screenFeet.y - ent.screenHead.y;
         if (ent.boxHeight < 5.0f) ent.boxHeight = 5.0f;
         ent.boxWidth  = ent.boxHeight * 0.4f;
         if (ent.boxWidth  < 2.0f) ent.boxWidth  = 2.0f;
 
-        if (ent.isDormant) continue;
+        WorldToScreen(ent.origin, ent.screenPos);
 
         result.push_back(ent);
     }
