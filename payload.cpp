@@ -195,7 +195,17 @@ static void CleanupInjectionTraces() {
 
     auto isKnownModule = [&](const wchar_t* name) -> bool {
         if (!name[0]) return true; // 空名跳过
+
+        // v3.32-plus: 文件名可能包含完整路径, 对末尾文件名做精确匹配
+        const wchar_t* basename = name;
+        // 跳过路径部分, 只保留最后一个 \ 之后
+        const wchar_t* lastSlash = wcsrchr(name, L'\\');
+        if (lastSlash) basename = lastSlash + 1;
+
         for (int i = 0; knownPrefixes[i]; i++) {
+            if (_wcsnicmp(basename, knownPrefixes[i], wcslen(knownPrefixes[i])) == 0)
+                return true;
+            // 回退: 全路径前缀匹配
             if (_wcsnicmp(name, knownPrefixes[i], wcslen(knownPrefixes[i])) == 0)
                 return true;
         }
