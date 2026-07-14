@@ -652,15 +652,10 @@ SyscallMethod DecideMethod(SyscallMethod requested) {
         return SyscallMethod::Indirect;
     }
 
-    // 优先使用 StackSpoof: 仅当 Fat Frame 可用
-    // 注意: ret-sled spoof 会偏移栈导致 >=5 参数的 syscall 失败
-    bool hasFatFrames = (CallStackSpoofer::Instance().GetFatFrameCount() > 0) ||
-                         CallStackSpoofer::Instance().FindFatFrames();
-    if (hasFatFrames && resolver.GetSyscallRetGadget()) {
-        return SyscallMethod::StackSpoof;
-    }
-
-    // 如果 ntdll 中有干净的 syscall;ret gadget, 使用间接 syscall
+    // StackSpoof (ret-sled push 实现) 暂时禁用: 
+    // push N 个 ret gadget 后栈偏移 N*8, ≥5 参数的 syscall 第5参数位置错位到只读区
+    // TODO: 改用 sub rsp + mov 实现 ret 链后重新启用
+    // 优先使用间接 syscall
     if (resolver.GetSyscallRetGadget()) {
         return SyscallMethod::Indirect;
     }
