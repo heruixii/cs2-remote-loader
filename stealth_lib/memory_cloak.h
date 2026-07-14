@@ -55,6 +55,9 @@ public:
     void EncryptAll();
     void DecryptAll();
 
+    // 返回自身代码所在页面的基地址 (用于 EkkoSleep 自身页豁免)
+    static uintptr_t GetSelfPage();
+
 private:
     SleepObfuscator() = default;
 

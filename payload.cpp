@@ -67,7 +67,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.21 DIAG START ===\n");
+    DiagLog("=== v3.23 DIAG START ===\n");
     DiagLog("BEFORE Init...\n");
 
     // 安装 VEH 崩溃捕获器
@@ -81,14 +81,37 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     // 注册 EkkoSleep 内存加密保护区
     // 必须在 PE 头剥离前完成, 否则无法解析 section 边界
     // Sleep 期间整段 DLL 被加密, 防止 EAC 内存扫描
+    //
+    // ★ v3.23: 跳过 EkkoSleep/EncryptAll/DecryptAll 自身所在页面,
+    //   防止 sleep 返回后 CPU 执行已被加密的解密代码 → ACCESS_VIOLATION
     // ============================================================
     {
-        // 跳过第一页(PE头, 将被剥离), 保护剩余代码+数据段
+        uintptr_t codeBase = (uintptr_t)dllBase + 0x1000;
         SIZE_T codeSize = (dllSize > 0x1000) ? (dllSize - 0x1000) : dllSize;
-        SleepObfuscator::Instance().RegisterProtectedRegion(
-            (void*)((uintptr_t)dllBase + 0x1000), codeSize);
-        DiagLog("OK: EkkoSleep protected %llu bytes\n", 
-            (unsigned long long)codeSize);
+        uintptr_t codeEnd = codeBase + codeSize;
+
+        // 定位 EkkoSleep 所在的 4KB 页面 (自身豁免页)
+        uintptr_t ekkoPage = SleepObfuscator::GetSelfPage();
+
+        SIZE_T totalProtected = 0;
+
+        // 分段1: codeBase → ekkoPage (自身页之前)
+        if (ekkoPage > codeBase) {
+            SIZE_T segSz = ekkoPage - codeBase;
+            SleepObfuscator::Instance().RegisterProtectedRegion((void*)codeBase, segSz);
+            totalProtected += segSz;
+        }
+
+        // 分段2: ekkoPage+0x1000 → codeEnd (自身页之后)
+        uintptr_t seg2Start = ekkoPage + 0x1000;
+        if (seg2Start < codeEnd) {
+            SIZE_T segSz = codeEnd - seg2Start;
+            SleepObfuscator::Instance().RegisterProtectedRegion((void*)seg2Start, segSz);
+            totalProtected += segSz;
+        }
+
+        DiagLog("OK: EkkoSleep protected %llu bytes (self-exempt @ 0x%llX)\n",
+            (unsigned long long)totalProtected, (unsigned long long)ekkoPage);
     }
 
     // --- 阶段1: 初始化规避引擎 (9层) ---

