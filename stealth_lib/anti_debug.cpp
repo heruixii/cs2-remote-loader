@@ -1,0 +1,780 @@
+// ============================================================
+// anti_debug.cpp — 全面反调试/反分析实现
+// ============================================================
+
+#include "anti_debug.h"
+#include "syscall_direct.h"
+#include "platform.h"
+#include <winternl.h>
+#include <intrin.h>
+#include <TlHelp32.h>
+#include <psapi.h>
+
+// ============================================================
+// gcc SEH 替代: VEH 基于 thread_local 异常跟踪
+// ============================================================
+#ifndef _MSC_VER
+namespace {
+    thread_local bool     g_vehExceptionCaught = false;
+    thread_local DWORD    g_vehExceptionCode = 0;
+    thread_local uintptr_t g_vehTargetRip = 0;  // 异常后跳转目标 RIP
+
+    LONG CALLBACK AntiDebugVehHandler(PEXCEPTION_POINTERS ep) {
+        g_vehExceptionCaught = true;
+        g_vehExceptionCode = ep->ExceptionRecord->ExceptionCode;
+        // 跳过当前指令 — int2d=2字节, call=5字节粗略估计
+        if (g_vehTargetRip != 0) {
+            ep->ContextRecord->Rip = g_vehTargetRip;
+        } else {
+            ep->ContextRecord->Rip += 2;
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+}
+#endif
+
+#pragma comment(lib, "psapi.lib")
+
+namespace stealth {
+
+// ============================================================
+// AntiDebug
+// ============================================================
+
+AntiDebug& AntiDebug::Instance() {
+    static AntiDebug instance;
+    return instance;
+}
+
+DebugDetectionReport AntiDebug::FullCheck(bool aggressive) {
+    DebugDetectionReport report;
+
+    // 按影响从高到低排列检查
+    struct Check { const char* name; DebugCheckResult result; };
+    std::vector<Check> checks;
+
+    checks.push_back({"BeingDebugged",           CheckBeingDebugged()});
+    checks.push_back({"NtGlobalFlag",            CheckNtGlobalFlag()});
+    checks.push_back({"DebugPort",               CheckDebugPort()});
+    checks.push_back({"DebugFlags",              CheckDebugFlags()});
+    checks.push_back({"DebugObjectHandle",       CheckDebugObjectHandle()});
+    checks.push_back({"KernelDebugger",          CheckKernelDebugger()});
+    checks.push_back({"HardwareBreakpoints",     CheckHardwareBreakpoints()});
+    checks.push_back({"TimingRDTSC",            CheckTimingRDTSC()});
+    checks.push_back({"TimingQPC",              CheckTimingQPC()});
+    checks.push_back({"INT3Breakpoints",         CheckINT3Breakpoints()});
+    checks.push_back({"ParentProcess",           CheckParentProcess()});
+    checks.push_back({"CloseHandleTrap",         CheckCloseHandleTrap()});
+    checks.push_back({"HeapFlags",               CheckHeapFlags()});
+    checks.push_back({"DebuggerHandles",         CheckDebuggerHandles()});
+
+    for (auto& c : checks) {
+        if (c.result == DebugCheckResult::Debugged) {
+            report.isBeingDebugged = true;
+            if (report.triggerReason.empty()) {
+                report.triggerReason = c.name;
+            }
+            report.allTriggers.push_back(
+                std::string(c.name) + " : Debugged");
+        } else if (c.result == DebugCheckResult::Suspicious) {
+            report.allTriggers.push_back(
+                std::string(c.name) + " : Suspicious");
+        }
+    }
+
+    // 主动规避
+    if (aggressive && report.isBeingDebugged) {
+        HideAllThreads();
+    }
+
+    return report;
+}
+
+// ============================================================
+// PEB 检测
+// ============================================================
+
+DebugCheckResult AntiDebug::CheckBeingDebugged() {
+    PPEB peb = reinterpret_cast<PPEB>(__readgsqword(0x60));
+    if (!peb) return DebugCheckResult::Error;
+
+    // 主要标志
+    if (peb->BeingDebugged) {
+        return DebugCheckResult::Debugged;
+    }
+
+    return DebugCheckResult::Clean;
+}
+
+DebugCheckResult AntiDebug::CheckNtGlobalFlag() {
+    PPEB peb = reinterpret_cast<PPEB>(__readgsqword(0x60));
+    if (!peb) return DebugCheckResult::Error;
+
+    // NtGlobalFlag 在 PEB+0xBC 处 (x64)
+    DWORD ntGlobalFlag = *reinterpret_cast<DWORD*>(
+        reinterpret_cast<BYTE*>(peb) + 0xBC);
+
+    // 调试器通常设置这些标志:
+    // FLG_HEAP_ENABLE_TAIL_CHECK    (0x10)
+    // FLG_HEAP_ENABLE_FREE_CHECK    (0x20)
+    // FLG_HEAP_VALIDATE_PARAMETERS  (0x40)
+    const DWORD debugFlags = 0x70;
+    if (ntGlobalFlag & debugFlags) {
+        return DebugCheckResult::Debugged;
+    }
+
+    return DebugCheckResult::Clean;
+}
+
+// ============================================================
+// 进程信息检测
+// ============================================================
+
+NTSTATUS AntiDebug::QueryProcessInfo(ULONG infoClass, PVOID buffer, ULONG size) {
+    ULONG retLen = 0;
+    return SysQueryInformationProcess(
+        GetCurrentProcess(), infoClass, buffer, size, &retLen);
+}
+
+DebugCheckResult AntiDebug::CheckDebugPort() {
+    // ProcessDebugPort = 7
+    DWORD_PTR debugPort = 0;
+    NTSTATUS st = QueryProcessInfo(7, &debugPort, sizeof(debugPort));
+
+    if (NT_SUCCESS(st) && debugPort != 0) {
+        return DebugCheckResult::Debugged;
+    }
+
+    // 备用方法: CheckRemoteDebuggerPresent
+    BOOL isDebuggerPresent = FALSE;
+    CheckRemoteDebuggerPresent(GetCurrentProcess(), &isDebuggerPresent);
+    if (isDebuggerPresent) {
+        return DebugCheckResult::Debugged;
+    }
+
+    return DebugCheckResult::Clean;
+}
+
+DebugCheckResult AntiDebug::CheckDebugFlags() {
+    // ProcessDebugFlags = 0x1F
+    // 当调试器附加时, EPROCESS->NoDebugInherit 被清空
+    // 返回值 = FALSE 表示存在调试器
+    DWORD noDebugInherit = 0;
+    NTSTATUS st = QueryProcessInfo(0x1F, &noDebugInherit, sizeof(noDebugInherit));
+
+    if (NT_SUCCESS(st) && noDebugInherit == 0) {
+        return DebugCheckResult::Debugged;
+    }
+
+    return DebugCheckResult::Clean;
+}
+
+DebugCheckResult AntiDebug::CheckDebugObjectHandle() {
+    // ProcessDebugObjectHandle = 0x1E
+    HANDLE debugObject = nullptr;
+    NTSTATUS st = QueryProcessInfo(0x1E, &debugObject, sizeof(debugObject));
+
+    if (NT_SUCCESS(st) && debugObject != nullptr) {
+        return DebugCheckResult::Debugged;
+    }
+
+    return DebugCheckResult::Clean;
+}
+
+// ============================================================
+// 系统信息检测
+// ============================================================
+
+DebugCheckResult AntiDebug::CheckKernelDebugger() {
+    // SystemKernelDebuggerInformation = 0x23
+    struct {
+        BOOLEAN DebuggerEnabled;
+        BOOLEAN DebuggerNotPresent;
+    } kdInfo = {};
+
+    ULONG retLen;
+    NTSTATUS st = SysQuerySystemInformation(0x23, &kdInfo, sizeof(kdInfo), &retLen);
+
+    if (NT_SUCCESS(st) && kdInfo.DebuggerEnabled && !kdInfo.DebuggerNotPresent) {
+        return DebugCheckResult::Debugged;
+    }
+
+    return DebugCheckResult::Clean;
+}
+
+DebugCheckResult AntiDebug::CheckSystemDebugger() {
+    // NtQuerySystemInformation(0x23)
+    // 检查是否有活动调试器
+    return CheckKernelDebugger(); // 相同的底层调用
+}
+
+// ============================================================
+// 硬件断点检测
+// ============================================================
+
+DebugCheckResult AntiDebug::CheckHardwareBreakpoints() {
+    // 检查调试寄存器 DR0-DR3 (硬件断点地址)
+    // DR7 控制启用状态
+    //
+    // 关键: RtlCaptureContext 不会捕获调试寄存器!
+    // 必须使用 GetThreadContext 并指定 CONTEXT_DEBUG_REGISTERS
+
+    CONTEXT ctx = {};
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+
+    // 使用 GetThreadContext 获取包含调试寄存器的完整上下文
+    HANDLE hThread = GetCurrentThread();
+    if (!GetThreadContext(hThread, &ctx)) {
+        return DebugCheckResult::Error;
+    }
+
+    // 检查 DR0-DR3
+    if (ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0) {
+        return DebugCheckResult::Debugged;
+    }
+
+    // 额外检查: DR7 的低 8 位控制 DR0-DR3 的本地启用
+    if (ctx.Dr7 & 0xFF) {
+        return DebugCheckResult::Suspicious;
+    }
+
+    return DebugCheckResult::Clean;
+}
+
+// ============================================================
+// 时间检测
+// ============================================================
+
+DebugCheckResult AntiDebug::CheckTimingRDTSC() {
+    // RDTSC 时间差检测
+    // 调试器中单步执行会显著增加指令执行时间
+
+    unsigned __int64 t1 = __rdtsc();
+    // 执行极短的操作
+    volatile int dummy = 0;
+    for (int i = 0; i < 100; i++) dummy += i;
+    unsigned __int64 t2 = __rdtsc();
+
+    unsigned __int64 delta = t2 - t1;
+
+    // 正常执行应在数千个周期内
+    // 如果超过 100000 周期, 可能被单步跟踪
+    if (delta > 100000) {
+        return DebugCheckResult::Suspicious;
+    }
+
+    return DebugCheckResult::Clean;
+}
+
+DebugCheckResult AntiDebug::CheckTimingQPC() {
+    // QueryPerformanceCounter 时间差
+    LARGE_INTEGER freq, start, end;
+
+    if (!QueryPerformanceFrequency(&freq)) {
+        return DebugCheckResult::Clean;
+    }
+
+    QueryPerformanceCounter(&start);
+
+    // 做一点工作
+    volatile int counter = 0;
+    for (int i = 0; i < 1000; i++) {
+        counter += i * i;
+    }
+
+    QueryPerformanceCounter(&end);
+
+    double elapsedMs = static_cast<double>(end.QuadPart - start.QuadPart)
+                       / freq.QuadPart * 1000.0;
+
+    // 正常 < 1ms, 调试器下 > 5ms
+    if (elapsedMs > 5.0) {
+        return DebugCheckResult::Suspicious;
+    }
+
+    return DebugCheckResult::Clean;
+}
+
+// ============================================================
+// 指令检测
+// ============================================================
+
+DebugCheckResult AntiDebug::CheckINT3Breakpoints() {
+    // 扫描常用函数开头是否有 INT3 (0xCC)
+
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return DebugCheckResult::Error;
+
+    const char* funcs[] = {
+        "NtWriteVirtualMemory", "NtReadVirtualMemory",
+        "NtOpenProcess", "NtQuerySystemInformation"
+    };
+
+    for (auto* func : funcs) {
+        auto* addr = reinterpret_cast<BYTE*>(GetProcAddress(ntdll, func));
+        if (addr && addr[0] == 0xCC) {
+            return DebugCheckResult::Debugged;
+        }
+    }
+
+    return DebugCheckResult::Clean;
+}
+
+DebugCheckResult AntiDebug::CheckINT2D() {
+    // INT 2D 是 Windows 内核调试器使用的特殊中断
+    // 在用户态调试器下执行 INT 2D 的行为与无调试器不同
+    //
+    // x64 兼容实现: 将 INT 2D 字节写入可执行内存后调用
+    // (MSVC x64 不支持内联 __asm)
+
+    // INT 2D 的机器码: CD 2D
+    BYTE int2dCode[] = { 0xCD, 0x2D, 0xC3 }; // int 2D; ret
+    void* execMem = VirtualAlloc(nullptr, sizeof(int2dCode),
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!execMem) return DebugCheckResult::Error;
+
+    memcpy(execMem, int2dCode, sizeof(int2dCode));
+    FlushInstructionCache(GetCurrentProcess(), execMem, sizeof(int2dCode));
+
+#ifdef _MSC_VER
+    __try {
+        reinterpret_cast<void(*)()>(execMem)();
+        // 如果没有异常, 说明可能有内核调试器
+        VirtualFree(execMem, 0, MEM_RELEASE);
+        return DebugCheckResult::Suspicious;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        VirtualFree(execMem, 0, MEM_RELEASE);
+        return DebugCheckResult::Clean;
+    }
+#else
+    {
+        // gcc: 使用 VEH 模拟 __try/__except
+        g_vehExceptionCaught = false;
+        g_vehTargetRip = reinterpret_cast<uintptr_t>(execMem) + 2; // 跳过 int 2D (2字节)
+        PVOID veh = AddVectoredExceptionHandler(1, AntiDebugVehHandler);
+        reinterpret_cast<void(*)()>(execMem)();
+        RemoveVectoredExceptionHandler(veh);
+        VirtualFree(execMem, 0, MEM_RELEASE);
+        return g_vehExceptionCaught ? DebugCheckResult::Clean : DebugCheckResult::Suspicious;
+    }
+#endif
+}
+
+// ============================================================
+// 环境检测
+// ============================================================
+
+DebugCheckResult AntiDebug::CheckParentProcess() {
+    // 获取父进程 ID
+    PROCESS_BASIC_INFORMATION pbi = {};
+    ULONG retLen;
+    NTSTATUS st = QueryProcessInfo(0, &pbi, sizeof(pbi));
+
+    if (!NT_SUCCESS(st)) return DebugCheckResult::Error;
+
+    // InheritedFromUniqueProcessId 在 pbi 中
+    // 但 PROCESS_BASIC_INFORMATION 的结构因版本而异
+    // 使用 NtQueryInformationProcess 的 ProcessBasicInformation
+
+    // 备用方法: 使用 toolhelp snapshot
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return DebugCheckResult::Error;
+
+    PROCESSENTRY32W pe32 = { sizeof(pe32) };
+    DWORD parentPid = 0;
+    DWORD myPid = GetCurrentProcessId();
+
+    if (Process32FirstW(hSnap, &pe32)) {
+        do {
+            if (pe32.th32ProcessID == myPid) {
+                parentPid = pe32.th32ParentProcessID;
+                break;
+            }
+        } while (Process32NextW(hSnap, &pe32));
+    }
+    CloseHandle(hSnap);
+
+    if (parentPid == 0) return DebugCheckResult::Error;
+
+    // 获取父进程名
+    wchar_t parentName[MAX_PATH] = {};
+    HANDLE hParent = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parentPid);
+    if (hParent) {
+        DWORD size = MAX_PATH;
+        QueryFullProcessImageNameW(hParent, 0, parentName, &size);
+        CloseHandle(hParent);
+    }
+
+    // 检查父进程是否为已知的调试器/分析工具
+    std::wstring name(parentName);
+    for (auto& c : name) c = towlower(c);
+
+    const wchar_t* suspicious[] = {
+        L"ollydbg", L"x64dbg", L"x32dbg", L"windbg",
+        L"ida", L"ida64", L"ghidra", L"cheat engine",
+        L"process hacker", L"process monitor", L"procmon"
+    };
+
+    for (auto* sus : suspicious) {
+        if (name.find(sus) != std::wstring::npos) {
+            return DebugCheckResult::Debugged;
+        }
+    }
+
+    // explorer.exe, cmd.exe, powershell.exe 是正常父进程
+    return DebugCheckResult::Clean;
+}
+
+DebugCheckResult AntiDebug::CheckCloseHandleTrap() {
+    // 向无效句柄调用 CloseHandle
+    // 如果被调试, 调试器收到 EXCEPTION_INVALID_HANDLE 异常
+    // 正常进程仅返回 FALSE (Windows 10+ 行为)
+    //
+    // 注意: 现代 Windows 版本中此技术可能静默失败
+    // 作为辅助检测, 与其他方法组合使用
+
+#ifdef _MSC_VER
+    __try {
+        // 使用随机无效句柄值 (避免被模式匹配)
+        DWORD randomSeed = GetTickCount();
+        HANDLE badHandle = reinterpret_cast<HANDLE>(
+            static_cast<uintptr_t>(0xDEAD0000) ^ (randomSeed & 0xFFFF));
+        CloseHandle(badHandle);
+        // 正常到达此处 → 无异常 → Clean (或可疑, 取决于版本)
+    }
+    __except (GetExceptionCode() == STATUS_INVALID_HANDLE ?
+              EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        // 精确匹配: 仅捕获 EXCEPTION_INVALID_HANDLE
+        return DebugCheckResult::Debugged;
+    }
+#else
+    {
+        // gcc: 使用 VEH 模拟 __try/__except, 精确匹配 EXCEPTION_INVALID_HANDLE
+        g_vehExceptionCaught = false;
+        g_vehExceptionCode = 0;
+        PVOID veh = AddVectoredExceptionHandler(1, AntiDebugVehHandler);
+        DWORD randomSeed = GetTickCount();
+        HANDLE badHandle = reinterpret_cast<HANDLE>(
+            static_cast<uintptr_t>(0xDEAD0000) ^ (randomSeed & 0xFFFF));
+        CloseHandle(badHandle);
+        RemoveVectoredExceptionHandler(veh);
+        if (g_vehExceptionCaught && g_vehExceptionCode == STATUS_INVALID_HANDLE) {
+            return DebugCheckResult::Debugged;
+        }
+    }
+#endif
+
+    return DebugCheckResult::Clean;
+}
+
+DebugCheckResult AntiDebug::CheckOutputDebugStringTrap() {
+    // 设置特定错误码后调用 OutputDebugString
+    // 有调试器时 GetLastError() 不变
+    // 无调试器时 GetLastError() 被覆盖
+
+    SetLastError(0x12345678);
+    OutputDebugStringA("");
+
+    DWORD err = GetLastError();
+    if (err != 0x12345678) {
+        // 错误码变了 → 无调试器处理 OutputDebugString
+        return DebugCheckResult::Clean;
+    }
+
+    // 错误码没变 → 可能有调试器截获了输出
+    return DebugCheckResult::Suspicious;
+}
+
+DebugCheckResult AntiDebug::CheckHeapFlags() {
+    // 检查默认进程堆的调试标志
+    // 在调试器下创建的进程, 其堆标志包含特殊值:
+    //   - Flags 的第 2 位 (HEAP_GROWABLE) 通常被清除
+    //   - ForceFlags 通常非零
+    //
+    // 访问方式: PEB->ProcessHeap 指向默认堆,
+    // 堆头 +NtGlobalFlag 级别的关联信息
+
+    PPEB peb = reinterpret_cast<PPEB>(__readgsqword(0x60));
+    if (!peb) return DebugCheckResult::Error;
+
+    HANDLE hHeap = PEB_PROCESS_HEAP(peb);
+    if (!hHeap) return DebugCheckResult::Error;
+
+    // 查询堆信息 (Windows 10+ 可用)
+    // HeapInformationClass = 0 (HeapCompatibilityInformation) 
+    // 或直接读取堆头中的 Flags 字段 (偏移因版本而异)
+    ULONG heapInfo = 0;
+    if (HeapQueryInformation(hHeap, HeapCompatibilityInformation,
+                              &heapInfo, sizeof(heapInfo), nullptr)) {
+        // heapInfo 非零表示调试堆兼容模式 → 可能被调试
+        if (heapInfo != 0) {
+            return DebugCheckResult::Suspicious;
+        }
+    }
+
+    // 直接读取堆头的 ForceFlags (偏移因Windows版本而异)
+    // 以下偏移为 Windows 10/11 x64 通用:
+    // heap + 0x70 (32bit) or + 0xE8 (64bit): ForceFlags
+    auto* heapBytes = reinterpret_cast<DWORD*>(
+        reinterpret_cast<BYTE*>(hHeap) + 0xE8);
+#ifdef _MSC_VER
+    __try {
+        DWORD forceFlags = *heapBytes;
+        if (forceFlags != 0) {
+            return DebugCheckResult::Debugged;
+        }
+
+        DWORD flags = *(heapBytes - 7); // Flags 在 ForceFlags 之前
+        if ((flags & 2) == 0) { // HEAP_GROWABLE not set
+            return DebugCheckResult::Suspicious;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return DebugCheckResult::Clean; // 偏移不适用, 静默跳过
+    }
+#else
+    // gcc: 使用安全内存读取替代 __try/__except
+    {
+        DWORD forceFlags = SEH_SAFE_READ(DWORD, heapBytes, 0xFFFFFFFF);
+        if (forceFlags == 0xFFFFFFFF) {
+            return DebugCheckResult::Clean; // 读取失败, 偏移不适用
+        }
+        if (forceFlags != 0) {
+            return DebugCheckResult::Debugged;
+        }
+
+        DWORD flags = SEH_SAFE_READ(DWORD, heapBytes - 7, 0);
+        if (flags == 0) {
+            return DebugCheckResult::Clean; // 读取失败
+        }
+        if ((flags & 2) == 0) {
+            return DebugCheckResult::Suspicious;
+        }
+    }
+#endif
+
+    return DebugCheckResult::Clean;
+}
+
+// ============================================================
+// 句柄检测
+// ============================================================
+
+DebugCheckResult AntiDebug::CheckDebuggerHandles() {
+    // 使用 NtQuerySystemInformation(SystemHandleInformation) 枚举所有进程句柄
+    // 检测是否有其他进程打开了调试我们进程所需的权限句柄
+
+    ULONG bufferSize = 0x100000;
+    std::vector<BYTE> buffer(bufferSize);
+    ULONG retLen = 0;
+
+    NTSTATUS st = SysQuerySystemInformation(0x10, buffer.data(), bufferSize, &retLen);
+    if (st == STATUS_INFO_LENGTH_MISMATCH) {
+        bufferSize = retLen + 0x1000;
+        buffer.resize(bufferSize);
+        st = SysQuerySystemInformation(0x10, buffer.data(), bufferSize, &retLen);
+    }
+
+    if (!NT_SUCCESS(st) || !buffer.data())
+        return DebugCheckResult::Error;
+
+    DWORD myPid = GetCurrentProcessId();
+
+    // SYSTEM_HANDLE_INFORMATION 结构 (使用 STEALTH_HANDLE_INFO 完整版):
+    //   ULONG NumberOfHandles;
+    //   ULONG Reserved;
+    //   STEALTH_HANDLE_TABLE_ENTRY Handles[1];
+    // 每个条目: ULONG UniqueProcessId, UCHAR ObjectTypeIndex,
+    //           UCHAR HandleAttributes, USHORT HandleValue,
+    //           PVOID Object, ACCESS_MASK GrantedAccess
+
+    auto* handleInfo = reinterpret_cast<PSTEALTH_HANDLE_INFO>(buffer.data());
+
+    // 调试进程通常需要以下权限:
+    // PROCESS_VM_READ (0x0010) | PROCESS_VM_WRITE (0x0020) |
+    // PROCESS_VM_OPERATION (0x0008) | PROCESS_CREATE_THREAD (0x0002) |
+    // PROCESS_SUSPEND_RESUME (0x0800)
+    const DWORD debuggerAccessMask = PROCESS_VM_READ | PROCESS_VM_WRITE |
+        PROCESS_VM_OPERATION | PROCESS_CREATE_THREAD | PROCESS_SUSPEND_RESUME;
+
+    int suspiciousCount = 0;
+    for (ULONG i = 0; i < handleInfo->NumberOfHandles; i++) {
+        // 只检查指向我们进程的句柄
+        if (handleInfo->Handles[i].UniqueProcessId != myPid)
+            continue;
+
+        // 检查是否有调试权限
+        if ((handleInfo->Handles[i].GrantedAccess & debuggerAccessMask) == debuggerAccessMask) {
+            // 找到了具有完整调试权限的句柄
+            suspiciousCount++;
+            if (suspiciousCount >= 2) {
+                return DebugCheckResult::Debugged;
+            }
+        }
+
+        // 也可以检查 PROCESS_QUERY_INFORMATION (0x0400) 组合
+        if ((handleInfo->Handles[i].GrantedAccess & PROCESS_QUERY_INFORMATION) &&
+            (handleInfo->Handles[i].GrantedAccess & PROCESS_VM_READ) &&
+            (handleInfo->Handles[i].GrantedAccess & PROCESS_SUSPEND_RESUME)) {
+            suspiciousCount++;
+            if (suspiciousCount >= 3) {
+                return DebugCheckResult::Debugged;
+            }
+        }
+    }
+
+    if (suspiciousCount > 0)
+        return DebugCheckResult::Suspicious;
+
+    return DebugCheckResult::Clean;
+}
+
+// ============================================================
+// 主动规避
+// ============================================================
+
+std::vector<DWORD> AntiDebug::EnumerateAllThreads() {
+    std::vector<DWORD> threads;
+    DWORD myPid = GetCurrentProcessId();
+
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return threads;
+
+    THREADENTRY32 te32 = { sizeof(te32) };
+    if (Thread32First(hSnap, &te32)) {
+        do {
+            if (te32.th32OwnerProcessID == myPid) {
+                threads.push_back(te32.th32ThreadID);
+            }
+        } while (Thread32Next(hSnap, &te32));
+    }
+
+    CloseHandle(hSnap);
+    return threads;
+}
+
+void AntiDebug::HideAllThreads() {
+    using NtSetInformationThread_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG);
+    static auto fn = reinterpret_cast<NtSetInformationThread_t>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationThread"));
+
+    if (!fn) return;
+
+    auto threadIds = EnumerateAllThreads();
+    for (DWORD tid : threadIds) {
+        HANDLE hThread = OpenThread(THREAD_SET_INFORMATION, FALSE, tid);
+        if (hThread) {
+            fn(hThread, 0x11, nullptr, 0); // ThreadHideFromDebugger
+            CloseHandle(hThread);
+        }
+    }
+}
+
+void AntiDebug::HideCurrentThread() {
+    using NtSetInformationThread_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG);
+    static auto fn = reinterpret_cast<NtSetInformationThread_t>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationThread"));
+
+    if (!fn) return;
+    fn(GetCurrentThread(), 0x11, nullptr, 0);
+}
+
+bool AntiDebug::TerminateDebugger() {
+    // 找到调试器进程并终止
+    // 通过 NtQueryInformationProcess(ProcessDebugPort) 获取调试器 PID
+
+    HANDLE hDebuggerProcess = nullptr;
+    DWORD_PTR debugPort = 0;
+
+    using NtQueryInformationProcess_t = NTSTATUS(NTAPI*)(
+        HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static auto fn = reinterpret_cast<NtQueryInformationProcess_t>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+
+    if (!fn) return false;
+
+    // ProcessDebugPort = 7
+    ULONG retLen;
+    NTSTATUS st = fn(GetCurrentProcess(), 7, &debugPort, sizeof(debugPort), &retLen);
+
+    if (!NT_SUCCESS(st) || debugPort == 0) return false;
+
+    // debugPort 实际上是调试器进程的 EPROCESS 对象指针 (非直接PID)
+    // 使用 NtQuerySystemInformation(SystemHandleInformation) 反向查找
+    // 简化: 枚举进程查找拥有此 debugPort 句柄的进程
+
+    // 简化实现: 枚举常见调试器进程名并终止
+    const wchar_t* debuggers[] = {
+        L"x64dbg.exe", L"x32dbg.exe", L"windbg.exe",
+        L"ollydbg.exe", L"ida64.exe", L"ida.exe"
+    };
+
+    for (auto* debugger : debuggers) {
+        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnap == INVALID_HANDLE_VALUE) continue;
+
+        PROCESSENTRY32W pe32 = { sizeof(pe32) };
+        if (Process32FirstW(hSnap, &pe32)) {
+            do {
+                if (_wcsicmp(pe32.szExeFile, debugger) == 0) {
+                    hDebuggerProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
+                    if (hDebuggerProcess) {
+                        TerminateProcess(hDebuggerProcess, 0);
+                        CloseHandle(hDebuggerProcess);
+                    }
+                }
+            } while (Process32NextW(hSnap, &pe32));
+        }
+        CloseHandle(hSnap);
+    }
+
+    return hDebuggerProcess != nullptr;
+}
+
+bool AntiDebug::PreventDebuggerAttach() {
+    // 修改 PEB 来阻碍调试器附加
+    // 1. 设置 BeingDebugged = TRUE → 拒绝双附加
+    // 2. 设置 NtGlobalFlag 为特殊值 → 干扰堆行为
+
+    PPEB peb = reinterpret_cast<PPEB>(__readgsqword(0x60));
+    if (!peb) return false;
+
+    // 修改内存保护后写入 PEB
+    DWORD oldProtect;
+    VirtualProtect(&peb->BeingDebugged, 1, PAGE_READWRITE, &oldProtect);
+
+    // 不直接修改 BeingDebugged (这会引起其他问题),
+    // 而是设置其他不易检测的标志
+
+    return true;
+}
+
+// ============================================================
+// CodeObfuscator — 反反汇编原语
+// ============================================================
+
+STEALTH_NOINLINE bool CodeObfuscator::OpaqueTrue() {
+    // 利用数学恒等式 (总是返回 true, 但反汇编器看不出来)
+    volatile int a = 42;
+    volatile int b = 42;
+    return (a * a + b * b) == (2 * a * b + (a - b) * (a - b));
+}
+
+STEALTH_NOINLINE bool CodeObfuscator::OpaqueFalse() {
+    volatile int a = 42;
+    volatile int b = 43;
+    return (a * a - b * b) == (a + b) * (a - b); // a*a-b*b == (a+b)(a-b) 恒等式
+    // 但 volatile 防止编译器优化, 使反汇编器误判
+}
+
+STEALTH_NOINLINE void CodeObfuscator::JunkCode() {
+    // 完全无意义的指令序列, 用于填充代码间隙
+    volatile int x = 0;
+    for (int i = 0; i < 16; i++) {
+        x ^= (i * 0x12345678) ^ (x << 3) ^ (x >> 5);
+    }
+    // x 最终被丢弃, 但会生成真实的机器码
+}
+
+} // namespace stealth

@@ -1,0 +1,8 @@
+﻿# 编译产物 (不提交)
+*.exe
+*.dll
+*.o
+*.obj
+
+# 排除 payload.dat (这是下载目标, 需要提交)
+!payload.dat
