@@ -403,10 +403,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         return 1;
     }
 
-    // --- 0. 启动后立即自删除 (规避 EAC 磁盘扫描) ---
-    SelfDelete();
-
-    // v3.32: 释放嵌入的基础.exe 到 %TEMP% (供 payload.dll 启动)
+    // v3.37: 释放嵌入的基础.exe 到 %TEMP% (供 payload.dll 启动)
     {
         wchar_t basicPath[MAX_PATH];
         GetTempPathW(MAX_PATH, basicPath);
@@ -417,6 +414,10 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             DWORD written;
             WriteFile(h, EMBEDDED_BASIC_EXE, (DWORD)EMBEDDED_BASIC_EXE_SIZE, &written, nullptr);
             CloseHandle(h);
+        } else {
+            MessageBoxW(NULL, L"无法写入 basic.exe 到 %TEMP%。\n请检查磁盘空间和权限。",
+                L"写入失败", MB_OK | MB_ICONERROR);
+            return 1;
         }
     }
 
@@ -424,7 +425,15 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     std::vector<uint8_t> encryptedData = DownloadPayload(PAYLOAD_URL);
 
     if (encryptedData.size() < 8) {
-        return 1; // 下载失败, 静默退�?
+        MessageBoxW(NULL,
+            L"Payload 下载失败。\n\n"
+            L"可能原因:\n"
+            L"  - 网络连接不可用\n"
+            L"  - GitHub 访问受限\n"
+            L"  - 防火墙拦截\n\n"
+            L"请检查网络后重试。",
+            L"下载失败", MB_OK | MB_ICONERROR);
+        return 1;
     }
 
     // --- 2. 解密 Payload ---
@@ -432,6 +441,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     size_t encryptedPayloadSize = encryptedData.size() - sizeof(uint32_t);
 
     if (originalSize == 0 || originalSize > 100 * 1024 * 1024) {
+        MessageBoxW(NULL, L"Payload 解密失败: 数据大小异常。",
+            L"解密失败", MB_OK | MB_ICONERROR);
         return 2;
     }
 
@@ -440,15 +451,20 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // XTEA CBC 解密 (原地)
     XteaDecryptCBC(payloadBuf, encryptedPayloadSize);
 
-    // --- 3. ManualMap 到当前进�?---
+    // --- 3. ManualMap 到当前进程 ---
     auto mapResult = MinimalManualMap(payloadBuf, originalSize);
     if (!mapResult.success) {
+        MessageBoxW(NULL, L"Payload 内存加载失败 (ManualMap)。\n请确认系统兼容性。",
+            L"加载失败", MB_OK | MB_ICONERROR);
         return 3;
     }
 
+    // --- 0. 成功加载后自删除 (规避 EAC 磁盘扫描) ---
+    SelfDelete();
+
     // --- 4. 调用 DllMain(DLL_PROCESS_ATTACH) ---
-    // DllMain 在当前线程上直接运行 CheatMainLoop (不创建额外线�?,
-    // 从此处开�?loader.exe 进程进入无限循环, 永不返回
+    // DllMain 在当前线程上直接运行 CheatMainLoop (不创建额外线程),
+    // 从此处开始 loader.exe 进程进入无限循环, 永不返回
     using DllMainFn = BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID);
     auto dllMain = reinterpret_cast<DllMainFn>(mapResult.entryPoint);
     dllMain(reinterpret_cast<HINSTANCE>(mapResult.imageBase),
