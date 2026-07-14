@@ -359,6 +359,63 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         }
     }
 
+    // --- 诊断: 追踪 Controller->Handle->Pawn 链条 ---
+    {
+        auto& mem = cs2::Memory::Instance();
+        auto& off = mem.GetOffsets();
+        uintptr_t elBase = mem.EntityList();
+        HANDLE hProcDiag = StealthEngine::Instance().GetProcessHandle();
+        uintptr_t lpCtl = mem.LocalPlayerController();
+
+        DiagLog("--- Entity Chain Trace ---\n");
+        DiagLog("LocalPlayerController: 0x%llX\n", (unsigned long long)lpCtl);
+
+        uint32_t rawHandle; SIZE_T br;
+        NTSTATUS st = SysReadVirtualMemory(hProcDiag, (PVOID)(lpCtl + off.m_hPlayerPawn), &rawHandle, 4, &br, SyscallMethod::Indirect);
+        DiagLog("pawnHandle raw: status=0x%08X bytes=%zu val=0x%08X idx=%u serial=0x%X\n",
+            (unsigned)st, br, rawHandle, rawHandle & 0x7FFF, rawHandle >> 15);
+
+        if (NT_SUCCESS(st) && br == 4 && rawHandle && rawHandle != 0xFFFFFFFF) {
+            uintptr_t le;
+            SysReadVirtualMemory(hProcDiag, (PVOID)(elBase + 8 * ((rawHandle & 0x7FFF) >> 9) + 16), &le, 8, &br, SyscallMethod::Indirect);
+            DiagLog("  pawn chunk raw=0x%llX cleaned=0x%llX\n",
+                (unsigned long long)le, (unsigned long long)(le & ~0xFULL));
+            le &= ~0xFULL;
+            if (le) {
+                uintptr_t pawn;
+                SysReadVirtualMemory(hProcDiag, (PVOID)(le + 120 * (rawHandle & 0x1FF)), &pawn, 8, &br, SyscallMethod::Indirect);
+                DiagLog("  pawn resolved=0x%llX (idx=%u entryOff=0x%llX)\n",
+                    (unsigned long long)pawn, rawHandle & 0x1FF,
+                    (unsigned long long)(120 * (rawHandle & 0x1FF)));
+            }
+        }
+
+        DiagLog("--- Entity Iteration (i=0..15) ---\n");
+        for (int i = 0; i < 16; i++) {
+            uintptr_t le; SIZE_T br2;
+            st = SysReadVirtualMemory(hProcDiag, (PVOID)(elBase + 8 * ((i & 0x7FFF) >> 9) + 16), &le, 8, &br2, SyscallMethod::Indirect);
+            le &= ~0xFULL;
+            if (!le) { DiagLog("[%d] chunk=NULL\n", i); continue; }
+            uintptr_t ctl = 0;
+            SysReadVirtualMemory(hProcDiag, (PVOID)(le + 120 * (i & 0x1FF)), &ctl, 8, &br2, SyscallMethod::Indirect);
+            if (!ctl) continue;
+            bool isLocal = (ctl == lpCtl);
+            DiagLog("[%d] ctl=0x%llX%s\n", i, (unsigned long long)ctl, isLocal ? " (LOCAL)" : "");
+            uint32_t ph = 0;
+            SysReadVirtualMemory(hProcDiag, (PVOID)(ctl + off.m_hPlayerPawn), &ph, 4, &br2, SyscallMethod::Indirect);
+            DiagLog("    pawnHandle=0x%08X idx=%u serial=0x%X\n", ph, ph & 0x7FFF, ph >> 15);
+            if (ph && ph != 0xFFFFFFFF) {
+                uintptr_t le2 = 0;
+                SysReadVirtualMemory(hProcDiag, (PVOID)(elBase + 8 * ((ph & 0x7FFF) >> 9) + 16), &le2, 8, &br2, SyscallMethod::Indirect);
+                le2 &= ~0xFULL;
+                uintptr_t pawn = 0;
+                if (le2) SysReadVirtualMemory(hProcDiag, (PVOID)(le2 + 120 * (ph & 0x1FF)), &pawn, 8, &br2, SyscallMethod::Indirect);
+                DiagLog("    pawn=0x%llX\n", (unsigned long long)pawn);
+            }
+        }
+        DiagLog("--- End Entity Chain Trace ---\n");
+    }
+
     DiagLog("=== MAIN LOOP START ===\n");
     int frameCount = 0;
     DWORD lastDiagTime = 0;
