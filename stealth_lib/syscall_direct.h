@@ -133,6 +133,9 @@ public:
     // 获取 spoof context
     const CallStackSpoofContext& GetContext() const { return m_context; }
 
+    // 获取已缓存的 Fat Frame 数量
+    size_t GetFatFrameCount() const { return m_fatFrames.size(); }
+
 private:
     CallStackSpoofer() = default;
 
@@ -143,6 +146,14 @@ private:
     std::vector<CallStackSpoofContext> m_fatFrames;
     bool m_initialized = false;
 };
+
+// ============================================================
+// RetGadget Scanner — 在合法模块中扫描 ret (C3) 指令
+// 用于构造多层伪造调用栈 (ret-sled)
+// RtlVirtualUnwind 回溯时将看到 ntdll→kernel32→user32 的合法调用链
+// ============================================================
+std::vector<uintptr_t> GetRetGadgets(size_t count = 32);
+bool FindRetGadgets(std::vector<uintptr_t>& outGadgets, size_t targetCount = 32);
 
 // ============================================================
 // Tartarus Gate — NtContinue 驱动的 syscall

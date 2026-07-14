@@ -502,6 +502,108 @@ uintptr_t PhantomSection::AllocatePhantomInProcess(HANDLE hProcess, SIZE_T size)
 }
 
 // ============================================================
+// ★ Fix B2: VAD Hiding — NtQueryVirtualMemory 代理实现
+// ============================================================
+
+std::vector<PhantomSection::VADHiddenRegion> PhantomSection::s_vadHiddenRegions;
+
+void PhantomSection::RegisterForVADHide(void* addr, SIZE_T size) {
+    if (!addr || size == 0) return;
+
+    VADHiddenRegion region;
+    region.addr = addr;
+    region.size = size;
+    s_vadHiddenRegions.push_back(region);
+}
+
+bool PhantomSection::IsInVADHiddenRegion(void* addr) {
+    uintptr_t target = reinterpret_cast<uintptr_t>(addr);
+    for (auto& region : s_vadHiddenRegions) {
+        uintptr_t base = reinterpret_cast<uintptr_t>(region.addr);
+        if (target >= base && target < base + region.size) {
+            return true;
+        }
+    }
+    return false;
+}
+
+HMODULE PhantomSection::GetDisguiseModuleBase() {
+    // ★ Fix B2: 返回 ntdll.dll 基址用于 VAD AllocationBase 伪装
+    // ntdll.dll 是所有 Windows 进程的默认加载模块, 
+    // 将其作为 AllocationBase 可使隐藏区域看起来像 ntdll 的正常映射
+    return GetModuleHandleW(L"ntdll.dll");
+}
+
+PhantomSection::NtQVM_t PhantomSection::GetRealNtQueryVirtualMemory() {
+    static NtQVM_t s_realNtQVM = nullptr;
+    if (!s_realNtQVM) {
+        s_realNtQVM = reinterpret_cast<NtQVM_t>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryVirtualMemory"));
+    }
+    return s_realNtQVM;
+}
+
+NTSTATUS NTAPI PhantomSection::NtQueryVirtualMemoryProxy(
+    HANDLE ProcessHandle,
+    PVOID BaseAddress,
+    ULONG MemoryInformationClass,
+    PVOID MemoryInformation,
+    SIZE_T MemoryInformationLength,
+    PSIZE_T ReturnLength)
+{
+    // ★ Fix B2: 首先调用真实的 NtQueryVirtualMemory 获取真实信息
+    auto realNtQVM = GetRealNtQueryVirtualMemory();
+    if (!realNtQVM) return STATUS_NOT_SUPPORTED;
+
+    NTSTATUS st = realNtQVM(ProcessHandle, BaseAddress,
+                             MemoryInformationClass,
+                             MemoryInformation,
+                             MemoryInformationLength,
+                             ReturnLength);
+
+    // 仅处理 MemoryBasicInformation (class 0) 的伪装
+    if (MemoryInformationClass != 0) return st;
+
+    // 仅伪装当前进程的查询 (外部进程不受影响)
+    if (ProcessHandle != GetCurrentProcess()) return st;
+
+    if (!NT_SUCCESS(st)) return st;
+
+    // 检查查询地址是否在我们的 VAD 隐藏区域内
+    if (!IsInVADHiddenRegion(BaseAddress)) return st;
+
+    // ★ Fix B2: 修改 MEMORY_BASIC_INFORMATION 进行 VAD 伪装
+    auto* mbi = static_cast<MEMORY_BASIC_INFORMATION*>(MemoryInformation);
+
+    // Type: 改为 MEM_IMAGE (0x1000000) 伪装成从磁盘映射的 DLL 镜像
+    // 而不是暴露 MEM_PRIVATE (0x20000) 的 VirtualAlloc 分配特征
+    mbi->Type = MEM_IMAGE;  // 0x1000000
+
+    // State: 保持 MEM_COMMIT (不变, 已提交的内存)
+    // mbi->State 保持不变
+
+    // Protection: 改为 PAGE_READONLY 而非 EXECUTE_READ
+    // 让区域看起来像只读数据, 不暴露可执行特征
+    // 只有当原本就是可执行才需要伪装, 如果是普通数据页则保持原样
+    if (mbi->Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) {
+        mbi->Protect = PAGE_READONLY;
+    }
+    // AllocationProtect 同样修改
+    if (mbi->AllocationProtect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) {
+        mbi->AllocationProtect = PAGE_READONLY;
+    }
+
+    // ★ Fix B2: AllocationBase 指向合法模块 (ntdll.dll)
+    // 使该区域看起来像是 ntdll 的一部分映射
+    HMODULE disguiseMod = GetDisguiseModuleBase();
+    if (disguiseMod) {
+        mbi->AllocationBase = disguiseMod;
+    }
+
+    return st;
+}
+
+// ============================================================
 // SelfCloaker — 自身 ManualMap 内存隐身
 // ============================================================
 

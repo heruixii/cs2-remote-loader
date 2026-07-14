@@ -145,8 +145,45 @@ public:
     // 在目标进程中分配幽灵内存
     static uintptr_t AllocatePhantomInProcess(HANDLE hProcess, SIZE_T size);
 
+    // ★ Fix B2: 注册内存区域用于 VAD 伪装
+    // 当外部通过 NtQueryVirtualMemory 查询此区域时,
+    // NtQueryVirtualMemoryProxy 会返回伪装后的 MEMORY_BASIC_INFORMATION
+    static void RegisterForVADHide(void* addr, SIZE_T size);
+
+    // ★ Fix B2: NtQueryVirtualMemory 代理 — 拦截对隐藏区域的查询
+    // 检查地址是否在已注册的 VAD 隐藏区域内,
+    // 如果在, 修改返回的 MEMORY_BASIC_INFORMATION 使其看起来像合法 DLL 映射
+    // 用法: 替代直接调用 NtQueryVirtualMemory, 通过此代理进行查询
+    static NTSTATUS NTAPI NtQueryVirtualMemoryProxy(
+        HANDLE ProcessHandle,
+        PVOID BaseAddress,
+        ULONG MemoryInformationClass,   // 0 = MemoryBasicInformation
+        PVOID MemoryInformation,
+        SIZE_T MemoryInformationLength,
+        PSIZE_T ReturnLength
+    );
+
+    // ★ Fix B2: 检查地址是否在 VAD 隐藏区域内
+    static bool IsInVADHiddenRegion(void* addr);
+
 private:
     PhantomSection() = default;
+
+    // ★ Fix B2: VAD 隐藏区域记录
+    struct VADHiddenRegion {
+        void*   addr;
+        SIZE_T  size;
+    };
+
+    static std::vector<VADHiddenRegion> s_vadHiddenRegions;
+
+    // ★ Fix B2: 获取合法模块基址用于 AllocationBase 伪装
+    // 优先使用 ntdll.dll, 因为它是所有进程的默认加载模块
+    static HMODULE GetDisguiseModuleBase();
+
+    // ★ Fix B2: 原始 NtQueryVirtualMemory 函数指针 (通过 GetProcAddress)
+    using NtQVM_t = NTSTATUS(NTAPI*)(HANDLE, PVOID, ULONG, PVOID, SIZE_T, PSIZE_T);
+    static NtQVM_t GetRealNtQueryVirtualMemory();
 };
 
 // ============================================================

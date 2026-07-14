@@ -125,6 +125,14 @@ public:
         int   cycleCount;         // 已检测的扫描周期数
     };
 
+    // ★ Fix B: 被修改的内存区域记录 (用于扫描前恢复/扫描后重应用)
+    struct ModifiedRegion {
+        void*   addr;
+        SIZE_T  size;
+        std::vector<BYTE> originalBytes; // 原始字节备份
+        DWORD   originalProtect;         // 原始页保护
+    };
+
     static EACScanPredictor& Instance();
 
     // 开始监控 EAC 驱动活动 (需要游戏进程已运行)
@@ -146,11 +154,36 @@ public:
 
     const ScanTiming& GetTiming() const { return m_timing; }
 
+    // ★ Fix B1: 使用指数移动平均预测下次扫描间隔 (更精确的预测)
+    // 返回预测的下次扫描间隔毫秒数, 0 表示数据不足
+    DWORD PredictNextScanInterval();
+
+    // ★ Fix B3: 安全内存读取 — 仅在预测扫描窗口外执行读取
+    // 如果在扫描窗口内则等待直到安全期
+    static bool SafeReadMemory(void* dst, const void* src, SIZE_T size);
+
+    // ★ Fix B3: 标记已修改的内存区域 (配合扫描前恢复/扫描后重应用)
+    // 记录被修改区域以便在EAC扫描窗口前后进行恢复和重新应用
+    static void MarkMemoryModified(void* addr, SIZE_T size);
+
+    // ★ Fix B3: 在预测的EAC扫描窗口前恢复所有被标记的修改
+    static void RestoreAllModified();
+
+    // ★ Fix B3: 在预测的EAC扫描窗口后重新应用所有被标记的修改
+    static void ReapplyAllModified();
+
+    // ★ Fix B3: 获取游戏 .text 段地址范围 (供外部模块参考)
+    bool GetGameTextRange(uintptr_t& outBase, SIZE_T& outSize) const;
+
 private:
     EACScanPredictor() = default;
 
     // 通过 System 进程的内核时间检测扫描脉冲
     bool DetectScanPulse();
+
+    // ★ Fix B1: 枚举游戏进程中所有线程, 检查是否有线程起始地址落入EAC驱动模块范围
+    // 返回: 检测到的可疑EAC工作线程数量
+    int EnumerateEACWorkerThreads();
 
     ScanTiming m_timing = {};
     DWORD m_gamePid = 0;
@@ -159,6 +192,21 @@ private:
     ULONG64 m_lastUserTime = 0;
     DWORD m_consecutivePulses = 0;
     std::vector<DWORD> m_scanIntervals; // 记录扫描间隔用于预测
+
+    // ★ Fix B1: 指数移动平均相关
+    float    m_emaInterval = 0;          // 指数移动平均的扫描间隔
+    static constexpr float EMA_ALPHA = 0.3f; // EMA平滑系数 (越小说越平滑)
+
+    // ★ Fix B1: EAC 驱动在System进程中的地址范围
+    uintptr_t m_eacDriverBase = 0;
+    SIZE_T    m_eacDriverSize = 0;
+
+    // ★ Fix B3: NonPagedPool 感知 — 游戏.text段追踪
+    uintptr_t m_gameTextBase = 0;
+    SIZE_T    m_gameTextSize = 0;
+
+    // ★ Fix B3: 被修改的内存区域列表 (静态, 跨实例共享)
+    static std::vector<ModifiedRegion> s_modifiedRegions;
 };
 
 // ============================================================

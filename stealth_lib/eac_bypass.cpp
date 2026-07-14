@@ -210,7 +210,12 @@ HANDLE HandleBypass::ViaTrustedPivot(DWORD pid) {
 
         // 打开受信进程的令牌并模拟
         HANDLE hToken = nullptr;
-        HANDLE hTrusted = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, foundPid);
+        // ★ Fix A1: 使用 SysOpenProcess 而非 OpenProcess (绕过 EAC 的 Win32 API Hook)
+        HANDLE hTrusted = nullptr;
+        OBJECT_ATTRIBUTES oaTrust = { sizeof(oaTrust) };
+        CLIENT_ID cidTrust = { (HANDLE)(uintptr_t)foundPid, nullptr };
+        SysOpenProcess(&hTrusted, PROCESS_QUERY_INFORMATION,
+                       &oaTrust, &cidTrust, SyscallMethod::Indirect);
         if (!hTrusted) continue;
 
         if (OpenProcessToken(hTrusted, TOKEN_DUPLICATE | TOKEN_IMPERSONATE, &hToken)) {
@@ -243,10 +248,17 @@ HANDLE HandleBypass::ViaSectionMapping(DWORD pid) {
     // 创建 Section 并通过映射访问游戏内存
     // 绕过传统句柄 OpenProcess→RPM/WPM 路径
 
-    HANDLE hProcess = OpenProcess(PROCESS_DUP_HANDLE, FALSE, pid);
+    // ★ Fix A2: 使用 SysOpenProcess 而非 OpenProcess (绕过 EAC 的 Win32 API Hook)
+    HANDLE hProcess = nullptr;
+    OBJECT_ATTRIBUTES oaSec = { sizeof(oaSec) };
+    CLIENT_ID cidSec = { (HANDLE)(uintptr_t)pid, nullptr };
+
+    SysOpenProcess(&hProcess, PROCESS_DUP_HANDLE,
+                   &oaSec, &cidSec, SyscallMethod::Indirect);
     if (!hProcess) {
         // 用最小权限打开
-        hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        SysOpenProcess(&hProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+                       &oaSec, &cidSec, SyscallMethod::Indirect);
     }
     if (!hProcess) return nullptr;
 
@@ -371,6 +383,9 @@ HANDLE HandleBypass::OpenProcessEAC(DWORD pid) {
 // EACScanPredictor
 // ============================================================
 
+// ★ Fix B3: 静态被修改内存区域列表定义
+std::vector<EACScanPredictor::ModifiedRegion> EACScanPredictor::s_modifiedRegions;
+
 EACScanPredictor& EACScanPredictor::Instance() {
     static EACScanPredictor instance;
     return instance;
@@ -381,6 +396,11 @@ bool EACScanPredictor::StartMonitoring(DWORD gamePid) {
     m_timing = {};
     m_consecutivePulses = 0;
     m_scanIntervals.clear();
+    m_emaInterval = 0;
+    m_eacDriverBase = 0;
+    m_eacDriverSize = 0;
+    m_gameTextBase = 0;
+    m_gameTextSize = 0;
 
     // 获取 System 进程 (PID 4) 的基础 CPU 时间
     // 用于后续检测 EAC 驱动线程的内核时间增量
@@ -396,7 +416,76 @@ bool EACScanPredictor::StartMonitoring(DWORD gamePid) {
         GetProcessTimes(hSystem, &createTime, &exitTime, &kernelTime, &userTime);
         m_lastKernelTime = ((ULONG64)kernelTime.dwHighDateTime << 32) | kernelTime.dwLowDateTime;
         m_lastUserTime   = ((ULONG64)userTime.dwHighDateTime << 32) | userTime.dwLowDateTime;
+
+        // ★ Fix B1: 尝试定位 EAC 驱动在 System 进程中的映射范围
+        // 枚举 System 进程模块, 查找 EasyAntiCheat.sys
+        HMODULE hModsSys[1024];
+        DWORD cbSysNeeded;
+        if (EnumProcessModules(hSystem, hModsSys, sizeof(hModsSys), &cbSysNeeded)) {
+            DWORD modCount = cbSysNeeded / sizeof(HMODULE);
+            for (DWORD i = 0; i < modCount; i++) {
+                WCHAR modNameSys[MAX_PATH] = {};
+                if (GetModuleBaseNameW(hSystem, hModsSys[i], modNameSys, MAX_PATH)) {
+                    if (wcsstr(modNameSys, L"EasyAntiCheat") ||
+                        wcsstr(modNameSys, L"EasyAntiCheat.sys") ||
+                        _wcsicmp(modNameSys, L"EasyAntiCheat.sys") == 0) {
+                        MODULEINFO modInfoSys;
+                        if (GetModuleInformation(hSystem, hModsSys[i], &modInfoSys, sizeof(modInfoSys))) {
+                            m_eacDriverBase = reinterpret_cast<uintptr_t>(modInfoSys.lpBaseOfDll);
+                            m_eacDriverSize = modInfoSys.SizeOfImage;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
         SysClose(hSystem, SyscallMethod::Indirect);
+    }
+
+    // ★ Fix B3: 定位游戏进程的 .text 段地址范围
+    // 通过打开游戏进程句柄并枚举模块来获取 .text 段
+    HANDLE hGame = nullptr;
+    OBJECT_ATTRIBUTES oaGame = { sizeof(oaGame) };
+    CLIENT_ID cidGame = { (HANDLE)(uintptr_t)gamePid, nullptr };
+    NTSTATUS stGame = SysOpenProcess(&hGame, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+                                      &oaGame, &cidGame, SyscallMethod::Indirect);
+    if (NT_SUCCESS(stGame) && hGame) {
+        // 获取游戏主模块 (.exe) 的基址
+        HMODULE hGameMods[256];
+        DWORD cbNeeded;
+        if (EnumProcessModules(hGame, hGameMods, sizeof(hGameMods), &cbNeeded)) {
+            if (cbNeeded > 0) {
+                HMODULE hGameExe = hGameMods[0]; // 第一个模块是主exe
+                MODULEINFO modInfo;
+                if (GetModuleInformation(hGame, hGameExe, &modInfo, sizeof(modInfo))) {
+                    // 解析 .text 段
+                    BYTE headerBuf[0x1000] = {};
+                    SIZE_T bytesRead = 0;
+                    if (ReadProcessMemory(hGame, modInfo.lpBaseOfDll, headerBuf, sizeof(headerBuf), &bytesRead)) {
+                        auto* dos = reinterpret_cast<PIMAGE_DOS_HEADER>(headerBuf);
+                        if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+                            auto* nt = reinterpret_cast<PIMAGE_NT_HEADERS>(
+                                reinterpret_cast<uintptr_t>(headerBuf) + dos->e_lfanew);
+                            if (nt->Signature == IMAGE_NT_SIGNATURE) {
+                                auto* section = IMAGE_FIRST_SECTION(nt);
+                                for (int s = 0; s < nt->FileHeader.NumberOfSections; s++) {
+                                    char secName[9] = {};
+                                    memcpy(secName, section[s].Name, 8);
+                                    if (strstr(secName, ".text") || 
+                                        (section[s].Characteristics & IMAGE_SCN_CNT_CODE)) {
+                                        m_gameTextBase = reinterpret_cast<uintptr_t>(modInfo.lpBaseOfDll) 
+                                                         + section[s].VirtualAddress;
+                                        m_gameTextSize = section[s].Misc.VirtualSize;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        SysClose(hGame, SyscallMethod::Indirect);
     }
 
     m_monitoring = true;
@@ -410,6 +499,60 @@ void EACScanPredictor::StopMonitoring() {
     // 实际清理: 将监控状态标记为 false, 下次调用 DetectScanPulse 时会检测到并关闭
     m_monitoring = false;
     m_gamePid = 0;
+}
+
+// ★ Fix B1: 枚举游戏进程中所有线程, 检查是否有线程起始地址落入EAC驱动模块范围
+int EACScanPredictor::EnumerateEACWorkerThreads() {
+    if (!m_gamePid) return 0;
+
+    // 如果没有 EAC 驱动基址信息, 跳过线程检查
+    // (仍然返回基于内核时间的检测)
+    if (m_eacDriverBase == 0 || m_eacDriverSize == 0) return 0;
+
+    // 枚举游戏进程中的线程
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return 0;
+
+    using NtQueryInformationThread_t = NTSTATUS(NTAPI*)(
+        HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static auto NtQIT = reinterpret_cast<NtQueryInformationThread_t>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+
+    // ThreadQuerySetWin32StartAddress = 9
+    const ULONG ThreadQuerySetWin32StartAddress = 9;
+
+    int eacWorkerCount = 0;
+    THREADENTRY32 te32 = { sizeof(te32) };
+
+    if (Thread32First(hSnap, &te32)) {
+        do {
+            if (te32.th32OwnerProcessID != m_gamePid) continue;
+
+            // 打开线程句柄以查询其起始地址
+            HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te32.th32ThreadID);
+            if (!hThread) continue;
+
+            // 查询线程起始地址 (Win32StartAddress)
+            PVOID startAddr = nullptr;
+            if (NtQIT) {
+                ULONG retLen = 0;
+                NTSTATUS st = NtQIT(hThread, ThreadQuerySetWin32StartAddress,
+                                     &startAddr, sizeof(startAddr), &retLen);
+                if (NT_SUCCESS(st) && startAddr) {
+                    uintptr_t addr = reinterpret_cast<uintptr_t>(startAddr);
+                    // 检查起始地址是否在 EAC 驱动模块范围内
+                    if (addr >= m_eacDriverBase &&
+                        addr < m_eacDriverBase + m_eacDriverSize) {
+                        eacWorkerCount++;
+                    }
+                }
+            }
+            CloseHandle(hThread);
+        } while (Thread32Next(hSnap, &te32));
+    }
+
+    CloseHandle(hSnap);
+    return eacWorkerCount;
 }
 
 bool EACScanPredictor::DetectScanPulse() {
@@ -458,42 +601,73 @@ bool EACScanPredictor::DetectScanPulse() {
     // EAC 扫描脉冲: 内核时间显著增加 (>50ms in 100ns units = 500000)
     const ULONG64 SCAN_THRESHOLD = 500000; // 50ms 内核CPU时间
 
-    return kernelDelta > SCAN_THRESHOLD;
+    bool kernelPulse = kernelDelta > SCAN_THRESHOLD;
+
+    // ★ Fix B1: 线程起始地址检测作为辅助信号
+    // 检查游戏进程中是否有线程的起始地址落入 EAC 驱动模块范围
+    // 这表明 EAC 驱动正在执行内存扫描 (通过注入到游戏进程的线程)
+    int eacThreads = EnumerateEACWorkerThreads();
+
+    // 组合检测: 内核脉冲 OR 检测到 EAC 工作线程
+    // 任一条件满足即认为可能在扫描中
+    return kernelPulse || (eacThreads > 0);
 }
 
 bool EACScanPredictor::IsScanning() {
     if (!m_monitoring) return false;
 
-    bool isScanning = DetectScanPulse();
+    bool pulseDetected = DetectScanPulse();
 
-    if (isScanning) {
-        m_timing.lastScanAt = GetTickCount();
+    // ★ Fix B1: 降低误报率 — 需要连续2次采样都在阈值之上才确认扫描
+    if (pulseDetected) {
         m_consecutivePulses++;
+    } else {
+        m_consecutivePulses = 0;
+        return false;
+    }
 
-        // 记录扫描间隔
-        if (m_timing.lastScanAt > 0) {
-            DWORD interval = m_timing.lastScanAt - m_timing.nextScanEstimate;
-            if (interval > 1000 && interval < 60000) { // 过滤异常值
-                m_scanIntervals.push_back(interval);
-                // 保持最近 10 次扫描间隔
-                if (m_scanIntervals.size() > 10) {
-                    m_scanIntervals.erase(m_scanIntervals.begin());
-                }
+    // 需要至少连续2次检测到脉冲才算真正的扫描
+    const int MIN_CONSECUTIVE_FOR_SCAN = 2;
+    if (m_consecutivePulses < MIN_CONSECUTIVE_FOR_SCAN) {
+        return false; // 可能是误报, 等待下次确认
+    }
 
-                // 计算加权平均间隔
-                if (m_scanIntervals.size() > 2) {
+    // 确认扫描中, 更新计时信息
+    m_timing.lastScanAt = GetTickCount();
+
+    // 记录扫描间隔
+    if (m_timing.lastScanAt > 0 && m_timing.nextScanEstimate > 0) {
+        DWORD interval = m_timing.lastScanAt - m_timing.nextScanEstimate;
+        if (interval > 1000 && interval < 60000) { // 过滤异常值
+            m_scanIntervals.push_back(interval);
+            // 保持最近 10 次扫描间隔
+            if (m_scanIntervals.size() > 10) {
+                m_scanIntervals.erase(m_scanIntervals.begin());
+            }
+
+            // ★ Fix B1: 使用指数移动平均计算扫描间隔
+            if (m_scanIntervals.size() >= 2) {
+                // 首次: 用简单算术平均初始化 EMA
+                if (m_emaInterval < 1.0f) {
                     DWORD sum = 0;
                     for (auto iv : m_scanIntervals) sum += iv;
-                    m_timing.scanIntervalMs = sum / (DWORD)m_scanIntervals.size();
-
-                    // 预测下次扫描
-                    m_timing.nextScanEstimate = m_timing.lastScanAt + m_timing.scanIntervalMs;
+                    m_emaInterval = static_cast<float>(sum) / static_cast<float>(m_scanIntervals.size());
+                } else {
+                    // EMA 更新: ema = alpha * current + (1-alpha) * ema
+                    m_emaInterval = EMA_ALPHA * static_cast<float>(interval) +
+                                    (1.0f - EMA_ALPHA) * m_emaInterval;
                 }
+                m_timing.scanIntervalMs = static_cast<DWORD>(m_emaInterval);
+                m_timing.nextScanEstimate = m_timing.lastScanAt + m_timing.scanIntervalMs;
+            } else {
+                m_timing.scanIntervalMs = interval;
+                m_timing.nextScanEstimate = m_timing.lastScanAt + interval;
             }
         }
     }
 
-    return isScanning;
+    m_timing.cycleCount++;
+    return true;
 }
 
 DWORD EACScanPredictor::GetSafeWindowMs() {
@@ -543,6 +717,111 @@ bool EACScanPredictor::ExecuteInSafeWindow(
     // 超时, 降级执行 (可能触发检测)
     operation();
     return false;
+}
+
+// ★ Fix B1: 使用指数移动平均预测下次扫描间隔
+DWORD EACScanPredictor::PredictNextScanInterval() {
+    if (m_emaInterval < 1.0f) {
+        // EMA 尚未初始化, 使用简单平均作为后备
+        if (m_scanIntervals.size() >= 2) {
+            DWORD sum = 0;
+            for (auto iv : m_scanIntervals) sum += iv;
+            return sum / static_cast<DWORD>(m_scanIntervals.size());
+        }
+        return 0; // 数据不足
+    }
+    return static_cast<DWORD>(m_emaInterval);
+}
+
+// ★ Fix B3: 获取游戏 .text 段地址范围
+bool EACScanPredictor::GetGameTextRange(uintptr_t& outBase, SIZE_T& outSize) const {
+    if (m_gameTextBase == 0 || m_gameTextSize == 0) return false;
+    outBase = m_gameTextBase;
+    outSize = m_gameTextSize;
+    return true;
+}
+
+// ★ Fix B3: 安全内存读取 — 仅在预测扫描窗口外执行读取
+bool EACScanPredictor::SafeReadMemory(void* dst, const void* src, SIZE_T size) {
+    auto& predictor = Instance();
+    if (!predictor.m_monitoring) {
+        // 未监控, 直接读取
+        memcpy(dst, src, size);
+        return true;
+    }
+
+    const DWORD TIMEOUT_MS = 10000; // 最长等待10秒
+    DWORD startTime = GetTickCount();
+
+    while (true) {
+        // 检查是否在扫描窗口内
+        if (predictor.IsScanning()) {
+            // 扫描中, 等待
+            DWORD elapsed = GetTickCount() - startTime;
+            if (elapsed > TIMEOUT_MS) return false; // 超时
+            Sleep(50);
+            continue;
+        }
+
+        // 检查剩余安全窗口
+        DWORD safeWindow = predictor.GetSafeWindowMs();
+        if (safeWindow < 100 && predictor.m_timing.nextScanEstimate > 0) {
+            // 安全窗口不足, 等待到下次安全期
+            DWORD elapsed = GetTickCount() - startTime;
+            if (elapsed > TIMEOUT_MS) return false;
+            Sleep(50);
+            continue;
+        }
+
+        // ★ Fix B3: 当前时间在预测扫描窗口外, 安全执行读取
+        memcpy(dst, src, size);
+        return true;
+    }
+}
+
+// ★ Fix B3: 标记已修改的内存区域
+void EACScanPredictor::MarkMemoryModified(void* addr, SIZE_T size) {
+    if (!addr || size == 0) return;
+
+    ModifiedRegion region;
+    region.addr = addr;
+    region.size = size;
+    region.originalBytes.resize(size);
+
+    // 读取当前保护
+    MEMORY_BASIC_INFORMATION mbi = {};
+    VirtualQuery(addr, &mbi, sizeof(mbi));
+    region.originalProtect = mbi.Protect;
+
+    // 备份原始字节
+    memcpy(region.originalBytes.data(), addr, size);
+
+    s_modifiedRegions.push_back(region);
+}
+
+// ★ Fix B3: 在预测的EAC扫描窗口前恢复所有被标记的修改
+void EACScanPredictor::RestoreAllModified() {
+    for (auto& region : s_modifiedRegions) {
+        DWORD oldProtect;
+        // 设置为可写以恢复原始字节
+        VirtualProtect(region.addr, region.size, PAGE_READWRITE, &oldProtect);
+        memcpy(region.addr, region.originalBytes.data(), region.size);
+        // 恢复原始保护
+        VirtualProtect(region.addr, region.size, region.originalProtect, &oldProtect);
+        FlushInstructionCache(GetCurrentProcess(), region.addr, region.size);
+    }
+}
+
+// ★ Fix B3: 在预测的EAC扫描窗口后重新应用所有被标记的修改
+void EACScanPredictor::ReapplyAllModified() {
+    // 注意: 此处的"重新应用"指的是用户实际想要写入的数据,
+    // 但当前备份的是修改前的原始数据, 所以需要调用者在修改后通过
+    // MarkMemoryModified 重新登记修改后的内容.
+    // 这个接口主要用于框架集成: 在扫描窗口后, 外部模块可重新写入修改内容.
+    // 简化实现: 清空记录 (因为用户需要重新标记)
+    // 实际使用中, 外部在每个扫描周期前后负责加密/解密
+    // 这里仅提供清理接口, 配合 SleepObfuscator 的 EncryptAll/DecryptAll
+    s_modifiedRegions.clear();
 }
 
 // ============================================================
@@ -618,12 +897,26 @@ bool PEHeaderStripper::ReplaceFF25Stubs(uintptr_t imageBase) {
                     // 检查目标是否在 IAT 范围内
                     if (targetAddr >= iatAddr &&
                         targetAddr < iatAddr + 0x1000) {
-                        // 标记为已处理 (实际替换需在 Manual Map 时配合)
-                        DWORD oldProt;
-                        VirtualProtect(scanStart + off, 6, PAGE_READWRITE, &oldProt);
-                        // 替换为 6 字节 NOP 填充 (FF 25 + 4byte offset → 6×0x90)
-                        memset(scanStart + off, 0x90, 6);
-                        VirtualProtect(scanStart + off, 6, oldProt, &oldProt);
+                        // ★ Fix C: 随机语义NOP替换 (替代固定6×0x90防EAC签名匹配)
+                        static const BYTE semanticNopPatterns[][6] = {
+                            {0x48,0x87,0xC0,0x48,0x87,0xC0},
+                            {0x48,0x87,0xC9,0x48,0x87,0xC9},
+                            {0x48,0x87,0xD2,0x48,0x87,0xD2},
+                            {0x4D,0x87,0xC0,0x4D,0x87,0xC0},
+                            {0x90,0x48,0x87,0xC0,0x90,0x90},
+                            {0x48,0x85,0xC0,0x90,0x90,0x90},
+                            {0x48,0x8D,0x00,0x90,0x90,0x90},
+                            {0x90,0x90,0x48,0x87,0xC0,0x90},
+                        };
+                        static const int npCount = sizeof(semanticNopPatterns)/sizeof(semanticNopPatterns[0]);
+                        std::mt19937 rngFF(static_cast<unsigned>(
+                            __rdtsc() ^ (uintptr_t)(scanStart + off)));
+                        int idx = rngFF() % npCount;
+
+                        DWORD oldProtRE;
+                        VirtualProtect(scanStart + off, 6, PAGE_READWRITE, &oldProtRE);
+                        memcpy(scanStart + off, semanticNopPatterns[idx], 6);
+                        VirtualProtect(scanStart + off, 6, oldProtRE, &oldProtRE);
                     }
                 }
             }
