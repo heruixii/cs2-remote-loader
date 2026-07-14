@@ -14,6 +14,26 @@
 #include "game_esp.h"
 #include "cs2_memory.h"
 #include "cs2_offsets.h"
+#include <cstdio>
+#include <cstdarg>
+
+// 轻量诊断: 写文件, 不弹 MessageBox 干扰游戏
+static void DiagLog(const char* fmt, ...) {
+    char buf[512];
+    va_list args;
+    va_start(args, fmt);
+    int len = _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, args);
+    va_end(args);
+    wchar_t path[MAX_PATH];
+    GetTempPathW(MAX_PATH, path);
+    wcscat_s(path, L"stealth_diag.log");
+    HANDLE h = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD w;
+        WriteFile(h, buf, (DWORD)len, &w, 0);
+        CloseHandle(h);
+    }
+}
 
 // ============================================================
 // 作弊主循环
@@ -23,28 +43,45 @@
 static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     using namespace stealth;
 
+    // 清除旧日志
+    wchar_t logPath[MAX_PATH];
+    GetTempPathW(MAX_PATH, logPath);
+    wcscat_s(logPath, L"stealth_diag.log");
+    DeleteFileW(logPath);
+    DiagLog("=== v3.2 DIAG START ===\n");
+
     // --- 阶段1: 初始化规避引擎 (9层) ---
     if (!StealthEngine::Instance().Initialize()) {
+        DiagLog("FAIL: StealthEngine::Initialize\n");
         return 1;
     }
+    DiagLog("OK: StealthEngine::Initialize\n");
 
     // --- 阶段2: 自身内存隐身 (跳过 UnlinkSelfLdr + RandomizeProtections, ManualMap 下不稳定) ---
     if (dllBase && dllSize > 0) {
         SelfCloaker::CloakManualMap(dllBase, dllSize);
     }
+    DiagLog("OK: CLOAK done\n");
 
     // --- 阶段3: 附加到 CS2 进程 ---
     if (!StealthEngine::Instance().AttachToProcess(L"cs2.exe")) {
+        DiagLog("FAIL: AttachToProcess\n");
         StealthEngine::Instance().Shutdown();
         return 2;
     }
+    DiagLog("OK: AttachToProcess, PID=%u HANDLE=%p\n",
+        StealthEngine::Instance().GetProcessId(),
+        StealthEngine::Instance().GetProcessHandle());
 
     // --- 阶段4: 初始化 CS2 内存读取 ---
     cs2::Offsets offsets;
     if (!cs2::Memory::Instance().Initialize(offsets)) {
+        DiagLog("FAIL: Memory::Initialize (client.dll not found?)\n");
         StealthEngine::Instance().Shutdown();
         return 3;
     }
+    DiagLog("OK: Memory::Initialize, clientBase=0x%llX\n",
+        (unsigned long long)cs2::Memory::Instance().ClientBase());
 
     // --- 阶段5: 查找 CS2 窗口并创建 Overlay ---
     HWND cs2Hwnd = FindWindowW(nullptr, nullptr);
@@ -57,11 +94,16 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         cs2Hwnd = FindWindowExW(nullptr, cs2Hwnd, nullptr, nullptr);
     }
     if (!cs2Hwnd) {
+        DiagLog("FAIL: FindWindow (cs2Hwnd)\n");
         StealthEngine::Instance().Shutdown();
         return 4;
     }
     RECT cs2Rect = {};
     GetWindowRect(cs2Hwnd, &cs2Rect);
+    DiagLog("OK: CS2 HWND=%p, RECT=(%d,%d %dx%d)\n",
+        cs2Hwnd, cs2Rect.left, cs2Rect.top,
+        cs2Rect.right - cs2Rect.left,
+        cs2Rect.bottom - cs2Rect.top);
 
     cs2::OverlayConfig overlayCfg;
     overlayCfg.width   = cs2Rect.right - cs2Rect.left;
@@ -70,9 +112,13 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     overlayCfg.screenY = cs2Rect.top;
 
     if (!cs2::CheatOverlay::Instance().Create(overlayCfg)) {
+        DiagLog("FAIL: CheatOverlay::Create\n");
         StealthEngine::Instance().Shutdown();
         return 5;
     }
+    DiagLog("OK: Overlay created %dx%d at (%d,%d)\n",
+        overlayCfg.width, overlayCfg.height,
+        overlayCfg.screenX, overlayCfg.screenY);
 
     // --- 阶段6: 配置 ESP ---
     cs2::ESPConfig espCfg;
@@ -88,7 +134,34 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     cs2::ESP::Instance().SetConfig(espCfg);
 
     // --- 阶段7: 主循环 (ESP 渲染) ---
+    DiagLog("=== MAIN LOOP START ===\n");
+    int frameCount = 0;
+    DWORD lastDiagTime = 0;
     while (true) {
+        frameCount++;
+        DWORD now = GetTickCount();
+
+        // 每秒一次诊断
+        if (now - lastDiagTime >= 1000) {
+            lastDiagTime = now;
+            auto local = cs2::Memory::Instance().GetLocalPlayer();
+            auto players = cs2::Memory::Instance().GetAllPlayers(true);
+            uintptr_t elBase = cs2::Memory::Instance().EntityList();
+            DiagLog("F=%d localPawn=0x%llX players=%zu elBase=0x%llX clientBase=0x%llX\n",
+                frameCount,
+                (unsigned long long)local.address,
+                players.size(),
+                (unsigned long long)elBase,
+                (unsigned long long)cs2::Memory::Instance().ClientBase());
+            if (!players.empty()) {
+                auto& p = players[0];
+                DiagLog("  P0: team=%d hp=%d origin=(%.0f,%.0f,%.0f) screen=(%.0f,%.0f) boxH=%.0f\n",
+                    p.team, p.health,
+                    p.origin.x, p.origin.y, p.origin.z,
+                    p.screenHead.x, p.screenHead.y, p.boxHeight);
+            }
+        }
+
         // 隐身维护 (ETW/AMSI/VAC/Hook检测/NMI心跳)
         StealthEngine::Instance().OnFrame();
 
@@ -101,12 +174,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             auto& overlay = cs2::CheatOverlay::Instance();
             overlay.BringToTop();
             overlay.CloakStyle();
-            HDC dc = overlay.BeginDraw();
+            HDC dc = overlay.BeginDraw();   // 已清黑色背景 (色键=透明)
             if (dc) {
-                // 清屏 (黑色透明)
-                RECT r = {0, 0, overlay.Width(), overlay.Height()};
-                FillRect(dc, &r, (HBRUSH)GetStockObject(BLACK_BRUSH));
-
                 cs2::ESP::Instance().Render(local, players);
             }
             overlay.RestoreStyle();
