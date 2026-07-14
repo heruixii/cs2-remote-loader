@@ -581,26 +581,24 @@ DebugCheckResult AntiDebug::CheckDebuggerHandles() {
 
     DWORD myPid = GetCurrentProcessId();
 
-    // SYSTEM_HANDLE_INFORMATION 结构 (使用 STEALTH_HANDLE_INFO 完整版):
-    //   ULONG NumberOfHandles;
-    //   ULONG Reserved;
-    //   STEALTH_HANDLE_TABLE_ENTRY Handles[1];
-    // 每个条目: ULONG UniqueProcessId, UCHAR ObjectTypeIndex,
-    //           UCHAR HandleAttributes, USHORT HandleValue,
-    //           PVOID Object, ACCESS_MASK GrantedAccess
-
     auto* handleInfo = reinterpret_cast<PSTEALTH_HANDLE_INFO>(buffer.data());
 
-    // 调试进程通常需要以下权限:
-    // PROCESS_VM_READ (0x0010) | PROCESS_VM_WRITE (0x0020) |
-    // PROCESS_VM_OPERATION (0x0008) | PROCESS_CREATE_THREAD (0x0002) |
-    // PROCESS_SUSPEND_RESUME (0x0800)
+    // ManualMap 下 SysQuerySystemInformation 可能返回垃圾数据导致越界崩溃
+    // 边界检查: 确保 NumberOfHandles 不会超出 buffer
+    {
+        size_t headerSize = sizeof(handleInfo->NumberOfHandles) + sizeof(handleInfo->Reserved);
+        size_t entrySize = sizeof(STEALTH_HANDLE_TABLE_ENTRY);
+        ULONG maxHandles = (ULONG)((bufferSize > headerSize) ? ((bufferSize - headerSize) / entrySize) : 0);
+        if (handleInfo->NumberOfHandles > maxHandles) {
+            return DebugCheckResult::Error;
+        }
+    }
+
     const DWORD debuggerAccessMask = PROCESS_VM_READ | PROCESS_VM_WRITE |
         PROCESS_VM_OPERATION | PROCESS_CREATE_THREAD | PROCESS_SUSPEND_RESUME;
 
     int suspiciousCount = 0;
     for (ULONG i = 0; i < handleInfo->NumberOfHandles; i++) {
-        // 只检查指向我们进程的句柄
         if (handleInfo->Handles[i].UniqueProcessId != myPid)
             continue;
 
