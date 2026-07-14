@@ -390,6 +390,26 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             }
         }
 
+        // 扫描 Controller 结构: 在 +0x700..+0x900 范围内找有效 pawnHandle
+        DiagLog("--- Controller memory scan for pawnHandle (offset+0x700..0x900) ---\n");
+        {
+            BYTE ctlMem[0x200] = {};
+            SIZE_T br2;
+            NTSTATUS st2 = SysReadVirtualMemory(hProcDiag, (PVOID)(lpCtl + 0x700), ctlMem, sizeof(ctlMem), &br2, SyscallMethod::Indirect);
+            if (NT_SUCCESS(st2)) {
+                for (int off = 0; off < (int)sizeof(ctlMem) - 4; off += 4) {
+                    uint32_t val = *(uint32_t*)(ctlMem + off);
+                    if (val == 0 || val == 0xFFFFFFFF) continue;
+                    uint32_t idx = val & 0x7FFF;
+                    uint32_t serial = val >> 15;
+                    // 有效 handle: index 在合理范围(1..511), serial 非零
+                    if (idx >= 1 && idx <= 256 && serial > 0) {
+                        DiagLog("  +0x%llX: handle=0x%08X idx=%u serial=0x%X\n",
+                            (unsigned long long)(0x700 + off), val, idx, serial);
+                    }
+                }
+            }
+        }
         DiagLog("--- Entity Iteration (i=0..15) ---\n");
         for (int i = 0; i < 16; i++) {
             uintptr_t le; SIZE_T br2;
