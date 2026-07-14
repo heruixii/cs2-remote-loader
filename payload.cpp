@@ -17,6 +17,7 @@
 #include "syscall_direct.h"
 #include <cstdio>
 #include <cstdarg>
+#include <tlhelp32.h>
 
 // 轻量诊断: 写文件, 不弹 MessageBox 干扰游戏
 static void DiagLog(const char* fmt, ...) {
