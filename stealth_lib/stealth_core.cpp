@@ -156,14 +156,20 @@ bool StealthEngine::Initialize(const StealthConfig& config) {
 bool StealthEngine::AttachToProcess(const wchar_t* processName) {
     if (!m_initialized) return false;
 
+    CoreDiag("AttachToProcess: Enumerating '%ls'...\n", processName);
     auto processes = StealthProcess::EnumerateProcesses(processName);
-    if (processes.empty()) return false;
+    if (processes.empty()) {
+        CoreDiag("AttachToProcess: process not found\n");
+        return false;
+    }
 
     auto& target = processes[0];
     m_pid = target.pid;
+    CoreDiag("AttachToProcess: found PID=%u, calling ViaExistingHandle...\n", m_pid);
 
     // Strategy 1: ViaExistingHandle
     m_hProcess = eac::HandleBypass::ViaExistingHandle(m_pid);
+    CoreDiag("AttachToProcess: ViaExistingHandle returned %p\n", m_hProcess);
     if (m_hProcess) return true;
 
     // Strategy 2: OpenProcessStealth → SysOpenProcess (GetProcAddress NtOpenProcess 走ntdll原生, 不触发ObCallbacks)

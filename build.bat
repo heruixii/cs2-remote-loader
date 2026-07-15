@@ -78,7 +78,7 @@ echo.
 echo ============================================
 echo [3/3] 编译 loader.exe (远程加载器)
 echo ============================================
-%GPP% %CFLAGS% -mwindows -static -o loader.exe loader.cpp -lwinhttp -lshell32
+%GPP% %CFLAGS% -mwindows -static -o loader.exe loader.cpp -lwininet -lshell32
 if %ERRORLEVEL% neq 0 (
     echo [ERROR] loader.exe 编译失败!
     pause & exit /b 1
