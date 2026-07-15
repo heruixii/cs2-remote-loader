@@ -103,17 +103,19 @@ std::vector<ProtectedUserRegion> g_protectedUserRegions;
 //       0x30: 物理内存映射 (MmMapIoSpace, 48字节输入)
 //       0x34: 物理内存映射变体 (48字节输入)
 //       0x40-0x54: 复用 0x30-0x34 的 handler
-// ★ v3.102: 安全 IOCTL 探测 — 0xC3502580 为主候选 (原始 RTCore64 IOCTL)
-//   BSOD教训: 0x80002040 导致 err=1450 (资源耗尽) → 蓝屏
-//   v3.101 错误: 仅有 0x80002000 系列 → 全部返回 err=87 (参数不匹配)
-//   修复: 0xC3502580 是 RTCore64.sys 原始物理内存映射 IOCTL, 格式为 12 字节 {u64 pa, u32 sz, u32 fl}
-//   0x80002000 系列作为备选 (不同驱动版本)
-//   测试物理地址改为 0x100000 (1MB), 避开 0x1000 (BIOS 数据区)
+// ★ v3.103: 安全 IOCTL 探测 — 0x80002048/0x8000204C 为物理内存 R/W 主候选
+//   参考: CVE-2022-22077, deepwiki RTCore64 Analysis
+//   BSOD教训: 0x80002040(PCI Bus) 导致 err=1450 (资源耗尽) → 蓝屏
+//   v3.102 错误: 0xC3502580 是 MSR 操作, 不是物理内存映射
+//   v3.101 错误: 0x80002030/0x34 返回 err=87 (参数不匹配)
+//   修复: 0x80002048(Read PhysMem) + 0x8000204C(Write PhysMem) 是正确 IOCTL
+//   输入结构: { uint64_t physAddr; uint32_t size; uint32_t reserved; } (12-16字节)
+//   测试物理地址: 0x100000 (1MB), 避开 BIOS 数据区
 static const uint32_t g_ioctlCandidates[] = {
-    0xC3502580,  // ★ 主候选: RTCore64.sys 原始物理内存 R/W IOCTL
-    0x80002000,  // 虚拟内存 R/W (48字节, 备选)
-    0x80002030,  // 物理内存映射 MmMapIoSpace (48字节, 备选)
-    0x80002034,  // 物理内存映射变体 (48字节, 备选)
+    0x80002048,  // ★ 主候选: 物理内存读取 (MmMapIoSpace)
+    0x8000204C,  // ★ 主候选: 物理内存写入 (MmMapIoSpace)
+    0x80002030,  // 备选: 物理内存映射变体
+    0x80002034,  // 备选: 物理内存映射变体
 };
 static const int g_ioctlCandidateCount = sizeof(g_ioctlCandidates) / sizeof(g_ioctlCandidates[0]);
 
@@ -236,9 +238,10 @@ static bool TryMapPhysical(HANDLE hDevice, uint32_t ioctlCode, uint64_t physAddr
     return false;
 }
 
-// ★ v3.102: 安全 IOCTL 探测 — 0xC3502580 优先, 适配多种格式
+// ★ v3.103: 安全 IOCTL 探测 — 0x80002048/0x8000204C 优先, 适配多种格式
 //   教训: 0x80002040 导致 err=1450 (资源耗尽) → 蓝屏
-//   v3.101 错误: 仅尝试 FMT_48B 格式 → 0xC3502580 需要 FMT_32B_RAW
+//   参考: CVE-2022-22077, deepwiki - 0x80002048=ReadPhysMem, 0x8000204C=WritePhysMem
+//   输入: { uint64_t physAddr; uint32_t size; uint32_t reserved; }
 //   - 4 个 IOCTL 码 × 3 种格式 = 最多 12 次探测
 //   - 使用 SAFE_TEST_PHYS (1MB) 而非危险的 0x1000
 //   - 每次探测间 Sleep(50ms) 防止资源耗尽

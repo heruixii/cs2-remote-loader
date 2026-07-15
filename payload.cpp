@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 400 (v3.102: 0xC3502580 as primary IOCTL + FMT_32B_RAW + GitHub URL)
+// BUILD: 401 (v3.103: 0x80002048/0x4C primary IOCTL — CVE-2022-22077 physmem R/W)
 // ============================================================
 
 #include "stealth_core.h"
