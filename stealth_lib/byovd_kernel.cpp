@@ -246,19 +246,32 @@ static std::wstring EnsureDriverFile(const std::wstring& driverName) {
             GetTempPathW(MAX_PATH, tempPath);
             wcscat_s(tempPath, driverName.c_str());
 
-            // v3.58: 用 CreateFileW 替代 ofstream — std 流可能被 AV/权限拦截
-            DeleteFileW(tempPath); // 先删旧文件
-            HANDLE hFile = CreateFileW(tempPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE,
-                                       nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (hFile != INVALID_HANDLE_VALUE) {
-                DWORD written;
-                WriteFile(hFile, embedData, (DWORD)embedSize, &written, nullptr);
-                FlushFileBuffers(hFile);
-                CloseHandle(hFile);
-                ByovdDiag("BYOVD:EnsureDriverFile: CreateFileW wrote %u/%zu bytes to %ls\n", written, embedSize, tempPath);
-                return std::wstring(tempPath);
-            } else {
-                ByovdDiag("BYOVD:EnsureDriverFile: CreateFileW FAILED for %ls (err=%u)\n", tempPath, GetLastError());
+            // v3.59: 随机化文件名 — 避免 err=32 (上一次驱动未卸载, 文件仍被占用)
+            // 最多重试 5 次不同文件名
+            for (int retry = 0; retry < 5; retry++) {
+                wchar_t tryPath[MAX_PATH];
+                GetTempPathW(MAX_PATH, tryPath);
+                if (retry == 0) {
+                    wcscat_s(tryPath, driverName.c_str()); // 首次尝试原名
+                } else {
+                    // 加随机后缀: RTCore64_A1B2.sys
+                    wchar_t altName[64];
+                    swprintf_s(altName, L"RTCore64_%04X.sys", rand() & 0xFFFF);
+                    wcscat_s(tryPath, altName);
+                }
+
+                DeleteFileW(tryPath); // 尝试删除 (忽略失败)
+                HANDLE hFile = CreateFileW(tryPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                                           nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (hFile != INVALID_HANDLE_VALUE) {
+                    DWORD written;
+                    WriteFile(hFile, embedData, (DWORD)embedSize, &written, nullptr);
+                    FlushFileBuffers(hFile);
+                    CloseHandle(hFile);
+                    ByovdDiag("BYOVD:EnsureDriverFile: wrote %u/%zu to %ls (retry=%d)\n", written, embedSize, tryPath, retry);
+                    return std::wstring(tryPath);
+                }
+                ByovdDiag("BYOVD:EnsureDriverFile: CreateFileW FAILED for %ls (err=%u, retry=%d)\n", tryPath, GetLastError(), retry);
             }
         } else {
             ByovdDiag("BYOVD:EnsureDriverFile: embedData=0x%p or embedSize=%zu — skipping\n", embedData, embedSize);
