@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 369 (v3.67: rebuild orig svc key on COLLISION to unload kernel object + retry)
+// BUILD: 370 (v3.69: IOCTL mapping overlap guard + code integrity checksum)
 // ============================================================
 
 #include "stealth_core.h"
@@ -42,8 +42,9 @@ static void DiagLog(const char* fmt, ...) {
     char buf[512];
     va_list args;
     va_start(args, fmt);
-    int len = _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, args);
+    int len = vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
+    if (len < 0) len = 0; // vsnprintf error fallback
     wchar_t path[MAX_PATH];
     GetTempPathW(MAX_PATH, path);
     wcscat_s(path, L"stealth_diag.log");
@@ -68,7 +69,9 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     DiagLog("CRASH: code=0x%08X addr=0x%llX off=%llX\n",
         code, crashAddr, offset);
 
-    // ★ v3.38: 弹窗显示崩溃信息 — 即使闪退用户也能看到
+    // ★ v3.68: 不在 VEH 上下文中直接调用 DisableAll (可能触发嵌套异常)
+    //   仅记录崩溃信息并通过 MessageBox 通知用户
+    //   DisableAll 会在 DllMain 退出路径中由 CheatMainLoop 的 return 分支调用
     wchar_t msg[300];
     swprintf_s(msg, L"崩溃代码: 0x%08X\n"
                      L"崩溃地址: 0x%llX\n"
@@ -77,8 +80,6 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
         code, crashAddr, offset);
     MessageBoxW(NULL, msg, L"CS2 Loader 崩溃", MB_OK | MB_ICONERROR | MB_TOPMOST);
 
-    // 卸载 BYOVD 驱动 (崩溃后残留内核驱动可被EAC扫描到)
-    stealth::KernelDefense::DisableAll();
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -673,7 +674,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.39 DIAG START (BUILD 369) ===\n");
+    DiagLog("=== v3.39 DIAG START (BUILD 370) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
@@ -768,8 +769,50 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     // BYOVD 内核防御 — 加载漏洞驱动 + 摘除 EAC 内核回调 (Ring-0)
     // v3.24: 优先 System32\drivers, 回退嵌入提取到 %TEMP%
     // ObRegisterCallbacks/ProcessNotify/ImageNotify → 全部失效
+    //
+    // ★ v3.69: 注册 DLL 代码区域防止 RTCore64 IOCTL 映射覆盖
+    //   先计算 DLL 代码校验和, After EnableAll 再校验
     {
+        // 注册所有 DLL 代码页为保护区 (跳过 PE 头第0页)
+        if (dllBase && dllSize > 0x1000) {
+            stealth::KernelMemoryAccessor::RegisterCodeRegion(
+                (void*)((uintptr_t)dllBase + 0x1000), dllSize - 0x1000);
+            DiagLog("BYOVD: registered DLL code region [0x%llX - 0x%llX]\n",
+                (unsigned long long)((uintptr_t)dllBase + 0x1000),
+                (unsigned long long)((uintptr_t)dllBase + dllSize));
+        }
+
+        // ★ v3.69: 预校验 — 计算 DLL 代码页的 XOR checksum
+        uint32_t preChecksum = 0;
+        if (dllBase && dllSize > 0x1000) {
+            uint8_t* code = (uint8_t*)dllBase + 0x1000;
+            SIZE_T codeLen = dllSize - 0x1000;
+            for (SIZE_T i = 0; i < codeLen; i += 4) {
+                preChecksum ^= *(uint32_t*)(code + i);
+            }
+        }
+
         auto kernelResult = stealth::KernelDefense::EnableAll();
+
+        // ★ v3.69: 后校验 — 检测 IOCTL 映射是否污染了 DLL 代码
+        if (dllBase && dllSize > 0x1000) {
+            uint32_t postChecksum = 0;
+            uint8_t* code = (uint8_t*)dllBase + 0x1000;
+            SIZE_T codeLen = dllSize - 0x1000;
+            for (SIZE_T i = 0; i < codeLen; i += 4) {
+                postChecksum ^= *(uint32_t*)(code + i);
+            }
+            if (preChecksum != postChecksum) {
+                DiagLog("CRITICAL: DLL CODE CORRUPTED! pre=0x%08X post=0x%08X\n",
+                    preChecksum, postChecksum);
+                // ★ v3.69: 代码被污染, 无法从用户态恢复 (原始内容未备份)
+                //   诊断日志已记录, 进程将继续 (若崩溃则由 DiagVehHandler 捕获)
+                //   核心防护: MapPhysical/WritePhysical 中的重叠检测已阻止进一步污染
+            } else {
+                DiagLog("BYOVD: code integrity OK (checksum=0x%08X)\n", postChecksum);
+            }
+        }
+
         DiagLog("OK: BYOVD driver=%d ob=%d proc=%d img=%d thread=%d\n",
             (int)kernelResult.driverLoaded,
             kernelResult.obCallbacksRemoved,

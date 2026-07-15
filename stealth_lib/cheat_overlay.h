@@ -74,6 +74,7 @@ private:
     HWND          m_hwnd        = nullptr;
     HDC           m_backDC      = nullptr;
     HBITMAP       m_backBmp     = nullptr;
+    HBITMAP       m_oldBmp      = nullptr;  // ★ 保存原始位图，清理时恢复
     HFONT         m_hFont       = nullptr;
     int           m_width       = 0;
     int           m_height      = 0;

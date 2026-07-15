@@ -57,6 +57,12 @@ static void ByovdDiag(const char* fmt, ...) {
 namespace stealth {
 
 // ============================================================
+// v3.69: 受保护用户态区域全局变量
+// 注意: 单线程访问, 无需同步
+// ============================================================
+std::vector<ProtectedUserRegion> g_protectedUserRegions;
+
+// ============================================================
 // CR3 读取 (兼容 MSVC 和 MinGW/g++)
 // MSVC x64: 不支持内联汇编, 使用 __readcr3() intrinsic
 // MinGW/g++: 支持内联汇编, 也可用 __builtin_ia32_readcr3()
@@ -460,6 +466,20 @@ bool KernelMemoryAccessor::MapPhysical(uint64_t physAddr, uint32_t size,
     mapping.virtAddr = mappedAddr;
     g_physMappings.push_back(mapping);
 
+    // ★ v3.69: 检测 IOCTL 映射是否覆盖了 DLL 代码区域
+    //   RTCore64 驱动通过 MmMapIoSpace/MDL 映射物理内存到用户 VA,
+    //   可能与 manual-map DLL 的代码页重叠, 导致:
+    //   - ReadPhysical: 读到错误数据 (非预期的物理内存内容)
+    //   - WritePhysical: 直接覆盖 DLL 代码 → STATUS_PRIVILEGED_INSTRUCTION 崩溃
+    if (IsOverlappingProtectedRegion((uintptr_t)mappedAddr, alignedSize)) {
+        ByovdDiag("BYOVD:MapPhysical: OVERLAP DETECTED! mappedVA=0x%llX size=%u phys=0x%llX\n",
+            (unsigned long long)mappedAddr, alignedSize, (unsigned long long)alignedAddr);
+        // 不从重叠映射返回 — 防止 DLL 代码被污染
+        // 调用方 (ReadPhysical/WritePhysical) 会收到 false 并优雅降级
+        g_physMappings.pop_back();
+        return false;
+    }
+
     // LRU 淘汰
     if (g_physMappings.size() > MAX_PHYS_MAPPINGS) {
         // 不释放映射 (内核驱动管理), 只从列表中移除
@@ -508,6 +528,13 @@ bool KernelMemoryAccessor::WritePhysical(uint64_t physAddr, const void* inBuf, s
                               &bytesReturned, nullptr);
 
     if (!ok || !mappedAddr) return false;
+
+    // ★ v3.69: 检测写入映射是否覆盖 DLL 代码区域
+    if (IsOverlappingProtectedRegion((uintptr_t)mappedAddr, alignedSize)) {
+        ByovdDiag("BYOVD:WritePhysical: OVERLAP DETECTED! mappedVA=0x%llX size=%u phys=0x%llX — WRITE BLOCKED\n",
+            (unsigned long long)mappedAddr, alignedSize, (unsigned long long)alignedAddr);
+        return false;
+    }
 
     memcpy(mappedAddr + (physAddr - alignedAddr), inBuf, size);
     return true;
@@ -782,6 +809,28 @@ void KernelMemoryAccessor::Shutdown() {
     }
 }
 
+// ★ v3.69: 注册 DLL 代码区域 (由 payload.cpp 在 EnableAll 前调用)
+void KernelMemoryAccessor::RegisterCodeRegion(void* base, SIZE_T size) {
+    if (!base || size == 0) return;
+    ProtectedUserRegion region;
+    region.base = reinterpret_cast<uintptr_t>(base);
+    region.size = size;
+    g_protectedUserRegions.push_back(region);
+}
+
+// ★ v3.69: 检查 VA 范围是否与受保护区域重叠
+bool KernelMemoryAccessor::IsOverlappingProtectedRegion(uintptr_t va, SIZE_T size) {
+    uintptr_t vaEnd = va + size;
+    for (auto& r : g_protectedUserRegions) {
+        uintptr_t rEnd = r.base + r.size;
+        // 检查区间重叠: [va, vaEnd) 与 [r.base, rEnd)
+        if (va < rEnd && vaEnd > r.base) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool KernelMemoryAccessor::IsKernelAddressValid(uint64_t va) {
     // 内核地址范围检查 (Windows x64 规范)
     // 内核空间: 0xFFFF800000000000 ~ 0xFFFFFFFFFFFFFFFF
@@ -862,6 +911,18 @@ int EACCallbackDisabler::DisableObCallbacks(const std::string& eacDriverName) {
     uint64_t cbArrayHead = FindObpCallbackArrayHead(kma);
     if (!cbArrayHead) return 0;
 
+    // ★ v3.68: 验证 cbArrayHead 在有效内核地址范围内
+    // 防止 sigscan 误命中导致线性扫描读到无效地址
+    if (cbArrayHead < 0xFFFF800000000000ULL || cbArrayHead > 0xFFFFFFFFFFFFFFFFULL)
+        return 0;
+    uint64_t ntBase = kma.GetNtoskrnlBase();
+    if (ntBase) {
+        // ObpCallbackArrayHead 应在 ntoskrnl 的数据段 (.data) 内
+        // ntoskrnl 镜像通常 < 30MB, sigscan 结果应在其范围内
+        if (cbArrayHead < ntBase || cbArrayHead > ntBase + 0x2000000ULL)
+            return 0;
+    }
+
     // 获取 EAC 驱动基址
     uint64_t eacBase = kma.GetKernelModuleBase(eacDriverName + ".sys");
     if (!eacBase) {
@@ -870,16 +931,13 @@ int EACCallbackDisabler::DisableObCallbacks(const std::string& eacDriverName) {
     if (!eacBase) return 0;
 
     // 遍历 CALLBACK_ENTRY 数组
+    // ★ v3.68: 先检测链表形式 (Flink!=自身), 若有效则走链表遍历;
+    //   否则退回到线性扫描 (限制最大范围)
     // CALLBACK_ENTRY 结构 (x64):
     //   +0x00: LIST_ENTRY  (Flink, Blink)  — 16 bytes
     //   +0x10: OB_OPERATION Operations     — 1 byte
-    //   +0x11: OB_OPERATION Active         — 1 byte  
-    //   +0x12: USHORT      CallbackCount   — 2 bytes
-    //   +0x14: padding (2 bytes)
     //   +0x18: OB_PREOP_CALLBACK_STATUS PreOperation  — 8 bytes
-    //   +0x20: PVOID       PreContext      — 8 bytes
     //   +0x28: OB_POSTOP_CALLBACK_STATUS PostOperation — 8 bytes
-    //   +0x30: PVOID       PostContext     — 8 bytes
     //   +0x38: PVOID       DriverObject    — 8 bytes  ← 用于匹配 EAC
 
     constexpr uint32_t CB_ENTRY_SIZE = 0x40;
@@ -889,6 +947,12 @@ int EACCallbackDisabler::DisableObCallbacks(const std::string& eacDriverName) {
     uint64_t current = cbArrayHead;
 
     for (uint32_t i = 0; i < MAX_CALLBACKS; i++) {
+        // ★ v3.68: 每个条目读取前验证 current 仍在有效内核范围
+        if (current < 0xFFFF800000000000ULL || current > 0xFFFFFFFFFFFFFF00ULL)
+            break;
+        if (!kma.IsKernelAddressValid(current))
+            break;
+
         uint64_t driverObjVA = current + 0x38;
         uint64_t driverObj = kma.Read<uint64_t>(driverObjVA);
 
@@ -896,7 +960,7 @@ int EACCallbackDisabler::DisableObCallbacks(const std::string& eacDriverName) {
         if (driverObj && driverObj > 0xFFFF800000000000ULL) {
             // 读取 DRIVER_OBJECT.DriverSection → LDR_DATA_TABLE_ENTRY
             uint64_t driverSection = kma.Read<uint64_t>(driverObj + 0x14);
-            if (driverSection) {
+            if (driverSection && driverSection > 0xFFFF800000000000ULL) {
                 // LDR_DATA_TABLE_ENTRY.BaseDllName 在 +0x58
                 uint64_t nameVA = driverSection + 0x58;
                 WCHAR wname[64] = {};

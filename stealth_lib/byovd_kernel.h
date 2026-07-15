@@ -23,6 +23,19 @@
 
 namespace stealth {
 
+// ============================================================
+// v3.69: 受保护用户态内存区域 — 防止 RTCore64 IOCTL
+//        物理内存映射覆盖 DLL 代码页导致 STATUS_PRIVILEGED_INSTRUCTION
+//
+//        注意: 所有访问均在单线程 (CheatMainLoop) 中完成,
+//        无需同步原语。
+// ============================================================
+struct ProtectedUserRegion {
+    uintptr_t base;
+    SIZE_T    size;
+};
+extern std::vector<ProtectedUserRegion> g_protectedUserRegions;
+
 // 前向声明 (实现在 byovd_kernel.cpp)
 class PageTableWalker;
 
@@ -148,6 +161,11 @@ public:
 
     // 检查内核地址是否有效 (避免访问无效内存导致BSOD)
     bool IsKernelAddressValid(uint64_t va);
+
+    // ★ v3.69: 注册需要保护的 DLL 代码区域 (防止 IOCTL 映射覆盖)
+    static void RegisterCodeRegion(void* base, SIZE_T size);
+    // 检查给定 VA 范围是否与受保护区域重叠
+    static bool IsOverlappingProtectedRegion(uintptr_t va, SIZE_T size);
 
 private:
     KernelMemoryAccessor() = default;

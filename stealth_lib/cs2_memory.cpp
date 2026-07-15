@@ -51,7 +51,9 @@ uintptr_t Memory::LocalPlayerPawn() {
     uintptr_t pawnHandle = Read<uint32_t>(controller + m_offsets.m_hPlayerPawn);
     if (!pawnHandle || pawnHandle == 0xFFFFFFFF) return 0;
 
-    uintptr_t listEntry = Read<uintptr_t>(EntityList() + 8 * ((pawnHandle & 0x7FFF) >> 9) + 16);
+    uintptr_t el = EntityList();
+    if (!el) return 0;
+    uintptr_t listEntry = Read<uintptr_t>(el + 8 * ((pawnHandle & 0x7FFF) >> 9) + 16);
     listEntry &= ~0xFULL;  // strip tag bits from entity identity pointer
     if (!listEntry) return 0;
     return Read<uintptr_t>(listEntry + 120 * (pawnHandle & 0x1FF));
@@ -188,7 +190,8 @@ std::vector<Entity> Memory::GetAllPlayers(bool onlyAlive) {
         // 读取 pawn 基础属性区域 (0x310-0x3D0, 覆盖 health/team/lifeState 等)
         // 单次 syscall 替代 3+ 次独立 Read()
         uint8_t pawnBuf[256] = {};
-        stealth::StealthEngine::Instance().ReadBytes(pawn + offsetof_PawnCore, pawnBuf, sizeof(pawnBuf));
+        if (!stealth::StealthEngine::Instance().ReadBytes(pawn + offsetof_PawnCore, pawnBuf, sizeof(pawnBuf)))
+            continue;
 
         // 解析本地 (无 syscall)
         ent.health    = *(int*)(pawnBuf + (m_offsets.m_iHealth - offsetof_PawnCore));

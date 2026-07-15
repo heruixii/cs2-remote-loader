@@ -299,7 +299,7 @@ bool ThreadHijacker::HijackThread(HANDLE hProcess, DWORD threadId,
     }
 
     // 分配用于 shellcode 的空间 (在当前进程中, 远程线程可以访问)
-    void* remoteCode = VirtualAllocEx(hProcess, nullptr, shellcodeSize + 64,
+    void* remoteCode = VirtualAllocEx(hProcess, nullptr, shellcodeSize + 128,
         MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!remoteCode) {
         ResumeThread(hThread);

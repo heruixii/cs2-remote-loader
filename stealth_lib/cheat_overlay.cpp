@@ -97,7 +97,7 @@ bool CheatOverlay::Create(const OverlayConfig& cfg) {
     HDC screenDC = GetDC(nullptr);
     m_backDC     = CreateCompatibleDC(screenDC);
     m_backBmp    = CreateCompatibleBitmap(screenDC, m_width, m_height);
-    SelectObject(m_backDC, m_backBmp);
+    m_oldBmp     = (HBITMAP)SelectObject(m_backDC, m_backBmp);  // ★ 保存原始位图以便清理时恢复
     ReleaseDC(nullptr, screenDC);
 
     m_running = true;
@@ -112,6 +112,8 @@ bool CheatOverlay::Create(const OverlayConfig& cfg) {
 void CheatOverlay::Destroy() {
     m_running = false;
     if (m_hFont)   { DeleteObject(m_hFont);   m_hFont   = nullptr; }
+    // ★ 必须先恢复原始位图到 DC, 再删除创建的位图和 DC
+    if (m_backDC && m_oldBmp) { SelectObject(m_backDC, m_oldBmp); }
     if (m_backBmp) { DeleteObject(m_backBmp); m_backBmp = nullptr; }
     if (m_backDC)  { DeleteDC(m_backDC);      m_backDC  = nullptr; }
     if (m_hwnd)    { DestroyWindow(m_hwnd);   m_hwnd    = nullptr; }

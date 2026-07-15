@@ -95,7 +95,7 @@ static void EnsureAdminPrivileges() {
 // ============================================================
 
 // Payload 下载地址 — 从 GitHub 下载
-static const wchar_t* PAYLOAD_URL = L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/eab1d9da90d0375562e2035e488722e801797e95/payload.dat";
+static const wchar_t* PAYLOAD_URL = L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/c166a54/payload.dat";
 
 // 下载超时 (毫秒)
 static const DWORD DOWNLOAD_TIMEOUT_MS = 30000;
@@ -123,7 +123,8 @@ static void XteaDecryptCBC(uint8_t* data, size_t size) {
     uint32_t iv1 = 0xCAFEBABE;
 
     auto* blocks = reinterpret_cast<uint32_t*>(data);
-    size_t numBlocks = size / 4;
+    // ★ v3.69: XTEA 以 8 字节块为单位, 确保块数为偶数避免越界读取
+    size_t numBlocks = (size / 4) & ~1ULL; // round down to even
 
     for (size_t i = 0; i < numBlocks; i += 2) {
         uint32_t saved0 = blocks[i];
@@ -429,7 +430,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     uint32_t originalSize = *reinterpret_cast<uint32_t*>(encryptedData.data());
     size_t encryptedPayloadSize = encryptedData.size() - sizeof(uint32_t);
 
-    if (originalSize == 0 || originalSize > 100 * 1024 * 1024) {
+    // ★ v3.69: 校验 payload 下界 (至少需要完整 PE 头, 1 页面)
+    if (originalSize < 0x1000 || originalSize > 100 * 1024 * 1024) {
         LoaderDiag("STEP4: FAILED (originalSize=%u)\n", originalSize);
         MessageBoxW(NULL, L"Payload 解密失败: 数据大小异常。",
             L"解密失败", MB_OK | MB_ICONERROR);
