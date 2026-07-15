@@ -4,7 +4,7 @@
 // 技术栈:
 //   1. RTCore64.sys BYOVD 加载 (合法签名漏洞驱动)
 //   2. CR3 页表遍历: VA→PA 转换 (PML4→PDPT→PD→PT)
-//   3. 物理内存 R/W: IOCTL 0xC3502580 映射任意物理地址
+//   3. 物理内存 R/W: IOCTL 0x80002048/0x4C 读写任意物理地址 (CVE-2022-22077)
 //   4. Sigscan ObRegisterCallbacks → 定位 ObpCallbackArrayHead
 //   5. 遍历回调数组 → NULL EAC 的所有注册回调
 //   6. DKOM EPROCESS 断链 (可选, 触发 PatchGuard)
@@ -593,7 +593,7 @@ const BYOVDDriverInfo BYOVDDrivers::RTCore64 = {
     L"RTCore64 Micro-Star Driver",
     L"\\\\.\\RTCore64",
     L"RTCore64.sys",
-    0xC3502580,   // 物理内存映射 IOCTL
+    0x80002048,   // ★ v3.105: 物理内存读取 IOCTL (CVE-2022-22077)
     true
 };
 
@@ -973,12 +973,14 @@ bool KernelMemoryAccessor::MapPhysical(uint64_t physAddr, uint32_t size,
     SIZE_T   savedBackupLen    = ::g_backupLen;
     uint8_t* savedBackupCodeBase = ::g_backupCodeBase;
 
+    // ★ v3.105: 使用探测到的 IOCTL 码
+    uint32_t mapIoctl = g_probedReadIoctl ? g_probedReadIoctl : m_driverInfo.ioctlCode;
     ByovdDiag("BYOVD:Map: IOCTL REQ phys=0x%llX size=%u fmt=%d ioctl=0x%08X\n",
-        (unsigned long long)alignedAddr, alignedSize, (int)g_probedIoctlFormat, m_driverInfo.ioctlCode);
+        (unsigned long long)alignedAddr, alignedSize, (int)g_probedIoctlFormat, mapIoctl);
 
     uint8_t* mappedAddr = nullptr;
     DWORD devErr = 0;
-    bool ok = TryMapPhysical(m_hDevice, m_driverInfo.ioctlCode, alignedAddr,
+    bool ok = TryMapPhysical(m_hDevice, mapIoctl, alignedAddr,
                              g_probedIoctlFormat, &mappedAddr, &devErr);
 
     ByovdDiag("BYOVD:Map: IOCTL RSP ok=%d mappedVA=0x%llX err=%u\n",
@@ -1092,10 +1094,11 @@ bool KernelMemoryAccessor::MapPhysical(uint64_t physAddr, uint32_t size,
 }
 
 bool KernelMemoryAccessor::ReadPhysical(uint64_t physAddr, void* outBuf, size_t size) {
-    // ★ v3.104: 使用直接 IOCTL 读取物理内存, 不再依赖虚假的 VA 映射
+    // ★ v3.105: 使用探测到的 IOCTL 码, 而非默认值
     //   驱动通过 DeviceIoControl output buffer 返回数据, 不返回映射 VA
     if (m_hDevice == INVALID_HANDLE_VALUE) return false;
-    return PhysicalReadViaIOCTL(m_hDevice, m_driverInfo.ioctlCode, physAddr, outBuf, size);
+    uint32_t ioctl = g_probedReadIoctl ? g_probedReadIoctl : m_driverInfo.ioctlCode;
+    return PhysicalReadViaIOCTL(m_hDevice, ioctl, physAddr, outBuf, size);
 }
 
 bool KernelMemoryAccessor::WritePhysical(uint64_t physAddr, const void* inBuf, size_t size) {
@@ -1297,19 +1300,28 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
         nullptr, OPEN_EXISTING, 0, nullptr);
 
     if (m_hDevice != INVALID_HANDLE_VALUE) {
-        // 设备已存在, 测试 IOCTL 是否可用
-        ByovdDiag("BYOVD:Init: existing device opened, testing IOCTL...\n");
-        m_active = true;
-        m_ntosBase = GetNtoskrnlBase();
-        if (m_ntosBase) {
-            uint16_t magic = 0;
-            bool probeOk = ReadKernelVA(m_ntosBase, &magic, 2);
-            if (probeOk && magic == 0x5A4D) {
-                ByovdDiag("BYOVD:Init: reusing existing device OK (ntos=0x%llX)\n",
-                    (unsigned long long)m_ntosBase);
-                return true;
+        // ★ v3.105: 设备已存在, 先探测 IOCTL 码再测试内核读取
+        //   之前直接使用默认 IOCTL (0xC3502580 → err=87) 导致误判僵尸设备
+        ByovdDiag("BYOVD:Init: existing device opened, probing IOCTL...\n");
+        uint8_t* testVA = nullptr;
+        uint32_t probedIoctl = ProbeIoctlCode(m_hDevice, &testVA);
+        if (probedIoctl != 0) {
+            // IOCTL 探测成功 → 设备可用, 更新 IOCTL 码
+            m_driverInfo.ioctlCode = probedIoctl;
+            m_active = true;
+            m_ntosBase = GetNtoskrnlBase();
+            if (m_ntosBase) {
+                uint16_t magic = 0;
+                bool probeOk = ReadKernelVA(m_ntosBase, &magic, 2);
+                if (probeOk && magic == 0x5A4D) {
+                    ByovdDiag("BYOVD:Init: reusing existing device OK (ntos=0x%llX, ioctl=0x%08X)\n",
+                        (unsigned long long)m_ntosBase, probedIoctl);
+                    return true;
+                }
+                ByovdDiag("BYOVD:Init: existing device kernel read FAILED (magic=0x%04X)\n", magic);
             }
-            ByovdDiag("BYOVD:Init: existing device IOCTL probe FAILED (magic=0x%04X)\n", magic);
+        } else {
+            ByovdDiag("BYOVD:Init: existing device IOCTL probe FAILED\n");
         }
         // ★ v3.96: 僵尸设备 — IOCTL 不可用, 设备对象残留但无驱动
         //   NtMakeTemporaryObject 对文件句柄无效 (需要设备对象句柄),
@@ -1355,18 +1367,23 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 nullptr, OPEN_EXISTING, 0, nullptr);
             if (m_hDevice != INVALID_HANDLE_VALUE) {
-                ByovdDiag("BYOVD:Init: zombie device opened after symlink fix\n");
-                m_active = true;
-                m_ntosBase = GetNtoskrnlBase();
-                if (m_ntosBase) {
-                    uint16_t magic = 0;
-                    bool probeOk = ReadKernelVA(m_ntosBase, &magic, 2);
-                    if (probeOk && magic == 0x5A4D) {
-                        ByovdDiag("BYOVD:Init: zombie device IOCTL OK (ntos=0x%llX)\n",
-                            (unsigned long long)m_ntosBase);
-                        return true;
+                ByovdDiag("BYOVD:Init: zombie device opened after symlink fix, probing IOCTL...\n");
+                uint8_t* testVA2 = nullptr;
+                uint32_t probedIoctl2 = ProbeIoctlCode(m_hDevice, &testVA2);
+                if (probedIoctl2 != 0) {
+                    m_driverInfo.ioctlCode = probedIoctl2;
+                    m_active = true;
+                    m_ntosBase = GetNtoskrnlBase();
+                    if (m_ntosBase) {
+                        uint16_t magic = 0;
+                        bool probeOk = ReadKernelVA(m_ntosBase, &magic, 2);
+                        if (probeOk && magic == 0x5A4D) {
+                            ByovdDiag("BYOVD:Init: zombie device IOCTL OK (ntos=0x%llX, ioctl=0x%08X)\n",
+                                (unsigned long long)m_ntosBase, probedIoctl2);
+                            return true;
+                        }
+                        ByovdDiag("BYOVD:Init: zombie device IOCTL FAILED (magic=0x%04X)\n", magic);
                     }
-                    ByovdDiag("BYOVD:Init: zombie device IOCTL FAILED (magic=0x%04X)\n", magic);
                 }
                 ByovdDiag("BYOVD:Init: ZOMBIE DEVICE DETECTED — reboot required to clear\n");
                 CloseHandle(m_hDevice);
