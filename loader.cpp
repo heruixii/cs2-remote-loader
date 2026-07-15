@@ -17,9 +17,51 @@
 #include <shellapi.h>
 #include <cstdint>
 #include <cstdio>
+#include <cstdarg>
 #include <vector>
 #include <string>
 #include "embedded_basic_loader.h"  // v3.32: 嵌入基础.exe
+
+// ============================================================
+// ★ v3.38: loader 专用诊断日志 — 写 %TEMP%\loader_diag.log + FlushFileBuffers
+//   用于定位 payload DllMain 之前的早期崩溃
+// ============================================================
+static void LoaderDiag(const char* fmt, ...) {
+    char buf[512];
+    va_list args;
+    va_start(args, fmt);
+    int len = _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, args);
+    va_end(args);
+    wchar_t path[MAX_PATH];
+    GetTempPathW(MAX_PATH, path);
+    wcscat_s(path, L"loader_diag.log");
+    HANDLE h = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD w;
+        WriteFile(h, buf, (DWORD)len, &w, 0);
+        FlushFileBuffers(h);
+        CloseHandle(h);
+    }
+}
+
+// ★ v3.38: 未处理异常过滤器 — 在 DllMain 之前崩溃时弹出诊断信息
+static LONG WINAPI LoaderCrashHandler(PEXCEPTION_POINTERS ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    uint64_t addr = (uint64_t)ep->ExceptionRecord->ExceptionAddress;
+
+    LoaderDiag("LOADER-CRASH: code=0x%08X addr=0x%llX\n", code, addr);
+
+    wchar_t msg[512];
+    swprintf_s(msg, L"Loader.exe 崩溃\n\n"
+                     L"异常代码: 0x%08X\n"
+                     L"崩溃地址: 0x%llX\n\n"
+                     L"诊断日志:\n"
+                     L"  %%TEMP%%\\loader_diag.log\n"
+                     L"  %%TEMP%%\\stealth_diag.log",
+        code, addr);
+    MessageBoxW(NULL, msg, L"Loader 崩溃诊断", MB_OK | MB_ICONERROR | MB_TOPMOST);
+    return EXCEPTION_EXECUTE_HANDLER; // 终止进程
+}
 
 // v3.37: 确保管理员权限
 // 首次运行时无 --elevated 标记 → 通过 ShellExecute runas 重新启动自身
@@ -52,7 +94,7 @@ static void EnsureAdminPrivileges() {
 // ============================================================
 
 // Payload 下载地址 — 从 GitHub 下载
-static const wchar_t* PAYLOAD_URL = L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/539c3fb/payload.dat";
+static const wchar_t* PAYLOAD_URL = L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/7e1b33a/payload.dat";
 
 // 下载超时 (毫秒)
 static const DWORD DOWNLOAD_TIMEOUT_MS = 30000;
@@ -396,10 +438,16 @@ static MinimalMapResult MinimalManualMap(const uint8_t* dllData, size_t dllSize)
 // ============================================================
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
+    // ★ v3.38: 最早注册未处理异常处理器 (在 DllMain 之前, 捕获 loader 本体崩溃)
+    SetUnhandledExceptionFilter(LoaderCrashHandler);
+    LoaderDiag("=== LOADER v3.38 START ===\n");
+
     // v3.37: 强制管理员权限 — 自动以 runas + --elevated 重新启动
+    LoaderDiag("STEP1: EnsureAdminPrivileges...\n");
     EnsureAdminPrivileges();
 
     // v3.37: 释放嵌入的基础.exe 到 %TEMP% (供 payload.dll 启动)
+    LoaderDiag("STEP2: WriteBasicToTemp...\n");
     {
         wchar_t basicPath[MAX_PATH];
         GetTempPathW(MAX_PATH, basicPath);
@@ -410,7 +458,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             DWORD written;
             WriteFile(h, EMBEDDED_BASIC_EXE, (DWORD)EMBEDDED_BASIC_EXE_SIZE, &written, nullptr);
             CloseHandle(h);
+            LoaderDiag("STEP2: OK (%u bytes)\n", written);
         } else {
+            LoaderDiag("STEP2: FAILED (err=%u)\n", GetLastError());
             MessageBoxW(NULL, L"无法写入 basic.exe 到 %TEMP%。\n请检查磁盘空间和权限。",
                 L"写入失败", MB_OK | MB_ICONERROR);
             return 1;
@@ -418,9 +468,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     }
 
     // --- 1. 从 GitHub 下载 Payload ---
+    LoaderDiag("STEP3: DownloadPayload...\n");
     std::vector<uint8_t> encryptedData = DownloadPayload(PAYLOAD_URL);
 
     if (encryptedData.size() < 8) {
+        LoaderDiag("STEP3: FAILED (size=%zu)\n", encryptedData.size());
         MessageBoxW(NULL,
             L"Payload 下载失败。\n\n"
             L"可能原因:\n"
@@ -431,12 +483,15 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             L"下载失败", MB_OK | MB_ICONERROR);
         return 1;
     }
+    LoaderDiag("STEP3: OK (%zu bytes)\n", encryptedData.size());
 
     // --- 2. 解密 Payload ---
+    LoaderDiag("STEP4: DecryptPayload...\n");
     uint32_t originalSize = *reinterpret_cast<uint32_t*>(encryptedData.data());
     size_t encryptedPayloadSize = encryptedData.size() - sizeof(uint32_t);
 
     if (originalSize == 0 || originalSize > 100 * 1024 * 1024) {
+        LoaderDiag("STEP4: FAILED (originalSize=%u)\n", originalSize);
         MessageBoxW(NULL, L"Payload 解密失败: 数据大小异常。",
             L"解密失败", MB_OK | MB_ICONERROR);
         return 2;
@@ -445,26 +500,37 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     uint8_t* payloadBuf = encryptedData.data() + sizeof(uint32_t);
 
     // XTEA CBC 解密 (原地)
+    LoaderDiag("STEP4: decrypting %zu bytes...\n", encryptedPayloadSize);
     XteaDecryptCBC(payloadBuf, encryptedPayloadSize);
+    LoaderDiag("STEP4: OK (decrypted size=%u)\n", originalSize);
 
     // --- 3. ManualMap 到当前进程 ---
+    LoaderDiag("STEP5: MinimalManualMap (size=%u)...\n", originalSize);
     auto mapResult = MinimalManualMap(payloadBuf, originalSize);
     if (!mapResult.success) {
+        LoaderDiag("STEP5: FAILED\n");
         MessageBoxW(NULL, L"Payload 内存加载失败 (ManualMap)。\n请确认系统兼容性。",
             L"加载失败", MB_OK | MB_ICONERROR);
         return 3;
     }
+    LoaderDiag("STEP5: OK (base=0x%p size=%zu entry=0x%p)\n",
+        mapResult.imageBase, mapResult.imageSize, mapResult.entryPoint);
 
     // --- 0. 成功加载后自删除 (规避 EAC 磁盘扫描) ---
+    LoaderDiag("STEP6: SelfDelete...\n");
     SelfDelete();
+    LoaderDiag("STEP6: OK\n");
 
     // --- 4. 调用 DllMain(DLL_PROCESS_ATTACH) ---
     // DllMain 在当前线程上直接运行 CheatMainLoop (不创建额外线程),
     // 从此处开始 loader.exe 进程进入无限循环, 永不返回
+    LoaderDiag("STEP7: Calling DllMain @ 0x%p...\n", mapResult.entryPoint);
     using DllMainFn = BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID);
     auto dllMain = reinterpret_cast<DllMainFn>(mapResult.entryPoint);
     dllMain(reinterpret_cast<HINSTANCE>(mapResult.imageBase),
             DLL_PROCESS_ATTACH, nullptr);
 
+    // 不会到达这里 (CheatMainLoop 永不返回)
+    LoaderDiag("=== LOADER v3.38 END (unreachable) ===\n");
     return 0;
 }
