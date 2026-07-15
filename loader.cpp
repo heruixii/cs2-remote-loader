@@ -410,7 +410,7 @@ static MinimalMapResult MinimalManualMap(const uint8_t* dllData, size_t dllSize)
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // ★ v3.38: 最早注册未处理异常处理器 (在 DllMain 之前, 捕获 loader 本体崩溃)
     SetUnhandledExceptionFilter(LoaderCrashHandler);
-    LoaderDiag("=== LOADER v3.81 START (BUILD 387: \\Driver scan zombie cleanup) ===\n");
+    LoaderDiag("=== LOADER v3.81 START (BUILD 388: patch driver device name) ===\n");
 
     // v3.37: 强制管理员权限 — 自动以 runas + --elevated 重新启动
     LoaderDiag("STEP1: EnsureAdminPrivileges...\n");

