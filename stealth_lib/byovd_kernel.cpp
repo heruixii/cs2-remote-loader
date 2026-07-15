@@ -297,50 +297,47 @@ bool KernelMemoryAccessor::LoadDriver(const std::wstring& serviceName,
     std::wstring keyPath = L"SYSTEM\\CurrentControlSet\\Services\\" + serviceName;
     HKEY hKey;
 
-    // 如果服务已存在, 尝试先使用
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(), 0,
-                      KEY_READ, &hKey) == ERROR_SUCCESS) {
-        ByovdDiag("BYOVD:LoadDriver: service key exists, using existing\n");
-        RegCloseKey(hKey);
-    } else {
-        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(),
-                            0, nullptr, REG_OPTION_NON_VOLATILE,
-                            KEY_ALL_ACCESS, nullptr, &hKey, nullptr) != ERROR_SUCCESS) {
-            return false;
-        }
-
-        DWORD type = 1; // SERVICE_KERNEL_DRIVER
-        DWORD start = 3; // SERVICE_DEMAND_START
-        DWORD errorControl = 1; // SERVICE_ERROR_NORMAL
-
-        RegSetValueExW(hKey, L"Type", 0, REG_DWORD, (BYTE*)&type, sizeof(type));
-        RegSetValueExW(hKey, L"Start", 0, REG_DWORD, (BYTE*)&start, sizeof(start));
-        RegSetValueExW(hKey, L"ErrorControl", 0, REG_DWORD, (BYTE*)&errorControl, sizeof(errorControl));
-
-        // 使用驱动文件名(同目录)或系统路径
-        wchar_t fullPath[MAX_PATH];
-        if (driverPath.find(L'\\') == std::wstring::npos) {
-            // 仅文件名 → 补充完整路径
-            GetSystemDirectoryW(fullPath, MAX_PATH);
-            wcscat_s(fullPath, L"\\drivers\\");
-            wcscat_s(fullPath, driverPath.c_str());
-        } else {
-            wcscpy_s(fullPath, driverPath.c_str());
-        }
-
-        // v3.48: 内核需要 NT 路径格式 — 自动加 \??\ 前缀
-        wchar_t ntPath[MAX_PATH * 2];
-        if (fullPath[0] != L'\\' && fullPath[1] != L'\\') {
-            swprintf_s(ntPath, L"\\??\\%ls", fullPath);
-        } else {
-            wcscpy_s(ntPath, fullPath);
-        }
-
-        RegSetValueExW(hKey, L"ImagePath", 0, REG_EXPAND_SZ,
-                       (BYTE*)ntPath, (DWORD)((wcslen(ntPath) + 1) * sizeof(wchar_t)));
-        ByovdDiag("BYOVD:LoadDriver: ImagePath=%ls\n", ntPath);
-        RegCloseKey(hKey);
+    // v3.55: 先删旧服务再重建 — 防止残留键导致 STATUS_OBJECT_NAME_INVALID
+    RegDeleteTreeW(HKEY_LOCAL_MACHINE, keyPath.c_str());
+    
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(),
+                        0, nullptr, REG_OPTION_NON_VOLATILE,
+                        KEY_ALL_ACCESS, nullptr, &hKey, nullptr) != ERROR_SUCCESS) {
+        ByovdDiag("BYOVD:LoadDriver: RegCreateKeyEx FAILED (err=%u)\n", GetLastError());
+        return false;
     }
+
+    DWORD type = 1; // SERVICE_KERNEL_DRIVER
+    DWORD start = 3; // SERVICE_DEMAND_START
+    DWORD errorControl = 1; // SERVICE_ERROR_NORMAL
+
+    RegSetValueExW(hKey, L"Type", 0, REG_DWORD, (BYTE*)&type, sizeof(type));
+    RegSetValueExW(hKey, L"Start", 0, REG_DWORD, (BYTE*)&start, sizeof(start));
+    RegSetValueExW(hKey, L"ErrorControl", 0, REG_DWORD, (BYTE*)&errorControl, sizeof(errorControl));
+
+    // 使用驱动文件名(同目录)或系统路径
+    wchar_t fullPath[MAX_PATH];
+    if (driverPath.find(L'\\') == std::wstring::npos) {
+        // 仅文件名 → 补充完整路径
+        GetSystemDirectoryW(fullPath, MAX_PATH);
+        wcscat_s(fullPath, L"\\drivers\\");
+        wcscat_s(fullPath, driverPath.c_str());
+    } else {
+        wcscpy_s(fullPath, driverPath.c_str());
+    }
+
+    // v3.48: 内核需要 NT 路径格式 — 自动加 \??\ 前缀
+    wchar_t ntPath[MAX_PATH * 2];
+    if (fullPath[0] != L'\\' && fullPath[1] != L'\\') {
+        swprintf_s(ntPath, L"\\??\\%ls", fullPath);
+    } else {
+        wcscpy_s(ntPath, fullPath);
+    }
+
+    RegSetValueExW(hKey, L"ImagePath", 0, REG_EXPAND_SZ,
+                   (BYTE*)ntPath, (DWORD)((wcslen(ntPath) + 1) * sizeof(wchar_t)));
+    ByovdDiag("BYOVD:LoadDriver: ImagePath=%ls\n", ntPath);
+    RegCloseKey(hKey);
 
     // 调用 NtLoadDriver (走 syscall 更安全, 但这里用直接调用)
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
