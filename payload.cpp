@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 370 (v3.69: IOCTL mapping overlap guard + code integrity checksum)
+// BUILD: 375 (v3.75: fix checksum false positive + SCM driver cleanup + -mwindows loader)
 // ============================================================
 
 #include "stealth_core.h"
@@ -868,31 +868,37 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 (unsigned long long)((uintptr_t)dllBase + dllSize));
         }
 
-        // ★ v3.70: 预校验 + 备份 — 计算 DLL 代码页 XOR checksum 并保存完整备份
+        // ★ v3.75: 预校验 + 备份 — 仅在 VEH 捕获到真实崩溃时恢复
+        //   注意：校验覆盖整个 DLL 镜像 (含 .data/.bss), 运行时数据变化是正常的
+        //   不能用校验和不匹配来触发恢复 — 那会导致误报和二次崩溃
         uint32_t preChecksum = 0;
         uint8_t* codeBackupBuf = nullptr;
         if (dllBase && dllSize > 0x1000) {
             uint8_t* code = (uint8_t*)dllBase + 0x1000;
             SIZE_T codeLen = dllSize - 0x1000;
-            for (SIZE_T i = 0; i < codeLen; i += 4) {
-                preChecksum ^= *(uint32_t*)(code + i);
-            }
             // 分配备份缓冲区 (在安全的独立内存区域)
             codeBackupBuf = (uint8_t*)VirtualAlloc(nullptr, codeLen, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
             if (codeBackupBuf) {
                 memcpy(codeBackupBuf, code, codeLen);
-                DiagLog("BYOVD: code backup saved [0x%llX, %llu bytes] checksum=0x%08X\n",
-                    (unsigned long long)codeBackupBuf, (unsigned long long)codeLen, preChecksum);
-                // ★ v3.70: 注册 VEH 自愈全局变量 — 崩溃时 DiagVehHandler 恢复代码
+                // ★ v3.75: 先设置 VEH 自愈全局变量, 再计算校验和
+                //   避免全局变量变更导致校验和误报
                 g_backupBuf = codeBackupBuf;
                 g_backupLen = codeLen;
                 g_backupCodeBase = code;
+                // 现在计算校验和 (包含已初始化的全局变量)
+                for (SIZE_T i = 0; i < codeLen; i += 4) {
+                    preChecksum ^= *(uint32_t*)(code + i);
+                }
+                DiagLog("BYOVD: code backup saved [0x%llX, %llu bytes] checksum=0x%08X\n",
+                    (unsigned long long)codeBackupBuf, (unsigned long long)codeLen, preChecksum);
             }
         }
 
         auto kernelResult = stealth::KernelDefense::EnableAll();
 
-        // ★ v3.69: 后校验 — 检测 IOCTL 映射是否污染了 DLL 代码
+        // ★ v3.75: 后校验 — 仅诊断，不自动恢复
+        //   校验覆盖整个 DLL 镜像 (.data/.bss 运行时变化是正常的),
+        //   真正的代码污染会触发 STATUS_PRIVILEGED_INSTRUCTION → VEH 自愈
         if (dllBase && dllSize > 0x1000) {
             uint32_t postChecksum = 0;
             uint8_t* code = (uint8_t*)dllBase + 0x1000;
@@ -901,25 +907,12 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 postChecksum ^= *(uint32_t*)(code + i);
             }
             if (preChecksum != postChecksum) {
-                DiagLog("CRITICAL: DLL CODE CORRUPTED! pre=0x%08X post=0x%08X\n",
+                DiagLog("WARN: DLL checksum changed pre=0x%08X post=0x%08X (data changes during init are normal)\n",
                     preChecksum, postChecksum);
-                // ★ v3.70 Layer 2: 从备份恢复被 IOCTL 映射污染的 DLL 代码页
-                if (codeBackupBuf) {
-                    DWORD oldProt;
-                    VirtualProtect(code, codeLen, PAGE_READWRITE, &oldProt);
-                    memcpy(code, codeBackupBuf, codeLen);
-                    VirtualProtect(code, codeLen, PAGE_EXECUTE_READ, &oldProt);
-                    // 验证恢复
-                    uint32_t verify = 0;
-                    for (SIZE_T i = 0; i < codeLen; i += 4)
-                        verify ^= *(uint32_t*)(code + i);
-                    DiagLog("BYOVD: RESTORE %s (verify=0x%08X)\n",
-                        (verify == preChecksum) ? "OK" : "FAILED", verify);
-                }
             } else {
                 DiagLog("BYOVD: code integrity OK (checksum=0x%08X)\n", postChecksum);
             }
-            // ★ v3.70: 清除 VEH 自愈全局变量 (不再需要恢复)
+            // ★ v3.75: 清除 VEH 自愈全局变量 (不再需要恢复)
             g_backupBuf = nullptr;
             g_backupLen = 0;
             g_backupCodeBase = nullptr;

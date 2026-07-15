@@ -15,6 +15,7 @@
 #include "byovd_kernel.h"
 #include <winreg.h>
 #include <winternl.h>
+#include <winsvc.h>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -290,8 +291,81 @@ static std::wstring EnsureDriverFile(const std::wstring& driverName) {
     return L"";
 }
 
+// ★ v3.75: 强制停止并删除所有残留 RTCore64 服务
+//   解决 STATUS_OBJECT_NAME_COLLISION (0xC0000035):
+//   之前异常的进程退出导致 \Driver\RTCore64 内核对象未清理,
+//   导致再次加载时 NtLoadDriver 返回重名冲突
+//   通过 SCM ControlService(SERVICE_CONTROL_STOP) 触发 DriverUnload,
+//   然后 NtUnloadDriver + DeleteService 彻底清理
+static void ForceRemoveRTCore64Services() {
+    SC_HANDLE hSCM = OpenSCManagerW(nullptr, nullptr,
+        SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
+    if (!hSCM) return;
+
+    DWORD bytesNeeded = 0, serviceCount = 0, resumeHandle = 0;
+    // 第一次调用获取所需缓冲区大小
+    EnumServicesStatusExW(hSCM, SC_ENUM_PROCESS_INFO, SERVICE_DRIVER,
+        SERVICE_STATE_ALL, nullptr, 0, &bytesNeeded,
+        &serviceCount, &resumeHandle, nullptr);
+    if (bytesNeeded == 0) { CloseServiceHandle(hSCM); return; }
+
+    std::vector<BYTE> buf(bytesNeeded + 0x100);
+    auto* services = (ENUM_SERVICE_STATUS_PROCESSW*)buf.data();
+    if (!EnumServicesStatusExW(hSCM, SC_ENUM_PROCESS_INFO, SERVICE_DRIVER,
+        SERVICE_STATE_ALL, buf.data(), (DWORD)buf.size(), &bytesNeeded,
+        &serviceCount, &resumeHandle, nullptr)) {
+        CloseServiceHandle(hSCM);
+        return;
+    }
+
+    for (DWORD i = 0; i < serviceCount; i++) {
+        if (wcsstr(services[i].lpServiceName, L"RTCore64") != services[i].lpServiceName)
+            continue;
+
+        ByovdDiag("BYOVD:ForceRemove: found stale service '%ls' (state=%u)\n",
+            services[i].lpServiceName, services[i].ServiceStatusProcess.dwCurrentState);
+
+        SC_HANDLE hSvc = OpenServiceW(hSCM, services[i].lpServiceName,
+            SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE);
+        if (!hSvc) continue;
+
+        // 发送 STOP 控制码 → 触发驱动的 DriverUnload 例程
+        SERVICE_STATUS svcStatus;
+        if (ControlService(hSvc, SERVICE_CONTROL_STOP, &svcStatus)) {
+            // 等待驱动完全卸载 (最多等 3 秒)
+            for (int wait = 0; wait < 30; wait++) {
+                if (!QueryServiceStatus(hSvc, &svcStatus)) break;
+                if (svcStatus.dwCurrentState == SERVICE_STOPPED) break;
+                Sleep(100);
+            }
+        }
+
+        // 删除服务
+        DeleteService(hSvc);
+        CloseServiceHandle(hSvc);
+
+        // ★ 兜底: 用 NtUnloadDriver 再试一次 (确保内核对象释放)
+        std::wstring regPath = L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\";
+        regPath += services[i].lpServiceName;
+        UNICODE_STRING us;
+        us.Buffer = regPath.data();
+        us.Length = (USHORT)(regPath.size() * sizeof(wchar_t));
+        us.MaximumLength = us.Length + sizeof(wchar_t);
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (ntdll) {
+            using NtUnloadDriver_t = NTSTATUS(NTAPI*)(PUNICODE_STRING);
+            auto pNtUnloadDriver = (NtUnloadDriver_t)GetProcAddress(ntdll, "NtUnloadDriver");
+            if (pNtUnloadDriver) pNtUnloadDriver(&us);
+        }
+    }
+    CloseServiceHandle(hSCM);
+}
+
 bool KernelMemoryAccessor::LoadDriver(const std::wstring& serviceName, 
                                        const std::wstring& driverPath) {
+    // ★ v3.75: 加载前强制清理所有残留 RTCore64 服务/驱动
+    ForceRemoveRTCore64Services();
+
     EnablePrivilege(L"SeLoadDriverPrivilege");
 
     // 注册表: 创建服务条目
