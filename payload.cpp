@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 338 (v3.38: FlushFileBuffers + VEH MessageBox to catch crash root cause)
+// BUILD: 338 (v3.38: FlushFileBuffers + VEH MessageBox + EkkoSleep no-threadpool)
 // ============================================================
 
 #include "stealth_core.h"

