@@ -817,27 +817,46 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     // ★ v3.69: 注册 DLL 代码区域防止 RTCore64 IOCTL 映射覆盖
     //   先计算 DLL 代码校验和, After EnableAll 再校验
     {
-        // ★ v3.70 Layer 1: Guard Pages — 在 BYOVD IOCTL 之前预留 DLL 周围
-        //   地址空间, 防止 RTCore64 驱动的物理内存映射覆盖 DLL 代码页
-        //   驱动内部通过 ZwAllocateVirtualMemory/MmMapLockedPages 分配 VA,
-        //   若 DLL 周围已被预留, 映射将被强制分配到其他安全区域
+        // ★ v3.74 Layer 1: 强化 Guard Pages — 在 BYOVD IOCTL 之前
+        //   用 VirtualQuery 扫描 DLL ±64MB 所有空闲区域并全部预留,
+        //   强制驱动物理内存映射分配到远离 DLL 的安全 VA
+        //   (之前只预留 2MB 固定地址, 常因相邻分配而失败)
+        struct GuardRegion { void* addr; SIZE_T size; };
+        std::vector<GuardRegion> guardRegions;
+
         if (dllBase && dllSize > 0x1000) {
-            const SIZE_T GUARD_SIZE = 0x200000; // 2MB guard each side
-            uint8_t* guardBefore = (uint8_t*)dllBase;
-            if ((uintptr_t)guardBefore > GUARD_SIZE) {
-                guardBefore = (uint8_t*)((uintptr_t)dllBase - GUARD_SIZE);
-                void* gb = VirtualAlloc(guardBefore, GUARD_SIZE, MEM_RESERVE, PAGE_NOACCESS);
-                DiagLog("BYOVD: guard-before@0x%llX sz=0x%X %s\n",
-                    (unsigned long long)guardBefore, (unsigned)GUARD_SIZE,
-                    gb ? "OK" : "FAIL");
+            uintptr_t dllStart = (uintptr_t)dllBase;
+            uintptr_t dllEnd   = dllStart + dllSize;
+            const SIZE_T SCAN_MARGIN = 0x4000000; // ±64MB
+            uintptr_t scanStart = (dllStart > SCAN_MARGIN) ? (dllStart - SCAN_MARGIN) : 0x10000;
+            uintptr_t scanEnd   = dllEnd + SCAN_MARGIN;
+            if (scanEnd < dllEnd) scanEnd = (uintptr_t)-1; // overflow guard
+
+            MEMORY_BASIC_INFORMATION mbi;
+            uintptr_t addr = scanStart;
+            while (addr < scanEnd) {
+                SIZE_T qr = VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi));
+                if (qr == 0) break;
+
+                if (mbi.State == MEM_FREE) {
+                    uintptr_t freeStart = (uintptr_t)mbi.BaseAddress;
+                    SIZE_T freeSize = mbi.RegionSize;
+                    if (freeStart < scanStart) {
+                        freeSize -= (scanStart - freeStart);
+                        freeStart = scanStart;
+                    }
+                    if (freeStart + freeSize > scanEnd)
+                        freeSize = scanEnd - freeStart;
+                    if (freeSize >= 0x1000) {
+                        void* r = VirtualAlloc((void*)freeStart, freeSize, MEM_RESERVE, PAGE_NOACCESS);
+                        if (r) guardRegions.push_back({r, freeSize});
+                    }
+                }
+                addr = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
             }
-            uint8_t* guardAfter = (uint8_t*)dllBase + dllSize;
-            // Align up to 64KB boundary for safety
-            guardAfter = (uint8_t*)(((uintptr_t)guardAfter + 0xFFFF) & ~0xFFFFULL);
-            void* ga = VirtualAlloc(guardAfter, GUARD_SIZE, MEM_RESERVE, PAGE_NOACCESS);
-            DiagLog("BYOVD: guard-after@0x%llX sz=0x%X %s\n",
-                (unsigned long long)guardAfter, (unsigned)GUARD_SIZE,
-                ga ? "OK" : "FAIL");
+            DiagLog("BYOVD: reserved %llu guard regions [0x%llX - 0x%llX]\n",
+                (unsigned long long)guardRegions.size(),
+                (unsigned long long)scanStart, (unsigned long long)scanEnd);
         }
 
         // 注册所有 DLL 代码页为保护区 (跳过 PE 头第0页)
@@ -909,6 +928,13 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 VirtualFree(codeBackupBuf, 0, MEM_RELEASE);
             }
         }
+
+        // ★ v3.74: 释放 guard pages — 物理映射已分配完毕, 释放预留空间
+        for (auto& g : guardRegions) {
+            VirtualFree(g.addr, 0, MEM_RELEASE);
+        }
+        DiagLog("BYOVD: freed %llu guard regions\n",
+            (unsigned long long)guardRegions.size());
 
         DiagLog("OK: BYOVD driver=%d ob=%d proc=%d img=%d thread=%d\n",
             (int)kernelResult.driverLoaded,
