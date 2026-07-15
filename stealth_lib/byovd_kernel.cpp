@@ -588,7 +588,7 @@ bool KernelMemoryAccessor::MapPhysical(uint64_t physAddr, uint32_t size,
                     void* pageVA = restoreDst + restoredBytes;
 
                     // 跳过 VEH handler 所在页 (保持不变)
-                    if (::g_vehHandlerPageVA && pageVA == (uintptr_t)::g_vehHandlerPageVA) {
+                    if (::g_vehHandlerPageVA && (uintptr_t)pageVA == (uintptr_t)::g_vehHandlerPageVA) {
                         restoredBytes += chunk;
                         continue;
                     }

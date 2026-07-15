@@ -102,7 +102,7 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
             SIZE_T chunk = (off + PAGE <= codeLen) ? PAGE : (codeLen - off);
 
             // 跳过 VEH 处理器所在页 (未被污染, 保护不变)
-            if (pageVA == handlerPage) {
+            if ((uintptr_t)pageVA == (uintptr_t)handlerPage) {
                 continue;
             }
 
