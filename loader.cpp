@@ -31,7 +31,9 @@ static void LoaderDiag(const char* fmt, ...) {
     char buf[512];
     va_list args;
     va_start(args, fmt);
-    int len = _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, args);
+    int len = vsnprintf(buf, sizeof(buf), fmt, args);
+    if (len < 0) len = 0;
+    if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
     va_end(args);
     wchar_t path[MAX_PATH];
     GetTempPathW(MAX_PATH, path);
@@ -172,12 +174,40 @@ static std::vector<uint8_t> DownloadPayload(const wchar_t* url) {
         return result;
     }
 
+    // ★ v3.81: 检查 HTTP 状态码, 拒绝 404/500 等非 200 响应
+    {
+        DWORD statusCode = 0;
+        DWORD statusSize = sizeof(statusCode);
+        if (HttpQueryInfoW(hUrl, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
+                           &statusCode, &statusSize, nullptr)) {
+            LoaderDiag("  HTTP status: %u\n", statusCode);
+            if (statusCode != 200) {
+                LoaderDiag("  FAIL: HTTP %u (expected 200), URL may be invalid or file not found\n", statusCode);
+                InternetCloseHandle(hUrl);
+                InternetCloseHandle(hInet);
+                return result;
+            }
+        } else {
+            LoaderDiag("  WARN: HttpQueryInfo failed, proceeding anyway\n");
+        }
+    }
+
     std::vector<uint8_t> buf(65536);
     DWORD bytesRead = 0;
-    while (InternetReadFile(hUrl, buf.data(), 65536, &bytesRead) && bytesRead > 0) {
+    BOOL readOk = TRUE;
+    while ((readOk = InternetReadFile(hUrl, buf.data(), 65536, &bytesRead)) && bytesRead > 0) {
         size_t oldSize = result.size();
         result.resize(oldSize + bytesRead);
         memcpy(result.data() + oldSize, buf.data(), bytesRead);
+    }
+    // ★ v3.81: 区分 "下载完成" 和 "下载中断"
+    if (!readOk) {
+        DWORD err = GetLastError();
+        LoaderDiag("  FAIL: InternetReadFile error %u, partial=%zu bytes\n", err, result.size());
+        InternetCloseHandle(hUrl);
+        InternetCloseHandle(hInet);
+        result.clear(); // 抛弃不完整数据
+        return result;
     }
 
     InternetCloseHandle(hUrl);
@@ -380,7 +410,7 @@ static MinimalMapResult MinimalManualMap(const uint8_t* dllData, size_t dllSize)
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // ★ v3.38: 最早注册未处理异常处理器 (在 DllMain 之前, 捕获 loader 本体崩溃)
     SetUnhandledExceptionFilter(LoaderCrashHandler);
-    LoaderDiag("=== LOADER v3.38 START ===\n");
+    LoaderDiag("=== LOADER v3.81 START (BUILD 381: fix download silent truncation + HTTP status check + vsnprintf) ===\n");
 
     // v3.37: 强制管理员权限 — 自动以 runas + --elevated 重新启动
     LoaderDiag("STEP1: EnsureAdminPrivileges...\n");
