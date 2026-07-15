@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 388 (v3.88: patch RTCore64 binary device name to avoid collision)
+// BUILD: 400 (v3.102: 0xC3502580 as primary IOCTL + FMT_32B_RAW + GitHub URL)
 // ============================================================
 
 #include "stealth_core.h"
@@ -757,7 +757,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.40 DIAG START (BUILD 388) ===\n");
+    DiagLog("=== v3.40 DIAG START (BUILD 396) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)

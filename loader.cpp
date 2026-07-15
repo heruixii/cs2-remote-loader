@@ -97,7 +97,7 @@ static void EnsureAdminPrivileges() {
 // ============================================================
 
 // Payload 下载地址 — 从 GitHub 下载
-static const wchar_t* PAYLOAD_URL = L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/1dc1d4d/payload.dat";
+static const wchar_t* PAYLOAD_URL = L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/main/payload.dat";
 
 // 下载超时 (毫秒)
 static const DWORD DOWNLOAD_TIMEOUT_MS = 30000;
@@ -166,7 +166,7 @@ static std::vector<uint8_t> DownloadPayload(const wchar_t* url) {
     InternetSetOptionW(hInet, INTERNET_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
 
     HINTERNET hUrl = InternetOpenUrlW(hInet, cacheBustedUrl, nullptr, 0,
-                                      INTERNET_FLAG_SECURE | INTERNET_FLAG_RELOAD |
+                                      INTERNET_FLAG_RELOAD |
                                       INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_NO_UI, 0);
     if (!hUrl) {
         LoaderDiag("  FAIL: InternetOpenUrl err=%u\n", GetLastError());
@@ -410,7 +410,7 @@ static MinimalMapResult MinimalManualMap(const uint8_t* dllData, size_t dllSize)
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // ★ v3.38: 最早注册未处理异常处理器 (在 DllMain 之前, 捕获 loader 本体崩溃)
     SetUnhandledExceptionFilter(LoaderCrashHandler);
-    LoaderDiag("=== LOADER v3.81 START (BUILD 388: patch driver device name) ===\n");
+    LoaderDiag("=== LOADER v3.82 START (BUILD 400: 0xC3502580 primary IOCTL + GitHub URL) ===\n");
 
     // v3.37: 强制管理员权限 — 自动以 runas + --elevated 重新启动
     LoaderDiag("STEP1: EnsureAdminPrivileges...\n");

