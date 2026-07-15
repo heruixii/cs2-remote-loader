@@ -180,6 +180,9 @@ private:
     BYOVDDriverInfo m_driverInfo;
     std::wstring m_actualServiceName;  // v3.60: 实际使用的服务名 (可能含随机后缀)
     std::unique_ptr<PageTableWalker> m_pageTableWalker;
+
+    // ★ v3.84: ReadCR3 需要通过 IOCTL 扫描 PML4, 需要访问 device handle
+    friend uint64_t ReadCR3();
 };
 
 // ============================================================
