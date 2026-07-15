@@ -564,6 +564,10 @@ bool KernelMemoryAccessor::LoadDriver(const std::wstring& serviceName,
 }
 
 bool KernelMemoryAccessor::UnloadDriver(const std::wstring& serviceName) {
+    // ★ v3.87: NtUnloadDriver 需要 SeLoadDriverPrivilege, 否则静默失败
+    //         之前缺少此特权导致驱动无法卸载 → zombie \Device\RTCore64 残留
+    EnablePrivilege(L"SeLoadDriverPrivilege");
+
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (!ntdll) return false;
 
@@ -577,7 +581,9 @@ bool KernelMemoryAccessor::UnloadDriver(const std::wstring& serviceName) {
     us.Length = (USHORT)(regPath.size() * sizeof(wchar_t));
     us.MaximumLength = us.Length + sizeof(wchar_t);
 
-    return NT_SUCCESS(pNtUnloadDriver(&us));
+    NTSTATUS st = pNtUnloadDriver(&us);
+    ByovdDiag("BYOVD:UnloadDriver: %ls → 0x%08X\n", serviceName.c_str(), (uint32_t)st);
+    return NT_SUCCESS(st);
 }
 
 bool KernelMemoryAccessor::EnablePrivilege(const wchar_t* privilegeName) {
@@ -1004,71 +1010,87 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     // 4. 加载驱动
     ByovdDiag("BYOVD:Init: loading %ls (path=%ls)\n", actualServiceName.c_str(), actualPath.c_str());
     if (!LoadDriver(actualServiceName, actualPath)) {
-        // v3.67: STATUS_OBJECT_NAME_COLLISION 回退 — 
-        //        注册表中随机化服务键已被上次 Shutdown 清理,
-        //        但内核 \Driver\RTCore64 仍存在
-        //        用原始服务名重建注册表键, 卸载内核驱动, 再重试加载
-        ByovdDiag("BYOVD:Init: LoadDriver FAILED for %ls, trying original svc %ls to unload kernel object...\n",
-            actualServiceName.c_str(), driver.serviceName.c_str());
+        // ★ v3.87: STATUS_OBJECT_NAME_COLLISION 回退
+        //   根因: 上次运行 UnloadDriver 缺少 SeLoadDriverPrivilege → NtUnloadDriver 静默失败
+        //         → 驱动残留内核, 注册表被删 → driver object 成为 zombie
+        //   修复: 枚举 \Driver 内核对象目录, 找到 RTCore64 驱动对象, 重建注册表键并卸载
+        ByovdDiag("BYOVD:Init: LoadDriver FAILED for %ls (0xC0000035), scanning \\Driver for zombie...\n",
+            actualServiceName.c_str());
 
-        // 重建原始服务名的注册表键 (内核需要匹配的 ImagePath 来定位驱动)
-        std::wstring origKeyPath = L"SYSTEM\\CurrentControlSet\\Services\\" + driver.serviceName;
-        HKEY hOrigKey;
-        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, origKeyPath.c_str(),
-                            0, nullptr, REG_OPTION_NON_VOLATILE,
-                            KEY_ALL_ACCESS, nullptr, &hOrigKey, nullptr) == ERROR_SUCCESS) {
-            DWORD t=1, s=3, e=1;
-            RegSetValueExW(hOrigKey, L"Type", 0, REG_DWORD, (BYTE*)&t, sizeof(t));
-            RegSetValueExW(hOrigKey, L"Start", 0, REG_DWORD, (BYTE*)&s, sizeof(s));
-            RegSetValueExW(hOrigKey, L"ErrorControl", 0, REG_DWORD, (BYTE*)&e, sizeof(e));
-            // 关键: ImagePath 必须指向实际的驱动文件路径
-            wchar_t ntOrigPath[MAX_PATH * 2];
-            swprintf_s(ntOrigPath, L"\\??\\%ls", actualPath.c_str());
-            RegSetValueExW(hOrigKey, L"ImagePath", 0, REG_EXPAND_SZ,
-                           (BYTE*)ntOrigPath, (DWORD)((wcslen(ntOrigPath) + 1) * sizeof(wchar_t)));
-            RegCloseKey(hOrigKey);
-            ByovdDiag("BYOVD:Init: rebuilt %ls with ImagePath=%ls, unloading...\n",
-                driver.serviceName.c_str(), ntOrigPath);
+        // 枚举 \Driver 目录找到所有 RTCore64Svc* 驱动对象
+        struct OBJECT_DIRECTORY_INFORMATION {
+            UNICODE_STRING Name;
+            UNICODE_STRING TypeName;
+        };
 
-            // ★ v3.86: 用 SCM ControlService STOP 而非仅 NtUnloadDriver
-            //   后者可能不触发驱动的 Unload 例程, 导致 \Device\RTCore64 残留
-            //   SCM STOP → 驱动 Unload → IoDeleteDevice → 内核清理 → 下次加载成功
-            {
-                SC_HANDLE hSCM = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-                if (hSCM) {
-                    SC_HANDLE hSvc = OpenServiceW(hSCM, driver.serviceName.c_str(),
-                        SERVICE_STOP | SERVICE_QUERY_STATUS);
-                    if (hSvc) {
-                        SERVICE_STATUS ss = {};
-                        ControlService(hSvc, SERVICE_CONTROL_STOP, &ss);
-                        for (int w = 0; w < 30; w++) {
-                            if (!QueryServiceStatus(hSvc, &ss)) break;
-                            if (ss.dwCurrentState == SERVICE_STOPPED) break;
-                            Sleep(100);
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (ntdll) {
+            using NtOpenDirectoryObject_t = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES);
+            using NtQueryDirectoryObject_t = NTSTATUS(NTAPI*)(HANDLE, PVOID, ULONG, BOOLEAN, BOOLEAN, PULONG, PULONG);
+
+            auto pNtOpenDirectoryObject = (NtOpenDirectoryObject_t)GetProcAddress(ntdll, "NtOpenDirectoryObject");
+            auto pNtQueryDirectoryObject = (NtQueryDirectoryObject_t)GetProcAddress(ntdll, "NtQueryDirectoryObject");
+
+            if (pNtOpenDirectoryObject && pNtQueryDirectoryObject) {
+                UNICODE_STRING dirName;
+                RtlInitUnicodeString(&dirName, L"\\Driver");
+                OBJECT_ATTRIBUTES oa;
+                InitializeObjectAttributes(&oa, &dirName, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
+
+                HANDLE hDir = nullptr;
+                if (NT_SUCCESS(pNtOpenDirectoryObject(&hDir, 1 /* DIRECTORY_QUERY */, &oa))) {
+                    std::vector<BYTE> dirBuf(0x10000);
+                    ULONG ctx = 0, retLen = 0;
+                    NTSTATUS querySt;
+
+                    while (NT_SUCCESS(querySt = pNtQueryDirectoryObject(hDir, dirBuf.data(),
+                        (ULONG)dirBuf.size(), FALSE, FALSE, &ctx, &retLen))) {
+                        auto* entry = (OBJECT_DIRECTORY_INFORMATION*)dirBuf.data();
+                        if (entry->Name.Buffer && entry->Name.Length > 0) {
+                            std::wstring objName(entry->Name.Buffer, entry->Name.Length / sizeof(wchar_t));
+                            if (objName.find(L"RTCore64") == 0) {
+                                ByovdDiag("BYOVD:Init: found zombie driver \\Driver\\%ls, unloading...\n",
+                                    objName.c_str());
+
+                                // 重建注册表键 (NtUnloadDriver 需要 registry key 存在)
+                                std::wstring zKeyPath = L"SYSTEM\\CurrentControlSet\\Services\\" + objName;
+                                HKEY hZKey;
+                                if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, zKeyPath.c_str(),
+                                    0, nullptr, REG_OPTION_NON_VOLATILE,
+                                    KEY_ALL_ACCESS, nullptr, &hZKey, nullptr) == ERROR_SUCCESS) {
+                                    DWORD t=1, st=3, e=1;
+                                    RegSetValueExW(hZKey, L"Type", 0, REG_DWORD, (BYTE*)&t, sizeof(t));
+                                    RegSetValueExW(hZKey, L"Start", 0, REG_DWORD, (BYTE*)&st, sizeof(st));
+                                    RegSetValueExW(hZKey, L"ErrorControl", 0, REG_DWORD, (BYTE*)&e, sizeof(e));
+                                    wchar_t ntPath[MAX_PATH * 2];
+                                    swprintf_s(ntPath, L"\\??\\%ls", actualPath.c_str());
+                                    RegSetValueExW(hZKey, L"ImagePath", 0, REG_EXPAND_SZ,
+                                        (BYTE*)ntPath, (DWORD)((wcslen(ntPath) + 1) * sizeof(wchar_t)));
+                                    RegCloseKey(hZKey);
+
+                                    // ★ v3.87: 用找到的真实驱动对象名卸载
+                                    EnablePrivilege(L"SeLoadDriverPrivilege");
+                                    bool unloaded = UnloadDriver(objName);
+                                    ByovdDiag("BYOVD:Init: zombie unload \\Driver\\%ls → %d\n",
+                                        objName.c_str(), (int)unloaded);
+
+                                    RegDeleteTreeW(HKEY_LOCAL_MACHINE, zKeyPath.c_str());
+                                }
+                            }
                         }
-                        ByovdDiag("BYOVD:Init: SCM stop %ls → state=%u (was running=%d)\n",
-                            driver.serviceName.c_str(), ss.dwCurrentState,
-                            (int)(ss.dwCurrentState == SERVICE_RUNNING));
-                        CloseServiceHandle(hSvc);
-                    } else {
-                        ByovdDiag("BYOVD:Init: SCM OpenService %ls FAILED (err=%u)\n",
-                            driver.serviceName.c_str(), GetLastError());
+                        // 检查是否还有更多条目
+                        if (ctx == 0) break;
                     }
-                    CloseServiceHandle(hSCM);
+                    CloseHandle(hDir);
+                    ByovdDiag("BYOVD:Init: \\Driver scan done (status=0x%08X)\n", (uint32_t)querySt);
                 }
             }
-
-            UnloadDriver(driver.serviceName);
-            RegDeleteTreeW(HKEY_LOCAL_MACHINE, origKeyPath.c_str());
         }
 
         // 重试加载 (用随机化服务名)
         ByovdDiag("BYOVD:Init: retrying load %ls...\n", actualServiceName.c_str());
         if (!LoadDriver(actualServiceName, actualPath)) {
             ByovdDiag("BYOVD:Init: LoadDriver FAILED for %ls (retry)\n", actualServiceName.c_str());
-            // ★ v3.77: 不放弃 — \Device\RTCore64 僵尸对象可能来自首次加载,
-            //         IoCreateDevice 硬编码设备名导致后续 DriverEntry 必失败,
-            //         但驱动仍在内核中运行, 直接打开现有设备复用即可
             ByovdDiag("BYOVD:Init: trying to open existing device %ls (driver already in kernel)...\n",
                 driver.devicePath.c_str());
             goto try_open_device;
@@ -1117,6 +1139,8 @@ try_open_device:
 }
 
 void KernelMemoryAccessor::Shutdown() {
+    // ★ v3.87: NtUnloadDriver 需要 SeLoadDriverPrivilege
+    EnablePrivilege(L"SeLoadDriverPrivilege");
     m_active = false;
     m_pageTableWalker.reset();
     g_physMappings.clear();
