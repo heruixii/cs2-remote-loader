@@ -290,7 +290,10 @@ bool KernelMemoryAccessor::LoadDriver(const std::wstring& serviceName,
     std::wstring keyPath = L"SYSTEM\\CurrentControlSet\\Services\\" + serviceName;
     HKEY hKey;
 
-    // v3.55: 先删旧服务再重建 — 防止残留键导致 STATUS_OBJECT_NAME_INVALID
+    // v3.61: 先尝试卸载旧驱动 (需要 registry key 还未删除)
+    UnloadDriver(serviceName);
+
+    // v3.55: 删旧服务再重建 — 防止残留键导致 STATUS_OBJECT_NAME_INVALID
     RegDeleteTreeW(HKEY_LOCAL_MACHINE, keyPath.c_str());
     
     if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(),
@@ -668,6 +671,35 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
         }
     }
     m_actualServiceName = actualServiceName;  // store for cleanup
+
+    // v3.61: 先卸载原始服务名 — 清理上次残留的驱动对象 (RTCore64.sys 内部对象名固定, 
+    //        即使之前用了不同服务名加载, 内核中 \Driver\RTCore64 仍在)
+    //        如果 registry key 已删除, 临时重建以支持 NtUnloadDriver
+    if (actualServiceName != driver.serviceName) {
+        ByovdDiag("BYOVD:Init: pre-cleaning stale service %ls\n", driver.serviceName.c_str());
+
+        // 先试直接卸载 (需要 registry key 存在)
+        bool unloaded = UnloadDriver(driver.serviceName);
+
+        // 若失败, registry key 可能已被删 — 临时重建然后卸载
+        if (!unloaded) {
+            std::wstring keyPath = L"SYSTEM\\CurrentControlSet\\Services\\" + driver.serviceName;
+            HKEY hTempKey;
+            if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(),
+                                0, nullptr, REG_OPTION_NON_VOLATILE,
+                                KEY_ALL_ACCESS, nullptr, &hTempKey, nullptr) == ERROR_SUCCESS) {
+                DWORD t=1, s=3, e=1;
+                RegSetValueExW(hTempKey, L"Type", 0, REG_DWORD, (BYTE*)&t, sizeof(t));
+                RegSetValueExW(hTempKey, L"Start", 0, REG_DWORD, (BYTE*)&s, sizeof(s));
+                RegSetValueExW(hTempKey, L"ErrorControl", 0, REG_DWORD, (BYTE*)&e, sizeof(e));
+                RegSetValueExW(hTempKey, L"ImagePath", 0, REG_EXPAND_SZ,
+                               (BYTE*)actualPath.c_str(), (DWORD)(actualPath.size() * sizeof(wchar_t) + 2));
+                RegCloseKey(hTempKey);
+                UnloadDriver(driver.serviceName);
+                RegDeleteTreeW(HKEY_LOCAL_MACHINE, keyPath.c_str());
+            }
+        }
+    }
 
     // 4. 加载驱动
     ByovdDiag("BYOVD:Init: loading %ls (path=%ls)\n", actualServiceName.c_str(), actualPath.c_str());
