@@ -750,17 +750,12 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     std::wstring resolvedPath = EnsureDriverFile(driver.driverPath);
     const std::wstring& actualPath = resolvedPath.empty() ? driver.driverPath : resolvedPath;
 
-    // 3. v3.60: 若路径含随机后缀, 同步随机化服务名 — 避免 STATUS_OBJECT_NAME_COLLISION
-    std::wstring actualServiceName = driver.serviceName;
-    if (!resolvedPath.empty()) {
-        // 检测随机后缀: RTCore64_32F2.sys → 提取 _32F2
-        size_t dashPos = resolvedPath.find_last_of(L'_');
-        size_t dotPos = resolvedPath.find_last_of(L'.');
-        if (dashPos != std::wstring::npos && dotPos != std::wstring::npos && dashPos < dotPos) {
-            std::wstring suffix = resolvedPath.substr(dashPos, dotPos - dashPos); // e.g. "_32F2"
-            actualServiceName = driver.serviceName + suffix; // e.g. "RTCore64Svc_32F2"
-        }
-    }
+    // 3. ★ v3.76: 始终随机化服务名 — 防止 \Driver\<ServiceName> 僵尸内核对象冲突
+    //   之前的逻辑依赖文件名含 '_' 后缀，但 EnsureDriverFile 首试即写原名，
+    //   导致 actualServiceName 永远 = "RTCore64Svc"，NtLoadDriver 必返回 0xC0000035
+    wchar_t suffix[16];
+    swprintf_s(suffix, L"_%04X", (rand() & 0xFFFF));
+    std::wstring actualServiceName = driver.serviceName + suffix;
     m_actualServiceName = actualServiceName;  // store for cleanup
 
     // v3.66: 扫描注册表, 卸载所有残留的 RTCore64 服务 (之前的随机化服务名)
