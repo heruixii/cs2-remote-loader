@@ -156,39 +156,9 @@ const BYOVDDriverInfo BYOVDDrivers::RTCore64 = {
     true
 };
 
-const BYOVDDriverInfo BYOVDDrivers::Gdrv = {
-    L"gdrv",
-    L"Gigabyte Kernel Driver",
-    L"\\\\.\\gdrv",
-    L"gdrv.sys",
-    0xC3502808,   // 内核内存拷贝 IOCTL
-    false
-};
-
-const BYOVDDriverInfo BYOVDDrivers::WinRing0 = {
-    L"WinRing0Svc",
-    L"WinRing0 OpenLibSys Driver",
-    L"\\\\.\\WinRing0_1_2_0",
-    L"WinRing0x64.sys",
-    0x9C402580,   // 物理内存映射 IOCTL
-    true
-};
-
-const BYOVDDriverInfo BYOVDDrivers::InpOut = {
-    L"InpOutSvc",
-    L"Logix4U InpOut Driver",
-    L"\\\\.\\inpoutx64",
-    L"inpoutx64.sys",
-    0x9C40A000,   // 物理内存 R/W IOCTL
-    true
-};
-
-// v3.34: 驱动候选列表 (按可用性和安全性排序)
+// v3.57: 仅 RTCore64 — 其他驱动无嵌入文件, 从候选列表移除
 static const BYOVDDriverInfo* g_driverCandidates[] = {
     &BYOVDDrivers::RTCore64,
-    &BYOVDDrivers::Gdrv,
-    &BYOVDDrivers::WinRing0,
-    &BYOVDDrivers::InpOut,
 };
 
 const BYOVDDriverInfo* BYOVDDrivers::GetAllCandidates() {

@@ -69,21 +69,9 @@ struct BYOVDDriverInfo {
 };
 
 namespace BYOVDDrivers {
-    // RTCore64.sys — MSI Afterburner (最常用)
+    // RTCore64.sys — MSI Afterburner (唯一嵌入驱动)
     // 暴露: 任意物理/虚拟内存 R/W via IOCTL 0xC3502580 / 0xC3502588
     extern const BYOVDDriverInfo RTCore64;
-
-    // gdrv.sys — Gigabyte (备选1)
-    // 暴露: 13 IOCTL, 包括内核 memcpy
-    extern const BYOVDDriverInfo Gdrv;
-
-    // WinRing0x64.sys — OpenLibSys (备选2, 常见于硬件监控工具)
-    // 暴露: IOCTL 0x9C402580 物理内存映射
-    extern const BYOVDDriverInfo WinRing0;
-
-    // inpoutx64.sys — Logix4U (备选3, 并行端口驱动)
-    // 暴露: IOCTL 0x9C40A000 物理内存 R/W
-    extern const BYOVDDriverInfo InpOut;
 
     // 获取所有可用驱动候选列表 (已排优先级)
     const BYOVDDriverInfo* GetAllCandidates();
