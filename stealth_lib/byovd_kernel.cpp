@@ -300,8 +300,8 @@ bool KernelMemoryAccessor::LoadDriver(const std::wstring& serviceName,
     // 如果服务已存在, 尝试先使用
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(), 0,
                       KEY_READ, &hKey) == ERROR_SUCCESS) {
+        ByovdDiag("BYOVD:LoadDriver: service key exists, using existing\n");
         RegCloseKey(hKey);
-        // 服务已存在, 尝试直接加载
     } else {
         if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(),
                             0, nullptr, REG_OPTION_NON_VOLATILE,
@@ -357,6 +357,7 @@ bool KernelMemoryAccessor::LoadDriver(const std::wstring& serviceName,
     us.MaximumLength = us.Length + sizeof(wchar_t);
 
     NTSTATUS status = pNtLoadDriver(&us);
+    ByovdDiag("BYOVD:LoadDriver: NtLoadDriver → 0x%08X\n", status);
     // STATUS_IMAGE_ALREADY_LOADED (0xC000010E) 也是成功
     return NT_SUCCESS(status) || status == 0xC000010E;
 }
