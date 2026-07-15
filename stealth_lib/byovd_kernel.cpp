@@ -829,12 +829,18 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
         ByovdDiag("BYOVD:Init: retrying load %ls...\n", actualServiceName.c_str());
         if (!LoadDriver(actualServiceName, actualPath)) {
             ByovdDiag("BYOVD:Init: LoadDriver FAILED for %ls (retry)\n", actualServiceName.c_str());
-            return false;
+            // ★ v3.77: 不放弃 — \Device\RTCore64 僵尸对象可能来自首次加载,
+            //         IoCreateDevice 硬编码设备名导致后续 DriverEntry 必失败,
+            //         但驱动仍在内核中运行, 直接打开现有设备复用即可
+            ByovdDiag("BYOVD:Init: trying to open existing device %ls (driver already in kernel)...\n",
+                driver.devicePath.c_str());
+            goto try_open_device;
         }
     }
     ByovdDiag("BYOVD:Init: LoadDriver OK\n");
 
-    // 4. 打开设备
+    // 4. 打开设备 (新加载或复用已存在)
+try_open_device:
     m_hDevice = CreateFileW(driver.devicePath.c_str(),
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -846,7 +852,8 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
         UnloadDriver(m_actualServiceName);
         return false;
     }
-    ByovdDiag("BYOVD:Init: device opened OK\n");
+    ByovdDiag("BYOVD:Init: device opened OK (reused=%d)\n",
+        m_actualServiceName.empty() ? 1 : 0);
 
     m_active = true;
     m_ntosBase = GetNtoskrnlBase();
