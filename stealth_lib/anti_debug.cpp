@@ -586,8 +586,8 @@ DebugCheckResult AntiDebug::CheckDebuggerHandles() {
     // ManualMap 下 SysQuerySystemInformation 可能返回垃圾数据导致越界崩溃
     // 边界检查: 确保 NumberOfHandles 不会超出 buffer
     {
-        size_t headerSize = sizeof(handleInfo->NumberOfHandles) + sizeof(handleInfo->Reserved);
-        size_t entrySize = sizeof(STEALTH_HANDLE_TABLE_ENTRY);
+        size_t headerSize = sizeof(handleInfo->NumberOfHandles);  // 4 bytes, no Reserved
+        size_t entrySize = sizeof(STEALTH_HANDLE_TABLE_ENTRY);   // 32 bytes
         ULONG maxHandles = (ULONG)((bufferSize > headerSize) ? ((bufferSize - headerSize) / entrySize) : 0);
         if (handleInfo->NumberOfHandles > maxHandles) {
             return DebugCheckResult::Error;

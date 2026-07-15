@@ -70,25 +70,27 @@ typedef struct _THREAD_BASIC_INFORMATION {
 } THREAD_BASIC_INFORMATION, *PTHREAD_BASIC_INFORMATION;
 #endif
 
-// ---- SYSTEM_HANDLE_INFORMATION 完整版 ----
-// MinGW 的 SYSTEM_HANDLE_INFORMATION 只有 Count 字段, 这里提供完整版
-// 不使用 #define 覆盖 typedef (MinGW 中它是 typedef 不是宏)
-// 改用独立命名, 代码中通过 reinterpret_cast 使用
+// ---- SYSTEM_HANDLE_INFORMATION 完整版 (x64 Windows 10/11) ----
+// SystemHandleInformation (0x10) 返回 32-byte 条目:
+//   ULONG UniqueProcessId(4) + USHORT CreatorBackTraceIndex(2) + UCHAR ObjectTypeIndex(1)
+//   + UCHAR HandleAttributes(1) + USHORT HandleValue(2) → 共 10 bytes
+//   + 6 bytes pad → PVOID Object 在 offset 16
+//   + ULONG GrantedAccess(4) → 共 24 bytes → +4 pad → 总共 32 bytes
 typedef struct _STEALTH_HANDLE_TABLE_ENTRY {
-    ULONG    UniqueProcessId;
-    UCHAR    ObjectTypeIndex;
-    UCHAR    HandleAttributes;
-    USHORT   HandleValue;
-    PVOID    Object;
-    ACCESS_MASK GrantedAccess;
-    ULONG    CreatorBackTraceIndex;
-    ULONG    Reserved;
+    ULONG    UniqueProcessId;       // offset 0 (4 bytes)
+    USHORT   CreatorBackTraceIndex; // offset 4 (2 bytes)
+    UCHAR    ObjectTypeIndex;       // offset 6
+    UCHAR    HandleAttributes;      // offset 7
+    USHORT   HandleValue;           // offset 8 (2 bytes)
+    // 6 bytes implicit padding here for 8-byte alignment
+    PVOID    Object;                // offset 16 (8 bytes)
+    ACCESS_MASK GrantedAccess;      // offset 24 (4 bytes)
+    // 4 bytes implicit pad → total 32 bytes
 } STEALTH_HANDLE_TABLE_ENTRY, *PSTEALTH_HANDLE_TABLE_ENTRY;
 
 typedef struct _STEALTH_HANDLE_INFO {
-    ULONG    NumberOfHandles;
-    ULONG    Reserved;
-    STEALTH_HANDLE_TABLE_ENTRY Handles[1];
+    ULONG    NumberOfHandles;       // offset 0 (4 bytes)
+    STEALTH_HANDLE_TABLE_ENTRY Handles[1];  // offset 4 — 直接, 无 Reserved!
 } STEALTH_HANDLE_INFO, *PSTEALTH_HANDLE_INFO;
 
 // ---- LDR_DATA_TABLE_ENTRY 完整版 ----
