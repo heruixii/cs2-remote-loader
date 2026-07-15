@@ -150,31 +150,38 @@ static bool IsValidPML4(HANDLE hDevice, uint32_t ioctlCode,
 
 // 通过 IOCTL 扫描物理内存寻找 PML4 表物理地址
 static uint64_t FindPML4Physical(HANDLE hDevice, uint32_t ioctlCode) {
-    // PML4 通常在低物理地址 (非分页池 → 前 2GB)
-    // 扫描策略: 先快速扫前 64MB, 未找到则扩展到 1GB
+    // ★ v3.85: 先验证 IOCTL 是否真的可用 (避免在僵尸驱动上白扫描)
+    {
+        uint8_t* testVA = nullptr;
+        bool testOk = MapPhysicalRaw(hDevice, ioctlCode, 0x1000, &testVA);
+        ByovdDiag("BYOVD:FindPML4: IOCTL test phys=0x1000 ok=%d va=0x%llX\n",
+                  (int)testOk, (unsigned long long)(uintptr_t)testVA);
+        if (!testOk) {
+            ByovdDiag("BYOVD:FindPML4: IOCTL FAILED — driver zombie?\n");
+            return 0; // IOCTL 不可用, 无需扫描
+        }
+    }
+
+    // PML4 通常在低物理地址 (非分页池)
+    // 扫描前 128MB (32K 页), 每 4MB 输出一次进度
     uint64_t pml4Entries[512]; // 栈上缓冲区
+    const uint64_t SCAN_LIMIT = 0x8000000; // 128 MB
 
-    // 第1轮: 前 64MB (16K 页), 步进 0x1000
-    for (uint64_t phys = 0x1000; phys < 0x4000000; phys += 0x1000) {
+    for (uint64_t phys = 0x1000; phys < SCAN_LIMIT; phys += 0x1000) {
+        // 每 4MB (1024 页) 输出进度
+        if ((phys & 0x3FFFFF) == 0x1000) {
+            ByovdDiag("BYOVD:FindPML4: scanning @ phys=0x%llX / 0x%llX...\n",
+                      (unsigned long long)phys, (unsigned long long)SCAN_LIMIT);
+        }
+
         if (IsValidPML4(hDevice, ioctlCode, phys, pml4Entries)) {
-            ByovdDiag("BYOVD:FindPML4: found at phys=0x%llX "
-                      "(scanned %llu pages)\n",
-                      (unsigned long long)phys,
-                      (unsigned long long)(phys >> 12));
+            ByovdDiag("BYOVD:FindPML4: FOUND at phys=0x%llX (scanned %llu pages)\n",
+                      (unsigned long long)phys, (unsigned long long)(phys >> 12));
             return phys;
         }
     }
 
-    // 第2轮: 扩展到 1GB
-    for (uint64_t phys = 0x4000000; phys < 0x40000000; phys += 0x1000) {
-        if (IsValidPML4(hDevice, ioctlCode, phys, pml4Entries)) {
-            ByovdDiag("BYOVD:FindPML4: found at phys=0x%llX "
-                      "(extended scan)\n",
-                      (unsigned long long)phys);
-            return phys;
-        }
-    }
-
+    ByovdDiag("BYOVD:FindPML4: NOT FOUND in 128MB scan range\n");
     return 0;
 }
 
