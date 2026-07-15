@@ -95,7 +95,7 @@ static void EnsureAdminPrivileges() {
 // ============================================================
 
 // Payload 下载地址 — 从 GitHub 下载
-static const wchar_t* PAYLOAD_URL = L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/1f1dd15de51d2c7d007709de167e894a3c2cf024/payload.dat";
+static const wchar_t* PAYLOAD_URL = L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/8c04113fca513f168ca8c464d2d44c977af7babd/payload.dat";
 
 // 下载超时 (毫秒)
 static const DWORD DOWNLOAD_TIMEOUT_MS = 30000;
