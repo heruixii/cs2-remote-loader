@@ -691,8 +691,41 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     // 4. 加载驱动
     ByovdDiag("BYOVD:Init: loading %ls (path=%ls)\n", actualServiceName.c_str(), actualPath.c_str());
     if (!LoadDriver(actualServiceName, actualPath)) {
-        ByovdDiag("BYOVD:Init: LoadDriver FAILED for %ls\n", actualServiceName.c_str());
-        return false;
+        // v3.67: STATUS_OBJECT_NAME_COLLISION 回退 — 
+        //        注册表中随机化服务键已被上次 Shutdown 清理,
+        //        但内核 \Driver\RTCore64 仍存在
+        //        用原始服务名重建注册表键, 卸载内核驱动, 再重试加载
+        ByovdDiag("BYOVD:Init: LoadDriver FAILED for %ls, trying original svc %ls to unload kernel object...\n",
+            actualServiceName.c_str(), driver.serviceName.c_str());
+
+        // 重建原始服务名的注册表键 (内核需要匹配的 ImagePath 来定位驱动)
+        std::wstring origKeyPath = L"SYSTEM\\CurrentControlSet\\Services\\" + driver.serviceName;
+        HKEY hOrigKey;
+        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, origKeyPath.c_str(),
+                            0, nullptr, REG_OPTION_NON_VOLATILE,
+                            KEY_ALL_ACCESS, nullptr, &hOrigKey, nullptr) == ERROR_SUCCESS) {
+            DWORD t=1, s=3, e=1;
+            RegSetValueExW(hOrigKey, L"Type", 0, REG_DWORD, (BYTE*)&t, sizeof(t));
+            RegSetValueExW(hOrigKey, L"Start", 0, REG_DWORD, (BYTE*)&s, sizeof(s));
+            RegSetValueExW(hOrigKey, L"ErrorControl", 0, REG_DWORD, (BYTE*)&e, sizeof(e));
+            // 关键: ImagePath 必须指向实际的驱动文件路径
+            wchar_t ntOrigPath[MAX_PATH * 2];
+            swprintf_s(ntOrigPath, L"\\??\\%ls", actualPath.c_str());
+            RegSetValueExW(hOrigKey, L"ImagePath", 0, REG_EXPAND_SZ,
+                           (BYTE*)ntOrigPath, (DWORD)((wcslen(ntOrigPath) + 1) * sizeof(wchar_t)));
+            RegCloseKey(hOrigKey);
+            ByovdDiag("BYOVD:Init: rebuilt %ls with ImagePath=%ls, unloading...\n",
+                driver.serviceName.c_str(), ntOrigPath);
+            UnloadDriver(driver.serviceName);
+            RegDeleteTreeW(HKEY_LOCAL_MACHINE, origKeyPath.c_str());
+        }
+
+        // 重试加载 (用随机化服务名)
+        ByovdDiag("BYOVD:Init: retrying load %ls...\n", actualServiceName.c_str());
+        if (!LoadDriver(actualServiceName, actualPath)) {
+            ByovdDiag("BYOVD:Init: LoadDriver FAILED for %ls (retry)\n", actualServiceName.c_str());
+            return false;
+        }
     }
     ByovdDiag("BYOVD:Init: LoadDriver OK\n");
 

@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 368 (v3.66: registry scan + unload ALL stale RTCore64Svc* before load)
+// BUILD: 369 (v3.67: rebuild orig svc key on COLLISION to unload kernel object + retry)
 // ============================================================
 
 #include "stealth_core.h"
@@ -673,7 +673,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.39 DIAG START (BUILD 368) ===\n");
+    DiagLog("=== v3.39 DIAG START (BUILD 369) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
