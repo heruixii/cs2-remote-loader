@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 377 (v3.77: reuse existing \Device\RTCore64 device when NtLoadDriver fails)
+// BUILD: 378 (v3.78: proactive restore on IOCTL overlap + save orig prot + keep backup forever + register backup as protected)
 // ============================================================
 
 #include "stealth_core.h"
@@ -60,10 +60,11 @@ static void DiagLog(const char* fmt, ...) {
 // 崩溃捕获 — 帮助定位 Init 期间的 crash
 static HMODULE g_diagDllBase;
 static SIZE_T g_diagDllSize;
-// ★ v3.70: VEH 自愈 — 备份缓冲区, 崩溃时自动恢复代码
-static uint8_t* g_backupBuf = nullptr;
-static SIZE_T   g_backupLen = 0;
-static uint8_t* g_backupCodeBase = nullptr; // 备份对应的 DLL 代码基址
+// ★ v3.70/v3.78: VEH 自愈 — 备份缓冲区 (非 static, byovd_kernel.cpp 通过 extern 引用)
+uint8_t* g_backupBuf = nullptr;
+SIZE_T   g_backupLen = 0;
+uint8_t* g_backupCodeBase = nullptr;
+void* g_vehHandlerPageVA = nullptr; // ★ v3.78: VEH handler 所在页 VA (extern 导出)
 
 static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     uint64_t crashAddr = (uint64_t)ep->ExceptionRecord->ExceptionAddress;
@@ -74,19 +75,23 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     DiagLog("CRASH: code=0x%08X addr=0x%llX off=%llX\n",
         code, crashAddr, offset);
 
-    // ★ v3.70: VEH 自愈 — 捕获 BYOVD IOCTL 导致的代码污染
-    //   STATUS_PRIVILEGED_INSTRUCTION (0xC0000096): RTCore64 映射
-    //   物理内存覆盖了 DLL 代码页, 从备份恢复后继续执行
-    if (code == 0xC0000096 && g_backupBuf && g_backupCodeBase && g_backupLen > 0) {
-        DiagLog("VEH-SELFHEAL: restoring %llu bytes from backup@0x%llX → code@0x%llX\n",
+    // ★ v3.78: VEH 自愈 — 捕获 BYOVD IOCTL 导致的代码/数据污染
+    //   STATUS_PRIVILEGED_INSTRUCTION (0xC0000096): 执行了被物理映射覆盖的代码页
+    //   STATUS_ACCESS_VIOLATION (0xC0000005): 访问了被破坏的 .data/.bss 页
+    bool isPrivInstr = (code == 0xC0000096);
+    bool isAccessViol = (code == 0xC0000005);
+    if ((isPrivInstr || isAccessViol) && g_backupBuf && g_backupCodeBase && g_backupLen > 0) {
+        DiagLog("VEH-SELFHEAL: restoring %llu bytes from backup@0x%llX → code@0x%llX (cause=%s)\n",
             (unsigned long long)g_backupLen,
             (unsigned long long)g_backupBuf,
-            (unsigned long long)g_backupCodeBase);
+            (unsigned long long)g_backupCodeBase,
+            isPrivInstr ? "PRIV_INSTR" : "ACCESS_VIOL");
 
-        // ★ v3.70 关键: 逐页恢复, 跳过 VEH 处理器自身所在页面
-        //   单次 VirtualProtect(全部, READWRITE) 会把当前执行页也改为
-        //   不可执行, 导致下一条指令 (memcpy) 无法 fetch → 嵌套异常
+        // ★ v3.70/v3.78: 逐页恢复, 保存/恢复原始保护
+        //   v3.70: 跳过 VEH 处理器自身所在页面 (未被污染, 保护不变)
+        //   v3.78: 不再强制全部 PAGE_EXECUTE_READ — .data/.bss 必须保持 PAGE_READWRITE
         uintptr_t handlerPage = ((uintptr_t)&DiagVehHandler) & ~0xFFFULL;
+        g_vehHandlerPageVA = (void*)handlerPage;  // 导出供 byovd_kernel.cpp 使用
         uintptr_t codeBase = (uintptr_t)g_backupCodeBase;
         SIZE_T codeLen = g_backupLen;
         const SIZE_T PAGE = 0x1000;
@@ -102,9 +107,16 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
             }
 
             DWORD oldProt;
-            VirtualProtect((void*)pageVA, chunk, PAGE_READWRITE, &oldProt);
+            if (!VirtualProtect((void*)pageVA, chunk, PAGE_READWRITE, &oldProt)) {
+                // 页可能无效 (guard/未提交), 跳过
+                continue;
+            }
             memcpy((void*)pageVA, g_backupBuf + off, chunk);
-            VirtualProtect((void*)pageVA, chunk, PAGE_EXECUTE_READ, &oldProt);
+            // ★ v3.78: 恢复原始保护, 而非强制 EXECUTE_READ
+            DWORD restoreProt = (oldProt == PAGE_READWRITE || oldProt == PAGE_READONLY
+                || oldProt == PAGE_WRITECOPY || oldProt == PAGE_EXECUTE_WRITECOPY)
+                ? PAGE_READWRITE : PAGE_EXECUTE_READ;
+            VirtualProtect((void*)pageVA, chunk, restoreProt, &oldProt);
             restored++;
         }
 
@@ -718,7 +730,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.39 DIAG START (BUILD 377) ===\n");
+    DiagLog("=== v3.39 DIAG START (BUILD 378) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
@@ -891,6 +903,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 }
                 DiagLog("BYOVD: code backup saved [0x%llX, %llu bytes] checksum=0x%08X\n",
                     (unsigned long long)codeBackupBuf, (unsigned long long)codeLen, preChecksum);
+                // ★ v3.78: 注册备份缓冲区为保护区, 防止 IOCTL 映射覆盖备份本身
+                stealth::KernelMemoryAccessor::RegisterCodeRegion(codeBackupBuf, codeLen);
             }
         }
 
@@ -912,14 +926,10 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             } else {
                 DiagLog("BYOVD: code integrity OK (checksum=0x%08X)\n", postChecksum);
             }
-            // ★ v3.75: 清除 VEH 自愈全局变量 (不再需要恢复)
-            g_backupBuf = nullptr;
-            g_backupLen = 0;
-            g_backupCodeBase = nullptr;
-            // 释放备份缓冲区
-            if (codeBackupBuf) {
-                VirtualFree(codeBackupBuf, 0, MEM_RELEASE);
-            }
+            // ★ v3.78: 永久保留备份 — 主循环中 DKOM/IOCTL 仍可能污染代码,
+            //   VEH handler 和 MapPhysical 重叠恢复依赖此备份
+            //   同时也保留 g_backupBuf/g_backupLen/g_backupCodeBase 给 byovd_kernel.cpp 使用
+            //   (不再释放 codeBackupBuf, 由进程退出时 OS 自动回收)
         }
 
         // ★ v3.74: 释放 guard pages — 物理映射已分配完毕, 释放预留空间

