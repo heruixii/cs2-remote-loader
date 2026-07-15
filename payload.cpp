@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 378 (v3.78: proactive restore on IOCTL overlap + save orig prot + keep backup forever + register backup as protected)
+// BUILD: 379 (v3.79: backup BEFORE guard scan + extended scan range covering backup VA)
 // ============================================================
 
 #include "stealth_core.h"
@@ -730,7 +730,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.39 DIAG START (BUILD 378) ===\n");
+    DiagLog("=== v3.39 DIAG START (BUILD 379) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
@@ -826,13 +826,37 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     // v3.24: 优先 System32\drivers, 回退嵌入提取到 %TEMP%
     // ObRegisterCallbacks/ProcessNotify/ImageNotify → 全部失效
     //
-    // ★ v3.69: 注册 DLL 代码区域防止 RTCore64 IOCTL 映射覆盖
-    //   先计算 DLL 代码校验和, After EnableAll 再校验
+    // ★ v3.79: BYOVD 初始化块 — 重新排序以修复备份缓冲区被 IOCTL 覆盖的致命 bug
+    //   BUILD 377/378 的 bug: 备份在 Guard scan 之后分配 → 备份 VA 在 scan 范围外
+    //   → IOCTL 映射物理内存到备份 VA → 备份腐败 → VEH 用腐败备份恢复 → 二次崩溃
+    //   v3.79 修复: (1) 先分配备份 (2) Guard scan 扩展覆盖备份 VA
     {
-        // ★ v3.74 Layer 1: 强化 Guard Pages — 在 BYOVD IOCTL 之前
-        //   用 VirtualQuery 扫描 DLL ±64MB 所有空闲区域并全部预留,
-        //   强制驱动物理内存映射分配到远离 DLL 的安全 VA
-        //   (之前只预留 2MB 固定地址, 常因相邻分配而失败)
+        // ★ v3.79 Step 0: 先分配备份缓冲区 — 必须在 Guard scan 之前
+        //   否则 Guard scan 不知道备份的 VA, 无法保护备份
+        uint32_t preChecksum = 0;
+        uint8_t* codeBackupBuf = nullptr;
+        SIZE_T   codeLen = 0;  // 供 guard scan 使用
+        if (dllBase && dllSize > 0x1000) {
+            uint8_t* code = (uint8_t*)dllBase + 0x1000;
+            codeLen = dllSize - 0x1000;
+            codeBackupBuf = (uint8_t*)VirtualAlloc(nullptr, codeLen, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+            if (codeBackupBuf) {
+                memcpy(codeBackupBuf, code, codeLen);
+                g_backupBuf = codeBackupBuf;
+                g_backupLen = codeLen;
+                g_backupCodeBase = code;
+                for (SIZE_T i = 0; i < codeLen; i += 4) {
+                    preChecksum ^= *(uint32_t*)(code + i);
+                }
+                DiagLog("BYOVD: code backup saved [0x%llX, %llu bytes] checksum=0x%08X\n",
+                    (unsigned long long)codeBackupBuf, (unsigned long long)codeLen, preChecksum);
+                // ★ v3.78: 注册备份缓冲区为保护区 (检测 IOCTL 重叠)
+                stealth::KernelMemoryAccessor::RegisterCodeRegion(codeBackupBuf, codeLen);
+            }
+        }
+
+        // ★ v3.74/v3.79 Layer 1: 强化 Guard Pages — 在 BYOVD IOCTL 之前
+        //   v3.79: 扩展扫描范围同时覆盖 DLL 和备份缓冲区
         struct GuardRegion { void* addr; SIZE_T size; };
         std::vector<GuardRegion> guardRegions;
 
@@ -840,9 +864,20 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             uintptr_t dllStart = (uintptr_t)dllBase;
             uintptr_t dllEnd   = dllStart + dllSize;
             const SIZE_T SCAN_MARGIN = 0x4000000; // ±64MB
-            uintptr_t scanStart = (dllStart > SCAN_MARGIN) ? (dllStart - SCAN_MARGIN) : 0x10000;
-            uintptr_t scanEnd   = dllEnd + SCAN_MARGIN;
-            if (scanEnd < dllEnd) scanEnd = (uintptr_t)-1; // overflow guard
+
+            // ★ v3.79: 扩展扫描范围覆盖备份缓冲区
+            //   备份与 DLL 可能相距甚远 (VirtualAlloc 可能分配到 DLL+89MB),
+            //   需要确保扫描范围同时覆盖两者
+            uintptr_t backupStart = codeBackupBuf ? (uintptr_t)codeBackupBuf : 0;
+            uintptr_t backupEnd   = (codeBackupBuf && codeLen > 0) ? (backupStart + codeLen) : 0;
+            uintptr_t minAddr = dllStart;
+            uintptr_t maxAddr = dllEnd;
+            if (backupStart && backupStart < minAddr) minAddr = backupStart;
+            if (backupEnd   && backupEnd   > maxAddr) maxAddr = backupEnd;
+
+            uintptr_t scanStart = (minAddr > SCAN_MARGIN) ? (minAddr - SCAN_MARGIN) : 0x10000;
+            uintptr_t scanEnd   = maxAddr + SCAN_MARGIN;
+            if (scanEnd < maxAddr) scanEnd = (uintptr_t)-1; // overflow guard
 
             MEMORY_BASIC_INFORMATION mbi;
             uintptr_t addr = scanStart;
@@ -866,9 +901,10 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 }
                 addr = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
             }
-            DiagLog("BYOVD: reserved %llu guard regions [0x%llX - 0x%llX]\n",
+            DiagLog("BYOVD: reserved %llu guard regions [0x%llX - 0x%llX] (backup@0x%llX dll@0x%llX)\n",
                 (unsigned long long)guardRegions.size(),
-                (unsigned long long)scanStart, (unsigned long long)scanEnd);
+                (unsigned long long)scanStart, (unsigned long long)scanEnd,
+                (unsigned long long)backupStart, (unsigned long long)dllStart);
         }
 
         // 注册所有 DLL 代码页为保护区 (跳过 PE 头第0页)
@@ -878,34 +914,6 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             DiagLog("BYOVD: registered DLL code region [0x%llX - 0x%llX]\n",
                 (unsigned long long)((uintptr_t)dllBase + 0x1000),
                 (unsigned long long)((uintptr_t)dllBase + dllSize));
-        }
-
-        // ★ v3.75: 预校验 + 备份 — 仅在 VEH 捕获到真实崩溃时恢复
-        //   注意：校验覆盖整个 DLL 镜像 (含 .data/.bss), 运行时数据变化是正常的
-        //   不能用校验和不匹配来触发恢复 — 那会导致误报和二次崩溃
-        uint32_t preChecksum = 0;
-        uint8_t* codeBackupBuf = nullptr;
-        if (dllBase && dllSize > 0x1000) {
-            uint8_t* code = (uint8_t*)dllBase + 0x1000;
-            SIZE_T codeLen = dllSize - 0x1000;
-            // 分配备份缓冲区 (在安全的独立内存区域)
-            codeBackupBuf = (uint8_t*)VirtualAlloc(nullptr, codeLen, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
-            if (codeBackupBuf) {
-                memcpy(codeBackupBuf, code, codeLen);
-                // ★ v3.75: 先设置 VEH 自愈全局变量, 再计算校验和
-                //   避免全局变量变更导致校验和误报
-                g_backupBuf = codeBackupBuf;
-                g_backupLen = codeLen;
-                g_backupCodeBase = code;
-                // 现在计算校验和 (包含已初始化的全局变量)
-                for (SIZE_T i = 0; i < codeLen; i += 4) {
-                    preChecksum ^= *(uint32_t*)(code + i);
-                }
-                DiagLog("BYOVD: code backup saved [0x%llX, %llu bytes] checksum=0x%08X\n",
-                    (unsigned long long)codeBackupBuf, (unsigned long long)codeLen, preChecksum);
-                // ★ v3.78: 注册备份缓冲区为保护区, 防止 IOCTL 映射覆盖备份本身
-                stealth::KernelMemoryAccessor::RegisterCodeRegion(codeBackupBuf, codeLen);
-            }
         }
 
         auto kernelResult = stealth::KernelDefense::EnableAll();
