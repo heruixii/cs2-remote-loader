@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 379 (v3.79: backup BEFORE guard scan + extended scan range covering backup VA)
+// BUILD: 380 (v3.80: fix basic.exe delete-after-hollow preventing retry + move guard-free after CleanupInjectionTraces)
 // ============================================================
 
 #include "stealth_core.h"
@@ -334,7 +334,7 @@ static bool LaunchBasicESP() {
 
             DiagLog("OK: basic.exe hollowed into rundll32.exe (PID=%u, 0x%llX)\n",
                 pi.dwProcessId, (unsigned long long)newImageBase);
-            DeleteFileW(exePath);
+            // ★ v3.80: 保留 basic.exe 文件以支持崩溃重连, 不再删除
             Sleep(RandomJitter(1500, 3000));
             return true;
         }
@@ -730,7 +730,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.39 DIAG START (BUILD 379) ===\n");
+    DiagLog("=== v3.39 DIAG START (BUILD 380) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
@@ -940,31 +940,34 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             //   (不再释放 codeBackupBuf, 由进程退出时 OS 自动回收)
         }
 
-        // ★ v3.74: 释放 guard pages — 物理映射已分配完毕, 释放预留空间
-        for (auto& g : guardRegions) {
-            VirtualFree(g.addr, 0, MEM_RELEASE);
-        }
-        DiagLog("BYOVD: freed %llu guard regions\n",
-            (unsigned long long)guardRegions.size());
-
         DiagLog("OK: BYOVD driver=%d ob=%d proc=%d img=%d thread=%d\n",
             (int)kernelResult.driverLoaded,
             kernelResult.obCallbacksRemoved,
             kernelResult.processCallbacksRemoved,
             kernelResult.imageCallbacksRemoved,
             kernelResult.threadCallbacksRemoved);
-    }
 
-    // v3.32: BYOVD 已加载(EAC内核回调已移除), 现在安全启动基础.exe
-    //        基础.exe 将调用 OpenProcess+ReadProcessMemory,
-    //        这些操作不再被 EAC 内核回调监控
-    {
-        bool basicOk = LaunchBasicESP();
-        DiagLog("LaunchBasicESP: %s\n", basicOk ? "SUCCESS" : "FAILED");
-        // v3.32-plus: 基础.exe 注入后清理痕迹 (PEB Ldr unlinking)
-        if (basicOk) {
-            CleanupInjectionTraces();
+        // v3.32: BYOVD 已加载(EAC内核回调已移除), 现在安全启动基础.exe
+        //        基础.exe 将调用 OpenProcess+ReadProcessMemory,
+        //        这些操作不再被 EAC 内核回调监控
+        // ★ v3.80: 移到 guard 释放之前, 确保 CleanupInjectionTraces 中的
+        //   DKOM/VAD 操作受 guard pages 保护
+        {
+            bool basicOk = LaunchBasicESP();
+            DiagLog("LaunchBasicESP: %s\n", basicOk ? "SUCCESS" : "FAILED");
+            // v3.32-plus: 基础.exe 注入后清理痕迹 (PEB Ldr unlinking)
+            if (basicOk) {
+                CleanupInjectionTraces();
+            }
         }
+
+        // ★ v3.80: 释放 guard pages — 延迟到 CleanupInjectionTraces 之后
+        //   防止 DKOM/VAD 操作的 IOCTL 映射腐败 DLL 代码或 VEH handler
+        for (auto& g : guardRegions) {
+            VirtualFree(g.addr, 0, MEM_RELEASE);
+        }
+        DiagLog("BYOVD: freed %llu guard regions\n",
+            (unsigned long long)guardRegions.size());
     }
 
     {
