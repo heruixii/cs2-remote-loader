@@ -773,6 +773,29 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     // ★ v3.69: 注册 DLL 代码区域防止 RTCore64 IOCTL 映射覆盖
     //   先计算 DLL 代码校验和, After EnableAll 再校验
     {
+        // ★ v3.70 Layer 1: Guard Pages — 在 BYOVD IOCTL 之前预留 DLL 周围
+        //   地址空间, 防止 RTCore64 驱动的物理内存映射覆盖 DLL 代码页
+        //   驱动内部通过 ZwAllocateVirtualMemory/MmMapLockedPages 分配 VA,
+        //   若 DLL 周围已被预留, 映射将被强制分配到其他安全区域
+        if (dllBase && dllSize > 0x1000) {
+            const SIZE_T GUARD_SIZE = 0x200000; // 2MB guard each side
+            uint8_t* guardBefore = (uint8_t*)dllBase;
+            if ((uintptr_t)guardBefore > GUARD_SIZE) {
+                guardBefore = (uint8_t*)((uintptr_t)dllBase - GUARD_SIZE);
+                void* gb = VirtualAlloc(guardBefore, GUARD_SIZE, MEM_RESERVE, PAGE_NOACCESS);
+                DiagLog("BYOVD: guard-before@0x%llX sz=0x%X %s\n",
+                    (unsigned long long)guardBefore, (unsigned)GUARD_SIZE,
+                    gb ? "OK" : "FAIL");
+            }
+            uint8_t* guardAfter = (uint8_t*)dllBase + dllSize;
+            // Align up to 64KB boundary for safety
+            guardAfter = (uint8_t*)(((uintptr_t)guardAfter + 0xFFFF) & ~0xFFFFULL);
+            void* ga = VirtualAlloc(guardAfter, GUARD_SIZE, MEM_RESERVE, PAGE_NOACCESS);
+            DiagLog("BYOVD: guard-after@0x%llX sz=0x%X %s\n",
+                (unsigned long long)guardAfter, (unsigned)GUARD_SIZE,
+                ga ? "OK" : "FAIL");
+        }
+
         // 注册所有 DLL 代码页为保护区 (跳过 PE 头第0页)
         if (dllBase && dllSize > 0x1000) {
             stealth::KernelMemoryAccessor::RegisterCodeRegion(
@@ -782,13 +805,21 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 (unsigned long long)((uintptr_t)dllBase + dllSize));
         }
 
-        // ★ v3.69: 预校验 — 计算 DLL 代码页的 XOR checksum
+        // ★ v3.70: 预校验 + 备份 — 计算 DLL 代码页 XOR checksum 并保存完整备份
         uint32_t preChecksum = 0;
+        uint8_t* codeBackupBuf = nullptr;
         if (dllBase && dllSize > 0x1000) {
             uint8_t* code = (uint8_t*)dllBase + 0x1000;
             SIZE_T codeLen = dllSize - 0x1000;
             for (SIZE_T i = 0; i < codeLen; i += 4) {
                 preChecksum ^= *(uint32_t*)(code + i);
+            }
+            // 分配备份缓冲区 (在安全的独立内存区域)
+            codeBackupBuf = (uint8_t*)VirtualAlloc(nullptr, codeLen, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+            if (codeBackupBuf) {
+                memcpy(codeBackupBuf, code, codeLen);
+                DiagLog("BYOVD: code backup saved [0x%llX, %llu bytes] checksum=0x%08X\n",
+                    (unsigned long long)codeBackupBuf, (unsigned long long)codeLen, preChecksum);
             }
         }
 
@@ -805,11 +836,25 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             if (preChecksum != postChecksum) {
                 DiagLog("CRITICAL: DLL CODE CORRUPTED! pre=0x%08X post=0x%08X\n",
                     preChecksum, postChecksum);
-                // ★ v3.69: 代码被污染, 无法从用户态恢复 (原始内容未备份)
-                //   诊断日志已记录, 进程将继续 (若崩溃则由 DiagVehHandler 捕获)
-                //   核心防护: MapPhysical/WritePhysical 中的重叠检测已阻止进一步污染
+                // ★ v3.70 Layer 2: 从备份恢复被 IOCTL 映射污染的 DLL 代码页
+                if (codeBackupBuf) {
+                    DWORD oldProt;
+                    VirtualProtect(code, codeLen, PAGE_READWRITE, &oldProt);
+                    memcpy(code, codeBackupBuf, codeLen);
+                    VirtualProtect(code, codeLen, PAGE_EXECUTE_READ, &oldProt);
+                    // 验证恢复
+                    uint32_t verify = 0;
+                    for (SIZE_T i = 0; i < codeLen; i += 4)
+                        verify ^= *(uint32_t*)(code + i);
+                    DiagLog("BYOVD: RESTORE %s (verify=0x%08X)\n",
+                        (verify == preChecksum) ? "OK" : "FAILED", verify);
+                }
             } else {
                 DiagLog("BYOVD: code integrity OK (checksum=0x%08X)\n", postChecksum);
+            }
+            // 释放备份缓冲区
+            if (codeBackupBuf) {
+                VirtualFree(codeBackupBuf, 0, MEM_RELEASE);
             }
         }
 

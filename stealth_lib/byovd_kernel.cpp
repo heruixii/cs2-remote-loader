@@ -441,12 +441,21 @@ bool KernelMemoryAccessor::MapPhysical(uint64_t physAddr, uint32_t size,
     request.flags    = 0;
 
     DWORD bytesReturned = 0;
+    // ★ v3.70 Layer 3: 增大 IOCTL output buffer 防止驱动栈溢出
+    //   某些 RTCore64 版本可能写入超过 8 字节到 output buffer,
+    //   使用 256 字节安全缓冲区避免栈溢出导致返回地址损坏
+    union {
+        uint8_t raw[256];
+        uint8_t* mappedPtr;
+    } outBuf;
+    outBuf.mappedPtr = nullptr;
     uint8_t* mappedAddr = nullptr;
 
     BOOL ok = DeviceIoControl(m_hDevice, m_driverInfo.ioctlCode,
                               &request, sizeof(request),
-                              &mappedAddr, sizeof(mappedAddr),
+                              outBuf.raw, sizeof(outBuf.raw),
                               &bytesReturned, nullptr);
+    mappedAddr = outBuf.mappedPtr;
 
     if (!ok || !mappedAddr) {
         // 备选: 某些版本 RTCore64 使用不同的 IOCTL 格式
