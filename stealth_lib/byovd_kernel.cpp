@@ -653,32 +653,38 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     }
     m_actualServiceName = actualServiceName;  // store for cleanup
 
-    // v3.61: 先卸载原始服务名 — 清理上次残留的驱动对象 (RTCore64.sys 内部对象名固定, 
-    //        即使之前用了不同服务名加载, 内核中 \Driver\RTCore64 仍在)
-    //        如果 registry key 已删除, 临时重建以支持 NtUnloadDriver
-    if (actualServiceName != driver.serviceName) {
-        ByovdDiag("BYOVD:Init: pre-cleaning stale service %ls\n", driver.serviceName.c_str());
-
-        // 先试直接卸载 (需要 registry key 存在)
-        bool unloaded = UnloadDriver(driver.serviceName);
-
-        // 若失败, registry key 可能已被删 — 临时重建然后卸载
-        if (!unloaded) {
-            std::wstring keyPath = L"SYSTEM\\CurrentControlSet\\Services\\" + driver.serviceName;
-            HKEY hTempKey;
-            if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(),
-                                0, nullptr, REG_OPTION_NON_VOLATILE,
-                                KEY_ALL_ACCESS, nullptr, &hTempKey, nullptr) == ERROR_SUCCESS) {
-                DWORD t=1, s=3, e=1;
-                RegSetValueExW(hTempKey, L"Type", 0, REG_DWORD, (BYTE*)&t, sizeof(t));
-                RegSetValueExW(hTempKey, L"Start", 0, REG_DWORD, (BYTE*)&s, sizeof(s));
-                RegSetValueExW(hTempKey, L"ErrorControl", 0, REG_DWORD, (BYTE*)&e, sizeof(e));
-                RegSetValueExW(hTempKey, L"ImagePath", 0, REG_EXPAND_SZ,
-                               (BYTE*)actualPath.c_str(), (DWORD)(actualPath.size() * sizeof(wchar_t) + 2));
-                RegCloseKey(hTempKey);
-                UnloadDriver(driver.serviceName);
-                RegDeleteTreeW(HKEY_LOCAL_MACHINE, keyPath.c_str());
+    // v3.66: 扫描注册表, 卸载所有残留的 RTCore64 服务 (之前的随机化服务名)
+    //        避免 STATUS_OBJECT_NAME_COLLISION (0xC0000035)
+    {
+        HKEY hServices;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+            L"SYSTEM\\CurrentControlSet\\Services", 0,
+            KEY_ENUMERATE_SUB_KEYS | DELETE, &hServices) == ERROR_SUCCESS)
+        {
+            wchar_t subKeyName[256];
+            DWORD idx = 0;
+            while (idx < 512) {
+                DWORD nameLen = 256;
+                LONG enumResult = RegEnumKeyExW(hServices, idx, subKeyName, &nameLen,
+                    nullptr, nullptr, nullptr, nullptr);
+                if (enumResult != ERROR_SUCCESS) break;
+                // 匹配 RTCore64Svc 前缀 (包括 RTCore64Svc_BE28 等随机化版本)
+                if (wcsstr(subKeyName, L"RTCore64Svc") == subKeyName) {
+                    std::wstring svcName(subKeyName);
+                    // 跳过当前要加载的服务名
+                    if (svcName == actualServiceName) { idx++; continue; }
+                    ByovdDiag("BYOVD:Init: found stale service '%ls', unloading...\n", subKeyName);
+                    // ★ 先卸载 (需要 registry key 存在)
+                    bool unloaded = UnloadDriver(svcName);
+                    ByovdDiag("BYOVD:Init: unload %ls → %d\n", subKeyName, (int)unloaded);
+                    // 卸载后删除注册表残留
+                    RegDeleteTreeW(hServices, subKeyName);
+                    // 不要 idx++ — 删除后索引会变, 重新从 idx 开始
+                } else {
+                    idx++;
+                }
             }
+            RegCloseKey(hServices);
         }
     }
 
