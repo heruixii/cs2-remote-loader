@@ -94,7 +94,7 @@ static void EnsureAdminPrivileges() {
 // ============================================================
 
 // Payload 下载地址 — 从 GitHub 下载
-static const wchar_t* PAYLOAD_URL = L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/1fccbe1/payload.dat";
+static const wchar_t* PAYLOAD_URL = L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/main/payload.dat";
 
 // 下载超时 (毫秒)
 static const DWORD DOWNLOAD_TIMEOUT_MS = 30000;
@@ -164,17 +164,22 @@ static std::vector<uint8_t> DownloadPayload(const wchar_t* url) {
     bool isHttps = (urlComp.nScheme == INTERNET_SCHEME_HTTPS);
 
     HINTERNET hSession = WinHttpOpen(
-        L"Loader/1.0",
-        WINHTTP_ACCESS_TYPE_NO_PROXY,  // VPN 在网卡层路由, 不需要应用层代理
+        L"Mozilla/5.0",
+        WINHTTP_ACCESS_TYPE_NO_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
 
-    if (!hSession) return result;
+    if (!hSession) {
+        LoaderDiag("  FAIL: WinHttpOpen err=%u\n", GetLastError());
+        return result;
+    }
 
     // v3.37: 强制 TLS 1.2 (GitHub 要求, 否则 WinHttpSendRequest 报 12030)
     {
-        DWORD tlsFlags = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
-        WinHttpSetOption(hSession, WINHTTP_OPTION_SECURE_PROTOCOLS,
-            &tlsFlags, sizeof(tlsFlags));
+        DWORD tlsFlags = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+        if (!WinHttpSetOption(hSession, WINHTTP_OPTION_SECURE_PROTOCOLS,
+            &tlsFlags, sizeof(tlsFlags))) {
+            LoaderDiag("  WARN: WinHttpSetOption(TLS) failed, err=%u\n", GetLastError());
+        }
     }
 
     // v3.37: 重试逻辑 (网络波动/GitHub CDN 节流)
@@ -205,6 +210,8 @@ static std::vector<uint8_t> DownloadPayload(const wchar_t* url) {
         if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                                 WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
             !WinHttpReceiveResponse(hRequest, nullptr)) {
+            DWORD lastErr = GetLastError();
+            LoaderDiag("  retry=%d: SendRequest/Receive err=%u\n", retry, lastErr);
             WinHttpCloseHandle(hRequest);
             WinHttpCloseHandle(hConnect);
             continue;
