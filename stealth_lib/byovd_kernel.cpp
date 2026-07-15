@@ -1029,6 +1029,35 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
             RegCloseKey(hOrigKey);
             ByovdDiag("BYOVD:Init: rebuilt %ls with ImagePath=%ls, unloading...\n",
                 driver.serviceName.c_str(), ntOrigPath);
+
+            // ★ v3.86: 用 SCM ControlService STOP 而非仅 NtUnloadDriver
+            //   后者可能不触发驱动的 Unload 例程, 导致 \Device\RTCore64 残留
+            //   SCM STOP → 驱动 Unload → IoDeleteDevice → 内核清理 → 下次加载成功
+            {
+                SC_HANDLE hSCM = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+                if (hSCM) {
+                    SC_HANDLE hSvc = OpenServiceW(hSCM, driver.serviceName.c_str(),
+                        SERVICE_STOP | SERVICE_QUERY_STATUS);
+                    if (hSvc) {
+                        SERVICE_STATUS ss = {};
+                        ControlService(hSvc, SERVICE_CONTROL_STOP, &ss);
+                        for (int w = 0; w < 30; w++) {
+                            if (!QueryServiceStatus(hSvc, &ss)) break;
+                            if (ss.dwCurrentState == SERVICE_STOPPED) break;
+                            Sleep(100);
+                        }
+                        ByovdDiag("BYOVD:Init: SCM stop %ls → state=%u (was running=%d)\n",
+                            driver.serviceName.c_str(), ss.dwCurrentState,
+                            (int)(ss.dwCurrentState == SERVICE_RUNNING));
+                        CloseServiceHandle(hSvc);
+                    } else {
+                        ByovdDiag("BYOVD:Init: SCM OpenService %ls FAILED (err=%u)\n",
+                            driver.serviceName.c_str(), GetLastError());
+                    }
+                    CloseServiceHandle(hSCM);
+                }
+            }
+
             UnloadDriver(driver.serviceName);
             RegDeleteTreeW(HKEY_LOCAL_MACHINE, origKeyPath.c_str());
         }
