@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 335 (v3.35: process hollowing + cert strip)
+// BUILD: 338 (v3.38: FlushFileBuffers + VEH MessageBox to catch crash root cause)
 // ============================================================
 
 #include "stealth_core.h"
@@ -37,6 +37,7 @@ static DWORD RandomJitter(DWORD baseMs, DWORD rangeMs) {
 }
 
 // 轻量诊断: 写文件, 不弹 MessageBox 干扰游戏
+// ★ v3.38: 加 FlushFileBuffers 确保崩溃日志实时落盘
 static void DiagLog(const char* fmt, ...) {
     char buf[512];
     va_list args;
@@ -50,6 +51,7 @@ static void DiagLog(const char* fmt, ...) {
     if (h != INVALID_HANDLE_VALUE) {
         DWORD w;
         WriteFile(h, buf, (DWORD)len, &w, 0);
+        FlushFileBuffers(h);  // ★ v3.38: 强制落盘, 防止崩溃时缓存丢失
         CloseHandle(h);
     }
 }
@@ -61,12 +63,23 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     uint64_t crashAddr = (uint64_t)ep->ExceptionRecord->ExceptionAddress;
     uint64_t dllBase   = (uint64_t)g_diagDllBase;
     uint64_t offset    = (dllBase && crashAddr >= dllBase) ? (crashAddr - dllBase) : 0;
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+
     DiagLog("CRASH: code=0x%08X addr=0x%llX off=%llX\n",
-        ep->ExceptionRecord->ExceptionCode, crashAddr, offset);
+        code, crashAddr, offset);
+
+    // ★ v3.38: 弹窗显示崩溃信息 — 即使闪退用户也能看到
+    wchar_t msg[300];
+    swprintf_s(msg, L"崩溃代码: 0x%08X\n"
+                     L"崩溃地址: 0x%llX\n"
+                     L"DLL偏移:   0x%llX\n\n"
+                     L"诊断日志: %%TEMP%%\\stealth_diag.log",
+        code, crashAddr, offset);
+    MessageBoxW(NULL, msg, L"CS2 Loader 崩溃", MB_OK | MB_ICONERROR | MB_TOPMOST);
+
     // 卸载 BYOVD 驱动 (崩溃后残留内核驱动可被EAC扫描到)
-    // 如果这里的卸载也崩溃, 进程本身已在崩溃中, 不影响
     stealth::KernelDefense::DisableAll();
-    return EXCEPTION_CONTINUE_SEARCH; // 让进程崩溃
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
 // v3.32: 基础.exe 进程句柄 (退出时清理)
@@ -660,7 +673,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.35 DIAG START ===\n");
+    DiagLog("=== v3.38 DIAG START (BUILD 338) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
@@ -1079,7 +1092,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         DiagLog("--- End Entity Chain Trace ---\n");
     }
 
-    DiagLog("=== MAIN LOOP START (v3.35: hollowing + cert-strip) ===\n");
+    DiagLog("=== MAIN LOOP START (v3.37: VirtualProtect fix + crash protection) ===\n");
     int frameCount = 0;
     DWORD lastDiagTime = 0;
     DWORD lastRetryTime = 0;
@@ -1164,7 +1177,9 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         }
 
         // v3.34: EkkoSleep 随机间隔 30-170ms (规避固定周期时序特征)
-        StealthEngine::Instance().StealthSleep(RandomJitter(40, 130));
+        DWORD sleepMs = RandomJitter(40, 130);
+        // DiagLog("SLEEP: entering StealthSleep(%u)\n", sleepMs); // 太频繁, 仅调试时启用
+        StealthEngine::Instance().StealthSleep(sleepMs);
     }
 
     TerminateBasicESP();

