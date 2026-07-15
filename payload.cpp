@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 382 (v3.82: VEH re-entrancy guard + __try memcpy + recursive abort)
+// BUILD: 383 (v3.83: full IOCTL diagnostic logging + save/restore globals in MapPhysical + VEH progress logs)
 // ============================================================
 
 #include "stealth_core.h"
@@ -111,6 +111,9 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
         const SIZE_T PAGE = 0x1000;
 
         SIZE_T restored = 0;
+        SIZE_T totalPages = (codeLen + PAGE - 1) / PAGE;
+        DiagLog("VEH-SELFHEAL: starting per-page restore (%llu pages total)\n",
+            (unsigned long long)totalPages);
         for (SIZE_T off = 0; off < codeLen; off += PAGE) {
             uintptr_t pageVA = codeBase + off;
             SIZE_T chunk = (off + PAGE <= codeLen) ? PAGE : (codeLen - off);
@@ -132,10 +135,17 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
                 ? PAGE_READWRITE : PAGE_EXECUTE_READ;
             VirtualProtect((void*)pageVA, chunk, restoreProt, &oldProt);
             restored++;
+
+            // ★ v3.83: 每16页输出一次进度日志 (避免撑爆日志但能定位进度)
+            if ((restored & 0xF) == 0) {
+                DiagLog("VEH-SELFHEAL: progress %llu/%llu pages (off=0x%llX)...\n",
+                    (unsigned long long)restored, (unsigned long long)totalPages,
+                    (unsigned long long)off);
+            }
         }
 
         g_vehRestoring = 0;
-        DiagLog("VEH-SELFHEAL: %llu pages restored, retrying...\n",
+        DiagLog("VEH-SELFHEAL: DONE %llu pages restored, retrying...\n",
             (unsigned long long)restored);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
