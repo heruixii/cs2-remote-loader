@@ -33,38 +33,66 @@ bool HandleBypass::HasSufficientAccess(ACCESS_MASK access) {
 std::vector<HandleBypass::ExistingHandle> HandleBypass::EnumerateHandles(DWORD targetPid) {
     std::vector<ExistingHandle> results;
 
-    // SystemHandleInformation = 0x10
+    // v3.64: 使用 SystemExtendedHandleInformation (0x40) — 结构体定义稳定
+    // 相比 SystemHandleInformation (0x10), 不会随 Windows 版本变化
     ULONG bufferSize = 0x400000;
     std::vector<BYTE> buffer(bufferSize);
     ULONG retLen = 0;
 
-    NTSTATUS st = SysQuerySystemInformation(0x10, buffer.data(), bufferSize, &retLen);
+    NTSTATUS st = SysQuerySystemInformation(0x40, buffer.data(), bufferSize, &retLen);
     if (st == STATUS_INFO_LENGTH_MISMATCH) {
         bufferSize = retLen + 0x10000;
         buffer.resize(bufferSize);
-        st = SysQuerySystemInformation(0x10, buffer.data(), bufferSize, &retLen);
+        st = SysQuerySystemInformation(0x40, buffer.data(), bufferSize, &retLen);
     }
 
     if (!NT_SUCCESS(st)) return results;
 
-    auto* info = STEALTH_HANDLE_INFO_CAST(buffer.data());
+    // SystemExtendedHandleInformation 结构:
+    //   typedef struct _SYSTEM_HANDLE_INFORMATION_EX {
+    //       ULONG_PTR NumberOfHandles;
+    //       ULONG_PTR Reserved;
+    //       SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX Handles[1];  // 40 bytes each
+    //   }
+    struct HandleEntryEx {
+        PVOID    Object;                // offset 0
+        ULONG_PTR UniqueProcessId;     // offset 8
+        ULONG_PTR HandleValue;         // offset 16
+        ULONG    GrantedAccess;        // offset 24
+        USHORT   CreatorBackTraceIndex;// offset 28
+        USHORT   ObjectTypeIndex;      // offset 30
+        ULONG    HandleAttributes;     // offset 32
+        ULONG    Reserved;             // offset 36
+        // total: 40 bytes
+    };
+    struct HandleInfoEx {
+        ULONG_PTR NumberOfHandles;     // offset 0
+        ULONG_PTR Reserved;            // offset 8
+        HandleEntryEx Handles[1];      // offset 16
+    };
+
+    auto* info = reinterpret_cast<HandleInfoEx*>(buffer.data());
+
+    // 边界检查
+    size_t headerSize = 16; // NumberOfHandles(8) + Reserved(8)
+    ULONG_PTR maxHandles = (bufferSize > headerSize) ? ((bufferSize - headerSize) / sizeof(HandleEntryEx)) : 0;
+    ULONG_PTR actualCount = info->NumberOfHandles;
+    if (actualCount > maxHandles) actualCount = maxHandles;
+
     DWORD myPid = GetCurrentProcessId();
 
-    for (ULONG i = 0; i < info->NumberOfHandles; i++) {
+    for (ULONG_PTR i = 0; i < actualCount; i++) {
         auto& handle = info->Handles[i];
-        // 跳过当前进程 (不能复制自己的句柄)
-        ULONG ownerId = (ULONG)(uintptr_t)handle.UniqueProcessId;
+        DWORD ownerId = (DWORD)handle.UniqueProcessId;
         if (ownerId == myPid) continue;
 
-        if (ownerId == targetPid ||
-            ownerId == 4) // System 进程句柄优先
-        {
+        if (ownerId == targetPid || ownerId == 4) {
             ExistingHandle eh;
-            eh.handleValue    = (HANDLE)(uintptr_t)handle.HandleValue;
+            eh.handleValue    = (HANDLE)handle.HandleValue;
             eh.ownerPid       = ownerId;
             eh.targetPid      = targetPid;
             eh.grantedAccess  = handle.GrantedAccess;
-            eh.objectTypeIndex = handle.ObjectTypeIndex;
+            eh.objectTypeIndex = (UCHAR)handle.ObjectTypeIndex;
             results.push_back(eh);
         }
     }
