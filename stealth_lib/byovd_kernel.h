@@ -94,7 +94,7 @@ public:
     bool IsActive() const { return m_active; }
 
     // v3.49: 获取服务名和驱动路径 (用于一用即卸清理)
-    const std::wstring& GetServiceName() const { return m_driverInfo.serviceName; }
+    const std::wstring& GetServiceName() const { return m_actualServiceName; }
     const std::wstring& GetDriverPath() const { return m_driverInfo.driverPath; }
 
     // === 物理内存映射/读写原语 (通过 RTCore64 IOCTL) ===
@@ -160,6 +160,7 @@ private:
     bool       m_active     = false;
     uint64_t   m_ntosBase   = 0;
     BYOVDDriverInfo m_driverInfo;
+    std::wstring m_actualServiceName;  // v3.60: 实际使用的服务名 (可能含随机后缀)
     std::unique_ptr<PageTableWalker> m_pageTableWalker;
 };
 

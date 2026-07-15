@@ -656,10 +656,23 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     std::wstring resolvedPath = EnsureDriverFile(driver.driverPath);
     const std::wstring& actualPath = resolvedPath.empty() ? driver.driverPath : resolvedPath;
 
-    // 3. 加载驱动
-    ByovdDiag("BYOVD:Init: loading %ls (path=%ls)\n", driver.serviceName.c_str(), actualPath.c_str());
-    if (!LoadDriver(driver.serviceName, actualPath)) {
-        ByovdDiag("BYOVD:Init: LoadDriver FAILED for %ls\n", driver.serviceName.c_str());
+    // 3. v3.60: 若路径含随机后缀, 同步随机化服务名 — 避免 STATUS_OBJECT_NAME_COLLISION
+    std::wstring actualServiceName = driver.serviceName;
+    if (!resolvedPath.empty()) {
+        // 检测随机后缀: RTCore64_32F2.sys → 提取 _32F2
+        size_t dashPos = resolvedPath.find_last_of(L'_');
+        size_t dotPos = resolvedPath.find_last_of(L'.');
+        if (dashPos != std::wstring::npos && dotPos != std::wstring::npos && dashPos < dotPos) {
+            std::wstring suffix = resolvedPath.substr(dashPos, dotPos - dashPos); // e.g. "_32F2"
+            actualServiceName = driver.serviceName + suffix; // e.g. "RTCore64Svc_32F2"
+        }
+    }
+    m_actualServiceName = actualServiceName;  // store for cleanup
+
+    // 4. 加载驱动
+    ByovdDiag("BYOVD:Init: loading %ls (path=%ls)\n", actualServiceName.c_str(), actualPath.c_str());
+    if (!LoadDriver(actualServiceName, actualPath)) {
+        ByovdDiag("BYOVD:Init: LoadDriver FAILED for %ls\n", actualServiceName.c_str());
         return false;
     }
     ByovdDiag("BYOVD:Init: LoadDriver OK\n");
@@ -673,7 +686,7 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     if (m_hDevice == INVALID_HANDLE_VALUE) {
         ByovdDiag("BYOVD:Init: CreateFileW FAILED for %ls (err=%u)\n",
             driver.devicePath.c_str(), GetLastError());
-        UnloadDriver(driver.serviceName);
+        UnloadDriver(m_actualServiceName);
         return false;
     }
     ByovdDiag("BYOVD:Init: device opened OK\n");
@@ -690,7 +703,7 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
             m_active = false;
             CloseHandle(m_hDevice);
             m_hDevice = INVALID_HANDLE_VALUE;
-            UnloadDriver(driver.serviceName);
+            UnloadDriver(m_actualServiceName);
             return false;
         }
         ByovdDiag("BYOVD:Init: IOCTL probe OK (ntos=0x%llX, magic=0x%04X)\n",
@@ -708,8 +721,8 @@ void KernelMemoryAccessor::Shutdown() {
     g_physMappings.clear();
 
     // v3.24: 先卸载驱动再关闭句柄, 避免 CloseHandle 期间 IOCTL 竞态
-    if (!m_driverInfo.serviceName.empty()) {
-        UnloadDriver(m_driverInfo.serviceName);
+    if (!m_actualServiceName.empty()) {
+        UnloadDriver(m_actualServiceName);
     }
     if (m_hDevice != INVALID_HANDLE_VALUE) {
         CloseHandle(m_hDevice);
