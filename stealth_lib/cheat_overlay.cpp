@@ -71,7 +71,6 @@ bool CheatOverlay::Create(const OverlayConfig& cfg) {
     // 创建窗口 (不使用 WS_EX_TOPMOST — 通过 SetWindowPos 每帧动态置顶)
     // EAC 检测窗口扩展风格: 移除 TOPMOST 静态标志减少特征
     m_hwnd = CreateWindowExW(
-        WS_EX_TRANSPARENT |         // 点击穿透
         WS_EX_LAYERED |             // 分层窗口 (透明度)
         WS_EX_TOOLWINDOW |          // 不显示在任务栏
         WS_EX_NOREDIRECTIONBITMAP,  // 禁止DWM重定向 (降低检测面)
@@ -158,13 +157,14 @@ void CheatOverlay::BringToTop() {
 }
 
 LONG CheatOverlay::GetCloakedExStyle() const {
-    // 伪装模式: 移除 LAYERED → GetLayeredWindowAttributes 返回失败
-    return WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP;
+    // v3.51: 移除 WS_EX_TRANSPARENT — EAC 窗口枚举的头号特征
+    //        点击穿透由 WM_NCHITTEST=HTTRANSPARENT 实现
+    return WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP;
 }
 
 LONG CheatOverlay::GetRenderExStyle() const {
-    // 渲染模式: 完整标志 (通过 SetWindowPos 动态置顶)
-    return WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP;
+    // 渲染模式: 不含 TRANSPARENT (EAC枚举特征)
+    return WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP;
 }
 
 void CheatOverlay::CloakStyle() {
@@ -182,12 +182,31 @@ void CheatOverlay::RestoreStyle() {
     // 随机位置抖动 (非确定性周期, 避免EAC行为图谱匹配)
     m_frameIndex++;
     if (m_frameIndex % (5 + (rand() % 5)) == 0) { // 每5-9帧随机触发
-        int offsetX = (rand() % 3) - 1;            // 随机 ±1px
-        int offsetY = (rand() % 3) - 1;
+        int offsetX = (rand() % 7) - 3;            // v3.51: ±3px (原±1px)
+        int offsetY = (rand() % 7) - 3;
+        // v3.50: 窗口尺寸微抖动 (+-1-2px), 破坏固定度量特征
+        int jitW = m_width  + ((rand() % 5) - 2);  // v3.51: ±2px (原±1px)
+        int jitH = m_height + ((rand() % 5) - 2);
         SetWindowPos(m_hwnd, HWND_TOPMOST,
                      m_config.screenX + offsetX, m_config.screenY + offsetY,
-                     m_width, m_height,
+                     jitW, jitH,
                      SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+
+        // v3.51: 每30-50帧随机更换窗口标题, 破坏静态字符串枚举
+        if (m_frameIndex % 35 == 0) {
+            static const wchar_t* titlePool[] = {
+                L"ShellExperienceHost", L"ApplicationFrameHost",
+                L"SystemSettings", L"TextInputHost",
+                L"RuntimeBroker", L"SearchApp",
+                L"ShellHost", L"WinStoreApp",
+                L"LockApp", L"YourPhone",
+            };
+            wchar_t newTitle[64];
+            swprintf_s(newTitle, L"%s_%04X",
+                titlePool[(rand() + GetTickCount()) % 10],
+                (GetTickCount() + m_frameIndex) & 0xFFFF);
+            SetWindowTextW(m_hwnd, newTitle);
+        }
     } else {
         SetWindowPos(m_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -211,6 +230,11 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case WM_ERASEBKGND:
             return 1; // 不擦除背景
+
+        case WM_NCHITTEST:
+            // v3.51: 替代 WS_EX_TRANSPARENT 的点击穿透
+            //        所有像素透传鼠标事件到下层窗口 (游戏)
+            return HTTRANSPARENT;
 
         default:
             return DefWindowProcW(hwnd, msg, wp, lp);

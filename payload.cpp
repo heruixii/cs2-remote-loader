@@ -1096,8 +1096,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     int frameCount = 0;
     DWORD lastDiagTime = 0;
     DWORD lastRetryTime = 0;
-    DWORD lastCallbackCheck = 0;
-    int  callbackCheckInterval = RandomJitter(25000, 10000); // 25-35s 随机
+    bool  g_basicDone = false;  // v3.48: 正常退出后禁止重连
 
     while (true) {
         frameCount++;
@@ -1112,37 +1111,29 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             syscallCheckInterval = (int)RandomJitter(25, 10); // 每次重随机
         }
 
-        // v3.34 Scheme 3: EAC 内核回调完整性监控
-        //   每 25-35 秒重新扫描 ObpCallbackArrayHead,
-        //   若 EAC 重新注册回调则自动摘除
-        {
-            DWORD nowTick = GetTickCount();
-            if (nowTick - lastCallbackCheck >= (DWORD)callbackCheckInterval) {
-                lastCallbackCheck = nowTick;
-                callbackCheckInterval = RandomJitter(25000, 10000);
-                auto& cbDisabler = stealth::EACCallbackDisabler::Instance();
-                int reRemoved = cbDisabler.DisableObCallbacks("EasyAntiCheat");
-                if (reRemoved > 0) {
-                    DiagLog("CB-MONITOR: EAC re-registered %d ObCallbacks → removed\n", reRemoved);
-                }
-            }
-        }
-
         // 监控基础.exe 是否还活着
-        if (g_hBasicProcess) {
+        if (g_hBasicProcess && !g_basicDone) {
             DWORD exitCode = STILL_ACTIVE;
             if (!GetExitCodeProcess(g_hBasicProcess, &exitCode) || exitCode != STILL_ACTIVE) {
-                DiagLog("WARN: basic.exe exited (code=%u), will retry...\n", exitCode);
-                CloseHandle(g_hBasicProcess);
-                g_hBasicProcess = nullptr;
-                lastRetryTime = GetTickCount() - g_basicRestartBackoffMs;
+                // v3.48: code=0 = normal exit (ESP injected), don't retry
+                if (exitCode == 0) {
+                    DiagLog("INFO: basic.exe exited normally (code=0), ESP injected. No retry.\n");
+                    CloseHandle(g_hBasicProcess);
+                    g_hBasicProcess = nullptr;
+                    g_basicDone = true; // permanent no-retry
+                } else {
+                    DiagLog("WARN: basic.exe crashed (code=%u), will retry...\n", exitCode);
+                    CloseHandle(g_hBasicProcess);
+                    g_hBasicProcess = nullptr;
+                    lastRetryTime = GetTickCount() - g_basicRestartBackoffMs;
+                }
             } else {
-                g_basicRestartBackoffMs = RandomJitter(800, 400); // v3.34: 随机化退避重置
+                g_basicRestartBackoffMs = RandomJitter(800, 400);
             }
         }
 
-        // 重试启动
-        if (!g_hBasicProcess) {
+        // 重试启动 (仅非正常退出时)
+        if (!g_hBasicProcess && !g_basicDone) {
             DWORD nowTick = GetTickCount();
             if (nowTick - lastRetryTime >= g_basicRestartBackoffMs) {
                 lastRetryTime = nowTick;

