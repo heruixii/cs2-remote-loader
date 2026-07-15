@@ -82,11 +82,34 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
             (unsigned long long)g_backupLen,
             (unsigned long long)g_backupBuf,
             (unsigned long long)g_backupCodeBase);
-        DWORD oldProt;
-        VirtualProtect(g_backupCodeBase, g_backupLen, PAGE_READWRITE, &oldProt);
-        memcpy(g_backupCodeBase, g_backupBuf, g_backupLen);
-        VirtualProtect(g_backupCodeBase, g_backupLen, PAGE_EXECUTE_READ, &oldProt);
-        DiagLog("VEH-SELFHEAL: restore done, retrying...\n");
+
+        // ★ v3.70 关键: 逐页恢复, 跳过 VEH 处理器自身所在页面
+        //   单次 VirtualProtect(全部, READWRITE) 会把当前执行页也改为
+        //   不可执行, 导致下一条指令 (memcpy) 无法 fetch → 嵌套异常
+        uintptr_t handlerPage = ((uintptr_t)&DiagVehHandler) & ~0xFFFULL;
+        uintptr_t codeBase = (uintptr_t)g_backupCodeBase;
+        SIZE_T codeLen = g_backupLen;
+        const SIZE_T PAGE = 0x1000;
+
+        SIZE_T restored = 0;
+        for (SIZE_T off = 0; off < codeLen; off += PAGE) {
+            uintptr_t pageVA = codeBase + off;
+            SIZE_T chunk = (off + PAGE <= codeLen) ? PAGE : (codeLen - off);
+
+            // 跳过 VEH 处理器所在页 (未被污染, 保护不变)
+            if (pageVA == handlerPage) {
+                continue;
+            }
+
+            DWORD oldProt;
+            VirtualProtect((void*)pageVA, chunk, PAGE_READWRITE, &oldProt);
+            memcpy((void*)pageVA, g_backupBuf + off, chunk);
+            VirtualProtect((void*)pageVA, chunk, PAGE_EXECUTE_READ, &oldProt);
+            restored++;
+        }
+
+        DiagLog("VEH-SELFHEAL: %llu pages restored, retrying...\n",
+            (unsigned long long)restored);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
