@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 380 (v3.80: fix basic.exe delete-after-hollow preventing retry + move guard-free after CleanupInjectionTraces)
+// BUILD: 382 (v3.82: VEH re-entrancy guard + __try memcpy + recursive abort)
 // ============================================================
 
 #include "stealth_core.h"
@@ -66,6 +66,9 @@ SIZE_T   g_backupLen = 0;
 uint8_t* g_backupCodeBase = nullptr;
 void* g_vehHandlerPageVA = nullptr; // ★ v3.78: VEH handler 所在页 VA (extern 导出)
 
+// ★ v3.82: VEH 重入防护 — 防止恢复过程中自身触发异常导致无限递归
+static volatile LONG g_vehRestoring = 0;
+
 static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     uint64_t crashAddr = (uint64_t)ep->ExceptionRecord->ExceptionAddress;
     uint64_t dllBase   = (uint64_t)g_diagDllBase;
@@ -81,6 +84,16 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     bool isPrivInstr = (code == 0xC0000096);
     bool isAccessViol = (code == 0xC0000005);
     if ((isPrivInstr || isAccessViol) && g_backupBuf && g_backupCodeBase && g_backupLen > 0) {
+        // ★ v3.82: 重入检测 — 如果已经在恢复中又触发异常, 说明恢复过程本身
+        //   有页面无法正常操作 (PTE 损坏 / 栈被污染), 放弃恢复避免无限递归
+        if (InterlockedExchange(&g_vehRestoring, 1)) {
+            DiagLog("VEH-SELFHEAL: RECURSIVE! aborting restore, re-crash at off=0x%llX code=0x%08X\n",
+                offset, code);
+            // 放弃自愈, 让 MessageBox 弹出通知用户
+            g_vehRestoring = 0;
+            goto veh_fatal;
+        }
+
         DiagLog("VEH-SELFHEAL: restoring %llu bytes from backup@0x%llX → code@0x%llX (cause=%s)\n",
             (unsigned long long)g_backupLen,
             (unsigned long long)g_backupBuf,
@@ -90,6 +103,7 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
         // ★ v3.70/v3.78: 逐页恢复, 保存/恢复原始保护
         //   v3.70: 跳过 VEH 处理器自身所在页面 (未被污染, 保护不变)
         //   v3.78: 不再强制全部 PAGE_EXECUTE_READ — .data/.bss 必须保持 PAGE_READWRITE
+        //   v3.82: 逐页 FlushFileBuffers 确保崩溃页可定位
         uintptr_t handlerPage = ((uintptr_t)&DiagVehHandler) & ~0xFFFULL;
         g_vehHandlerPageVA = (void*)handlerPage;  // 导出供 byovd_kernel.cpp 使用
         uintptr_t codeBase = (uintptr_t)g_backupCodeBase;
@@ -120,10 +134,13 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
             restored++;
         }
 
+        g_vehRestoring = 0;
         DiagLog("VEH-SELFHEAL: %llu pages restored, retrying...\n",
             (unsigned long long)restored);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
+
+veh_fatal:
 
     // ★ v3.68: 不在 VEH 上下文中直接调用 DisableAll (可能触发嵌套异常)
     //   仅记录崩溃信息并通过 MessageBox 通知用户
