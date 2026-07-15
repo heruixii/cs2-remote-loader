@@ -246,19 +246,19 @@ static std::wstring EnsureDriverFile(const std::wstring& driverName) {
             GetTempPathW(MAX_PATH, tempPath);
             wcscat_s(tempPath, driverName.c_str());
 
-            std::ofstream out(tempPath, std::ios::binary);
-            if (out.is_open()) {
-                out.write(reinterpret_cast<const char*>(embedData), embedSize);
-                out.close();
-
-                if (GetFileAttributesW(tempPath) != INVALID_FILE_ATTRIBUTES) {
-                    ByovdDiag("BYOVD:EnsureDriverFile: extracted to %ls\n", tempPath);
-                    return std::wstring(tempPath);
-                } else {
-                    ByovdDiag("BYOVD:EnsureDriverFile: file not found after write: %ls (err=%u)\n", tempPath, GetLastError());
-                }
+            // v3.58: 用 CreateFileW 替代 ofstream — std 流可能被 AV/权限拦截
+            DeleteFileW(tempPath); // 先删旧文件
+            HANDLE hFile = CreateFileW(tempPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                                       nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (hFile != INVALID_HANDLE_VALUE) {
+                DWORD written;
+                WriteFile(hFile, embedData, (DWORD)embedSize, &written, nullptr);
+                FlushFileBuffers(hFile);
+                CloseHandle(hFile);
+                ByovdDiag("BYOVD:EnsureDriverFile: CreateFileW wrote %u/%zu bytes to %ls\n", written, embedSize, tempPath);
+                return std::wstring(tempPath);
             } else {
-                ByovdDiag("BYOVD:EnsureDriverFile: ofstream open FAILED for %ls\n", tempPath);
+                ByovdDiag("BYOVD:EnsureDriverFile: CreateFileW FAILED for %ls (err=%u)\n", tempPath, GetLastError());
             }
         } else {
             ByovdDiag("BYOVD:EnsureDriverFile: embedData=0x%p or embedSize=%zu — skipping\n", embedData, embedSize);
