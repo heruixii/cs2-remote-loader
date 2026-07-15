@@ -60,7 +60,7 @@ echo ============================================
     %STEALTH_LIB%/cheat_overlay.cpp ^
     %STEALTH_LIB%/game_esp.cpp ^
     %STEALTH_LIB%/byovd_kernel.cpp ^
-    -lwinhttp -lws2_32 -lntdll -ldwmapi -lgdi32 -ladvapi32
+    -lwinhttp -lws2_32 -lntdll -ldwmapi -lgdi32 -ladvapi32 -lpsapi
 if %ERRORLEVEL% neq 0 (
     echo [ERROR] payload.dll 编译失败!
     pause & exit /b 1

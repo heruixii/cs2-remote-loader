@@ -14,8 +14,9 @@ static void CoreDiag(const char* fmt, ...) {
     char buf[256];
     va_list args;
     va_start(args, fmt);
-    int len = _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, args);
+    int len = vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
+    if (len < 0) return;
     wchar_t path[MAX_PATH];
     GetTempPathW(MAX_PATH, path);
     wcscat_s(path, L"stealth_diag.log");

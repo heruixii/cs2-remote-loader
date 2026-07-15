@@ -22,6 +22,7 @@
 #include <random>
 #include <ctime>
 #include <cstdarg>
+#include <Psapi.h>
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif
@@ -31,8 +32,9 @@ static void ByovdDiag(const char* fmt, ...) {
     char buf[512];
     va_list args;
     va_start(args, fmt);
-    int len = _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, args);
+    int len = vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
+    if (len < 0) return;
     wchar_t path[MAX_PATH];
     GetTempPathW(MAX_PATH, path);
     wcscat_s(path, L"stealth_diag.log");
@@ -592,54 +594,33 @@ uint64_t KernelMemoryAccessor::GetNtoskrnlBase() {
 }
 
 uint64_t KernelMemoryAccessor::GetKernelModuleBase(const std::string& moduleName) {
-    // 通过 NtQuerySystemInformation(SystemModuleInformation, class=11)
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    if (!ntdll) return 0;
+    // v3.65: 使用 EnumDeviceDrivers — 比手动解析 SystemModuleInformation 更可靠
+    // 之前的 NtQuerySystemInformation class=11 方法在 MinGW/manual-map 下不稳定
+    LPVOID drivers[1024];
+    DWORD cbNeeded = 0;
 
-    using NtQuery_t = LONG(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
-    auto pNtQuery = (NtQuery_t)GetProcAddress(ntdll, "NtQuerySystemInformation");
-    if (!pNtQuery) return 0;
+    if (!EnumDeviceDrivers(drivers, sizeof(drivers), &cbNeeded)) {
+        ByovdDiag("BYOVD:GetKernelModuleBase: EnumDeviceDrivers FAILED (err=%u)\n", GetLastError());
+        return 0;
+    }
 
-    // 查询所需缓冲区大小
-    ULONG bufSize = 0;
-    pNtQuery(11, nullptr, 0, &bufSize);
-    if (bufSize == 0) return 0;
+    int driverCount = cbNeeded / sizeof(LPVOID);
+    ByovdDiag("BYOVD:GetKernelModuleBase: %d kernel drivers found, searching '%s'...\n",
+        driverCount, moduleName.c_str());
 
-    std::vector<uint8_t> buffer(bufSize + 0x1000);
-    if (pNtQuery(11, buffer.data(), bufSize, &bufSize) != 0) return 0;
-
-    // 解析 RTL_PROCESS_MODULES
-    // 结构: ULONG count; RTL_PROCESS_MODULE_INFORMATION modules[];
-    ULONG count = *(ULONG*)buffer.data();
-    auto* modules = (uint8_t*)(buffer.data() + sizeof(ULONG));
-
-    // RTL_PROCESS_MODULE_INFORMATION (x64):
-    //   HANDLE Section;          // +0x00 (8 bytes)
-    //   PVOID  MappedBase;       // +0x08 (8 bytes)
-    //   PVOID  ImageBase;        // +0x10 (8 bytes)  ← 基址
-    //   ULONG  ImageSize;        // +0x18 (4 bytes)
-    //   ULONG  Flags;            // +0x1C (4 bytes)
-    //   USHORT LoadOrderIndex;   // +0x20
-    //   USHORT InitOrderIndex;   // +0x22
-    //   USHORT LoadCount;        // +0x24
-    //   USHORT OffsetToFileName; // +0x26
-    //   UCHAR  FullPathName[256];// +0x28
-
-    constexpr size_t MODULE_ENTRY_SIZE = 0x128; // Windows 11: 0x128, Win10: may differ
-
-    for (ULONG i = 0; i < count; i++) {
-        auto* mod = modules + i * MODULE_ENTRY_SIZE;
-        uint64_t imageBase = *(uint64_t*)(mod + 0x10);
-        ULONG offsetToName = *(USHORT*)(mod + 0x26);
-        char* fullPath = (char*)(mod + 0x28);
-
-        // 提取文件名
-        char* name = fullPath + offsetToName;
-        if (_stricmp(name, moduleName.c_str()) == 0) {
-            return imageBase;
+    for (int i = 0; i < driverCount; i++) {
+        char baseName[256] = {};
+        DWORD nameLen = GetDeviceDriverBaseNameA(drivers[i], baseName, sizeof(baseName));
+        if (nameLen > 0) {
+            if (_stricmp(baseName, moduleName.c_str()) == 0) {
+                ByovdDiag("BYOVD:GetKernelModuleBase: found %s at 0x%p\n", baseName, drivers[i]);
+                return (uint64_t)drivers[i];
+            }
         }
     }
 
+    ByovdDiag("BYOVD:GetKernelModuleBase: '%s' NOT FOUND among %d drivers\n",
+        moduleName.c_str(), driverCount);
     return 0;
 }
 
