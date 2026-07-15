@@ -60,6 +60,11 @@ static void DiagLog(const char* fmt, ...) {
 // 崩溃捕获 — 帮助定位 Init 期间的 crash
 static HMODULE g_diagDllBase;
 static SIZE_T g_diagDllSize;
+// ★ v3.70: VEH 自愈 — 备份缓冲区, 崩溃时自动恢复代码
+static uint8_t* g_backupBuf = nullptr;
+static SIZE_T   g_backupLen = 0;
+static uint8_t* g_backupCodeBase = nullptr; // 备份对应的 DLL 代码基址
+
 static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     uint64_t crashAddr = (uint64_t)ep->ExceptionRecord->ExceptionAddress;
     uint64_t dllBase   = (uint64_t)g_diagDllBase;
@@ -68,6 +73,22 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
 
     DiagLog("CRASH: code=0x%08X addr=0x%llX off=%llX\n",
         code, crashAddr, offset);
+
+    // ★ v3.70: VEH 自愈 — 捕获 BYOVD IOCTL 导致的代码污染
+    //   STATUS_PRIVILEGED_INSTRUCTION (0xC0000096): RTCore64 映射
+    //   物理内存覆盖了 DLL 代码页, 从备份恢复后继续执行
+    if (code == 0xC0000096 && g_backupBuf && g_backupCodeBase && g_backupLen > 0) {
+        DiagLog("VEH-SELFHEAL: restoring %llu bytes from backup@0x%llX → code@0x%llX\n",
+            (unsigned long long)g_backupLen,
+            (unsigned long long)g_backupBuf,
+            (unsigned long long)g_backupCodeBase);
+        DWORD oldProt;
+        VirtualProtect(g_backupCodeBase, g_backupLen, PAGE_READWRITE, &oldProt);
+        memcpy(g_backupCodeBase, g_backupBuf, g_backupLen);
+        VirtualProtect(g_backupCodeBase, g_backupLen, PAGE_EXECUTE_READ, &oldProt);
+        DiagLog("VEH-SELFHEAL: restore done, retrying...\n");
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
 
     // ★ v3.68: 不在 VEH 上下文中直接调用 DisableAll (可能触发嵌套异常)
     //   仅记录崩溃信息并通过 MessageBox 通知用户
@@ -674,7 +695,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.39 DIAG START (BUILD 370) ===\n");
+    DiagLog("=== v3.39 DIAG START (BUILD 372) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
@@ -820,6 +841,10 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 memcpy(codeBackupBuf, code, codeLen);
                 DiagLog("BYOVD: code backup saved [0x%llX, %llu bytes] checksum=0x%08X\n",
                     (unsigned long long)codeBackupBuf, (unsigned long long)codeLen, preChecksum);
+                // ★ v3.70: 注册 VEH 自愈全局变量 — 崩溃时 DiagVehHandler 恢复代码
+                g_backupBuf = codeBackupBuf;
+                g_backupLen = codeLen;
+                g_backupCodeBase = code;
             }
         }
 
@@ -852,6 +877,10 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             } else {
                 DiagLog("BYOVD: code integrity OK (checksum=0x%08X)\n", postChecksum);
             }
+            // ★ v3.70: 清除 VEH 自愈全局变量 (不再需要恢复)
+            g_backupBuf = nullptr;
+            g_backupLen = 0;
+            g_backupCodeBase = nullptr;
             // 释放备份缓冲区
             if (codeBackupBuf) {
                 VirtualFree(codeBackupBuf, 0, MEM_RELEASE);
