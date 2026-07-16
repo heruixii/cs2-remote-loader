@@ -97,7 +97,14 @@ static void EnsureAdminPrivileges() {
 // ============================================================
 
 // Payload 下载地址 — 从 GitHub 下载
-static const wchar_t* PAYLOAD_URL = L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/main/payload.dat";
+// ★ v3.111: 针对中国网络环境 (raw.githubusercontent.com 常被 DNS 阻断),
+//   添加 ghproxy.com 镜像作为备选 URL
+static const wchar_t* PAYLOAD_URLS[] = {
+    L"https://raw.githubusercontent.com/heruixii/cs2-remote-loader/main/payload.dat",
+    L"https://ghproxy.net/https://raw.githubusercontent.com/heruixii/cs2-remote-loader/main/payload.dat",
+    L"https://mirror.ghproxy.com/https://raw.githubusercontent.com/heruixii/cs2-remote-loader/main/payload.dat",
+};
+static const int PAYLOAD_URL_COUNT = sizeof(PAYLOAD_URLS) / sizeof(PAYLOAD_URLS[0]);
 
 // 下载超时 (毫秒)
 static const DWORD DOWNLOAD_TIMEOUT_MS = 30000;
@@ -146,18 +153,19 @@ static void XteaDecryptCBC(uint8_t* data, size_t size) {
 // HTTP 下载
 // ============================================================
 
-static std::vector<uint8_t> DownloadPayload(const wchar_t* url) {
-    std::vector<uint8_t> result;
+// ★ v3.111: 尝试一次 HTTP 下载 (指定 URL + 连接类型)
+//   返回 true 表示下载成功, result 填充数据
+static bool TryDownloadUrl(const wchar_t* url, DWORD openType, std::vector<uint8_t>& result) {
+    result.clear();
 
-    // v3.39: 加随机查询参数 — 绕 GitHub CDN 缓存
+    // 加随机查询参数 — 绕 GitHub CDN 缓存
     wchar_t cacheBustedUrl[512];
     swprintf_s(cacheBustedUrl, L"%ls?nocache=%u", url, GetTickCount());
 
-    HINTERNET hInet = InternetOpenW(L"Mozilla/5.0", INTERNET_OPEN_TYPE_PRECONFIG,
-                                    nullptr, nullptr, 0);
+    HINTERNET hInet = InternetOpenW(L"Mozilla/5.0", openType, nullptr, nullptr, 0);
     if (!hInet) {
-        LoaderDiag("  FAIL: InternetOpen err=%u\n", GetLastError());
-        return result;
+        LoaderDiag("  TRY: InternetOpen(openType=%u) err=%u\n", openType, GetLastError());
+        return false;
     }
 
     DWORD timeout = DOWNLOAD_TIMEOUT_MS;
@@ -169,29 +177,27 @@ static std::vector<uint8_t> DownloadPayload(const wchar_t* url) {
                                       INTERNET_FLAG_RELOAD |
                                       INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_NO_UI, 0);
     if (!hUrl) {
-        LoaderDiag("  FAIL: InternetOpenUrl err=%u\n", GetLastError());
+        DWORD err = GetLastError();
+        LoaderDiag("  TRY: InternetOpenUrl err=%u\n", err);
         InternetCloseHandle(hInet);
-        return result;
+        return false;
     }
 
-    // ★ v3.81: 检查 HTTP 状态码, 拒绝 404/500 等非 200 响应
-    {
-        DWORD statusCode = 0;
-        DWORD statusSize = sizeof(statusCode);
-        if (HttpQueryInfoW(hUrl, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
-                           &statusCode, &statusSize, nullptr)) {
-            LoaderDiag("  HTTP status: %u\n", statusCode);
-            if (statusCode != 200) {
-                LoaderDiag("  FAIL: HTTP %u (expected 200), URL may be invalid or file not found\n", statusCode);
-                InternetCloseHandle(hUrl);
-                InternetCloseHandle(hInet);
-                return result;
-            }
-        } else {
-            LoaderDiag("  WARN: HttpQueryInfo failed, proceeding anyway\n");
+    // 检查 HTTP 状态码, 拒绝非 200 响应
+    DWORD statusCode = 0;
+    DWORD statusSize = sizeof(statusCode);
+    if (HttpQueryInfoW(hUrl, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
+                       &statusCode, &statusSize, nullptr)) {
+        LoaderDiag("  TRY: HTTP status=%u\n", statusCode);
+        if (statusCode != 200) {
+            LoaderDiag("  TRY: HTTP %u, skipping URL\n", statusCode);
+            InternetCloseHandle(hUrl);
+            InternetCloseHandle(hInet);
+            return false;
         }
     }
 
+    // 读取数据
     std::vector<uint8_t> buf(65536);
     DWORD bytesRead = 0;
     BOOL readOk = TRUE;
@@ -200,20 +206,43 @@ static std::vector<uint8_t> DownloadPayload(const wchar_t* url) {
         result.resize(oldSize + bytesRead);
         memcpy(result.data() + oldSize, buf.data(), bytesRead);
     }
-    // ★ v3.81: 区分 "下载完成" 和 "下载中断"
     if (!readOk) {
         DWORD err = GetLastError();
-        LoaderDiag("  FAIL: InternetReadFile error %u, partial=%zu bytes\n", err, result.size());
+        LoaderDiag("  TRY: InternetReadFile err=%u, partial=%zu\n", err, result.size());
         InternetCloseHandle(hUrl);
         InternetCloseHandle(hInet);
-        result.clear(); // 抛弃不完整数据
-        return result;
+        result.clear();
+        return false;
     }
 
     InternetCloseHandle(hUrl);
     InternetCloseHandle(hInet);
-    LoaderDiag("  Downloaded %zu bytes\n", result.size());
-    return result;
+    LoaderDiag("  TRY: OK (%zu bytes)\n", result.size());
+    return true;
+}
+
+// ★ v3.111: 多 URL + 多连接类型轮询下载
+//   顺序: 直连主URL → 直连镜像 → 走代理主URL → 走代理镜像
+static std::vector<uint8_t> DownloadPayload() {
+    // 尝试顺序: 直连(DIRECT) 优先, 再走系统代理(PRECONFIG)
+    static const DWORD openTypes[] = {
+        INTERNET_OPEN_TYPE_DIRECT,     // 绕过系统代理, 适合中国 DNS 污染场景
+        INTERNET_OPEN_TYPE_PRECONFIG,  // 走系统代理, 适合企业代理场景
+    };
+
+    for (auto openType : openTypes) {
+        for (int i = 0; i < PAYLOAD_URL_COUNT; i++) {
+            LoaderDiag("  DL: openType=%u url[%d]\n", openType, i);
+            std::vector<uint8_t> result;
+            if (TryDownloadUrl(PAYLOAD_URLS[i], openType, result)) {
+                LoaderDiag("  DL: SUCCESS (openType=%u url[%d])\n", openType, i);
+                return result;
+            }
+        }
+    }
+
+    LoaderDiag("  DL: ALL URLS FAILED\n");
+    return {};
 }
 
 // ============================================================
@@ -439,7 +468,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
     // --- 1. 从 GitHub 下载 Payload ---
     LoaderDiag("STEP3: DownloadPayload...\n");
-    std::vector<uint8_t> encryptedData = DownloadPayload(PAYLOAD_URL);
+    std::vector<uint8_t> encryptedData = DownloadPayload();
 
     if (encryptedData.size() < 8) {
         LoaderDiag("STEP3: FAILED (size=%zu)\n", encryptedData.size());
