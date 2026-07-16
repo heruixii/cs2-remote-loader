@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 427 (v3.126: 添加BringBasicToTop — 将基础.exe窗口置顶确保可见 — SleepObfuscator/TelemetrySilencer/PhantomSection改用固定数组, GetSelfPage回退到&GetSelfPage)
+// BUILD: 428 (v3.126b: 移除CREATE_NO_WINDOW — base.exe无法创建窗口 — SleepObfuscator/TelemetrySilencer/PhantomSection改用固定数组, GetSelfPage回退到&GetSelfPage)
 // ============================================================
 
 #include "stealth_core.h"
@@ -257,9 +257,10 @@ static bool LaunchBasicESP() {
     si.wShowWindow = SW_HIDE; // v3.34: 隐藏窗口 (overlay 由 basic.exe 内部创建)
     PROCESS_INFORMATION pi = {};
 
+    // ★ v3.126b: 移除 CREATE_NO_WINDOW — base.exe 可能因此无法创建窗口
     BOOL ok = CreateProcessW(hostPath, nullptr,
         nullptr, nullptr, FALSE,
-        CREATE_SUSPENDED | CREATE_NO_WINDOW,
+        CREATE_SUSPENDED,
         nullptr, nullptr, &si, &pi);
     bool canHollow = ok;
     if (!ok) {
@@ -829,7 +830,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.126 DIAG START (BUILD 427: 添加BringBasicToTop — 将基础.exe窗口置顶确保可见) ===\n");
+    DiagLog("=== v3.126b DIAG START (BUILD 428: 移除CREATE_NO_WINDOW — base.exe可能因此无法创建窗口) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
