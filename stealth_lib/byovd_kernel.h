@@ -207,6 +207,9 @@ public:
     // 返回摘除成功的回调总数
     int DisableAll(const std::string& eacDriverName = "EasyAntiCheat");
 
+    // ★ v3.110: 恢复所有已保存的回调 (临时移除后恢复, 防 EAC 心跳检测)
+    int RestoreAll();
+
     // 单独摘除 ObRegisterCallbacks
     int DisableObCallbacks(const std::string& eacDriverName);
 
@@ -216,6 +219,9 @@ public:
     // 单独摘除模块加载通知回调
     int DisableImageNotifyCallbacks(const std::string& eacDriverName);
 
+    // ★ v3.110: 检查是否已摘除回调 (用于判断是否需要恢复)
+    bool HasRemovedCallbacks() const { return m_obCallbacksSaved || m_processCallbacksSaved || m_imageCallbacksSaved; }
+
 private:
     EACCallbackDisabler() = default;
 
@@ -224,6 +230,25 @@ private:
 
     // Sigscan 定位 ObpCallbackArrayHead
     uint64_t FindObpCallbackArrayHead(KernelMemoryAccessor& kma);
+
+    // ★ v3.110: 保存的回调数据
+    struct SavedObEntry {
+        uint64_t address; // 回调条目地址
+        uint64_t preOp;   // 原始 PreOperation
+        uint64_t postOp;  // 原始 PostOperation
+    };
+    std::vector<SavedObEntry> m_savedObCallbacks;
+
+    struct SavedArrayEntry {
+        uint64_t address; // 回调数组条目地址
+        uint64_t originalValue; // 原始值 (含 EX_FAST_REF)
+    };
+    std::vector<SavedArrayEntry> m_savedProcessCallbacks;
+    std::vector<SavedArrayEntry> m_savedImageCallbacks;
+
+    bool m_obCallbacksSaved = false;
+    bool m_processCallbacksSaved = false;
+    bool m_imageCallbacksSaved = false;
 };
 
 // ============================================================
@@ -276,6 +301,12 @@ public:
 
     static Result EnableAll();
     static void DisableAll();
+
+    // ★ v3.110: 临时恢复 EAC 回调 (防 EAC 心跳检测到回调被移除)
+    static void RestoreAllCallbacks();
+
+    // ★ v3.110: 重新摘除 EAC 回调 (恢复后重新摘除)
+    static void ReapplyAllCallbacks();
 };
 
 // ============================================================

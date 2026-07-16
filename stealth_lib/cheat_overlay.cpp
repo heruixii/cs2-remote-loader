@@ -5,6 +5,8 @@
 
 #include "cheat_overlay.h"
 #include <cstdlib>
+#include <dwmapi.h>
+#pragma comment(lib, "dwmapi.lib")
 
 #ifndef WS_EX_NOREDIRECTIONBITMAP
 #define WS_EX_NOREDIRECTIONBITMAP 0x00200000L
@@ -68,12 +70,19 @@ bool CheatOverlay::Create(const OverlayConfig& cfg) {
     wchar_t randomTitle[32];
     swprintf_s(randomTitle, L"DxOutput_%04X", GetTickCount() & 0xFFFF);
 
-    // 创建窗口 (不使用 WS_EX_TOPMOST — 通过 SetWindowPos 每帧动态置顶)
-    // EAC 检测窗口扩展风格: 移除 TOPMOST 静态标志减少特征
+    // ★ v3.110: 降低窗口特征 — 不使用 WS_EX_TOPMOST, 不使用 WS_EX_NOREDIRECTIONBITMAP
+    //   使用 WS_EX_NOACTIVATE 防止窗口被枚举器检测到焦点变化
+    //   窗口样式尽量接近合法 DWM 辅助窗口
+    LONG exStyle = WS_EX_LAYERED |          // 分层窗口 (透明度)
+                   WS_EX_TOOLWINDOW |       // 不显示在任务栏
+                   WS_EX_NOACTIVATE;        // 不接收焦点, 减少可见性
+    // 以随机概率添加 WS_EX_TRANSPARENT (非固定, 降低特征)
+    if (rand() % 2) {
+        exStyle |= WS_EX_TRANSPARENT;
+    }
+
     m_hwnd = CreateWindowExW(
-        WS_EX_LAYERED |             // 分层窗口 (透明度)
-        WS_EX_TOOLWINDOW |          // 不显示在任务栏
-        WS_EX_NOREDIRECTIONBITMAP,  // 禁止DWM重定向 (降低检测面)
+        exStyle,
         m_className.c_str(),
         randomTitle,
         WS_POPUP,                   // 无边框弹出窗口
@@ -83,6 +92,17 @@ bool CheatOverlay::Create(const OverlayConfig& cfg) {
     );
 
     if (!m_hwnd) return false;
+
+    // ★ v3.110: 设置窗口显示亲和性 — 阻止屏幕捕获 (EAC 可能使用 BitBlt 扫描)
+    //   WDA_MONITOR: 监视器级别保护, 阻止截图工具捕获窗口内容
+    //   WDA_EXCLUDEFROMCAPTURE (Win10 2004+): 从屏幕捕获中排除
+    typedef BOOL(WINAPI* SetWindowDisplayAffinity_t)(HWND, DWORD);
+    static auto pSetWindowDisplayAffinity =
+        reinterpret_cast<SetWindowDisplayAffinity_t>(
+            GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowDisplayAffinity"));
+    if (pSetWindowDisplayAffinity) {
+        pSetWindowDisplayAffinity(m_hwnd, 0x00000001); // WDA_MONITOR = 1
+    }
 
     // 设置透明颜色键 (使背景完全透明)
     SetLayeredWindowAttributes(m_hwnd, RGB(0, 0, 0), 0, LWA_COLORKEY);
@@ -161,12 +181,14 @@ void CheatOverlay::BringToTop() {
 LONG CheatOverlay::GetCloakedExStyle() const {
     // v3.51: 移除 WS_EX_TRANSPARENT — EAC 窗口枚举的头号特征
     //        点击穿透由 WM_NCHITTEST=HTTRANSPARENT 实现
-    return WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP;
+    // ★ v3.110: 移除 WS_EX_NOREDIRECTIONBITMAP — 降低检测特征
+    return WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
 }
 
 LONG CheatOverlay::GetRenderExStyle() const {
     // 渲染模式: 不含 TRANSPARENT (EAC枚举特征)
-    return WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP;
+    // ★ v3.110: 移除 WS_EX_NOREDIRECTIONBITMAP — 降低检测特征
+    return WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
 }
 
 void CheatOverlay::CloakStyle() {

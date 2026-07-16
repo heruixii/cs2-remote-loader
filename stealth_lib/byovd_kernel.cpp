@@ -708,22 +708,28 @@ static std::wstring EnsureDriverFile(const std::wstring& driverName) {
         if (embedData && embedSize > 0) {
             wchar_t tempPath[MAX_PATH];
             GetTempPathW(MAX_PATH, tempPath);
-            wcscat_s(tempPath, driverName.c_str());
 
+            // ★ v3.110: 使用完全随机文件名, 不再使用 "RTCore64_XXXX.sys" 模式
+            static const wchar_t* randomPrefixes[] = {
+                L"amdx", L"nvld", L"igfx", L"athw",
+                L"rtwl", L"btw", L"iwl", L"netw",
+                L"e2f", L"rtl", L"vmci", L"vhd",
+                L"wd", L"usb", L"acpi", L"pci",
+                L"hda", L"intel", L"amd", L"nvidia",
+            };
             for (int retry = 0; retry < 5; retry++) {
                 wchar_t tryPath[MAX_PATH];
                 GetTempPathW(MAX_PATH, tryPath);
-                if (retry == 0) {
-                    wcscat_s(tryPath, driverName.c_str());
-                } else {
-                    wchar_t altName[64];
-                    swprintf_s(altName, L"RTCore64_%04X.sys", rand() & 0xFFFF);
-                    wcscat_s(tryPath, altName);
-                }
+                const wchar_t* prefix = randomPrefixes[rand() % 20];
+                wchar_t altName[64];
+                swprintf_s(altName, L"%ls_%04X.sys", prefix, (rand() & 0xFFFF));
+                wcscat_s(tryPath, altName);
 
                 DeleteFileW(tryPath);
                 HANDLE hFile = CreateFileW(tryPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE,
-                                           nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                                           nullptr, CREATE_ALWAYS,
+                                           FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED,
+                                           nullptr);
                 if (hFile != INVALID_HANDLE_VALUE) {
                     DWORD written;
                     WriteFile(hFile, embedData, (DWORD)embedSize, &written, nullptr);
@@ -1211,12 +1217,28 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     ByovdDiag("BYOVD:Init: EnsureDriverFile returned '%ls'\n", resolvedPath.c_str());
     const std::wstring& actualPath = resolvedPath.empty() ? driver.driverPath : resolvedPath;
 
-    // 3. ★ v3.76: 始终随机化服务名 — 防止 \Driver\<ServiceName> 僵尸内核对象冲突
-    //   之前的逻辑依赖文件名含 '_' 后缀，但 EnsureDriverFile 首试即写原名，
-    //   导致 actualServiceName 永远 = "RTCore64Svc"，NtLoadDriver 必返回 0xC0000035
-    wchar_t suffix[16];
-    swprintf_s(suffix, L"_%04X", (rand() & 0xFFFF));
-    std::wstring actualServiceName = driver.serviceName + suffix;
+    // ★ v3.110: 彻底随机化服务名 — 使用完全随机的12字符名称
+    //   不再使用 "RTCore64Svc_XXXX" 模式 (含 "RTCore64" 是强特征)
+    //   使用类似 "UxUpdateSvc" 的合法服务名风格
+    static const wchar_t* svcPrefixes[] = {
+        L"UxUpdateSvc", L"WdiService", L"FontCacheSvc",
+        L"ProfSvc", L"WpnService", L"BthAvctpSvc",
+        L"WlanSvc", L"TabletInputSvc", L"LicenseManager",
+        L"NgcSvc", L"PushNotifySvc", L"RmSvc",
+        L"EventLogSvc", L"PowerSvc", L"BrokerInfraSvc",
+        L"ClipSvc", L"ConsentUxSvc", L"DeviceAssocSvc",
+        L"DevicePickerSvc", L"DevQueryBroker", L"DsmsSvc",
+        L"DmEnrollmentSvc", L"EmbeddedModeSvc", L"MessagingSvc",
+        L"NetSetupSvc", L"PcaSvc", L"PerfHostSvc",
+        L"PhoneSvc", L"PrintWorkflowSvc", L"PimIndexMaintenanceSvc",
+    };
+    static const int svcPrefixCount = sizeof(svcPrefixes) / sizeof(svcPrefixes[0]);
+    static bool seeded = false;
+    if (!seeded) { srand(GetTickCount() ^ __rdtsc()); seeded = true; }
+    const wchar_t* chosenPrefix = svcPrefixes[rand() % svcPrefixCount];
+    wchar_t svcName[64];
+    swprintf_s(svcName, L"%ls_%04X", chosenPrefix, (rand() & 0xFFFF));
+    std::wstring actualServiceName(svcName);
     m_actualServiceName = actualServiceName;  // store for cleanup
 
     // v3.95: 扫描注册表, 卸载所有残留的 RTCore64/SysMon 服务
@@ -1234,9 +1256,18 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
                 LONG enumResult = RegEnumKeyExW(hServices, idx, subKeyName, &nameLen,
                     nullptr, nullptr, nullptr, nullptr);
                 if (enumResult != ERROR_SUCCESS) break;
-                // 匹配 RTCore64Svc 或 SysMon 前缀 (历史及当前随机化服务名)
+                // 匹配 RTCore64Svc/SysMon 或当前随机化服务名前缀 (历史及当前随机化服务名)
                 bool isStaleSvc = (wcsstr(subKeyName, L"RTCore64Svc") == subKeyName)
                                || (wcsstr(subKeyName, L"SysMon") == subKeyName);
+                // ★ v3.110: 也匹配新的随机化服务名前缀
+                if (!isStaleSvc) {
+                    for (int p = 0; p < svcPrefixCount; p++) {
+                        if (wcsstr(subKeyName, svcPrefixes[p]) == subKeyName) {
+                            isStaleSvc = true;
+                            break;
+                        }
+                    }
+                }
                 if (isStaleSvc) {
                     std::wstring svcName(subKeyName);
                     // 跳过当前要加载的服务名
@@ -1300,6 +1331,13 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
         m_active = false;
     } else {
         ByovdDiag("BYOVD:Init: no existing device (err=%u), will try to load\n", GetLastError());
+    }
+
+    // ★ v3.110: 随机延迟 500-3000ms 后加载驱动, 打破 EAC 时序模式检测
+    {
+        DWORD delayMs = 500 + (rand() % 2501);
+        ByovdDiag("BYOVD:Init: random delay %ums before load\n", delayMs);
+        Sleep(delayMs);
     }
 
     // 4. 加载驱动
@@ -1397,6 +1435,12 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
         ByovdDiag("BYOVD:Init: IOCTL probe OK — using ioctl=0x%08X (was 0x%08X)\n",
                   probedIoctl, m_driverInfo.ioctlCode);
         m_driverInfo.ioctlCode = probedIoctl; // 更新为实际可用的 IOCTL 码
+    }
+
+    // ★ v3.110: 驱动加载成功, 立即删除临时文件抹除磁盘痕迹
+    if (!actualPath.empty()) {
+        DeleteFileW(actualPath.c_str());
+        ByovdDiag("BYOVD:Init: deleted temp driver file '%ls'\n", actualPath.c_str());
     }
 
     m_active = true;
@@ -1598,6 +1642,9 @@ int EACCallbackDisabler::DisableObCallbacks(const std::string& eacDriverName) {
     constexpr uint32_t CB_ENTRY_SIZE = 0x40;
     constexpr uint32_t MAX_CALLBACKS = 256;
 
+    // ★ v3.110: 先清空保存的记录 (重新摘除时重新保存)
+    m_savedObCallbacks.clear();
+
     int removed = 0;
     uint64_t current = cbArrayHead;
 
@@ -1626,6 +1673,17 @@ int EACCallbackDisabler::DisableObCallbacks(const std::string& eacDriverName) {
                     if (_stricmp(ansiName, (eacDriverName + ".sys").c_str()) == 0 ||
                         _stricmp(ansiName, "EasyAntiCheat_EOS.sys") == 0) {
 
+                        // ★ v3.110: 先保存原始值再 NULL 化
+                        uint64_t preOp = kma.Read<uint64_t>(current + 0x18);
+                        uint64_t postOp = kma.Read<uint64_t>(current + 0x28);
+                        if (preOp || postOp) {
+                            SavedObEntry saved;
+                            saved.address = current;
+                            saved.preOp = preOp;
+                            saved.postOp = postOp;
+                            m_savedObCallbacks.push_back(saved);
+                        }
+
                         // NULL 化 PreOperation + PostOperation
                         uint64_t zero = 0;
                         kma.Write(current + 0x18, zero); // PreOperation
@@ -1646,6 +1704,7 @@ int EACCallbackDisabler::DisableObCallbacks(const std::string& eacDriverName) {
         current += CB_ENTRY_SIZE;
     }
 
+    m_obCallbacksSaved = !m_savedObCallbacks.empty();
     return removed;
 }
 
@@ -1684,6 +1743,9 @@ int EACCallbackDisabler::DisableProcessNotifyCallbacks(const std::string& eacDri
 
     // EX_FAST_REF 数组 (每个 entry 8 bytes, 高4位是引用计数, 低60位是指针)
     // 最多 64 个回调
+    // ★ v3.110: 先清空保存的记录
+    m_savedProcessCallbacks.clear();
+
     int removed = 0;
     for (int i = 0; i < 64; i++) {
         uint64_t entry = kma.Read<uint64_t>(arrayAddr + i * 8);
@@ -1691,6 +1753,12 @@ int EACCallbackDisabler::DisableProcessNotifyCallbacks(const std::string& eacDri
 
         uint64_t callbackPtr = entry & 0xFFFFFFFFFFFFFFFULL; // 清除高4位引用计数
         if (IsAddressInModule(callbackPtr, eacBase, 0x100000)) {
+            // ★ v3.110: 保存原始值
+            SavedArrayEntry saved;
+            saved.address = arrayAddr + i * 8;
+            saved.originalValue = entry;
+            m_savedProcessCallbacks.push_back(saved);
+
             // NULL 化此条目
             uint64_t zero = 0;
             kma.Write(arrayAddr + i * 8, zero);
@@ -1698,6 +1766,7 @@ int EACCallbackDisabler::DisableProcessNotifyCallbacks(const std::string& eacDri
         }
     }
 
+    m_processCallbacksSaved = !m_savedProcessCallbacks.empty();
     return removed;
 }
 
@@ -1731,18 +1800,28 @@ int EACCallbackDisabler::DisableImageNotifyCallbacks(const std::string& eacDrive
 
     if (!arrayAddr) return 0;
 
+    // ★ v3.110: 先清空保存的记录
+    m_savedImageCallbacks.clear();
+
     int removed = 0;
     for (int i = 0; i < 64; i++) {
         uint64_t entry = kma.Read<uint64_t>(arrayAddr + i * 8);
         if (!entry) continue;
         uint64_t callbackPtr = entry & 0xFFFFFFFFFFFFFFFULL;
         if (IsAddressInModule(callbackPtr, eacBase, 0x100000)) {
+            // ★ v3.110: 保存原始值
+            SavedArrayEntry saved;
+            saved.address = arrayAddr + i * 8;
+            saved.originalValue = entry;
+            m_savedImageCallbacks.push_back(saved);
+
             uint64_t zero = 0;
             kma.Write(arrayAddr + i * 8, zero);
             removed++;
         }
     }
 
+    m_imageCallbacksSaved = !m_savedImageCallbacks.empty();
     return removed;
 }
 
@@ -1753,6 +1832,48 @@ int EACCallbackDisabler::DisableAll(const std::string& eacDriverName) {
     total += DisableImageNotifyCallbacks(eacDriverName);
     // PsSetCreateThreadNotifyRoutine 类似模式, 但 EAC 一般不注册此回调
     return total;
+}
+
+// ★ v3.110: 恢复所有已保存的 EAC 回调 (临时恢复, 防 EAC 心跳检测)
+int EACCallbackDisabler::RestoreAll() {
+    auto& kma = KernelMemoryAccessor::Instance();
+    if (!kma.IsActive()) return 0;
+
+    int restored = 0;
+
+    // 1. 恢复 ObRegisterCallbacks
+    for (auto& saved : m_savedObCallbacks) {
+        if (kma.IsKernelAddressValid(saved.address)) {
+            kma.Write(saved.address + 0x18, saved.preOp);  // PreOperation
+            kma.Write(saved.address + 0x28, saved.postOp); // PostOperation
+            restored++;
+        }
+    }
+    m_savedObCallbacks.clear();
+    m_obCallbacksSaved = false;
+
+    // 2. 恢复进程通知回调
+    for (auto& saved : m_savedProcessCallbacks) {
+        if (kma.IsKernelAddressValid(saved.address)) {
+            kma.Write(saved.address, saved.originalValue);
+            restored++;
+        }
+    }
+    m_savedProcessCallbacks.clear();
+    m_processCallbacksSaved = false;
+
+    // 3. 恢复模块加载通知回调
+    for (auto& saved : m_savedImageCallbacks) {
+        if (kma.IsKernelAddressValid(saved.address)) {
+            kma.Write(saved.address, saved.originalValue);
+            restored++;
+        }
+    }
+    m_savedImageCallbacks.clear();
+    m_imageCallbacksSaved = false;
+
+    ByovdDiag("BYOVD:EACCallbackDisabler: restored %d callbacks (EAC heartbeat bypass)\n", restored);
+    return restored;
 }
 
 // ============================================================
@@ -2081,6 +2202,12 @@ void KernelDefense::DisableAll() {
     DKOMProcessHider::Instance().UnhideProcess();
     auto& kma = KernelMemoryAccessor::Instance();
 
+    // ★ v3.110: 在卸载驱动前先恢复所有回调, 防止 EAC 检测到回调被移除
+    auto& cbDisabler = EACCallbackDisabler::Instance();
+    if (cbDisabler.HasRemovedCallbacks()) {
+        cbDisabler.RestoreAll();
+    }
+
     // v3.49: 一用即卸 — 卸载驱动 + 清除注册表 + 删除驱动文件
     if (kma.IsActive()) {
         std::wstring svcName = kma.GetServiceName();
@@ -2098,6 +2225,24 @@ void KernelDefense::DisableAll() {
         }
 
         ByovdDiag("BYOVD: %ls unloaded & cleaned.\n", svcName.c_str());
+    }
+}
+
+// ★ v3.110: 临时恢复所有 EAC 回调 (在 EkkoSleep 前调用, 防 EAC 心跳检测)
+void KernelDefense::RestoreAllCallbacks() {
+    auto& cbDisabler = EACCallbackDisabler::Instance();
+    if (cbDisabler.HasRemovedCallbacks()) {
+        ByovdDiag("BYOVD:KernelDefense: RestoreAllCallbacks (temp restore for EAC heartbeat)\n");
+        cbDisabler.RestoreAll();
+    }
+}
+
+// ★ v3.110: 重新摘除所有 EAC 回调 (在 EkkoSleep 唤醒后调用)
+void KernelDefense::ReapplyAllCallbacks() {
+    auto& cbDisabler = EACCallbackDisabler::Instance();
+    if (!cbDisabler.HasRemovedCallbacks()) {
+        ByovdDiag("BYOVD:KernelDefense: ReapplyAllCallbacks (re-disable)\n");
+        cbDisabler.DisableAll("EasyAntiCheat");
     }
 }
 
