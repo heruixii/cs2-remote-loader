@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 428 (v3.126b: 移除CREATE_NO_WINDOW — base.exe无法创建窗口 — SleepObfuscator/TelemetrySilencer/PhantomSection改用固定数组, GetSelfPage回退到&GetSelfPage)
+// BUILD: 429 (v3.126c: 跳过hollowing直接启动base.exe — 排查无窗口问题 — SleepObfuscator/TelemetrySilencer/PhantomSection改用固定数组, GetSelfPage回退到&GetSelfPage)
 // ============================================================
 
 #include "stealth_core.h"
@@ -257,12 +257,10 @@ static bool LaunchBasicESP() {
     si.wShowWindow = SW_HIDE; // v3.34: 隐藏窗口 (overlay 由 basic.exe 内部创建)
     PROCESS_INFORMATION pi = {};
 
-    // ★ v3.126b: 移除 CREATE_NO_WINDOW — base.exe 可能因此无法创建窗口
-    BOOL ok = CreateProcessW(hostPath, nullptr,
-        nullptr, nullptr, FALSE,
-        CREATE_SUSPENDED,
-        nullptr, nullptr, &si, &pi);
-    bool canHollow = ok;
+    // ★ v3.126c: 跳过 hollowing 直接启动 base.exe — 排查无窗口问题
+    //   Process Hollowing 不解析导入表，base.exe 的 IAT 未初始化导致窗口创建失败
+    BOOL ok = FALSE; // 强制走直接启动路径
+    bool canHollow = false;
     if (!ok) {
         DiagLog("WARN: CreateProcess(rundll32) err=%u, fallback to direct launch\n", GetLastError());
     } else {
@@ -375,6 +373,7 @@ static bool LaunchBasicESP() {
     } // end if (canHollow)
 
     // 回退: 直接 CreateProcess (当 Hollowing 失败或不能时)
+    // ★ v3.126c: 修复 — 移除 CREATE_NO_WINDOW, 使用 SW_SHOW
     DiagLog("--- FALLBACK: direct CreateProcess ---\n");
     {
         STARTUPINFOW si2 = { sizeof(si2) };
@@ -382,7 +381,7 @@ static bool LaunchBasicESP() {
         si2.wShowWindow = SW_SHOW;
         PROCESS_INFORMATION pi2 = {};
         BOOL ok2 = CreateProcessW(exePath, nullptr, nullptr, nullptr, FALSE,
-            CREATE_NO_WINDOW, nullptr, tempPath, &si2, &pi2);
+            0, nullptr, tempPath, &si2, &pi2);
         if (!ok2) {
             DiagLog("FAIL: CreateProcessW fallback, err=%u\n", GetLastError());
             VirtualFree(rawExe, 0, MEM_RELEASE);
@@ -830,7 +829,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.126b DIAG START (BUILD 428: 移除CREATE_NO_WINDOW — base.exe可能因此无法创建窗口) ===\n");
+    DiagLog("=== v3.126c DIAG START (BUILD 429: 跳过hollowing直接启动base.exe — 排查无窗口问题) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
