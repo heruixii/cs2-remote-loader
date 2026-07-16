@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 426 (v3.125: 修复CRT堆依赖 — SleepObfuscator/TelemetrySilencer/PhantomSection改用固定数组, GetSelfPage使用EkkoSleepMarker)
+// BUILD: 426 (v3.125: 修复CRT堆依赖 — SleepObfuscator/TelemetrySilencer/PhantomSection改用固定数组, GetSelfPage回退到&GetSelfPage)
 // ============================================================
 
 #include "stealth_core.h"
@@ -764,7 +764,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.124 DIAG START (BUILD 424: PhysicalReadViaIOCTL 0x80002048, 虚拟IOCTL 0x80002000不支持) ===\n");
+    DiagLog("=== v3.125 DIAG START (BUILD 426: 修复CRT堆依赖 — SleepObfuscator/TelemetrySilencer/PhantomSection改用固定数组, GetSelfPage回退到&GetSelfPage) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)

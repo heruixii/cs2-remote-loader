@@ -52,15 +52,11 @@ void SleepObfuscator::XorCrypt(void* data, SIZE_T size, BYTE key) {
 }
 
 // 返回自身代码所在页面的基地址 (用于 EkkoSleep 自身页豁免)
-// ★ v3.125: 使用 EkkoSleepMarker 确保与 EkkoSleep 在同一编译单元且同页
-namespace {
-    // 占位函数: 与 EkkoSleep 在同一 .cpp 文件, 确保代码页被豁免
-    static void EkkoSleepMarker() {}
-}
+// ★ v3.125: 使用 &GetSelfPage 自身地址 — 与 EkkoSleep 在同一编译单元,
+//   编译器将同一 .cpp 的所有函数放在 .text 区段中, 大概率在同一 4KB 页面
+//   (不可使用匿名命名空间中的辅助函数, 因为编译器可能将其放在不同区段)
 uintptr_t SleepObfuscator::GetSelfPage() {
-    // 使用 EkkoSleepMarker 的地址 — 与 EkkoSleep 在同一编译单元,
-    // 编译器将其放置在 .text 区段的临近位置, 大概率在同一 4KB 页面
-    return reinterpret_cast<uintptr_t>(&EkkoSleepMarker) & ~0xFFFULL;
+    return reinterpret_cast<uintptr_t>(&GetSelfPage) & ~0xFFFULL;
 }
 
 void SleepObfuscator::RegisterProtectedRegion(void* addr, SIZE_T size) {
