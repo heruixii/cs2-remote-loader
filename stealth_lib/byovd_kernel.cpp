@@ -1651,6 +1651,7 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
             ByovdDiag("BYOVD:Init: STEP_C delete FAILED err=%d, retrying with MOVEFILE_DELAY_UNTIL_REBOOT\n", (int)err);
             MoveFileExW(actualPath.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
         }
+    }
 
     m_active = true;
     ByovdDiag("BYOVD:Init: STEP_D m_active=true, verifying IOCTL...\n");
@@ -2889,6 +2890,11 @@ bool KernelTraceCleaner::CleanAllTraces() {
 
 // ============================================================
 // ★ v3.126n: MinifilterNeutralizer — 中和而非卸载 MessageTransfer
+
+// ★ v3.126p: 前向声明 — PAC 模块函数 (实现在 MinifilterNeutralizer 之后)
+static uint64_t FindPacFilterInKernel(uint64_t fltmgrBase, uint64_t fltGlobals, std::wstring& outName);
+static bool IsPacPattern(const wchar_t* name);
+static std::wstring GetPacTargetName();
 //
 // 此前方案: FilterUnload → 卸载 minifilter → PAC 客户端检测到缺失
 // 新方案:   不卸载, 用 BYOVD 内核 R/W 替换所有操作回调为无害 stub
@@ -3202,9 +3208,19 @@ bool MinifilterNeutralizer::NeutralizeMessageTransfer() {
     uint64_t fltGlobals = FindFltGlobals(fltmgrBase);
     if (!fltGlobals) return false;
 
-    // 2. 查找 MessageTransfer
-    uint64_t filterAddr = FindFilterByName(fltmgrBase, fltGlobals, L"MessageTransfer");
-    if (!filterAddr) return false;
+    // 2. 查找 PAC minifilter
+    std::wstring pacName = GetPacTargetName();
+    uint64_t filterAddr = FindFilterByName(fltmgrBase, fltGlobals, pacName.c_str());
+    if (!filterAddr) {
+        // ★ v3.126p: 精确匹配失败 → 尝试内核模糊扫描
+        std::wstring kernName;
+        filterAddr = FindPacFilterInKernel(fltmgrBase, fltGlobals, kernName);
+        if (!filterAddr) {
+            ByovdDiag("FLT:NTRL: no PAC filter found in kernel\n");
+            return false;
+        }
+        pacName = kernName;
+    }
 
     // 3. 中和回调
     if (!NeutralizeCallbacks(filterAddr)) return false;
@@ -3225,10 +3241,15 @@ bool MinifilterNeutralizer::IsMessageTransferNeutralized() {
     uint64_t fltGlobals = FindFltGlobals(fltmgrBase);
     if (!fltGlobals) return true; // 找不到 Globals 不报错
 
-    uint64_t filterAddr = FindFilterByName(fltmgrBase, fltGlobals, L"MessageTransfer");
+    uint64_t filterAddr = FindFilterByName(fltmgrBase, fltGlobals, GetPacTargetName().c_str());
+    if (!filterAddr) {
+        // ★ v3.126p: 精确匹配失败 → 模糊扫描
+        std::wstring kernName;
+        filterAddr = FindPacFilterInKernel(fltmgrBase, fltGlobals, kernName);
+    }
     if (!filterAddr) {
         // minifilter 不在列表中 — 被卸载了, 需要重新安装假的存在性
-        ByovdDiag("FLT:NTRL:Guard: MessageTransfer not found in FilterList!\n");
+        ByovdDiag("FLT:NTRL:Guard: PAC filter not found in FilterList!\n");
         return false;
     }
 
@@ -3279,9 +3300,130 @@ bool MinifilterNeutralizer::IsMessageTransferNeutralized() {
 //   4. 删除驱动文件 (完美平台plugin目录 + system32/drivers)
 //   5. 周期性守卫 (GuardPac) 检查 PAC 是否恢复
 //
-// 注意: PAC 自我保护不强, B站已验证删除驱动后完美平台仍正常运行
-//       但 minifilter 卸载需在平台启动前完成, 运行中卸载可能触发检测
+// ★ v3.126p: PAC 改名容错 — 不依赖 "MessageTransfer" 硬编码
+//   如果 PAC 更新改名 (如 v2.0 改成 "PvpAcFilter"), 自动通过关键词扫描发现
+//   策略: 精确匹配 → 模糊扫描 → 最佳匹配
 // ============================================================
+
+// ★ v3.126p: PAC 相关关键词 — 用于模糊匹配 PAC 的 minifilter/服务/驱动名
+static const wchar_t* g_pacPatterns[] = {
+    L"messagetransfer",     // 当前已知名称 (2024-2026)
+    L"pvpac",               // 常见变体 (PvP Anti-Cheat)
+    L"pw_ac",               // PerfectWorld Anti-Cheat 缩写
+    L"perfectworldac",      // 完整名称
+    L"perfectworld",        // 完美世界
+    L"pwanti",              // PerfectWorld Anti-*
+    nullptr
+};
+
+static bool IsPacPattern(const wchar_t* name) {
+    if (!name || !name[0]) return false;
+    for (int i = 0; g_pacPatterns[i]; i++) {
+        const wchar_t* p = name;
+        while (*p) {
+            const wchar_t* a = p, *b = g_pacPatterns[i];
+            while (*a && *b && towlower(*a) == towlower(*b)) { a++; b++; }
+            if (!*b) return true;
+            p++;
+        }
+    }
+    return false;
+}
+
+// ★ v3.126p: 统一 PAC 目标名获取 — 支持改名容错
+static std::wstring g_cachedPacName;
+static DWORD     g_lastPacNameCheck = 0;
+
+static std::wstring GetPacTargetName() {
+    DWORD now = GetTickCount();
+    if (!g_cachedPacName.empty() && now - g_lastPacNameCheck < 30000)
+        return g_cachedPacName;
+    g_lastPacNameCheck = now;
+
+    // 枚举所有 minifilter, 找 PAC 匹配
+    std::wstring found;
+    HMODULE hFltLib = LoadLibraryW(L"fltlib.dll");
+    if (hFltLib) {
+        auto pFF = (HRESULT(WINAPI*)(DWORD,LPVOID,DWORD,LPDWORD,LPVOID))GetProcAddress(hFltLib,"FilterFindFirst");
+        auto pFN = (HRESULT(WINAPI*)(HANDLE,LPVOID,DWORD,LPDWORD))GetProcAddress(hFltLib,"FilterFindNext");
+        auto pFC = (HRESULT(WINAPI*)(HANDLE))GetProcAddress(hFltLib,"FilterFindClose");
+        if (pFF && pFN && pFC) {
+            BYTE buf[1024]={}; HANDLE hF=nullptr; DWORD br=0;
+            HRESULT hr = pFF(0,buf,sizeof(buf),&br,&hF);
+            while (SUCCEEDED(hr)) {
+                wchar_t* fn = (wchar_t*)(buf+8);
+                if (IsPacPattern(fn)) { found = fn; break; }
+                hr = pFN(hF,buf,sizeof(buf),&br);
+            }
+            if (hF) pFC(hF);
+        }
+        FreeLibrary(hFltLib);
+    }
+    if (found.empty()) found = L"MessageTransfer"; // 回退默认
+    g_cachedPacName = found;
+    return found;
+}
+
+static void RefreshPacName() { g_cachedPacName.clear(); g_lastPacNameCheck=0; GetPacTargetName(); }
+
+// ★ v3.126p: wstring → string 辅助转换
+static std::string WStringToString(const std::wstring& ws) {
+    if (ws.empty()) return "";
+    int len = WideCharToMultiByte(CP_ACP, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return "";
+    std::string result(len - 1, '\0');
+    WideCharToMultiByte(CP_ACP, 0, ws.c_str(), -1, &result[0], len, nullptr, nullptr);
+    return result;
+}
+
+// ★ v3.126p: 内核层模糊扫描 PAC minifilter (用于 Neutralize 失败后的回退)
+static uint64_t FindPacFilterInKernel(uint64_t fltmgrBase, uint64_t fltGlobals, std::wstring& outName) {
+    auto& kma = KernelMemoryAccessor::Instance();
+    if (!kma.IsActive()) return 0;
+
+    uint64_t frameList = 0;
+    if (!kma.ReadKernelVA(fltGlobals, &frameList, sizeof(frameList))) return 0;
+
+    uint64_t filterOffsets[] = { 0x140, 0x148, 0x150, 0x138 };
+    uint64_t filterListHead = 0;
+    for (uint64_t off : filterOffsets) {
+        uint64_t addr = frameList + off;
+        uint64_t flink = 0, blink = 0;
+        if (kma.ReadKernelVA(addr, &flink, sizeof(flink)) &&
+            kma.ReadKernelVA(addr + 8, &blink, sizeof(blink))) {
+            if (flink != addr && flink > 0xFFFF800000000000ULL && blink > 0xFFFF800000000000ULL) {
+                filterListHead = addr;
+                break;
+            }
+        }
+    }
+    if (!filterListHead) return 0;
+
+    uint64_t nameOffsets[] = { 0x188, 0x198, 0x1A8, 0x178 };
+    uint64_t current = 0;
+    if (!kma.ReadKernelVA(filterListHead, &current, sizeof(current))) return 0;
+
+    for (int iter = 0; iter < 100 && current && current != filterListHead; iter++) {
+        uint64_t filterBase = current - 0x008;
+        for (uint64_t nameOff : nameOffsets) {
+            uint16_t nameLen = 0;
+            uint64_t nameBuf = 0;
+            if (kma.ReadKernelVA(filterBase + nameOff, &nameLen, sizeof(nameLen)) &&
+                kma.ReadKernelVA(filterBase + nameOff + 8, &nameBuf, sizeof(nameBuf))) {
+                if (nameLen > 0 && nameLen <= 256 && nameLen % 2 == 0 &&
+                    nameBuf > 0xFFFF800000000000ULL) {
+                    std::wstring filterName = ReadKernelUnicodeString(nameBuf, nameLen);
+                    if (IsPacPattern(filterName.c_str())) {
+                        outName = filterName;
+                        return filterBase;
+                    }
+                }
+            }
+        }
+        if (!kma.ReadKernelVA(current, &current, sizeof(current))) break;
+    }
+    return 0;
+}
 
 // 动态加载 fltlib.dll 的 FilterUnload 函数 (无需 WDK)
 typedef HRESULT (WINAPI* _FilterUnload)(LPCWSTR lpFilterName);
@@ -3324,7 +3466,7 @@ static bool IsPacMinifilterLoaded() {
         auto* info = (BYTE*)buf;
         // FILTER_FULL_INFORMATION: Name is at offset 8 (wchar_t[256])
         const wchar_t* filterName = (const wchar_t*)(info + 8);
-        if (_wcsicmp(filterName, L"MessageTransfer") == 0) {
+        if (_wcsicmp(filterName, GetPacTargetName().c_str()) == 0) {
             found = true;
             break;
         }
@@ -3346,10 +3488,11 @@ static bool DisablePacService() {
         return false;
     }
 
-    SC_HANDLE svc = OpenServiceW(scm, L"MessageTransfer",
+    std::wstring pacName = GetPacTargetName();
+    SC_HANDLE svc = OpenServiceW(scm, pacName.c_str(),
         SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE | SERVICE_START);
     if (!svc) {
-        ByovdDiag("PAC: MessageTransfer service not found (may already be removed)\n");
+        ByovdDiag("PAC: SCM service '%ls' not found (may already be removed)\n", pacName.c_str());
         CloseServiceHandle(scm);
         return true; // 未找到 = 已经移除, 不算失败
     }
@@ -3412,7 +3555,8 @@ static bool UnloadPacMinifilter() {
         return false;
     }
 
-    HRESULT hr = pFilterUnload(L"MessageTransfer");
+    std::wstring pacName = GetPacTargetName();
+    HRESULT hr = pFilterUnload(pacName.c_str());
     FreeLibrary(hFltLib);
 
     if (SUCCEEDED(hr)) {
@@ -3462,13 +3606,33 @@ static void DeletePacDriverFiles() {
                 wchar_t pluginDir[MAX_PATH] = {};
                 wsprintfW(pluginDir, L"%s\\%s\\plugin", base, fd.cFileName);
                 if (GetFileAttributesW(pluginDir) != INVALID_FILE_ATTRIBUTES) {
+                    // ★ v3.126p: 先搜索确切名称, 未找到则模糊扫描 *.sys
                     wchar_t drvFile[MAX_PATH] = {};
-                    wsprintfW(drvFile, L"%s\\MessageTransfer.sys", pluginDir);
-                    if (GetFileAttributesW(drvFile) != INVALID_FILE_ATTRIBUTES) {
-                        ByovdDiag("PAC: found driver at %ls\n", drvFile);
-                        // 尝试删除: 先改名为 .bak 再删除 (绕过使用中的文件保护)
+                    wsprintfW(drvFile, L"%s\\%s.sys", pluginDir, GetPacTargetName().c_str());
+                    bool found = (GetFileAttributesW(drvFile) != INVALID_FILE_ATTRIBUTES);
+
+                    if (!found) {
+                        // 模糊扫描: 在 plugin 目录中搜索任何匹配 PAC 模式的 .sys 文件
+                        wchar_t sysPattern[MAX_PATH] = {};
+                        wsprintfW(sysPattern, L"%s\\*.sys", pluginDir);
+                        WIN32_FIND_DATAW sfd = {};
+                        HANDLE sFind = FindFirstFileW(sysPattern, &sfd);
+                        if (sFind != INVALID_HANDLE_VALUE) {
+                            do {
+                                if (IsPacPattern(sfd.cFileName)) {
+                                    wsprintfW(drvFile, L"%s\\%s", pluginDir, sfd.cFileName);
+                                    found = true;
+                                    break;
+                                }
+                            } while (FindNextFileW(sFind, &sfd));
+                            FindClose(sFind);
+                        }
+                    }
+
+                    if (found) {
+                        ByovdDiag("PAC:DeleteDrvFiles: found %ls\n", drvFile);
                         wchar_t bakFile[MAX_PATH] = {};
-                        wsprintfW(bakFile, L"%s\\MessageTransfer.sys.bak", pluginDir);
+                        wsprintfW(bakFile, L"%s.bak", drvFile);
                         MoveFileExW(drvFile, bakFile, MOVEFILE_REPLACE_EXISTING);
                         DeleteFileW(bakFile);
                         DeleteFileW(drvFile);
@@ -3479,17 +3643,19 @@ static void DeletePacDriverFiles() {
         FindClose(hFind);
     }
 
-    // 2. system32\drivers 中的备份
-    // ★ v3.126o: 修复 — 检查删除结果, 失败时标记为重启后删除
-    if (!DeleteFileW(L"C:\\Windows\\System32\\drivers\\MessageTransfer.sys")) {
+    // 2. system32\drivers 中的备份 (★ v3.126p: 动态名称)
+    wchar_t sys32Drv[MAX_PATH] = {};
+    wsprintfW(sys32Drv, L"C:\\Windows\\System32\\drivers\\%s.sys", GetPacTargetName().c_str());
+    if (!DeleteFileW(sys32Drv)) {
         DWORD err = GetLastError();
         if (err != ERROR_FILE_NOT_FOUND) {
-            ByovdDiag("PAC:DeleteDrvFiles: cannot delete drivers, err=%d, scheduling reboot cleanup\n", (int)err);
-            MoveFileExW(L"C:\\Windows\\System32\\drivers\\MessageTransfer.sys", nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
-            MoveFileExW(L"C:\\Windows\\System32\\drivers\\MessageTransfer.sys.bak", nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+            ByovdDiag("PAC:DeleteDrvFiles: cannot delete system32 driver, err=%d, scheduling reboot\n", (int)err);
+            MoveFileExW(sys32Drv, nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
         }
     } else {
-        DeleteFileW(L"C:\\Windows\\System32\\drivers\\MessageTransfer.sys.bak");
+        wchar_t sys32Bak[MAX_PATH] = {};
+        wsprintfW(sys32Bak, L"C:\\Windows\\System32\\drivers\\%s.sys.bak", GetPacTargetName().c_str());
+        DeleteFileW(sys32Bak);
     }
 }
 
@@ -3530,7 +3696,7 @@ void KernelDefense::GuardPac() {
     // 检查 1: SCM 服务状态
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (scm) {
-        SC_HANDLE svc = OpenServiceW(scm, L"MessageTransfer", SERVICE_QUERY_STATUS);
+        SC_HANDLE svc = OpenServiceW(scm, GetPacTargetName().c_str(), SERVICE_QUERY_STATUS);
         if (svc) {
             SERVICE_STATUS_PROCESS ssp = {};
             DWORD bytesNeeded = 0;
@@ -3616,14 +3782,14 @@ KernelDefense::Result KernelDefense::EnableAll() {
     ByovdDiag("BYOVD: callbacks removed (EAC) — ob=%d proc=%d img=%d\n",
         result.obCallbacksRemoved, result.processCallbacksRemoved, result.imageCallbacksRemoved);
 
-    // ★ v3.126i: 完美世界 PAC (MessageTransfer.sys) — 与 EAC 不同, 是 minifilter 驱动
-    //   但仍可能注册 ObRegisterCallbacks / 进程通知回调, 一并尝试摘除
-    int pacOb = cbDisabler.DisableObCallbacks("MessageTransfer");
-    int pacProc = cbDisabler.DisableProcessNotifyCallbacks("MessageTransfer");
-    int pacImg = cbDisabler.DisableImageNotifyCallbacks("MessageTransfer");
+    // ★ v3.126p: PAC 回调摘除 — 动态名称
+    std::string pacNameA = WStringToString(GetPacTargetName());
+    int pacOb = cbDisabler.DisableObCallbacks(pacNameA);
+    int pacProc = cbDisabler.DisableProcessNotifyCallbacks(pacNameA);
+    int pacImg = cbDisabler.DisableImageNotifyCallbacks(pacNameA);
     if (pacOb || pacProc || pacImg) {
-        ByovdDiag("BYOVD: callbacks removed (PAC) — ob=%d proc=%d img=%d\n",
-            pacOb, pacProc, pacImg);
+        ByovdDiag("BYOVD: callbacks removed (PAC/%s) — ob=%d proc=%d img=%d\n",
+            pacNameA.c_str(), pacOb, pacProc, pacImg);
         result.obCallbacksRemoved += pacOb;
         result.processCallbacksRemoved += pacProc;
         result.imageCallbacksRemoved += pacImg;
@@ -3748,8 +3914,8 @@ void KernelDefense::ReapplyAllCallbacks() {
 
     // 尝试 EAC
     total += cbDisabler.DisableAll("EasyAntiCheat");
-    // ★ v3.126i: 尝试完美世界 PAC (MessageTransfer.sys)
-    total += cbDisabler.DisableAll("MessageTransfer");
+    // ★ v3.126p: PAC — 动态名称
+    total += cbDisabler.DisableAll(WStringToString(GetPacTargetName()));
 
     if (total > 0) {
         ByovdDiag("BYOVD:KernelDefense: ReapplyAllCallbacks removed %d callbacks\n", total);
