@@ -3,16 +3,14 @@
 //
 // 技术栈:
 //   1. RTCore64.sys BYOVD 加载 (合法签名漏洞驱动)
-//   2. 虚拟内存 R/W: IOCTL 0x80002000 读写任意内核虚拟地址 (v3.123: 唯一路径)
+//   2. 内核VA R/W: IOCTL 0x80002048/0x4C 直接读写任意内核虚拟地址 (v3.124: 唯一路径)
 //   3. Sigscan ObRegisterCallbacks → 定位 ObpCallbackArrayHead
 //   4. 遍历回调数组 → NULL EAC 的所有注册回调
 //   5. DKOM EPROCESS 断链 (可选, 触发 PatchGuard)
 //
-// 注意: v3.123 移除了物理 IOCTL (0x80002048/0x4C) + PageTableWalker 路径,
-//   因为该版本 RTCore64.sys 的 MmMapIoSpace 实现会导致 BSOD。
-//   仅使用虚拟内存 IOCTL (0x80002000) 直接读写内核 VA。
-//
-// 参考: Lazarus FudModule, kdmapper, EDRSandBlast, CheekyBlinder
+// 注意: v3.124 使用 PhysicalReadViaIOCTL (0x80002048) 直接读写内核VA,
+//   此 RTCore64 版本不支持 VirtualReadViaIOCTL (0x80002000, err=87)。
+//   物理 IOCTL (0x80002048/0x4C) 实际功能是直接读写内核VA, 非 MmMapIoSpace。
 // ============================================================
 
 #include "byovd_kernel.h"
@@ -151,14 +149,14 @@ static RTCore64Format g_probedIoctlFormat = RTCore64Format::FMT_32B_RAW;
 //   默认 false (物理IOCTL模式), 探测成功时切换
 static bool g_useVirtualIOCTL = false;
 
-// ★ v3.114: 虚拟内存 R/W 用 IOCTL 0x80002000 (sub-code 0x00)
+// ★ v3.114: 虚拟内存 R/W 用 IOCTL 0x80002000 (sub-code 0x00) — 此RTCore64版本不支持
 //   物理内存 R/W 用 IOCTL 0x80002048/0x8000204C (sub-code 0x12/0x13)
-//   ReadKernelVA/WriteKernelVA 必须使用虚拟内存 IOCTL,
-//   否则 MmMapIoSpace 将内核VA当作物理地址映射 → 蓝屏
+// ★ v3.123: 实际测试证实 0x80002048 直接读写内核VA (非物理地址),
+//   BUILD 407 (v3.109) 已验证此方案正常工作。
 // ★ v3.120: 移至 VirtualReadViaIOCTL 之前 — 确保在第一次使用前定义
-static const uint32_t IOCTL_VIRTUAL_MEM   = 0x80002000;   // 虚拟内存读/写
-static const uint32_t IOCTL_PHYSICAL_READ  = 0x80002048; // 物理内存读取 (MmMapIoSpace)
-static const uint32_t IOCTL_PHYSICAL_WRITE = 0x8000204C; // 物理内存写入 (MmMapIoSpace)
+static const uint32_t IOCTL_VIRTUAL_MEM   = 0x80002000;   // 虚拟内存读/写 (不支持)
+static const uint32_t IOCTL_PHYSICAL_READ  = 0x80002048; // 实际功能: 内核VA读取 (非MmMapIoSpace)
+static const uint32_t IOCTL_PHYSICAL_WRITE = 0x8000204C; // 实际功能: 内核VA写入
 
 // ★ v3.104: 存储探测到的 IOCTL 码 (读/写分开)
 static uint32_t g_probedReadIoctl  = 0;
@@ -1210,26 +1208,27 @@ bool KernelMemoryAccessor::WritePhysical(uint64_t physAddr, const void* inBuf, s
 }
 
 // ============================================================
-// 内核虚拟地址读写 (仅通过 VirtualReadViaIOCTL / VirtualWriteViaIOCTL)
-// ★ v3.123: 移除物理 IOCTL 降级路径 (PageTableWalker + PhysicalReadViaIOCTL),
-//   因为物理 IOCTL (0x80002048/0x4C) 在此系统上会导致 BSOD。
-//   仅使用虚拟内存 IOCTL (0x80002000) 直接读写内核 VA。
+// 内核虚拟地址读写 (通过 PhysicalReadViaIOCTL / PhysicalWriteViaIOCTL)
+// ★ v3.124: 实际测试证实 0x80002048 直接读写内核VA (非物理地址),
+//   BUILD 407 (v3.109) 已验证此方案正常工作。
+//   VirtualReadViaIOCTL (0x80002000) 在此RTCore64版本不支持 (err=87)。
 // ============================================================
 
 bool KernelMemoryAccessor::ReadKernelVA(uint64_t va, void* outBuf, size_t size) {
     if (!m_active) return false;
     if (va < 0xFFFF800000000000ULL) return false;
 
-    // ★ v3.123: 仅使用 VirtualReadViaIOCTL — 直接读写内核VA, 无需页表遍历
-    return VirtualReadViaIOCTL(m_hDevice, va, outBuf, size);
+    // ★ v3.124: 使用 PhysicalReadViaIOCTL (0x80002048) — 此RTCore64版本直接将地址作为内核VA处理
+    //   VirtualReadViaIOCTL (0x80002000) 在此RTCore64版本不支持 (err=87)
+    return PhysicalReadViaIOCTL(m_hDevice, g_probedReadIoctl, va, outBuf, size);
 }
 
 bool KernelMemoryAccessor::WriteKernelVA(uint64_t va, const void* inBuf, size_t size) {
     if (!m_active) return false;
     if (va < 0xFFFF800000000000ULL) return false;
 
-    // ★ v3.123: 仅使用 VirtualWriteViaIOCTL — 直接读写内核VA, 无需页表遍历
-    return VirtualWriteViaIOCTL(m_hDevice, va, inBuf, size);
+    // ★ v3.124: 使用 PhysicalWriteViaIOCTL (0x8000204C) — 直接内核VA写入
+    return PhysicalWriteViaIOCTL(m_hDevice, g_probedWriteIoctl, va, inBuf, size);
 }
 
 // ============================================================
@@ -1609,55 +1608,34 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     ByovdDiag("BYOVD:Init: STEP_B ntos=0x%llX, ioctl=0x%08X\n",
               (unsigned long long)m_ntosBase, m_driverInfo.ioctlCode);
 
-    // ★ v3.123: 仅使用 VirtualReadViaIOCTL (0x80002000) — 虚拟内存 IOCTL
-    //   不移除物理 IOCTL 降级路径 (0x80002048/0x4C + PageTableWalker) 的原因:
-    //   该版本 RTCore64.sys 的 MmMapIoSpace 实现会导致蓝屏 (BSOD)。
-    //   参考: BUILD 420 验证 0x80002048 物理 IOCTL 在此系统上不稳定。
-    //   先尝试新格式 (addr@+0x00, size@+0x08), 若失败再尝试旧格式 (size@+0x00, addr@+0x08)。
-    //   两种格式都失败则返回失败, 不再降级到物理 IOCTL。
-    ByovdDiag("BYOVD:Init: STEP_B1 trying VirtualReadViaIOCTL (0x80002000)...\n");
+    // ★ v3.123: 直接使用 IOCTL 0x80002048/0x4C 读写内核VA
+    //   BUILD 407 (v3.109) 已验证此方案正常工作。
+    //   不再尝试 IOCTL 0x80002000 (虚拟内存IOCTL) — 此RTCore64版本不支持。
+    //   不再降级到物理IOCTL + PageTableWalker — 此前导致BSOD。
+    ByovdDiag("BYOVD:Init: STEP_B1 probing IOCTL 0x80002048 (verified working in BUILD 407)...\n");
     {
-        uint8_t virtTestBuf[8] = {};
-        bool virtOk = VirtualReadViaIOCTL(m_hDevice, m_ntosBase, virtTestBuf, 8);
-        DWORD virtErr = GetLastError();
-        uint32_t virtVal = *(uint32_t*)virtTestBuf;
-        ByovdDiag("BYOVD:Init: VirtualReadViaIOCTL ok=%d err=%u val=0x%08X (fmt: addr@+0x00, size@+0x08)\n",
-                  (int)virtOk, virtErr, virtVal);
-        if (virtOk && virtVal != 0 && virtVal != 0xFFFFFFFF) {
-            // ★ 虚拟内存 IOCTL 可用 — 直接读写内核VA, 无需页表遍历
-            g_probedReadIoctl = IOCTL_VIRTUAL_MEM;
-            g_probedWriteIoctl = IOCTL_VIRTUAL_MEM;
-            g_useVirtualIOCTL = true;
-            ByovdDiag("BYOVD:Init: VirtualReadViaIOCTL OK — using IOCTL_VIRTUAL_MEM (safe, no BSOD)\n");
+        // 直接设置 IOCTL 码
+        g_probedReadIoctl = IOCTL_PHYSICAL_READ;   // 0x80002048
+        g_probedWriteIoctl = IOCTL_PHYSICAL_WRITE;  // 0x8000204C
+        g_useVirtualIOCTL = false;
+
+        // 从 ntoskrnl 头部读取 MZ 签名验证 IOCTL 可用
+        uint8_t testBuf[8] = {};
+        bool ok = PhysicalReadViaIOCTL(m_hDevice, g_probedReadIoctl, m_ntosBase, testBuf, 2);
+        DWORD err = GetLastError();
+        uint16_t magic = *(uint16_t*)testBuf;
+        ByovdDiag("BYOVD:Init: IOCTL 0x%08X read ntos+0x0 ok=%d err=%u magic=0x%04X (expect 0x5A4D)\n",
+                  g_probedReadIoctl, (int)ok, err, magic);
+        if (ok && magic == 0x5A4D) {
+            ByovdDiag("BYOVD:Init: IOCTL 0x%08X OK — kernel VA R/W via physical IOCTL\n",
+                      g_probedReadIoctl);
         } else {
-            // ★ v3.123: 尝试旧格式 (size@+0x00, addr@+0x08) 作为回退
-            //   某些 RTCore64 版本使用不同的输入格式
-            ByovdDiag("BYOVD:Init: trying alternate format (size@+0x00, addr@+0x08)...\n");
-            uint8_t altBuf[48] = {};
-            *(uint32_t*)(altBuf + 0x00) = 4;    // size = DWORD
-            *(uint64_t*)(altBuf + 0x08) = m_ntosBase; // addr
-            DWORD bytesRet = 0;
-            BOOL altOk = DeviceIoControl(m_hDevice, IOCTL_VIRTUAL_MEM,
-                                          altBuf, sizeof(altBuf),
-                                          altBuf, sizeof(altBuf),
-                                          &bytesRet, nullptr);
-            DWORD altErr = GetLastError();
-            uint32_t altVal = *(uint32_t*)(altBuf + 0x10);
-            ByovdDiag("BYOVD:Init: alt format ok=%d err=%u val=0x%08X\n",
-                      (int)altOk, altErr, altVal);
-            if (altOk && altVal != 0 && altVal != 0xFFFFFFFF) {
-                g_probedReadIoctl = IOCTL_VIRTUAL_MEM;
-                g_probedWriteIoctl = IOCTL_VIRTUAL_MEM;
-                g_useVirtualIOCTL = true;
-                ByovdDiag("BYOVD:Init: virtual IOCTL OK with alt format — using IOCTL_VIRTUAL_MEM\n");
-            } else {
-                // ★ 两种格式都失败 — 不再降级到物理 IOCTL (会导致 BSOD)
-                ByovdDiag("BYOVD:Init: both virtual IOCTL formats FAILED — driver unusable, skipping physical IOCTL fallback (avoids BSOD)\n");
-                CloseHandle(m_hDevice);
-                m_hDevice = INVALID_HANDLE_VALUE;
-                UnloadDriver(m_actualServiceName);
-                return false;
-            }
+            ByovdDiag("BYOVD:Init: IOCTL 0x%08X FAILED — driver unusable\n",
+                      g_probedReadIoctl);
+            CloseHandle(m_hDevice);
+            m_hDevice = INVALID_HANDLE_VALUE;
+            UnloadDriver(m_actualServiceName);
+            return false;
         }
     }
 
@@ -1671,16 +1649,17 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     m_active = true;
     ByovdDiag("BYOVD:Init: STEP_D m_active=true, verifying IOCTL...\n");
 
-    // ★ v3.123: 验证 IOCTL R/W 可用 — 仅使用虚拟内存 IOCTL (0x80002000)
-    //   物理 IOCTL 路径 (0x80002048/0x4C + PageTableWalker) 已移除, 因为会导致 BSOD。
+    // ★ v3.124: 验证 IOCTL R/W 可用 — 使用 PhysicalReadViaIOCTL (0x80002048)
+    //   之前使用了 VirtualReadViaIOCTL (0x80002000) 做验证, 但此RTCore64版本不支持,
+    //   导致验证失败后卸载驱动, 虽已成功打开物理IOCTL却功亏一篑。
     {
         uint8_t testBuf[8] = {};
-        bool virtOk = VirtualReadViaIOCTL(m_hDevice, m_ntosBase, testBuf, 8);
+        bool ok = PhysicalReadViaIOCTL(m_hDevice, g_probedReadIoctl, m_ntosBase, testBuf, 8);
         uint32_t readVal = *(uint32_t*)testBuf;
-        ByovdDiag("BYOVD:Init: STEP_E VirtualReadViaIOCTL(ntos+0x0)=%d val=0x%08X\n",
-                  (int)virtOk, readVal);
-        if (!virtOk || readVal == 0 || readVal == 0xFFFFFFFF) {
-            ByovdDiag("BYOVD:Init: Virtual IOCTL verify FAILED (val=0x%08X)\n", readVal);
+        ByovdDiag("BYOVD:Init: STEP_E PhysicalReadViaIOCTL(ntos+0x0)=%d val=0x%08X\n",
+                  (int)ok, readVal);
+        if (!ok || readVal == 0 || readVal == 0xFFFFFFFF) {
+            ByovdDiag("BYOVD:Init: Physical IOCTL verify FAILED (val=0x%08X)\n", readVal);
             m_active = false;
             CloseHandle(m_hDevice);
             m_hDevice = INVALID_HANDLE_VALUE;
