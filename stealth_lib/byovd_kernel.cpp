@@ -1643,9 +1643,14 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     // ★ v3.110: 驱动加载成功, 立即删除临时文件抹除磁盘痕迹
     if (!actualPath.empty()) {
         ByovdDiag("BYOVD:Init: STEP_C deleting temp file '%ls'...\n", actualPath.c_str());
-        DeleteFileW(actualPath.c_str());
-        ByovdDiag("BYOVD:Init: STEP_C deleted OK\n");
-    }
+        if (DeleteFileW(actualPath.c_str())) {
+            ByovdDiag("BYOVD:Init: STEP_C deleted OK\n");
+        } else {
+            // ★ v3.126o: 修复 — 检查删除失败 (AV 锁定 / 权限不足)
+            DWORD err = GetLastError();
+            ByovdDiag("BYOVD:Init: STEP_C delete FAILED err=%d, retrying with MOVEFILE_DELAY_UNTIL_REBOOT\n", (int)err);
+            MoveFileExW(actualPath.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+        }
 
     m_active = true;
     ByovdDiag("BYOVD:Init: STEP_D m_active=true, verifying IOCTL...\n");
@@ -3475,8 +3480,17 @@ static void DeletePacDriverFiles() {
     }
 
     // 2. system32\drivers 中的备份
-    DeleteFileW(L"C:\\Windows\\System32\\drivers\\MessageTransfer.sys");
-    DeleteFileW(L"C:\\Windows\\System32\\drivers\\MessageTransfer.sys.bak");
+    // ★ v3.126o: 修复 — 检查删除结果, 失败时标记为重启后删除
+    if (!DeleteFileW(L"C:\\Windows\\System32\\drivers\\MessageTransfer.sys")) {
+        DWORD err = GetLastError();
+        if (err != ERROR_FILE_NOT_FOUND) {
+            ByovdDiag("PAC:DeleteDrvFiles: cannot delete drivers, err=%d, scheduling reboot cleanup\n", (int)err);
+            MoveFileExW(L"C:\\Windows\\System32\\drivers\\MessageTransfer.sys", nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+            MoveFileExW(L"C:\\Windows\\System32\\drivers\\MessageTransfer.sys.bak", nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+        }
+    } else {
+        DeleteFileW(L"C:\\Windows\\System32\\drivers\\MessageTransfer.sys.bak");
+    }
 }
 
 bool KernelDefense::DisablePac() {

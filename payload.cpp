@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 446 (v3.126n-review: minifilter 伪造代码自审修复 — 全部回调+MJ验证)
+// BUILD: 447 (v3.126o: 删除文件错误处理修复 + PAC虚拟化风险确认安全)
 // ============================================================
 
 #include "stealth_core.h"
