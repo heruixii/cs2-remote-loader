@@ -2484,12 +2484,14 @@ void KernelDefense::RestoreAllCallbacks() {
     }
 }
 
-// ★ v3.110: 重新摘除所有 EAC 回调 (在 EkkoSleep 唤醒后调用)
+// ★ v3.126g: 重新摘除所有 EAC 回调 — 周期性监控用
+//   注意: 不检查 HasRemovedCallbacks(), 始终尝试重新摘除,
+//   以处理 EAC 卸载后重加载的场景 (新回调需重新 NULL 化)
 void KernelDefense::ReapplyAllCallbacks() {
     auto& cbDisabler = EACCallbackDisabler::Instance();
-    if (!cbDisabler.HasRemovedCallbacks()) {
-        ByovdDiag("BYOVD:KernelDefense: ReapplyAllCallbacks (re-disable)\n");
-        cbDisabler.DisableAll("EasyAntiCheat");
+    int total = cbDisabler.DisableAll("EasyAntiCheat");
+    if (total > 0) {
+        ByovdDiag("BYOVD:KernelDefense: ReapplyAllCallbacks removed %d callbacks\n", total);
     }
 }
 
