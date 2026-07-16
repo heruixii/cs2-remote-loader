@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 407 (v3.109: 修复IOCTL sizeType — 4=DWORD, 移除PageTableWalker)
+// BUILD: 423 (v3.123: 修复VirtualReadViaIOCTL格式 — addr@+0x00, 移除物理IOCTL降级路径防止BSOD)
 // ============================================================
 
 #include "stealth_core.h"
