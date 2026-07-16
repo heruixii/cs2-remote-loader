@@ -1265,11 +1265,11 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
                 // ★ v3.110: 也匹配新的随机化服务名前缀
                 // ★ v3.113: 必须检查 _XXXX 后缀, 防止误匹配合法系统服务
                 if (!isStaleSvc) {
-                    size_t nameLen = wcslen(subKeyName);
+                    size_t subKeyLen = wcslen(subKeyName);
                     for (int p = 0; p < svcPrefixCount; p++) {
                         size_t prefixLen = wcslen(svcPrefixes[p]);
                         // 服务名必须 完整匹配前缀 + 下划线 + 4位十六进制数
-                        if (nameLen == prefixLen + 5 &&
+                        if (subKeyLen == prefixLen + 5 &&
                             wcsncmp(subKeyName, svcPrefixes[p], prefixLen) == 0 &&
                             subKeyName[prefixLen] == L'_')
                         {
