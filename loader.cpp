@@ -6,7 +6,7 @@
 //   2. 内存�?XTEA+CBC 解密
 //   3. 使用 ManualMapper 映射 DLL 到当前进�?
 //   4. 调用 DllMain(DLL_PROCESS_ATTACH)
-//   5. 自删�?(规避 EAC 文件扫描)
+//   5. 自删除 (规避 minifilter 文件扫描)
 //
 // 磁盘上仅短暂存在 loader.exe 本身 (启动后立即自删除),
 // Payload 全程在内存中, 不落盘�?
@@ -283,7 +283,7 @@ static void SelfDelete() {
 // 最小化 PE 手动映射�?(不依�?stealth_lib, 独立实现)
 //
 // 纯内存操�? download �?decrypt �?VirtualAlloc manual map
-// 不写磁盘 �?规避 EAC minifilter 文件系统监控
+// 不写磁盘 — 规避 minifilter 文件系统监控
 // VAD伪装交由 payload 端的 SelfCloaker 处理
 // ============================================================
 
@@ -297,7 +297,7 @@ struct MinimalMapResult {
 #define SECTION_MAP_EXECUTE    0x0008
 // 全程纯内存操�? download �?decrypt �?VirtualAlloc manual map
 // VAD伪装交由 payload 端的 SelfCloaker 处理
-// (已移�?SEC_IMAGE 磁盘路径 �?规避 EAC minifilter)
+// (已移除 SEC_IMAGE 磁盘路径 — 规避 minifilter)
 
 static MinimalMapResult MinimalManualMap(const uint8_t* dllData, size_t dllSize) {
     MinimalMapResult result = {};
@@ -315,7 +315,7 @@ static MinimalMapResult MinimalManualMap(const uint8_t* dllData, size_t dllSize)
     DWORD imageSize = nt->OptionalHeader.SizeOfImage;
     uintptr_t preferredBase = nt->OptionalHeader.ImageBase;
 
-    // --- 2. 纯内�?VirtualAlloc (无磁盘写�? 规避 EAC minifilter) ---
+    // --- 2. 纯内存 VirtualAlloc (无磁盘写入, 规避 minifilter) ---
     auto* imageBase = reinterpret_cast<uint8_t*>(
         VirtualAlloc(nullptr, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     if (!imageBase) return result;
@@ -533,7 +533,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     LoaderDiag("STEP5: OK (base=0x%p size=%zu entry=0x%p)\n",
         mapResult.imageBase, mapResult.imageSize, mapResult.entryPoint);
 
-    // --- 0. 成功加载后自删除 (规避 EAC 磁盘扫描) ---
+    // --- 0. 成功加载后自删除 (规避磁盘扫描) ---
     LoaderDiag("STEP6: SelfDelete...\n");
     SelfDelete();
     LoaderDiag("STEP6: OK\n");

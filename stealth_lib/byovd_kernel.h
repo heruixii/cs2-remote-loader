@@ -1,10 +1,10 @@
 #pragma once
 // ============================================================
-// byovd_kernel.h — BYOVD 内核级 EAC 防御模块
+// byovd_kernel.h — BYOVD 内核级反作弊防御模块
 //
 // 原理: 加载合法签名但有漏洞的内核驱动 (RTCore64.sys / gdrv.sys)
 //       通过 IOCTL 获取内核内存任意读写能力 (Ring-0)
-//       然后从内核层直接摘除 EAC 注册的 ObRegisterCallbacks
+//       然后从内核层直接摘除 PAC 注册的 ObRegisterCallbacks
 //       和 EPROCESS DKOM 隐藏进程
 //
 // 参考:
@@ -191,28 +191,28 @@ private:
 };
 
 // ============================================================
-// EAC 内核回调摘除器
+// 内核回调摘除器
 // 
-// EAC 注册 4 类内核回调:
+// PAC 注册多类内核回调:
 //   1. ObRegisterCallbacks — 句柄访问监控 (最关键)
 //   2. PsSetCreateProcessNotifyRoutine — 进程创建通知
-//   3. PsSetLoadImageNotifyRoutine — 模块加载通知  
-//   4. PsSetCreateThreadNotifyRoutine — 线程创建通知
+//   3. PsSetLoadImageNotifyRoutine — 模块加载通知
+//   4. PsSetCreateThreadNotifyRoutine — 线程创建通知 (可选)
 //
 // 本类使用 KernelMemoryAccessor 的内核R/W能力:
 //   - 遍历各回调数组
-//   - 找到 EAC 驱动注册的回调
-//   - 将回调函数指针 NULL 化 → EAC 内核组件"失明"
+//   - 找到反作弊驱动注册的回调
+//   - 将回调函数指针 NULL 化 → 反作弊内核组件"失明"
 // ============================================================
 class EACCallbackDisabler {
 public:
     static EACCallbackDisabler& Instance();
 
-    // 尝试摘除所有 EAC 内核回调
+    // 尝试摘除所有内核回调
     // 返回摘除成功的回调总数
-    int DisableAll(const std::string& eacDriverName = "EasyAntiCheat");
+    int DisableAll(const std::string& acDriverName = "EasyAntiCheat");
 
-    // ★ v3.110: 恢复所有已保存的回调 (临时移除后恢复, 防 EAC 心跳检测)
+    // ★ v3.110: 恢复所有已保存的回调 (临时移除后恢复)
     int RestoreAll();
 
     // 单独摘除 ObRegisterCallbacks
@@ -266,7 +266,7 @@ private:
 // DKOM 进程隐藏器
 //
 // 将我们的进程从 EPROCESS.ActiveProcessLinks 双向链表中摘除
-// 效果: EAC 通过 NtQuerySystemInformation 枚举无法找到我们
+// 效果: 反作弊通过 NtQuerySystemInformation 枚举无法找到我们
 //       进程继续正常执行 (调度器不依赖 ActiveProcessLinks)
 // ============================================================
 class DKOMProcessHider {
@@ -318,10 +318,10 @@ public:
     // ★ v3.126j: PAC 周期性守卫 — 检查 PAC 是否被重新安装/启动并重新禁用
     static void GuardPac();
 
-    // ★ v3.110: 临时恢复 EAC 回调 (防 EAC 心跳检测到回调被移除)
+    // ★ v3.110: 临时恢复反作弊回调
     static void RestoreAllCallbacks();
 
-    // ★ v3.110: 重新摘除 EAC 回调 (恢复后重新摘除)
+    // ★ v3.110: 重新摘除反作弊回调 (恢复后重新摘除)
     static void ReapplyAllCallbacks();
 };
 
@@ -330,7 +330,7 @@ public:
 //
 // 通过 BYOVD 内核 R/W 修改 cs2.exe 的 VAD 树,
 // 将注入区域的 MEM_PRIVATE 标记改为 MEM_MAPPED,
-// 使其看起来像正常模块映射, 绕过 EAC VAD 扫描
+// 使其看起来像正常模块映射, 绕过反作弊 VAD 扫描
 // ============================================================
 class VADConcealer {
 public:

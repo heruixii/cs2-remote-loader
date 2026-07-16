@@ -43,7 +43,7 @@ public:
     // 确保窗口在游戏之上 (动态 TOPMOST, 无静态标志)
     void BringToTop();
 
-    // === EAC 规避: 窗口风格伪装 ===
+    // === 规避: 窗口风格伪装 ===
     // 临时剥离 LAYERED 标志以规避 GetLayeredWindowAttributes 检测
     void CloakStyle();
     // 恢复完整渲染标志
@@ -64,10 +64,10 @@ public:
 private:
     CheatOverlay() = default;
 
-    // 生成随机窗口类名 (EAC 检测规避)
+    // 生成随机窗口类名 (检测规避)
     static std::wstring GenerateRandomClassName();
 
-    // EAC 规避辅助
+    // 规避辅助
     LONG GetCloakedExStyle() const;
     LONG GetRenderExStyle()  const;
 

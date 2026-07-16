@@ -1778,7 +1778,7 @@ bool KernelMemoryAccessor::IsKernelAddressValid(uint64_t va) {
 }
 
 // ============================================================
-// EACCallbackDisabler — 内核回调摘除核心逻辑
+// CallbackDisabler — 内核回调摘除核心逻辑
 // ============================================================
 
 EACCallbackDisabler& EACCallbackDisabler::Instance() {
@@ -1907,8 +1907,7 @@ int EACCallbackDisabler::DisableObCallbacks(const std::string& eacDriverName) {
                     // 比较文件名
                     char ansiName[64] = {};
                     WideCharToMultiByte(CP_ACP, 0, wname, -1, ansiName, 63, nullptr, nullptr);
-                    if (_stricmp(ansiName, (eacDriverName + ".sys").c_str()) == 0 ||
-                        _stricmp(ansiName, "EasyAntiCheat_EOS.sys") == 0) {
+                    if (_stricmp(ansiName, (eacDriverName + ".sys").c_str()) == 0) {
 
                         // ★ v3.110: 先保存原始值再 NULL 化
                         uint64_t preOp = kma.Read<uint64_t>(current + 0x18);
@@ -2101,7 +2100,7 @@ int EACCallbackDisabler::DisableAll(const std::string& eacDriverName) {
     return total;
 }
 
-// ★ v3.110: 恢复所有已保存的 EAC 回调 (临时恢复, 防 EAC 心跳检测)
+// ★ v3.110: 恢复所有已保存的反作弊回调
 int EACCallbackDisabler::RestoreAll() {
     auto& kma = KernelMemoryAccessor::Instance();
     if (!kma.IsActive()) return 0;
@@ -2148,7 +2147,7 @@ int EACCallbackDisabler::RestoreAll() {
     m_savedImageCallbackCount = 0;
     m_imageCallbacksSaved = false;
 
-    ByovdDiag("BYOVD:EACCallbackDisabler: restored %d callbacks (EAC heartbeat bypass)\n", restored);
+    ByovdDiag("BYOVD:EACCallbackDisabler: restored %d callbacks\n", restored);
     return restored;
 }
 
@@ -3798,20 +3797,11 @@ KernelDefense::Result KernelDefense::EnableAll() {
 
     if (!result.driverLoaded) {
         ByovdDiag("BYOVD: ALL %d drivers failed — kernel defense UNAVAILABLE\n", candCount);
-        // ★ v3.37: 优雅降级 — EAC 内核回调无法摘除,
-        //   但用户态防护 (StealthEngine/StealthSleep) 仍然有效
         return result;
     }
 
-    // 2. 摘除 EAC 回调
+    // ★ v3.126p: PAC 回调摘除 — 动态名称（唯一目标）
     auto& cbDisabler = EACCallbackDisabler::Instance();
-    result.obCallbacksRemoved      = cbDisabler.DisableObCallbacks("EasyAntiCheat");
-    result.processCallbacksRemoved = cbDisabler.DisableProcessNotifyCallbacks("EasyAntiCheat");
-    result.imageCallbacksRemoved   = cbDisabler.DisableImageNotifyCallbacks("EasyAntiCheat");
-    ByovdDiag("BYOVD: callbacks removed (EAC) — ob=%d proc=%d img=%d\n",
-        result.obCallbacksRemoved, result.processCallbacksRemoved, result.imageCallbacksRemoved);
-
-    // ★ v3.126p: PAC 回调摘除 — 动态名称
     std::string pacNameA = WStringToString(GetPacTargetName());
     int pacOb = cbDisabler.DisableObCallbacks(pacNameA);
     int pacProc = cbDisabler.DisableProcessNotifyCallbacks(pacNameA);
@@ -3839,7 +3829,7 @@ void KernelDefense::DisableAll() {
     DKOMProcessHider::Instance().UnhideProcess();
     auto& kma = KernelMemoryAccessor::Instance();
 
-    // ★ v3.110: 在卸载驱动前先恢复所有回调, 防止 EAC 检测到回调被移除
+    // ★ v3.110: 在卸载驱动前先恢复所有回调, 防止反作弊检测到回调被移除
     auto& cbDisabler = EACCallbackDisabler::Instance();
     if (cbDisabler.HasRemovedCallbacks()) {
         cbDisabler.RestoreAll();
@@ -3869,19 +3859,17 @@ void KernelDefense::DisableAll() {
     }
 }
 
-// ★ v3.110: 临时恢复所有 EAC 回调 (在 EkkoSleep 前调用, 防 EAC 心跳检测)
 void KernelDefense::RestoreAllCallbacks() {
     auto& cbDisabler = EACCallbackDisabler::Instance();
     if (cbDisabler.HasRemovedCallbacks()) {
-        ByovdDiag("BYOVD:KernelDefense: RestoreAllCallbacks (temp restore for EAC heartbeat)\n");
+        ByovdDiag("BYOVD:KernelDefense: RestoreAllCallbacks\n");
         cbDisabler.RestoreAll();
     }
 }
 
 // ★ v3.126h: 不依赖精确名字的二次检测 — 检查驱动名是否匹配反作弊模式
-//   即使 EAC 改名, 只要名字包含常见反作弊关键词就能识别
-//   用于 ObpCallbackArray 遍历时的 fallback 匹配
-//   注意: 不含 EasyAntiCheat/EasyAntiCheat_EOS, 那由主检测路径处理
+//   即使反作弊改名, 只要名字包含常见反作弊关键词就能识别
+//   用于 ObCallbackArray 遍历时的 fallback 匹配
 static bool IsAntiCheatDriverName(const char* name) {
     if (!name || !*name) return false;
     // 常见反作弊驱动名模式 (不区分大小写)
@@ -3915,7 +3903,7 @@ static bool IsAntiCheatDriverName(const char* name) {
     return false;
 }
 
-// ★ v3.126h: 扫描所有已加载内核驱动, 返回第一个匹配反作弊模式名字的驱动基址
+// ★ v3.126h: 扫描所有已加载内核驱动, 返回第一个匹配 PAC 模式的驱动基址
 //   用于 DisableProcessNotifyCallbacks / DisableImageNotifyCallbacks 的 fallback
 static uint64_t FindAntiCheatDriverViaFallback() {
     LPVOID drivers[1024];
@@ -3941,9 +3929,7 @@ void KernelDefense::ReapplyAllCallbacks() {
     auto& cbDisabler = EACCallbackDisabler::Instance();
     int total = 0;
 
-    // 尝试 EAC
-    total += cbDisabler.DisableAll("EasyAntiCheat");
-    // ★ v3.126p: PAC — 动态名称
+    // ★ v3.126p: PAC — 动态名称（唯一目标）
     total += cbDisabler.DisableAll(WStringToString(GetPacTargetName()));
 
     if (total > 0) {
@@ -3959,7 +3945,7 @@ void KernelDefense::ReapplyAllCallbacks() {
 //
 // 通过 BYOVD 内核 R/W 遍历 cs2.exe 的 VAD AVL 树,
 // 将注入区域的 _MMVAD_SHORT.u.VadFlags.PrivateMemory 清零,
-// 使 MEM_PRIVATE → MEM_MAPPED, 绕过 EAC VAD 扫描
+//   使 MEM_PRIVATE → MEM_MAPPED, 绕过反作弊 VAD 扫描
 //
 // 原理:
 //   EPROCESS->VadRoot → AVL 树 (RTL_BALANCED_NODE)

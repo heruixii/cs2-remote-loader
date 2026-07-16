@@ -44,12 +44,6 @@ public:
         config.detectInHooks        = true;
         config.minimalProcessHandle = true;
         config.enableSelfCloaking   = true;
-        config.enableEACScanPrediction = true;
-        config.enableEACPEStrip      = true;
-        config.enableEACProcessDisguise = true;
-        config.enableVMGateBypass   = true;
-        config.enableNMISpoofing    = true;
-        config.enableFakePEConstruction = true;
 
         if (!StealthEngine::Instance().Initialize(config)) {
             return false;
@@ -61,7 +55,7 @@ public:
         }
 
         // Step 2.5: 封锁句柄 (DACL → 仅允许自身进程访问)
-        // 阻止 EAC 通过 NtQuerySystemInformation 枚举到我们的句柄
+        // 阻止反作弊通过 NtQuerySystemInformation 枚举到我们的句柄
         HANDLE hGame = StealthEngine::Instance().GetProcessHandle();
         if (hGame) {
             stealth::HandleACLGuard::LockHandle(hGame);
@@ -86,8 +80,8 @@ public:
             return false;
         }
 
-        // Step 6.5: BYOVD 内核防御 — 摘除 EAC 内核回调 (Ring-0)
-        // 成功后 EAC 的 ObRegisterCallbacks/ProcessNotify/ImageNotify 全部失效
+        // Step 6.5: BYOVD 内核防御 — 摘除反作弊内核回调 (Ring-0)
+        // 成功后反作弊的 ObRegisterCallbacks/ProcessNotify/ImageNotify 全部失效
         auto kernelResult = stealth::KernelDefense::EnableAll();
         (void)kernelResult; // 非致命: 内核模块失败不阻塞外挂加载
 
@@ -132,7 +126,7 @@ public:
             // 处理窗口消息
             overlay.PumpMessages();
 
-            // 时序抖动 (±2ms), 破坏EAC行为图谱的精确时间匹配
+            // 时序抖动 (±2ms), 破坏行为图谱的精确时间匹配
             DWORD jitter = (rng() % 5); // 0-4ms
             DWORD adjustedFrameTime = frameTime + jitter - 2;
             if (now - lastFrame < adjustedFrameTime) {
@@ -144,7 +138,7 @@ public:
             // === 反检测帧维护 ===
             engine.OnFrame();
 
-            // === EAC 纵深防御: Syscall Stub 完整性验证 (每 30 帧) ===
+            // === 纵深防御: Syscall Stub 完整性验证 (每 30 帧) ===
             if ((frameCount % 30) == 0) {
                 stealth::SyscallGuard::VerifyAndRepair();
             }

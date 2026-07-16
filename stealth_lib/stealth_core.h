@@ -15,12 +15,6 @@
 //                         + Thread Hijacking + APC Injection
 //                         + Process Hollowing + StealthThread
 //   - anti_debug:        17项反调试检测 + 主动规避
-//   - eac_bypass:        EAC Handle Stripping 6策略绕过
-//                         + 扫描周期预测 + PE头擦除
-//                         + 32帧深栈伪造 + 进程伪装
-//   - eac_vm_evasion:    EAC VM门控绕过 + NMI回调欺骗
-//                         + Instrumentation回调规避
-//                         + 假PE构造 + 代码虚拟化 + 多态代码
 // ============================================================
 
 #include "syscall_direct.h"
@@ -30,8 +24,7 @@
 #include "memory_cloak.h"
 #include "stealth_injection.h"
 #include "anti_debug.h"
-#include "eac_bypass.h"
-#include "eac_vm_evasion.h"
+
 
 namespace stealth {
 
@@ -86,8 +79,6 @@ struct StealthConfig {
     bool enableAngleValidation  = true;  // 视角变化校验
 
     // 反调试 (anti_debug)
-    // v3.25: aggressiveAntiDebug 默认 false — ThreadHideFromDebugger(0x11)
-    //   是 EAC 内核回调的重点监控目标, 在 EAC 环境下会暴露自身而非规避
     bool enableAntiDebug        = true;
     bool aggressiveAntiDebug    = false;
 
@@ -95,22 +86,6 @@ struct StealthConfig {
     bool enableManualMap        = false; // 使用 Manual Map 替代 LoadLibrary
     bool enableThreadHijack     = false; // 使用 Thread Hijacking
     bool enableHiddenThreads    = true;  // 使用隐藏线程创建
-
-    // === EAC 专用 (eac_bypass) ===
-    bool enableEACBypass        = true;  // 启用 EAC 多路径句柄绕过
-    bool enableEACScanPrediction= true;  // 启用 EAC 扫描周期预测
-    bool enableEACPEStrip       = true;  // Manual Map 后擦除 PE 头
-    bool enableEACStackSpoof    = true;  // 32 帧深度调用栈伪造
-    bool enableEACProcessDisguise = true; // 进程名称/父进程伪装
-    bool enableEACTimingWindow  = true;  // 仅在 EAC 扫描间歇执行操作
-
-    // === EAC VM/内核反调试规避 (eac_vm_evasion) ===
-    bool enableVMGateBypass      = true;  // INT 1/INT 3/RDTSC 门控绕过
-    bool enableNMISpoofing       = true;  // NMI 回调链清理
-    bool enableInstrCallbackBypass = true; // Instrumentation 回调规避
-    bool enableVirtualization    = false; // 代码虚拟化 (开销较大)
-    bool enablePolymorphism      = false; // 多态代码生成 (开销较大)
-    bool enableFakePEConstruction = true;  // 假PE头构造
 
     // === 自身内存隐身 (ManualMap 区域防护) ===
     bool enableSelfCloaking       = true;  // PE头擦除 + 假Ldr条目 + 页保护随机化
@@ -188,38 +163,6 @@ public:
     // 注入并隐藏线程到目标进程
     HANDLE InjectAndHideThread(HANDLE hTargetProcess,
                                 LPTHREAD_START_ROUTINE start, PVOID param);
-
-    // ---- EAC 专用 (eac_bypass) ----
-    // 使用 EAC 多策略句柄获取打开游戏进程
-    HANDLE AttachToProcessEAC(DWORD pid);
-    HANDLE AttachToProcessEAC(const wchar_t* processName);
-
-    // 在 EAC 扫描安全窗口内执行操作
-    bool ExecuteInEACSafeWindow(std::function<void()> op, DWORD timeoutMs = 5000);
-
-    // Manual Map 并剥除 PE 痕迹 (EAC PE 扫描规避)
-    uintptr_t ManualMapAndStrip(const void* dllData, SIZE_T dllSize);
-
-    // 伪装当前进程 (EAC 进程枚举规避)
-    void DisguiseForEAC();
-
-    // 预测 EAC 扫描周期
-    DWORD GetEACSafeTimeMs();
-
-    // ---- EAC VM/内核规避 (eac_vm_evasion) ----
-    // 安装 VM 门控绕过 (INT 1/INT 3/RDTSC)
-    bool EnableVMGateProtection();
-    // 注册 NMI 回调清理
-    bool EnableNMICleanup();
-    // 从 PEB Ldr 链表隐藏自身
-    bool HideSelfFromPEB();
-    // 在注入区域放置假 PE 头
-    uintptr_t PlaceFakePEHeader(void* region, SIZE_T regionSize);
-    // 将关键代码虚拟机化执行
-    bool ExecuteVirtualized(const void* code, SIZE_T size,
-                             eac::CodeVirtualizer::VMContext& ctx);
-    // 生成多态代码替换
-    SIZE_T MutateCodeRegion(void* code, SIZE_T codeSize);
 
     // ---- 自我隐藏 (PE擦除 + 假Ldr + 断链 + 页保护随机化) ----
     void SelfCloak();

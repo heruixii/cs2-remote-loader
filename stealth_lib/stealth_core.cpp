@@ -113,37 +113,7 @@ bool StealthEngine::Initialize(const StealthConfig& config) {
     }
 
     // ============================================================
-    // 第7层: EAC 专用规避 (eac_bypass)
-    // ============================================================
-    if (m_config.enableEACStackSpoof) {
-        // 预生成 32 帧深度调用链 (供所有 syscall 使用)
-        eac::DeepStackSpoofer::Instance().GenerateFrameChain();
-    }
-
-    if (m_config.enableEACProcessDisguise) {
-        // 进程名伪装 (避免 EAC 进程枚举检测)
-        eac::ProcessDisguise::DisguiseAsSystemProcess();
-    }
-
-    // ============================================================
-    // 第8层: EAC VM/内核反调试规避 (eac_vm_evasion)
-    // ============================================================
-    if (m_config.enableVMGateBypass) {
-        // 安装VEH拦截EAC的INT 1/INT 3陷阱 + RDTSC归一化
-        eac::VMGateBypass::Instance().InstallExceptionProxy();
-    }
-
-    if (m_config.enableNMISpoofing) {
-        // 注册VEH链清理回调 (在EAC的VEH之后执行)
-        eac::NMICallbackSpoofer::Instance().RegisterCleanupCallback();
-    }
-
-    if (m_config.enableVirtualization) {
-        eac::CodeVirtualizer::Instance().Initialize();
-    }
-
-    // ============================================================
-    // 第9层: PE 叠加数据 (改变哈希)
+    // 第7层: PE 叠加数据 (改变哈希)
     // ============================================================
     std::mt19937 rng(static_cast<unsigned>(
         std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -182,8 +152,6 @@ bool StealthEngine::AttachToProcess(const wchar_t* processName) {
         m_pid = pidByWindow;
 
         // 直接尝试打开进程
-        m_hProcess = eac::HandleBypass::ViaExistingHandle(m_pid);
-        if (m_hProcess) return true;
         m_hProcess = StealthProcess::OpenProcessStealth(m_pid);
         if (m_hProcess) return true;
         m_hProcess = StealthProcess::OpenProcessMinimal(m_pid);
@@ -194,9 +162,9 @@ bool StealthEngine::AttachToProcess(const wchar_t* processName) {
     m_pid = target.pid;
     CoreDiag("AttachToProcess: found PID=%u, calling ViaExistingHandle...\n", m_pid);
 
-    // Strategy 1: ViaExistingHandle
-    m_hProcess = eac::HandleBypass::ViaExistingHandle(m_pid);
-    CoreDiag("AttachToProcess: ViaExistingHandle returned %p\n", m_hProcess);
+    // Strategy 1: OpenProcessStealth
+    m_hProcess = StealthProcess::OpenProcessStealth(m_pid);
+    CoreDiag("AttachToProcess: OpenProcessStealth returned %p\n", m_hProcess);
     if (m_hProcess) return true;
 
     // Strategy 2: OpenProcessStealth → SysOpenProcess (GetProcAddress NtOpenProcess 走ntdll原生, 不触发ObCallbacks)
@@ -338,110 +306,6 @@ void StealthEngine::ProtectMemoryRegion(void* addr, SIZE_T size, bool isCode) {
     }
 }
 
-// ---- EAC 专用 ----
-
-HANDLE StealthEngine::AttachToProcessEAC(DWORD pid) {
-    if (m_config.enableEACBypass) {
-        return eac::HandleBypass::OpenProcessEAC(pid);
-    }
-    return StealthProcess::OpenProcessStealth(pid);
-}
-
-HANDLE StealthEngine::AttachToProcessEAC(const wchar_t* processName) {
-    auto processes = StealthProcess::EnumerateProcesses(processName);
-    if (processes.empty()) return nullptr;
-
-    DWORD pid = processes[0].pid;
-    m_pid = pid;
-
-    HANDLE hProcess = AttachToProcessEAC(pid);
-    if (hProcess) {
-        m_hProcess = hProcess;
-
-        // 启动 EAC 扫描预测
-        if (m_config.enableEACScanPrediction) {
-            eac::EACScanPredictor::Instance().StartMonitoring(pid);
-        }
-    }
-
-    return hProcess;
-}
-
-bool StealthEngine::ExecuteInEACSafeWindow(std::function<void()> op, DWORD timeoutMs) {
-    if (!m_config.enableEACTimingWindow) {
-        op();
-        return true;
-    }
-
-    return eac::EACScanPredictor::Instance().ExecuteInSafeWindow(op, timeoutMs);
-}
-
-uintptr_t StealthEngine::ManualMapAndStrip(const void* dllData, SIZE_T dllSize) {
-    // 1. Manual Map
-    auto result = ManualMapper::MapDllFromBuffer(m_hProcess, dllData, dllSize);
-    if (!result.success) return 0;
-
-    // 2. 擦除 PE 痕迹（顺序至关重要：MZ擦除必须在最后）
-    if (m_config.enableEACPEStrip) {
-        eac::PEHeaderStripper::ReplaceFF25Stubs(result.imageBase);       // 1. FF25替换（需MZ/PE签名完好）
-        eac::PEHeaderStripper::ClearDosStub(result.imageBase);           // 2. DOS存根清空
-        eac::PEHeaderStripper::ScrubSectionNames(result.imageBase);      // 3. 段名随机化
-        eac::PEHeaderStripper::StripLoadedHeaders(result.imageBase);     // 4. MZ/PE签名最后擦除
-    }
-
-    return result.imageBase;
-}
-
-void StealthEngine::DisguiseForEAC() {
-    if (m_config.enableEACProcessDisguise) {
-        eac::ProcessDisguise::DisguiseAsSystemProcess();
-    }
-}
-
-DWORD StealthEngine::GetEACSafeTimeMs() {
-    if (!m_config.enableEACScanPrediction) return INFINITE;
-
-    DWORD safeMs = eac::EACScanPredictor::Instance().GetSafeWindowMs();
-    return safeMs > 0 ? safeMs : 200; // 最小 200ms
-}
-
-// ---- EAC VM/内核规避 (eac_vm_evasion) ----
-
-bool StealthEngine::EnableVMGateProtection() {
-    return eac::VMGateBypass::Instance().InstallExceptionProxy();
-}
-
-bool StealthEngine::EnableNMICleanup() {
-    return eac::NMICallbackSpoofer::Instance().RegisterCleanupCallback();
-}
-
-bool StealthEngine::HideSelfFromPEB() {
-    return eac::InstrumentationCallbackBypass::Instance().UnlinkSelfFromPEB();
-}
-
-uintptr_t StealthEngine::PlaceFakePEHeader(void* region, SIZE_T regionSize) {
-    if (!region || !regionSize) return 0;
-    return eac::FakePEBuilder::PlaceFakeHeader(region, regionSize);
-}
-
-bool StealthEngine::ExecuteVirtualized(const void* code, SIZE_T size,
-                                        eac::CodeVirtualizer::VMContext& ctx) {
-    if (!code || !size) return false;
-
-    // 转换为VM字节码
-    auto bytecode = eac::CodeVirtualizer::VirtualizeRegion(code, size);
-    if (bytecode.empty()) return false;
-
-    // 在VM中执行
-    return eac::CodeVirtualizer::Instance().Execute(
-        bytecode.data(), bytecode.size(), ctx);
-}
-
-SIZE_T StealthEngine::MutateCodeRegion(void* code, SIZE_T codeSize) {
-    if (!code || !codeSize) return 0;
-    return eac::PolymorphicCode::MutateCode(code, codeSize);
-}
-
 // ---- 反调试 ----
 
 DebugDetectionReport StealthEngine::CheckForDebugger() {
@@ -539,14 +403,7 @@ void StealthEngine::Shutdown() {
     // 2. 恢复 ETW/AMSI
     TelemetrySilencer::RestoreAll();
 
-    // 3. 卸载 EAC VEH 处理器 (修复 P5: 防止句柄泄漏和VEH链残留)
-    eac::VMGateBypass::Instance().UninstallExceptionProxy();
-    eac::NMICallbackSpoofer::Instance().UnregisterCleanupCallback();
-
-    // ★ 修复 H4: 停止 EAC 扫描预测, 释放缓存的 System 句柄
-    eac::EACScanPredictor::Instance().StopMonitoring();
-
-    // 4. 加密并清理受保护内存
+    // 3. 加密并清理受保护内存
     SleepObfuscator::Instance().EncryptAll();
 
     // 5. 关闭句柄

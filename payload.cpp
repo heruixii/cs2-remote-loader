@@ -3,7 +3,7 @@
 //
 // 编译为 DLL, 经 XTEA 加密后托管在 HTTP 服务器上,
 // 由 loader.exe 下载 → 解密 → ManualMap 到内存中执行,
-// 全程不落盘, 规避 EAC minifilter 文件扫描。
+// 全程不落盘, 规避 minifilter 文件扫描。
 //
 // v3.32: 嵌入基础.exe, 注入后自动启动基础.exe 做 ESP 渲染,
 //        本 DLL 只负责反检测 (BYOVD/Syscall/内存加密等),
@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 449 (v3.126q: 深度审计修复 — srand顺序/死字段/regionSize/误伤防护)
+// BUILD: 450 (v3.127: EAC 全部移除, 只保留 PAC 防御)
 // ============================================================
 
 #include "stealth_core.h"
@@ -666,7 +666,7 @@ static void TerminateBasicESP() {
 }
 
 // v3.32-plus: 注入痕迹清理 — 基础.exe 注入到 cs2.exe 后, 从外部通过 handles
-// 清除 PEB Ldr 链表中的注入模块条目, 防止 EAC 用户态模块枚举检测
+// 清除 PEB Ldr 链表中的注入模块条目, 防止反作弊用户态模块枚举检测
 // 同时清理 VAD PE 头部 + 注入线程的 TEB Win32StartAddress
 // v3.33: 新增 VAD PE 头清零 (Method 1) + 线程 StartAddress 欺骗 (Method 2)
 static void CleanupInjectionTraces() {
@@ -718,7 +718,6 @@ static void CleanupInjectionTraces() {
         L"ntmarta", L"fltlib", L"sechost", L"sspicli",
         L"gdi32full", L"win32u", L"msctf", L"textinput",
         L"msimg32", L"dbghelp", L"dbgcore",
-        L"EasyAntiCheat", L"EAC",
         nullptr
     };
 
@@ -815,7 +814,7 @@ static void CleanupInjectionTraces() {
 
     // ============================================================
     // v3.33 Method 1: VAD 区域 PE 头清零
-    // 即使 EAC 绕过 PEB Ldr 直接扫描 MEM_PRIVATE 可执行页,
+    // 即使反作弊绕过 PEB Ldr 直接扫描 MEM_PRIVATE 可执行页,
     // 也找不到 PE 头 (MZ/PE 签名), 无法确认为注入 DLL
     // ============================================================
     for (int i = 0; i < numCleaned; i++) {
@@ -841,7 +840,7 @@ static void CleanupInjectionTraces() {
                     (unsigned)ws, wb);
 
                 // 改保护: MEM_PRIVATE 可执行页 → EXECUTE_READ (模拟 mapped image 的 .text 段)
-                // EAC VAD 扫描: mapped image = MEM_MAPPED + EXECUTE_READ; injected = MEM_PRIVATE + EXECUTE_READWRITE
+                // 反作弊 VAD 扫描: mapped image = MEM_MAPPED + EXECUTE_READ; injected = MEM_PRIVATE + EXECUTE_READWRITE
                 // 我们无法改 MEM 类型, 但把 protection 改成 EXECUTE_READ 降低可疑程度
                 ULONG oldProt = 0;
                 SIZE_T regionSize = 0x1000;
@@ -861,7 +860,7 @@ static void CleanupInjectionTraces() {
     // ============================================================
     // v3.33 Method 2: 线程 StartAddress 欺骗
     // 基础.exe 注入后在 cs2.exe 中有额外线程,
-    // EAC 可通过 NtQueryInformationThread → Win32StartAddress 发现
+    // 反作弊可通过 NtQueryInformationThread → Win32StartAddress 发现
     // 未知范围内的线程 → 判定为注入线程
     // 策略: 将注入线程的 Win32StartAddress 改写为 ntdll!RtlUserThreadStart
     // ============================================================
@@ -1039,7 +1038,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     // ============================================================
     // 注册 EkkoSleep 内存加密保护区
     // 必须在 PE 头剥离前完成, 否则无法解析 section 边界
-    // Sleep 期间整段 DLL 被加密, 防止 EAC 内存扫描
+    // Sleep 期间整段 DLL 被加密, 防止反作弊内存扫描
     //
     // ★ v3.23: 跳过 EkkoSleep/EncryptAll/DecryptAll 自身所在页面
     // ★ v3.24: 同时跳过 VEH handler (DiagVehHandler) 所在页面,
@@ -1115,7 +1114,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         StealthEngine::Instance().GetProcessId(),
         StealthEngine::Instance().GetProcessHandle());
 
-    // 封锁进程句柄 (DACL → 仅允许自身访问, 阻止EAC通过NtQuerySystemInformation枚举)
+    // 封锁进程句柄 (DACL → 仅允许自身访问, 阻止反作弊通过NtQuerySystemInformation枚举)
     {
         HANDLE hGame = StealthEngine::Instance().GetProcessHandle();
         if (hGame) {
@@ -1126,7 +1125,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         }
     }
 
-    // BYOVD 内核防御 — 加载漏洞驱动 + 摘除 EAC 内核回调 (Ring-0)
+    // BYOVD 内核防御 — 加载漏洞驱动 + 摘除 PAC 内核回调 (Ring-0)
     // v3.24: 优先 System32\drivers, 回退嵌入提取到 %TEMP%
     // ObRegisterCallbacks/ProcessNotify/ImageNotify → 全部失效
     //
@@ -1261,9 +1260,9 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             kernelResult.threadCallbacksRemoved,
             (int)kernelResult.pacDisabled);
 
-        // v3.32: BYOVD 已加载(EAC内核回调已移除), 现在安全启动基础.exe
+        // v3.32: BYOVD 已加载(PAC内核回调已移除), 现在安全启动基础.exe
         //        基础.exe 将调用 OpenProcess+ReadProcessMemory,
-        //        这些操作不再被 EAC 内核回调监控
+        //        这些操作不再被 PAC 内核回调监控
         // ★ v3.80: 移到 guard 释放之前, 确保 CleanupInjectionTraces 中的
         //   DKOM/VAD 操作受 guard pages 保护
         {
@@ -1607,17 +1606,17 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             syscallCheckInterval = (int)RandomJitter(25, 10); // 每次重随机
         }
 
-        // ★ v3.126g: EAC 周期性监控 — 每500-1500ms 检查 EAC.sys 是否加载,
-        //   如果加载则自动摘除内核回调, 解决 EAC 在 BYOVD 之后启动的问题
-        //   短随机间隔确保 EAC 初始化未完成时就被摘除, 不给 EAC 可乘之机
+        // ★ v3.126g: PAC 周期性监控 — 每500-1500ms 检查反作弊驱动是否加载,
+        //   如果加载则自动摘除内核回调, 解决反作弊在 BYOVD 之后启动的问题
+        //   短随机间隔确保反作弊初始化未完成时就被摘除, 不给反作弊可乘之机
         //   注意: 使用 GetTickCount 而非 frameCount, 避免 Sleep 波动影响
         {
-            static DWORD lastEacCheck = 0;
+            static DWORD lastPacCheck = 0;
             DWORD nowTick = GetTickCount();
-            static DWORD eacCheckInterval = RandomJitter(500, 1000);
-            if (nowTick - lastEacCheck >= eacCheckInterval) {
-                lastEacCheck = nowTick;
-                eacCheckInterval = RandomJitter(500, 1000);
+            static DWORD pacCheckInterval = RandomJitter(500, 1000);
+            if (nowTick - lastPacCheck >= pacCheckInterval) {
+                lastPacCheck = nowTick;
+                pacCheckInterval = RandomJitter(500, 1000);
                 if (stealth::KernelMemoryAccessor::Instance().IsActive()) {
                     stealth::KernelDefense::ReapplyAllCallbacks();
                 }

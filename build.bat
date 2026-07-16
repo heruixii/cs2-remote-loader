@@ -48,8 +48,6 @@ echo ============================================
     %STEALTH_LIB%/stealth_core.cpp ^
     %STEALTH_LIB%/syscall_direct.cpp ^
     %STEALTH_LIB%/anti_debug.cpp ^
-    %STEALTH_LIB%/eac_bypass.cpp ^
-    %STEALTH_LIB%/eac_vm_evasion.cpp ^
     %STEALTH_LIB%/eac_syscall_guard.cpp ^
     %STEALTH_LIB%/memory_cloak.cpp ^
     %STEALTH_LIB%/pe_mutator.cpp ^
