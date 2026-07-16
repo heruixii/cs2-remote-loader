@@ -114,11 +114,10 @@ int g_protectedRegionCount = 0;
 //   修复: 0x80002048(Read PhysMem) + 0x8000204C(Write PhysMem) 是正确 IOCTL
 //   输入结构: { uint64_t physAddr; uint32_t size; uint32_t reserved; } (12-16字节)
 //   测试物理地址: 0x100000 (1MB), 避开 BIOS 数据区
+// ★ v3.122: 仅保留安全 IOCTL 候选 — 移除 0x80002030/0x34 (导致 BSOD)
 static const uint32_t g_ioctlCandidates[] = {
-    0x80002048,  // ★ 主候选: 物理内存读取 (MmMapIoSpace)
-    0x8000204C,  // ★ 主候选: 物理内存写入 (MmMapIoSpace)
-    0x80002030,  // 备选: 物理内存映射变体
-    0x80002034,  // 备选: 物理内存映射变体
+    0x80002048,  // ★ 主候选: 物理内存读取 (MmMapIoSpace, CVE-2022-22077)
+    0x8000204C,  // ★ 主候选: 物理内存写入 (MmMapIoSpace, CVE-2022-22077)
 };
 static const int g_ioctlCandidateCount = sizeof(g_ioctlCandidates) / sizeof(g_ioctlCandidates[0]);
 
