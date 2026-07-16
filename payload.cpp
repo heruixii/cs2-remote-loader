@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 440 (v3.126j: 完美世界 PAC MessageTransfer.sys 摘除支持)
+// BUILD: 441 (v3.126k: PAC minifilter 禁用 — sc stop + FilterUnload + 文件删除 + Guard)
 // ============================================================
 
 #include "stealth_core.h"
@@ -1253,12 +1253,13 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
 
         g_byovdDriverLoaded = kernelResult.driverLoaded;
 
-        DiagLog("OK: BYOVD driver=%d ob=%d proc=%d img=%d thread=%d\n",
+        DiagLog("OK: BYOVD driver=%d ob=%d proc=%d img=%d thread=%d pac=%d\n",
             (int)kernelResult.driverLoaded,
             kernelResult.obCallbacksRemoved,
             kernelResult.processCallbacksRemoved,
             kernelResult.imageCallbacksRemoved,
-            kernelResult.threadCallbacksRemoved);
+            kernelResult.threadCallbacksRemoved,
+            (int)kernelResult.pacDisabled);
 
         // v3.32: BYOVD 已加载(EAC内核回调已移除), 现在安全启动基础.exe
         //        基础.exe 将调用 OpenProcess+ReadProcessMemory,

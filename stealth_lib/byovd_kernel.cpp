@@ -25,6 +25,7 @@
 #include <ctime>
 #include <cstdarg>
 #include <Psapi.h>
+#include <shlobj.h>
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif
@@ -2420,6 +2421,212 @@ static BYOVDDriverInfo MutateAndRandomizeDriver(const BYOVDDriverInfo& original)
 }
 
 // ============================================================
+// ★ v3.126j: PAC (完美世界反作弊) 专用禁用模块
+//
+// PAC = Perfect Anti-Cheat, 完美世界自研反作弊系统
+// 与 EAC 不同, PAC 使用 minifilter (MessageTransfer.sys) 而非 ObRegisterCallbacks
+// 检测方式: 扫盘 (文件特征码) + 文件操作拦截 (minifilter) + 人工定罪
+//
+// 策略:
+//   1. 停止 MessageTransfer 服务 (sc stop)
+//   2. 卸载 minifilter (FilterUnload via fltlib.dll)
+//   3. 删除注册表服务条目
+//   4. 删除驱动文件 (完美平台plugin目录 + system32/drivers)
+//   5. 周期性守卫 (GuardPac) 检查 PAC 是否恢复
+//
+// 注意: PAC 自我保护不强, B站已验证删除驱动后完美平台仍正常运行
+//       但 minifilter 卸载需在平台启动前完成, 运行中卸载可能触发检测
+// ============================================================
+
+// 动态加载 fltlib.dll 的 FilterUnload 函数 (无需 WDK)
+typedef HRESULT (WINAPI* _FilterUnload)(LPCWSTR lpFilterName);
+
+static bool DisablePacService() {
+    ByovdDiag("PAC:DisablePacService: opening SCM...\n");
+
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS);
+    if (!scm) {
+        ByovdDiag("PAC: OpenSCManager failed (err=%u)\n", GetLastError());
+        return false;
+    }
+
+    SC_HANDLE svc = OpenServiceW(scm, L"MessageTransfer",
+        SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE | SERVICE_START);
+    if (!svc) {
+        ByovdDiag("PAC: MessageTransfer service not found (may already be removed)\n");
+        CloseServiceHandle(scm);
+        return true; // 未找到 = 已经移除, 不算失败
+    }
+
+    // 查询状态
+    SERVICE_STATUS_PROCESS ssp = {};
+    DWORD bytesNeeded = 0;
+    if (QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO, (LPBYTE)&ssp, sizeof(ssp), &bytesNeeded)) {
+        ByovdDiag("PAC: service state=%u\n", ssp.dwCurrentState);
+        if (ssp.dwCurrentState == SERVICE_RUNNING) {
+            // 发送停止命令
+            SERVICE_STATUS stopStatus = {};
+            if (ControlService(svc, SERVICE_CONTROL_STOP, &stopStatus)) {
+                ByovdDiag("PAC: STOP signal sent\n");
+                // 等待最多 3 秒
+                for (int i = 0; i < 15; i++) {
+                    Sleep(200);
+                    QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO, (LPBYTE)&ssp, sizeof(ssp), &bytesNeeded);
+                    if (ssp.dwCurrentState == SERVICE_STOPPED) break;
+                }
+                ByovdDiag("PAC: final state=%u\n", ssp.dwCurrentState);
+            } else {
+                DWORD err = GetLastError();
+                ByovdDiag("PAC: ControlService(STOP) failed (err=%u)\n", err);
+                // 错误 1062 (服务未启动) 不算失败
+                if (err != 1062) {
+                    CloseServiceHandle(svc);
+                    CloseServiceHandle(scm);
+                    return false;
+                }
+            }
+        }
+    }
+
+    // 删除服务
+    if (DeleteService(svc)) {
+        ByovdDiag("PAC: service deleted\n");
+    } else {
+        ByovdDiag("PAC: DeleteService failed (err=%u), marking for deletion\n", GetLastError());
+        // 标记为删除: 下次重启时系统会清理
+        SERVICE_STATUS markStatus = {};
+        ControlService(svc, SERVICE_CONTROL_STOP, &markStatus);
+    }
+
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return true;
+}
+
+static bool UnloadPacMinifilter() {
+    // 动态加载 fltlib.dll → FilterUnload
+    HMODULE hFltLib = LoadLibraryW(L"fltlib.dll");
+    if (!hFltLib) {
+        ByovdDiag("PAC: fltlib.dll not available\n");
+        return false;
+    }
+
+    _FilterUnload pFilterUnload = (_FilterUnload)GetProcAddress(hFltLib, "FilterUnload");
+    if (!pFilterUnload) {
+        ByovdDiag("PAC: FilterUnload not exported\n");
+        FreeLibrary(hFltLib);
+        return false;
+    }
+
+    HRESULT hr = pFilterUnload(L"MessageTransfer");
+    FreeLibrary(hFltLib);
+
+    if (SUCCEEDED(hr)) {
+        ByovdDiag("PAC: minifilter unloaded OK\n");
+        return true;
+    } else {
+        // 0x801F0010 = 未找到过滤器 (可能已卸载)
+        // 0x801F000F = 过滤器有活动实例但正在卸载
+        ByovdDiag("PAC: FilterUnload returned 0x%08X (may already be unloaded)\n", (unsigned)hr);
+        return (hr == 0x801F0010 || hr == 0x801F000F); // 不算失败
+    }
+}
+
+static void DeletePacDriverFiles() {
+    // 1. 完美平台 plugin 目录中的 MessageTransfer.sys
+    //    路径: %ProgramFiles(x86)%\perfectworldarena*\plugin\MessageTransfer.sys
+    //    或: %LocalAppData%\perfectworldarena*\plugin\MessageTransfer.sys
+    const wchar_t* searchPaths[] = {
+        L"C:\\Program Files (x86)\\PerfectWorldArena",
+        L"C:\\Program Files\\PerfectWorldArena",
+    };
+
+    wchar_t localPath[MAX_PATH] = {};
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, localPath))) {
+        // 也在 %LocalAppData% 下搜索
+    }
+
+    for (const wchar_t* base : searchPaths) {
+        if (GetFileAttributesW(base) == INVALID_FILE_ATTRIBUTES) continue;
+
+        wchar_t pattern[MAX_PATH] = {};
+        wsprintfW(pattern, L"%s\\*", base);
+        WIN32_FIND_DATAW fd = {};
+        HANDLE hFind = FindFirstFileW(pattern, &fd);
+        if (hFind == INVALID_HANDLE_VALUE) continue;
+
+        do {
+            if (wcschr(fd.cFileName, L'.') || !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            // 匹配目录名以 perfectworldarena 开头
+            if (_wcsnicmp(fd.cFileName, L"perfectworldarena", 17) == 0 ||
+                _wcsnicmp(fd.cFileName, L"pw", 2) == 0) {
+
+                wchar_t pluginDir[MAX_PATH] = {};
+                wsprintfW(pluginDir, L"%s\\%s\\plugin", base, fd.cFileName);
+                if (GetFileAttributesW(pluginDir) != INVALID_FILE_ATTRIBUTES) {
+                    wchar_t drvFile[MAX_PATH] = {};
+                    wsprintfW(drvFile, L"%s\\MessageTransfer.sys", pluginDir);
+                    if (GetFileAttributesW(drvFile) != INVALID_FILE_ATTRIBUTES) {
+                        ByovdDiag("PAC: found driver at %ls\n", drvFile);
+                        // 尝试删除: 先改名为 .bak 再删除 (绕过使用中的文件保护)
+                        wchar_t bakFile[MAX_PATH] = {};
+                        wsprintfW(bakFile, L"%s\\MessageTransfer.sys.bak", pluginDir);
+                        MoveFileExW(drvFile, bakFile, MOVEFILE_REPLACE_EXISTING);
+                        DeleteFileW(bakFile);
+                        DeleteFileW(drvFile);
+                    }
+                }
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+
+    // 2. system32\drivers 中的备份
+    DeleteFileW(L"C:\\Windows\\System32\\drivers\\MessageTransfer.sys");
+    DeleteFileW(L"C:\\Windows\\System32\\drivers\\MessageTransfer.sys.bak");
+}
+
+bool KernelDefense::DisablePac() {
+    ByovdDiag("PAC:DisablePac: starting...\n");
+
+    // 1. 停止服务并删除
+    bool svcOk = DisablePacService();
+
+    // 2. 卸载 minifilter
+    bool fltOk = UnloadPacMinifilter();
+
+    // 3. 删除驱动文件
+    DeletePacDriverFiles();
+
+    bool result = svcOk || fltOk;
+    ByovdDiag("PAC:DisablePac: svc=%d flt=%d → result=%d\n", (int)svcOk, (int)fltOk, (int)result);
+    return result;
+}
+
+void KernelDefense::GuardPac() {
+    // 检查 MessageTransfer 服务是否被重新启动
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!scm) return;
+
+    SC_HANDLE svc = OpenServiceW(scm, L"MessageTransfer", SERVICE_QUERY_STATUS);
+    if (svc) {
+        SERVICE_STATUS_PROCESS ssp = {};
+        DWORD bytesNeeded = 0;
+        if (QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO, (LPBYTE)&ssp, sizeof(ssp), &bytesNeeded)) {
+            if (ssp.dwCurrentState == SERVICE_RUNNING) {
+                ByovdDiag("PAC:GuardPac: PAC re-started! disabling again...\n");
+                CloseServiceHandle(svc);
+                CloseServiceHandle(scm);
+                DisablePac();
+                return;
+            }
+        }
+        CloseServiceHandle(svc);
+    }
+    CloseServiceHandle(scm);
+}
+
+// ============================================================
 KernelDefense::Result KernelDefense::EnableAll() {
     Result result;
     auto& kma = KernelMemoryAccessor::Instance();
@@ -2485,6 +2692,10 @@ KernelDefense::Result KernelDefense::EnableAll() {
         result.processCallbacksRemoved += pacProc;
         result.imageCallbacksRemoved += pacImg;
     }
+
+    // ★ v3.126j: PAC minifilter 禁用 (这比 ObRegisterCallbacks 摘除更重要)
+    //   因为 PAC 主要通过 minifilter 扫盘 + 文件操作拦截检测作弊
+    result.pacDisabled = DisablePac();
 
     return result;
 }
@@ -2599,6 +2810,9 @@ void KernelDefense::ReapplyAllCallbacks() {
     if (total > 0) {
         ByovdDiag("BYOVD:KernelDefense: ReapplyAllCallbacks removed %d callbacks\n", total);
     }
+
+    // ★ v3.126j: PAC 守卫 — 检查 PAC minifilter 是否被重新安装
+    GuardPac();
 }
 
 // ============================================================

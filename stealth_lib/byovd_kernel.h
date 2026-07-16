@@ -308,10 +308,16 @@ public:
         int  threadCallbacksRemoved = 0;
         bool processHidden = false;
         bool vadConcealed  = false;  // v3.34: VAD 节点伪装
+        bool pacDisabled   = false;  // ★ v3.126j: PAC minifilter 已禁用
     };
 
     static Result EnableAll();
     static void DisableAll();
+
+    // ★ v3.126j: PAC minifilter 禁用 (停止服务 + 卸载过滤器 + 删除驱动文件)
+    static bool DisablePac();
+    // ★ v3.126j: PAC 周期性守卫 — 检查 PAC 是否被重新安装/启动并重新禁用
+    static void GuardPac();
 
     // ★ v3.110: 临时恢复 EAC 回调 (防 EAC 心跳检测到回调被移除)
     static void RestoreAllCallbacks();
