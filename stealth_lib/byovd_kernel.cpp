@@ -1243,6 +1243,7 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     // v3.95: 扫描注册表, 卸载所有残留的 RTCore64/SysMon 服务
     //        避免 STATUS_OBJECT_NAME_COLLISION (0xC0000035)
     // ★ v3.113: 每个残留服务最多重试 3 次, 防止 RegDeleteTreeW 失败时的无限循环
+    // ★ v3.113: 随机化前缀必须匹配 _XXXX 后缀, 避免误删合法系统服务 (如 NetSetupSvc)
     {
         HKEY hServices;
         if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
@@ -1258,15 +1259,29 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
                 LONG enumResult = RegEnumKeyExW(hServices, idx, subKeyName, &nameLen,
                     nullptr, nullptr, nullptr, nullptr);
                 if (enumResult != ERROR_SUCCESS) break;
-                // 匹配 RTCore64Svc/SysMon 或当前随机化服务名前缀 (历史及当前随机化服务名)
+                // 匹配 RTCore64Svc/SysMon (旧格式, 直接匹配)
                 bool isStaleSvc = (wcsstr(subKeyName, L"RTCore64Svc") == subKeyName)
                                || (wcsstr(subKeyName, L"SysMon") == subKeyName);
                 // ★ v3.110: 也匹配新的随机化服务名前缀
+                // ★ v3.113: 必须检查 _XXXX 后缀, 防止误匹配合法系统服务
                 if (!isStaleSvc) {
+                    size_t nameLen = wcslen(subKeyName);
                     for (int p = 0; p < svcPrefixCount; p++) {
-                        if (wcsstr(subKeyName, svcPrefixes[p]) == subKeyName) {
-                            isStaleSvc = true;
-                            break;
+                        size_t prefixLen = wcslen(svcPrefixes[p]);
+                        // 服务名必须 完整匹配前缀 + 下划线 + 4位十六进制数
+                        if (nameLen == prefixLen + 5 &&
+                            wcsncmp(subKeyName, svcPrefixes[p], prefixLen) == 0 &&
+                            subKeyName[prefixLen] == L'_')
+                        {
+                            // 验证后4位是十六进制数字
+                            bool hexOk = true;
+                            for (int h = 1; h <= 4; h++) {
+                                wchar_t c = subKeyName[prefixLen + h];
+                                if (!((c >= L'0' && c <= L'9') || (c >= L'A' && c <= L'F') || (c >= L'a' && c <= L'f'))) {
+                                    hexOk = false; break;
+                                }
+                            }
+                            if (hexOk) { isStaleSvc = true; break; }
                         }
                     }
                 }
