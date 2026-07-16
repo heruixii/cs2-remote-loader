@@ -309,10 +309,13 @@ bool ThreadHijacker::HijackThread(HANDLE hProcess, DWORD threadId,
 
     // 构建完整的 hijack shellcode:
     // [shellcode] + [保存原始 CONTEXT] + [恢复 RIP/RSP 并跳回原始地址]
-    std::vector<BYTE> fullCode(shellcodeSize + 128);
+    SIZE_T fullSize = shellcodeSize + 128;
+    std::vector<BYTE> fullCode(fullSize);
 
-    // 复制用户 shellcode
-    memcpy(fullCode.data(), shellcode, shellcodeSize);
+    // 复制用户 shellcode (安全校验: shellcodeSize 不超出 fullSize)
+    if (shellcodeSize > 0 && shellcodeSize <= fullSize) {
+        memcpy(fullCode.data(), shellcode, shellcodeSize);
+    }
 
     // 追加恢复代码 (shellcode 执行完后恢复并跳回)
     // 实际实现需要将原始 CONTEXT 也写入远程内存

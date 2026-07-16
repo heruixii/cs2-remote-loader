@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 405 (v3.107: 修复 PhysicalReadViaIOCTL — 不再设置 size 字段导致 err=87)
+// BUILD: 407 (v3.109: 修复IOCTL sizeType — 4=DWORD, 移除PageTableWalker)
 // ============================================================
 
 #include "stealth_core.h"
@@ -757,7 +757,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.107 DIAG START (BUILD 405: fix PhysicalReadViaIOCTL input format) ===\n");
+    DiagLog("=== v3.109 DIAG START (BUILD 407: fixed IOCTL sizeType 4=DWORD, removed PageTableWalker) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)

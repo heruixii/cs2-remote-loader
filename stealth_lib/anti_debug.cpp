@@ -768,9 +768,9 @@ STEALTH_NOINLINE bool CodeObfuscator::OpaqueFalse() {
 
 STEALTH_NOINLINE void CodeObfuscator::JunkCode() {
     // 完全无意义的指令序列, 用于填充代码间隙
-    volatile int x = 0;
-    for (int i = 0; i < 16; i++) {
-        x ^= (i * 0x12345678) ^ (x << 3) ^ (x >> 5);
+    volatile unsigned int x = 0;
+    for (unsigned int i = 0; i < 16; i++) {
+        x ^= (i * 0x12345678u) ^ (x << 3) ^ (x >> 5);
     }
     // x 最终被丢弃, 但会生成真实的机器码
 }
