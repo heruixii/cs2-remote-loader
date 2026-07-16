@@ -372,4 +372,39 @@ private:
     static bool ClearCiHashBucket(uint64_t ciBase);
 };
 
+// ============================================================
+// ★ v3.126n: Minifilter Neutralizer — 中和 MessageTransfer minifilter
+//
+// 替换 FilterUnload 方案:
+//   不卸载 minifilter (避免 PAC 平台检测到 minifilter 缺失)
+//   而是用 BYOVD 内核 R/W 替换其操作回调为无害 stub
+//   使 minifilter 在结构上"存在"但功能上完全失效
+//
+// 原理:
+//   1. 定位 fltmgr.sys 中 FltGlobals → FrameList → FilterList
+//   2. 遍历找到 MessageTransfer 的 FLT_FILTER 结构
+//   3. 读取 FLT_FILTER.Operations → FLT_OPERATION_REGISTRATION 数组
+//   4. 将每个 PreOp/PostOp 回调替换为返回
+//      FLT_PREOP_SUCCESS_NO_CALLBACK(=0) 的 stub
+//   5. minifilter 仍在 FilterFindFirst 列表中, 但文件操作不受拦截
+// ============================================================
+class MinifilterNeutralizer {
+public:
+    // 中和 MessageTransfer minifilter (不卸载)
+    // 返回 true = 成功中和, false = 失败 (可回退到 FilterUnload)
+    static bool NeutralizeMessageTransfer();
+
+    // ★ v3.126n: 检查 MessageTransfer 回调是否仍为无害 stub
+    //   用于 GuardPac 周期性验证 — 防止 PAC 平台修复回调
+    static bool IsMessageTransferNeutralized();
+
+private:
+    // 通过 sigscan 在 fltmgr.sys 中定位 FltGlobals
+    static uint64_t FindFltGlobals(uint64_t fltmgrBase);
+    // 在 FilterList 中查找 Name=="MessageTransfer" 的 FLT_FILTER
+    static uint64_t FindFilterByName(uint64_t fltmgrBase, uint64_t fltGlobals, const wchar_t* name);
+    // 替换 FLT_FILTER.Operations 数组中所有回调为无害 stub
+    static bool NeutralizeCallbacks(uint64_t filterAddr);
+};
+
 } // namespace stealth

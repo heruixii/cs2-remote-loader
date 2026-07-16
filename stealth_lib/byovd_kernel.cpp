@@ -2883,6 +2883,384 @@ bool KernelTraceCleaner::CleanAllTraces() {
 }
 
 // ============================================================
+// ★ v3.126n: MinifilterNeutralizer — 中和而非卸载 MessageTransfer
+//
+// 此前方案: FilterUnload → 卸载 minifilter → PAC 客户端检测到缺失
+// 新方案:   不卸载, 用 BYOVD 内核 R/W 替换所有操作回调为无害 stub
+//           → minifilter 仍出现在 FilterFindFirst 列表中
+//           → 所有文件操作回调返回 FLT_PREOP_SUCCESS_NO_CALLBACK(=0)
+//           → PAC 平台满意, 但文件扫描完全失效
+//
+// fltmgr.sys 内部结构遍历:
+//   FltGlobals → FrameList → FLTP_FRAME.FilterList
+//   → FLT_FILTER.ActiveLink(+0x00) → 下一个 FLT_FILTER
+//
+// FLT_FILTER 关键字段 (Win10 22H2 / Win11 22H2, x64):
+//   +0x008:  Name.UNICODE_STRING (16 bytes)
+//           此偏移因版本而异, 使用运行时 sigscan 动态定位
+//   +0x2A8:  Operations 指针 (FLT_OPERATION_REGISTRATION*)
+//           每个条目 0x20 bytes: MajorFunction(1)+pad(3)+Flags(4)+
+//                                PreOp(8)+PostOp(8)+Reserved(8)
+//
+// Stub 代码: XOR EAX, EAX; RET = {0x33, 0xC0, 0xC3}
+//   在 fltmgr.sys 中扫描此特征码, 复用已有指令作为 stub 目标
+// ============================================================
+
+// FLT_OPERATION_REGISTRATION 内核实际布局 (x64, 自然对齐)
+struct KernFltOpReg {
+    uint8_t  MajorFunction;   // +0x00 IRP_MJ_*
+    uint8_t  _pad[3];         // +0x01
+    uint32_t Flags;           // +0x04
+    uint64_t PreOperation;    // +0x08
+    uint64_t PostOperation;   // +0x10
+    uint64_t Reserved1;       // +0x18
+}; // sizeof = 0x20
+
+// FLT_FILTER 简化布局 — 运行时不需要完整结构体
+//   关键偏移通过 sigscan 动态检测, 不硬编码
+
+// Stub 代码: return 0 (FLT_PREOP_SUCCESS_NO_CALLBACK / FLT_POSTOP_FINISHED_PROCESSING)
+#define STUB_RET0_BYTES {0x33, 0xC0, 0xC3}  // XOR EAX, EAX; RET
+
+// 在 fltmgr.sys 内核镜像中扫描 "return 0" stub
+static uint64_t FindRet0Stub(uint64_t fltmgrBase, uint64_t fltmgrSize) {
+    auto& kma = KernelMemoryAccessor::Instance();
+    const uint8_t stub[] = STUB_RET0_BYTES;
+
+    // 扫描 fltmgr.sys 的代码段 (.text, 通常在基址 +0x1000 到 +0x300000)
+    uint64_t scanStart = fltmgrBase + 0x1000;
+    uint64_t scanEnd = scanStart + (fltmgrSize > 0x300000 ? 0x300000 : fltmgrSize - 0x1000);
+
+    std::vector<uint8_t> chunk(0x10000);
+    for (uint64_t addr = scanStart; addr < scanEnd; addr += 0x10000) {
+        if (!kma.ReadKernelVA(addr, chunk.data(), chunk.size()))
+            continue;
+        for (size_t off = 0; off < chunk.size() - 3; off++) {
+            if (chunk[off] == stub[0] && chunk[off+1] == stub[1] && chunk[off+2] == stub[2]) {
+                uint64_t stubAddr = addr + off;
+                ByovdDiag("FLT:NTRL: found ret0 stub at fltmgr+0x%llX\n",
+                    (unsigned long long)(stubAddr - fltmgrBase));
+                return stubAddr;
+            }
+        }
+    }
+    ByovdDiag("FLT:NTRL: ret0 stub not found in fltmgr\n");
+    return 0;
+}
+
+// 通过 sigscan 在 FltEnlistFilterForDriverInterface 中查找 FltGlobals
+// 模式: LEA RCX, [RIP + xx xx xx xx] → 目标地址 = RIP(下条指令) + rel32
+uint64_t MinifilterNeutralizer::FindFltGlobals(uint64_t fltmgrBase) {
+    auto& kma = KernelMemoryAccessor::Instance();
+
+    // 解析 fltmgr.sys PE 导出表, 找 FltEnlistFilterForDriverInterface
+    uint64_t targetFunc = kma.ResolveExport(fltmgrBase, "FltEnlistFilterForDriverInterface");
+    if (!targetFunc) {
+        ByovdDiag("FLT:NTRL: FltEnlistFilterForDriverInterface not found\n");
+        return 0;
+    }
+
+    // 读取函数体前 512 字节
+    uint8_t buf[512] = {};
+    if (!kma.ReadKernelVA(targetFunc, buf, sizeof(buf))) {
+        ByovdDiag("FLT:NTRL: cannot read FltEnlistFilterForDriverInterface body\n");
+        return 0;
+    }
+
+    // 搜索: 48 8D 0D ?? ?? ?? ?? (LEA RCX, [RIP+rel32])
+    for (int i = 0; i < 500; i++) {
+        if (buf[i] == 0x48 && buf[i+1] == 0x8D && buf[i+2] == 0x0D) {
+            int32_t rel32 = *(int32_t*)(buf + i + 3);
+            uint64_t candidate = targetFunc + i + 7 + rel32;
+            // FltGlobals 在 fltmgr.sys 的 .data 段中 (基址+0x100000 ~ +0x400000)
+            if (candidate > fltmgrBase + 0x100000 && candidate < fltmgrBase + 0x400000) {
+                ByovdDiag("FLT:NTRL: FltGlobals at 0x%llX (+%d in func)\n",
+                    (unsigned long long)candidate, i);
+                return candidate;
+            }
+        }
+    }
+    ByovdDiag("FLT:NTRL: FltGlobals pattern not found\n");
+    return 0;
+}
+
+// 在 FilterList 中查找指定名称的 FLT_FILTER
+uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t fltGlobals, const wchar_t* name) {
+    auto& kma = KernelMemoryAccessor::Instance();
+    ByovdDiag("FLT:NTRL: finding filter '%ls'\n", name);
+
+    // FltGlobals → FrameList (FltGlobals + 0x000 → LIST_ENTRY / FLTP_FRAME*)
+    uint64_t frameList = 0;
+    if (!kma.ReadKernelVA(fltGlobals, &frameList, sizeof(frameList))) {
+        ByovdDiag("FLT:NTRL: cannot read FrameList from FltGlobals\n");
+        return 0;
+    }
+    if (!frameList || frameList < fltmgrBase || frameList > fltmgrBase + 0x500000) {
+        ByovdDiag("FLT:NTRL: FrameList invalid 0x%llX\n", (unsigned long long)frameList);
+        return 0;
+    }
+
+    // FLTP_FRAME.FilterList 通常在 +0x140 偏移
+    //  尝试几个已知偏移进行匹配
+    uint64_t filterOffsets[] = { 0x140, 0x148, 0x150, 0x138 };
+    uint64_t filterListHead = 0;
+
+    for (uint64_t off : filterOffsets) {
+        uint64_t addr = frameList + off;
+        uint64_t flink = 0, blink = 0;
+        if (kma.ReadKernelVA(addr, &flink, sizeof(flink)) &&
+            kma.ReadKernelVA(addr + 8, &blink, sizeof(blink))) {
+            // FilterList 非空: Flink → 第一个 FLT_FILTER.ActiveLink
+            //   Flink 应该 != Blink (非空链表), 且 Flink 应在内核池中
+            if (flink != addr && flink > 0xFFFF800000000000ULL && blink > 0xFFFF800000000000ULL) {
+                filterListHead = addr;
+                ByovdDiag("FLT:NTRL: FilterList head at frame+0x%llX\n", off);
+                break;
+            }
+        }
+    }
+
+    if (!filterListHead) {
+        ByovdDiag("FLT:NTRL: FilterList not found in FLTP_FRAME\n");
+        return 0;
+    }
+
+    // 遍历 FilterList 链表
+    // FLT_FILTER.ActiveLink 在 FLT_FILTER + 0x008
+    // Name.UNICODE_STRING 的偏移需要运行时检测 (尝试几个常见偏移)
+    uint64_t nameOffsets[] = { 0x188, 0x198, 0x1A8, 0x178 }; // Win10/11 变体
+
+    uint64_t current = 0;
+    if (!kma.ReadKernelVA(filterListHead, &current, sizeof(current)))
+        return 0;
+
+    for (int iter = 0; iter < 100 && current && current != filterListHead; iter++) {
+        // current = &(FLT_FILTER.ActiveLink), FLT_FILTER 基址 = current - 0x008
+        uint64_t filterBase = current - 0x008;
+
+        // 尝试不同偏移读取 Name
+        for (uint64_t nameOff : nameOffsets) {
+            uint16_t nameLen = 0;
+            uint64_t nameBuf = 0;
+            uint64_t uniAddr = filterBase + nameOff;
+
+            if (kma.ReadKernelVA(uniAddr, &nameLen, sizeof(nameLen)) &&
+                kma.ReadKernelVA(uniAddr + 8, &nameBuf, sizeof(nameBuf))) {
+
+                if (nameLen > 0 && nameLen <= 256 && nameLen % 2 == 0 &&
+                    nameBuf > 0xFFFF800000000000ULL) {
+
+                    std::wstring filterName = ReadKernelUnicodeString(nameBuf, nameLen);
+                    if (_wcsicmp(filterName.c_str(), name) == 0) {
+                        ByovdDiag("FLT:NTRL: found '%ls' at 0x%llX (nameOff=0x%llX)\n",
+                            filterName.c_str(), (unsigned long long)filterBase, nameOff);
+                        return filterBase;
+                    }
+                }
+            }
+        }
+
+        // 下一个: current → ActiveLink.Flink
+        if (!kma.ReadKernelVA(current, &current, sizeof(current)))
+            break;
+    }
+
+    ByovdDiag("FLT:NTRL: filter '%ls' not found in FilterList\n", name);
+    return 0;
+}
+
+// 替换 FLT_FILTER.Operations 数组中所有回调为无害 stub
+bool MinifilterNeutralizer::NeutralizeCallbacks(uint64_t filterAddr) {
+    auto& kma = KernelMemoryAccessor::Instance();
+
+    // 获取 fltmgr.sys 基址用于 stub 扫描
+    uint64_t fltmgrBase = kma.GetKernelModuleBase("fltmgr.sys");
+    if (!fltmgrBase) {
+        ByovdDiag("FLT:NTRL: fltmgr.sys not found\n");
+        return false;
+    }
+
+    // 找到 return-0 stub 地址
+    uint64_t stubAddr = FindRet0Stub(fltmgrBase, 0x400000);
+    if (!stubAddr) return false;
+
+    // Operations 指针偏移 — 尝试常见值
+    uint64_t opsOffsets[] = { 0x2A8, 0x2B8, 0x2C8, 0x2A0, 0x2B0 };
+    uint64_t opsAddr = 0;
+
+    for (uint64_t off : opsOffsets) {
+        uint64_t val = 0;
+        if (kma.ReadKernelVA(filterAddr + off, &val, sizeof(val))) {
+            // Operations 数组应在内核池中 (高地址), 不在 fltmgr 模块内
+            if (val > 0xFFFF800000000000ULL && val < 0xFFFFFFFFFFFFFFFFULL) {
+                // ★ v3.126n-review: 加强验证 — 检查前 3 个条目的 MJ 是否均为合法 IRP_MJ_* 值
+                bool valid = true;
+                for (int checkIdx = 0; checkIdx < 3; checkIdx++) {
+                    uint8_t mj = 0;
+                    uint64_t checkAddr = val + (uint64_t)(checkIdx * 0x20); // sizeof(KernFltOpReg)=0x20
+                    if (!kma.ReadKernelVA(checkAddr, &mj, sizeof(mj)) ||
+                        (mj > 0x1B && mj != 0x80)) {
+                        valid = false;
+                        break;
+                    }
+                }
+                if (valid) {
+                    opsAddr = val;
+                    uint8_t firstMJ = 0;
+                    kma.ReadKernelVA(val, &firstMJ, sizeof(firstMJ));
+                    ByovdDiag("FLT:NTRL: Operations at filter+0x%llX → 0x%llX (MJ=%u, 3-verified)\n",
+                        off, (unsigned long long)opsAddr, (unsigned int)firstMJ);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!opsAddr) {
+        ByovdDiag("FLT:NTRL: Operations pointer not found in FLT_FILTER\n");
+        return false;
+    }
+
+    // 遍历 FLT_OPERATION_REGISTRATION 数组 (以 IRP_MJ_OPERATION_END=0x80 终结)
+    int replaced = 0;
+    int totalCallbacks = 0; // 非 NULL 回调总数
+
+    for (int i = 0; i < 64; i++) {  // 最多 64 个操作注册
+        KernFltOpReg reg = {};
+        uint64_t regAddr = opsAddr + (uint64_t)(i * sizeof(KernFltOpReg));
+        if (!kma.ReadKernelVA(regAddr, &reg, sizeof(reg)))
+            break;
+
+        if (reg.MajorFunction == 0x80) break;  // IRP_MJ_OPERATION_END
+
+        // 统计非 NULL 回调
+        if (reg.PreOperation)  totalCallbacks++;
+        if (reg.PostOperation) totalCallbacks++;
+
+        bool modified = false;
+
+        // 替换 PreOp 回调
+        if (reg.PreOperation != 0 && reg.PreOperation != stubAddr) {
+            uint64_t preOpAddr = regAddr + offsetof(KernFltOpReg, PreOperation);
+            if (kma.WriteKernelVA(preOpAddr, &stubAddr, sizeof(stubAddr))) {
+                ByovdDiag("FLT:NTRL: [%d] MJ=0x%02X PreOp 0x%llX→stub\n",
+                    i, (unsigned)reg.MajorFunction, (unsigned long long)reg.PreOperation);
+                replaced++;
+                modified = true;
+            }
+        } else if (reg.PreOperation == stubAddr) {
+            replaced++; // 已经是 stub, 计入成功
+        }
+
+        // 替换 PostOp 回调 (可能为 NULL, 跳过)
+        if (reg.PostOperation != 0 && reg.PostOperation != stubAddr) {
+            uint64_t postOpAddr = regAddr + offsetof(KernFltOpReg, PostOperation);
+            if (kma.WriteKernelVA(postOpAddr, &stubAddr, sizeof(stubAddr))) {
+                ByovdDiag("FLT:NTRL: [%d] MJ=0x%02X PostOp 0x%llX→stub\n",
+                    i, (unsigned)reg.MajorFunction, (unsigned long long)reg.PostOperation);
+                replaced++;
+                modified = true;
+            }
+        } else if (reg.PostOperation == stubAddr) {
+            replaced++; // 已经是 stub, 计入成功
+        }
+
+        // 不修改 Flags (保留 FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO 等标志)
+    }
+
+    // ★ v3.126n-review: 修复部分成功误报 — 只有全部回调都被 stub 替换才算成功
+    bool allReplaced = (replaced >= totalCallbacks);
+    ByovdDiag("FLT:NTRL: replaced %d/%d callback pointers → %s\n",
+        replaced, totalCallbacks, allReplaced ? "ALL OK" : "PARTIAL FAIL");
+    return allReplaced;
+}
+
+// === Public API ===
+
+bool MinifilterNeutralizer::NeutralizeMessageTransfer() {
+    auto& kma = KernelMemoryAccessor::Instance();
+    if (!kma.IsActive()) {
+        ByovdDiag("FLT:NTRL: Neutralize skipped — BYOVD not active\n");
+        return false;
+    }
+
+    ByovdDiag("FLT:NTRL: === NEUTRALIZING MessageTransfer (keep alive) ===\n");
+
+    uint64_t fltmgrBase = kma.GetKernelModuleBase("fltmgr.sys");
+    if (!fltmgrBase) {
+        ByovdDiag("FLT:NTRL: fltmgr.sys not loaded\n");
+        return false;
+    }
+    ByovdDiag("FLT:NTRL: fltmgr.sys at 0x%llX\n", (unsigned long long)fltmgrBase);
+
+    // 1. 定位 FltGlobals
+    uint64_t fltGlobals = FindFltGlobals(fltmgrBase);
+    if (!fltGlobals) return false;
+
+    // 2. 查找 MessageTransfer
+    uint64_t filterAddr = FindFilterByName(fltmgrBase, fltGlobals, L"MessageTransfer");
+    if (!filterAddr) return false;
+
+    // 3. 中和回调
+    if (!NeutralizeCallbacks(filterAddr)) return false;
+
+    ByovdDiag("FLT:NTRL: === NEUTRALIZED SUCCESSFULLY ===\n");
+    return true;
+}
+
+bool MinifilterNeutralizer::IsMessageTransferNeutralized() {
+    auto& kma = KernelMemoryAccessor::Instance();
+    if (!kma.IsActive()) return true; // BYOVD 未激活时不报错
+
+    // 检查 fltmgr FilterFindFirst 列表中的 minifilter 是否仍然是 stub
+    // 简化为: 检查 fltmgr 内是否有非 stub 的 MessageTransfer 回调
+    uint64_t fltmgrBase = kma.GetKernelModuleBase("fltmgr.sys");
+    if (!fltmgrBase) return true;
+
+    uint64_t fltGlobals = FindFltGlobals(fltmgrBase);
+    if (!fltGlobals) return true; // 找不到 Globals 不报错
+
+    uint64_t filterAddr = FindFilterByName(fltmgrBase, fltGlobals, L"MessageTransfer");
+    if (!filterAddr) {
+        // minifilter 不在列表中 — 被卸载了, 需要重新安装假的存在性
+        ByovdDiag("FLT:NTRL:Guard: MessageTransfer not found in FilterList!\n");
+        return false;
+    }
+
+    // 检查 Operations 中的回调是否仍指向 stub
+    uint64_t stubAddr = FindRet0Stub(fltmgrBase, 0x400000);
+    if (!stubAddr) return true;
+
+    uint64_t opsOffsets[] = { 0x2A8, 0x2B8, 0x2C8, 0x2A0, 0x2B0 };
+    uint64_t opsAddr = 0;
+    for (uint64_t off : opsOffsets) {
+        if (kma.ReadKernelVA(filterAddr + off, &opsAddr, sizeof(opsAddr)) &&
+            opsAddr > 0xFFFF800000000000ULL)
+            break;
+    }
+
+    if (!opsAddr) return false;
+
+    // ★ v3.126n-review: 修复 — 遍历全部条目到 MJ=0x80, 而非仅前 8 条
+    for (int i = 0; i < 64; i++) {
+        KernFltOpReg reg = {};
+        if (!kma.ReadKernelVA(opsAddr + (uint64_t)(i * sizeof(reg)), &reg, sizeof(reg)))
+            break;
+        if (reg.MajorFunction == 0x80) break;
+        if ((reg.PreOperation && reg.PreOperation != stubAddr) ||
+            (reg.PostOperation && reg.PostOperation != stubAddr)) {
+            ByovdDiag("FLT:NTRL:Guard: MJ=0x%02X PreOp=0x%llX PostOp=0x%llX not stub!\n",
+                (unsigned)reg.MajorFunction,
+                (unsigned long long)reg.PreOperation,
+                (unsigned long long)reg.PostOperation);
+            return false;
+        }
+    }
+
+    return true; // 全部 stub → 已中和
+}
+
+// ============================================================
 // ★ v3.126j: PAC (完美世界反作弊) 专用禁用模块
 //
 // PAC = Perfect Anti-Cheat, 完美世界自研反作弊系统
@@ -3107,24 +3485,32 @@ bool KernelDefense::DisablePac() {
     // 1. 停止服务并删除
     bool svcOk = DisablePacService();
 
-    // 2. 卸载 minifilter
-    bool fltOk = UnloadPacMinifilter();
+    // 2. ★ v3.126n: 中和 minifilter (不卸载, 替换回调为无害 stub)
+    //   与 UnloadPacMinifilter 不同: Neutralize 保留 minifilter 在 FilterFindFirst 列表中
+    //   PAC 客户端检查 minifilter 存在性时看到 MessageTransfer 仍在, 但回调已失效
+    bool ntrlOk = MinifilterNeutralizer::NeutralizeMessageTransfer();
 
     // 3. 删除驱动文件
     DeletePacDriverFiles();
 
-    // ★ v3.126l: 修复 — minifilter 是 PAC 核心检测机制, 必须卸载成功才返回 true
-    //   svcOk 仅表示服务停止, 文件扫描仍在运行; 必须以 fltOk 为准
-    bool result = fltOk;
-    ByovdDiag("PAC:DisablePac: svc=%d flt=%d → result=%d%s\n",
-        (int)svcOk, (int)fltOk, (int)result,
-        (!fltOk && svcOk) ? " (WARNING: minifilter still loaded!)" : "");
+    // ★ v3.126n: 成功条件 — 中和或卸载任一个完成即可
+    //   Neutralize 是首选方案 (不报缺失), 但 Unload 是回退方案
+    bool result = ntrlOk;
+    if (!result) {
+        // 回退: 中和失败, 尝试传统卸载
+        ByovdDiag("PAC:DisablePac: neutralize failed, fallback to FilterUnload\n");
+        bool fltOk = UnloadPacMinifilter();
+        result = fltOk;
+    }
+
+    ByovdDiag("PAC:DisablePac: svc=%d ntrl=%d → result=%d%s\n",
+        (int)svcOk, (int)ntrlOk, (int)result,
+        (!result && svcOk) ? " (WARNING: minifilter still active!)" : "");
     return result;
 }
 
 void KernelDefense::GuardPac() {
-    // ★ v3.126l: 双重检查 — 服务状态 + minifilter 加载状态
-    //   minifilter 可以通过 fltmc load 独立加载, 不依赖 SCM 服务
+    // ★ v3.126n: 三重检查 — 服务 + minifilter 存在性 + 回调完整性
     bool needReDisable = false;
 
     // 检查 1: SCM 服务状态
@@ -3144,10 +3530,16 @@ void KernelDefense::GuardPac() {
         CloseServiceHandle(scm);
     }
 
-    // 检查 2: minifilter 直接在 Filter Manager 中 (不通过 SCM)
-    if (!needReDisable && IsPacMinifilterLoaded()) {
-        ByovdDiag("PAC:GuardPac: minifilter loaded without service, re-disabling...\n");
-        needReDisable = true;
+    // 检查 2: minifilter 存在 + 回调是否被恢复
+    //   ★ v3.126n: 如果 minifilter 存在但回调是 stub → 无害 (Neutralize 成功)
+    //              如果 minifilter 存在但回调已恢复 → PAC 修复了 → 重新禁用
+    //              如果 minifilter 不在列表中 → 被卸载了 → 可能需要重新处理
+    if (!needReDisable) {
+        bool filterExists = IsPacMinifilterLoaded();
+        if (filterExists && !MinifilterNeutralizer::IsMessageTransferNeutralized()) {
+            ByovdDiag("PAC:GuardPac: callback stubs overwritten! re-neutralizing...\n");
+            needReDisable = true;
+        }
     }
 
     if (needReDisable) {
