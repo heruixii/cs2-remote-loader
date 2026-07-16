@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 431 (v3.126e: 跳过NtUnmapViewOfSection + VEH崩溃范围检查 + 崩溃计数 — 防止无限循环 — SleepObfuscator/TelemetrySilencer/PhantomSection改用固定数组, GetSelfPage回退到&GetSelfPage)
+// BUILD: 432 (v3.126f: SEH 保护 Hollowing 过程 — 崩溃时自动回退到直接 CreateProcess)
 // ============================================================
 
 #include "stealth_core.h"
@@ -371,6 +371,17 @@ static bool LaunchBasicESP() {
     //   完全不同, 无需先 unmapping, 直接分配内存即可。
     // ★ v3.126d: 修复 — 跳过 NtUnmapViewOfSection 避免 ntdll 崩溃
     bool hollowOk = canHollow; // 不 unmapping, 直接进行后续分配
+
+    if (hollowOk) {
+        // ★ v3.126f: 当 BYOVD 不可用时, 跳过 Hollowing (VirtualAllocEx 等 ntdll 调用可能崩溃)
+        //   直接回退到 CreateProcess
+        if (!stealth::KernelMemoryAccessor::Instance().IsActive()) {
+            DiagLog("BYOVD inactive, skipping hollowing (ntdll crash risk), fallback to direct CreateProcess\n");
+            TerminateProcess(pi.hProcess, 0);
+            CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+            hollowOk = false;
+        }
+    }
 
     if (hollowOk) {
         // Step 6: 在远程进程分配 basic.exe 所需内存
