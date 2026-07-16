@@ -2440,6 +2440,57 @@ static BYOVDDriverInfo MutateAndRandomizeDriver(const BYOVDDriverInfo& original)
 
 // 动态加载 fltlib.dll 的 FilterUnload 函数 (无需 WDK)
 typedef HRESULT (WINAPI* _FilterUnload)(LPCWSTR lpFilterName);
+// ★ v3.126l: FilterFindFirst/FilterFindNext — 枚举已加载 minifilter
+typedef HRESULT (WINAPI* _FilterFindFirst)(
+    DWORD dwInformationClass, LPVOID lpBuffer, DWORD dwBufferSize,
+    LPDWORD lpBytesReturned, LPDWORD lpFilterFind);
+typedef HRESULT (WINAPI* _FilterFindNext)(
+    DWORD dwFilterFind, DWORD dwInformationClass, LPVOID lpBuffer,
+    DWORD dwBufferSize, LPDWORD lpBytesReturned);
+typedef HRESULT (WINAPI* _FilterFindClose)(DWORD dwFilterFind);
+
+// ★ v3.126l: 检查 MessageTransfer minifilter 是否已加载
+//   不依赖 SCM 服务状态, 直接查询 Filter Manager
+static bool IsPacMinifilterLoaded() {
+    HMODULE hFltLib = LoadLibraryW(L"fltlib.dll");
+    if (!hFltLib) return false;
+
+    _FilterFindFirst pFindFirst = (_FilterFindFirst)GetProcAddress(hFltLib, "FilterFindFirst");
+    _FilterFindNext  pFindNext  = (_FilterFindNext)GetProcAddress(hFltLib, "FilterFindNext");
+    _FilterFindClose pFindClose = (_FilterFindClose)GetProcAddress(hFltLib, "FilterFindClose");
+
+    if (!pFindFirst || !pFindNext || !pFindClose) {
+        FreeLibrary(hFltLib);
+        return false;
+    }
+
+    // FILTER_FULL_INFORMATION = 0 (enumerates by filter name)
+    wchar_t buf[512] = {};
+    DWORD bytesReturned = 0;
+    DWORD filterFind = 0;
+    HRESULT hr = pFindFirst(0, buf, sizeof(buf), &bytesReturned, &filterFind);
+    if (FAILED(hr)) {
+        FreeLibrary(hFltLib);
+        return false;
+    }
+
+    bool found = false;
+    do {
+        auto* info = (BYTE*)buf;
+        // FILTER_FULL_INFORMATION: Name is at offset 8 (wchar_t[256])
+        const wchar_t* filterName = (const wchar_t*)(info + 8);
+        if (_wcsicmp(filterName, L"MessageTransfer") == 0) {
+            found = true;
+            break;
+        }
+        bytesReturned = 0;
+        hr = pFindNext(filterFind, 0, buf, sizeof(buf), &bytesReturned);
+    } while (SUCCEEDED(hr));
+
+    pFindClose(filterFind);
+    FreeLibrary(hFltLib);
+    return found;
+}
 
 static bool DisablePacService() {
     ByovdDiag("PAC:DisablePacService: opening SCM...\n");
@@ -2492,10 +2543,8 @@ static bool DisablePacService() {
     if (DeleteService(svc)) {
         ByovdDiag("PAC: service deleted\n");
     } else {
-        ByovdDiag("PAC: DeleteService failed (err=%u), marking for deletion\n", GetLastError());
-        // 标记为删除: 下次重启时系统会清理
-        SERVICE_STATUS markStatus = {};
-        ControlService(svc, SERVICE_CONTROL_STOP, &markStatus);
+        ByovdDiag("PAC: DeleteService failed (err=%u), service persists until reboot\n", GetLastError());
+        // 确保服务已停止 (即使删除失败, 至少停用)
     }
 
     CloseServiceHandle(svc);
@@ -2536,17 +2585,21 @@ static void DeletePacDriverFiles() {
     // 1. 完美平台 plugin 目录中的 MessageTransfer.sys
     //    路径: %ProgramFiles(x86)%\perfectworldarena*\plugin\MessageTransfer.sys
     //    或: %LocalAppData%\perfectworldarena*\plugin\MessageTransfer.sys
-    const wchar_t* searchPaths[] = {
-        L"C:\\Program Files (x86)\\PerfectWorldArena",
-        L"C:\\Program Files\\PerfectWorldArena",
-    };
+    wchar_t searchPaths[4][MAX_PATH] = {};
+    int searchPathCount = 0;
 
+    // Program Files 路径 (常见安装位置)
+    wsprintfW(searchPaths[searchPathCount++], L"C:\\Program Files (x86)\\PerfectWorldArena");
+    wsprintfW(searchPaths[searchPathCount++], L"C:\\Program Files\\PerfectWorldArena");
+
+    // ★ v3.126l: 修复 — 激活 %LocalAppData% 搜索路径 (之前是死代码)
     wchar_t localPath[MAX_PATH] = {};
     if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, localPath))) {
-        // 也在 %LocalAppData% 下搜索
+        wsprintfW(searchPaths[searchPathCount++], L"%s\\PerfectWorldArena", localPath);
     }
 
-    for (const wchar_t* base : searchPaths) {
+    for (int si = 0; si < searchPathCount; si++) {
+        const wchar_t* base = searchPaths[si];
         if (GetFileAttributesW(base) == INVALID_FILE_ATTRIBUTES) continue;
 
         wchar_t pattern[MAX_PATH] = {};
@@ -2557,9 +2610,9 @@ static void DeletePacDriverFiles() {
 
         do {
             if (wcschr(fd.cFileName, L'.') || !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-            // 匹配目录名以 perfectworldarena 开头
-            if (_wcsnicmp(fd.cFileName, L"perfectworldarena", 17) == 0 ||
-                _wcsnicmp(fd.cFileName, L"pw", 2) == 0) {
+            // ★ v3.126l: 更精确匹配 — 移除过于宽泛的 "pw" 模糊匹配
+            //   仅匹配以 perfectworldarena 开头的目录
+            if (_wcsnicmp(fd.cFileName, L"perfectworldarena", 17) == 0) {
 
                 wchar_t pluginDir[MAX_PATH] = {};
                 wsprintfW(pluginDir, L"%s\\%s\\plugin", base, fd.cFileName);
@@ -2598,32 +2651,47 @@ bool KernelDefense::DisablePac() {
     // 3. 删除驱动文件
     DeletePacDriverFiles();
 
-    bool result = svcOk || fltOk;
-    ByovdDiag("PAC:DisablePac: svc=%d flt=%d → result=%d\n", (int)svcOk, (int)fltOk, (int)result);
+    // ★ v3.126l: 修复 — minifilter 是 PAC 核心检测机制, 必须卸载成功才返回 true
+    //   svcOk 仅表示服务停止, 文件扫描仍在运行; 必须以 fltOk 为准
+    bool result = fltOk;
+    ByovdDiag("PAC:DisablePac: svc=%d flt=%d → result=%d%s\n",
+        (int)svcOk, (int)fltOk, (int)result,
+        (!fltOk && svcOk) ? " (WARNING: minifilter still loaded!)" : "");
     return result;
 }
 
 void KernelDefense::GuardPac() {
-    // 检查 MessageTransfer 服务是否被重新启动
-    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-    if (!scm) return;
+    // ★ v3.126l: 双重检查 — 服务状态 + minifilter 加载状态
+    //   minifilter 可以通过 fltmc load 独立加载, 不依赖 SCM 服务
+    bool needReDisable = false;
 
-    SC_HANDLE svc = OpenServiceW(scm, L"MessageTransfer", SERVICE_QUERY_STATUS);
-    if (svc) {
-        SERVICE_STATUS_PROCESS ssp = {};
-        DWORD bytesNeeded = 0;
-        if (QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO, (LPBYTE)&ssp, sizeof(ssp), &bytesNeeded)) {
-            if (ssp.dwCurrentState == SERVICE_RUNNING) {
-                ByovdDiag("PAC:GuardPac: PAC re-started! disabling again...\n");
-                CloseServiceHandle(svc);
-                CloseServiceHandle(scm);
-                DisablePac();
-                return;
+    // 检查 1: SCM 服务状态
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (scm) {
+        SC_HANDLE svc = OpenServiceW(scm, L"MessageTransfer", SERVICE_QUERY_STATUS);
+        if (svc) {
+            SERVICE_STATUS_PROCESS ssp = {};
+            DWORD bytesNeeded = 0;
+            if (QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO, (LPBYTE)&ssp, sizeof(ssp), &bytesNeeded)) {
+                if (ssp.dwCurrentState == SERVICE_RUNNING) {
+                    needReDisable = true;
+                }
             }
+            CloseServiceHandle(svc);
         }
-        CloseServiceHandle(svc);
+        CloseServiceHandle(scm);
     }
-    CloseServiceHandle(scm);
+
+    // 检查 2: minifilter 直接在 Filter Manager 中 (不通过 SCM)
+    if (!needReDisable && IsPacMinifilterLoaded()) {
+        ByovdDiag("PAC:GuardPac: minifilter loaded without service, re-disabling...\n");
+        needReDisable = true;
+    }
+
+    if (needReDisable) {
+        ByovdDiag("PAC:GuardPac: PAC re-enabled! disabling again...\n");
+        DisablePac();
+    }
 }
 
 // ============================================================
