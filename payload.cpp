@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 437 (v3.126g: BYOVD 加载成功时跳过 Hollowing, 直接 CreateProcess)
+// BUILD: 437 (v3.126g: BYOVD 加载成功时跳过 Hollowing + 周期性 EAC 监控)
 // ============================================================
 
 #include "stealth_core.h"
@@ -1604,6 +1604,22 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         if ((frameCount % syscallCheckInterval) == 0) {
             stealth::SyscallGuard::VerifyAndRepair();
             syscallCheckInterval = (int)RandomJitter(25, 10); // 每次重随机
+        }
+
+        // ★ v3.126g: EAC 周期性监控 — 每5-10秒检查 EAC.sys 是否加载,
+        //   如果加载则自动摘除内核回调, 解决 EAC 在 BYOVD 之后启动的问题
+        //   注意: 使用 GetTickCount 而非 frameCount, 避免 Sleep 波动影响
+        {
+            static DWORD lastEacCheck = 0;
+            DWORD nowTick = GetTickCount();
+            static DWORD eacCheckInterval = RandomJitter(5000, 5000);
+            if (nowTick - lastEacCheck >= eacCheckInterval) {
+                lastEacCheck = nowTick;
+                eacCheckInterval = RandomJitter(5000, 5000);
+                if (stealth::KernelMemoryAccessor::Instance().IsActive()) {
+                    stealth::KernelDefense::ReapplyAllCallbacks();
+                }
+            }
         }
 
         // 监控基础.exe 是否还活着
