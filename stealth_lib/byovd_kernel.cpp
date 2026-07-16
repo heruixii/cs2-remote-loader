@@ -1242,6 +1242,7 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
 
     // v3.95: 扫描注册表, 卸载所有残留的 RTCore64/SysMon 服务
     //        避免 STATUS_OBJECT_NAME_COLLISION (0xC0000035)
+    // ★ v3.113: 每个残留服务最多重试 3 次, 防止 RegDeleteTreeW 失败时的无限循环
     {
         HKEY hServices;
         if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
@@ -1249,6 +1250,8 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
             KEY_ENUMERATE_SUB_KEYS | DELETE, &hServices) == ERROR_SUCCESS)
         {
             wchar_t subKeyName[256];
+            wchar_t prevKey[256] = {};
+            int sameKeyRetries = 0;
             DWORD idx = 0;
             while (idx < 512) {
                 DWORD nameLen = 256;
@@ -1271,6 +1274,20 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
                     std::wstring svcName(subKeyName);
                     // 跳过当前要加载的服务名
                     if (svcName == actualServiceName) { idx++; continue; }
+                    // ★ v3.113: 检测是否反复处理同一个键, 防止无限循环
+                    if (wcscmp(subKeyName, prevKey) == 0) {
+                        sameKeyRetries++;
+                        if (sameKeyRetries >= 3) {
+                            ByovdDiag("BYOVD:Init: stale '%ls' retry limit, skipping\n", subKeyName);
+                            idx++;
+                            sameKeyRetries = 0;
+                            prevKey[0] = 0;
+                            continue;
+                        }
+                    } else {
+                        sameKeyRetries = 0;
+                        wcscpy_s(prevKey, subKeyName);
+                    }
                     ByovdDiag("BYOVD:Init: found stale service '%ls', unloading...\n", subKeyName);
                     // ★ 先卸载 (需要 registry key 存在)
                     bool unloaded = UnloadDriver(svcName);
