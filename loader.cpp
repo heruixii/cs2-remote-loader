@@ -497,6 +497,23 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         return 2;
     }
 
+    // ★ v3.111: 校验下载完整性 — 加密数据大小必须匹配
+    //   加密格式: [4字节 originalSize] [XTEA加密数据, 8字节对齐]
+    size_t expectedEncryptedSize = 4 + ((originalSize + 7) & ~7ULL);
+    if (encryptedData.size() != expectedEncryptedSize) {
+        LoaderDiag("STEP4: SIZE MISMATCH (got=%zu expected=%zu)\n",
+            encryptedData.size(), expectedEncryptedSize);
+        MessageBoxW(NULL,
+            L"Payload 下载不完整，数据大小不匹配。\n\n"
+            L"可能原因:\n"
+            L"  - 网络中断导致下载不完整\n"
+            L"  - GitHub 镜像代理返回了不完整数据\n"
+            L"  - 文件被篡改\n\n"
+            L"请重新运行 loader.exe 重试。",
+            L"下载不完整", MB_OK | MB_ICONERROR);
+        return 2;
+    }
+
     uint8_t* payloadBuf = encryptedData.data() + sizeof(uint32_t);
 
     // XTEA CBC 解密 (原地)

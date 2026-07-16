@@ -832,6 +832,11 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         DiagLog("FAIL: AttachToProcess\n");
         stealth::KernelDefense::DisableAll();
         StealthEngine::Instance().Shutdown();
+        // ★ v3.111: 提示用户启动 CS2
+        MessageBoxW(NULL,
+            L"未找到 CS2 进程 (cs2.exe)。\n\n"
+            L"请先启动 Counter-Strike 2，然后重新运行 loader.exe。",
+            L"CS2 未运行", MB_OK | MB_ICONINFORMATION);
         return 2;
     }
     DiagLog("OK: AttachToProcess, PID=%u HANDLE=%p\n",
