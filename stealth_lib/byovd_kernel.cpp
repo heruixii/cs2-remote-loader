@@ -3878,9 +3878,9 @@ static bool IsAntiCheatDriverName(const char* name) {
         "anticheat", "anti_cheat", "anti-cheat",
         "battleye", "bedaisy",
         "xigncode", "xhc",
-        "nprotect", "npf",
+        "nprotect",
         "gameguard",
-        "tenprotect", "tp",
+        "tenprotect",
         "ace", "anti-cheat-expert",
         "equ8",
         "fate",
@@ -3888,6 +3888,35 @@ static bool IsAntiCheatDriverName(const char* name) {
         // ★ v3.126i: 完美世界 PAC (Perfect World Anti-Cheat)
         "messagetransfer",
         "pvpac", "pvp", "perfectworld",
+    };
+
+    // ★ v3.127: 系统驱动黑名单 — 防止短模式名误伤关键系统驱动
+    //   "ace"/"npf"/"tp" 等短子串可能误匹配 Windows 内置驱动,
+    //   在模式匹配之后做精确排除
+    static const char* g_systemDriverBlocklist[] = {
+        "tpm.sys",      // Trusted Platform Module — BSOD 根因
+        "npfs.sys",     // Named Pipe File System
+        "msfs.sys",     // Mailslot File System
+        "dfsc.sys",     // DFS Namespace Client
+        "cldflt.sys",   // Cloud Files Mini Filter
+        "fileinfo.sys", // File Information Mini Filter
+        "wof.sys",      // Windows Overlay Filter
+        "luafv.sys",    // LUA File Virtualization
+        "wcifs.sys",    // Windows Container Isolation
+        "bindflt.sys",  // Bind Filter
+        "bfs.sys",      // Boot File System
+        "storqosflt.sys", // Storage QoS Filter
+        "iorate.sys",   // IO Rate Control
+        "fsdepends.sys", // File System Dependency
+        "fltmgr.sys",   // Filter Manager
+        "npsvctrig.sys", // Named Pipe Service Triggers
+        "win32k.sys",   // Win32k
+        "win32kfull.sys", // Win32k Full
+        "win32kbase.sys", // Win32k Base
+        "hal.sys",      // Hardware Abstraction Layer
+        "clipsp.sys",   // Client License Service
+        "cmimcext.sys", // CMI MCE Extension
+        nullptr
     };
     char lower[64] = {};
     size_t len = strlen(name);
@@ -3897,6 +3926,13 @@ static bool IsAntiCheatDriverName(const char* name) {
         lower[i] = (c >= 'A' && c <= 'Z') ? (c - 'A' + 'a') : c;
     }
     lower[len] = '\0';
+
+    // ★ v3.127 fix: 先精确排除系统关键驱动, 再做模式匹配
+    //   防止短模式名 (如 "ace"/"npf") 误伤内核安全驱动
+    for (const char** bl = g_systemDriverBlocklist; *bl; bl++) {
+        if (_stricmp(name, *bl) == 0) return false;
+    }
+
     for (const char* pat : patterns) {
         if (strstr(lower, pat)) return true;
     }
