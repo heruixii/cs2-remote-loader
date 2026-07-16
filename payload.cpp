@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 435 (v3.126f: 恢复 Hollowing — 跳过 preferred base + 批量 IAT 写入)
+// BUILD: 436 (v3.126f: 恢复 Hollowing — setjmp/longjmp 捕获 ntdll 崩溃, 自动回退)
 // ============================================================
 
 #include "stealth_core.h"
@@ -23,6 +23,7 @@
 #include <vector>
 #include <cstdlib>
 #include <ctime>
+#include <setjmp.h>
 #include "cs2_offsets.h"
 #include "syscall_direct.h"
 #include "eac_syscall_guard.h"
@@ -71,6 +72,10 @@ static volatile LONG g_vehRestoring = 0;
 // ★ v3.126d: 崩溃计数 — 防止自愈后同一指令再次崩溃导致的无限循环
 static volatile LONG g_vehCrashCount = 0;
 static constexpr LONG MAX_VEH_RETRIES = 3;
+
+// ★ v3.126f: Hollowing crash fallback — 用 setjmp/longjmp 捕获 ntdll 崩溃并回退到 CreateProcess
+static jmp_buf g_hollowJmpBuf;
+static bool g_hollowJmpSet = false;
 
 static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     uint64_t crashAddr = (uint64_t)ep->ExceptionRecord->ExceptionAddress;
@@ -171,6 +176,17 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     }
 
 veh_fatal:
+
+    // ★ v3.126f: Hollowing crash — 用 longjmp 跳回 setjmp 点, 回退到 CreateProcess
+    if (g_hollowJmpSet) {
+        DiagLog("VEH: hollowing crash detected (addr=0x%llX), jumping to fallback\n",
+            (unsigned long long)crashAddr);
+        // 清理远程进程
+        // 注意: longjmp 会跳转到 setjmp 点, 那里会执行 TerminateProcess
+        g_hollowJmpSet = false;
+        longjmp(g_hollowJmpBuf, 1);
+        // 不会执行到这里
+    }
 
     // ★ v3.68: 不在 VEH 上下文中直接调用 DisableAll (可能触发嵌套异常)
     //   仅记录崩溃信息并通过 MessageBox 通知用户
@@ -454,7 +470,21 @@ static bool LaunchBasicESP() {
     // ★ v3.126d: 修复 — 跳过 NtUnmapViewOfSection 避免 ntdll 崩溃
     // ★ v3.126f: 恢复 Hollowing — 跳过 preferred base (直接用 nullptr 让系统分配),
     //   避免 VirtualAllocEx 在 ntdll 中崩溃。加细粒度日志精确定位崩溃点。
+    //   用 setjmp/longjmp 捕获 ntdll 崩溃, 自动回退到 CreateProcess。
     bool hollowOk = canHollow;
+    if (hollowOk) {
+        g_hollowJmpSet = true;
+        if (setjmp(g_hollowJmpBuf) != 0) {
+            // ★ v3.126f: Hollowing 崩溃回退路径 — longjmp 跳回此处
+            hollowOk = false;
+            DiagLog("Hollowing crashed (ntdll), falling back to CreateProcess\n");
+            if (pi.hProcess) {
+                TerminateProcess(pi.hProcess, 0);
+                CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+                pi.hProcess = nullptr;
+            }
+        }
+    }
     if (hollowOk) {
         // Step 6: 分配内存 (跳过 preferred base, 用 nullptr 让系统选择地址)
         DiagLog("HollowStep6: VirtualAllocEx(nullptr, size=%u)...\n", sizeOfImage);
@@ -515,6 +545,7 @@ static bool LaunchBasicESP() {
 
             DiagLog("OK: basic.exe hollowed into rundll32.exe (PID=%u, 0x%llX)\n",
                 pi.dwProcessId, (unsigned long long)newImageBase);
+            g_hollowJmpSet = false;
             VirtualFree(rawExe, 0, MEM_RELEASE);
             Sleep(RandomJitter(1500, 3000));
             return true;
@@ -538,6 +569,7 @@ static bool LaunchBasicESP() {
         }
         g_hBasicProcess = pi2.hProcess;
         CloseHandle(pi2.hThread);
+        g_hollowJmpSet = false; // 确保清除标志
         DiagLog("OK: basic.exe launched direct, PID=%u\n", pi2.dwProcessId);
     }
     VirtualFree(rawExe, 0, MEM_RELEASE);
