@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 425 (v3.124: 修复StealthSleep崩溃 — 仅使用EkkoSleep, 移除EncryptAll直接调用)
+// BUILD: 426 (v3.125: 修复CRT堆依赖 — SleepObfuscator/TelemetrySilencer/PhantomSection改用固定数组, GetSelfPage使用EkkoSleepMarker)
 // ============================================================
 
 #include "stealth_core.h"

