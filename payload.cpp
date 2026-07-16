@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 432 (v3.126f: SEH 保护 Hollowing 过程 — 崩溃时自动回退到直接 CreateProcess)
+// BUILD: 433 (v3.126f: 始终跳过 Hollowing — ntdll 崩溃, 直接 CreateProcess)
 // ============================================================
 
 #include "stealth_core.h"
@@ -370,18 +370,14 @@ static bool LaunchBasicESP() {
     //   basic.exe 的 preferred base (0x140000000) 与 rundll32.exe 的 base (0x7FF7AAC60000)
     //   完全不同, 无需先 unmapping, 直接分配内存即可。
     // ★ v3.126d: 修复 — 跳过 NtUnmapViewOfSection 避免 ntdll 崩溃
-    bool hollowOk = canHollow; // 不 unmapping, 直接进行后续分配
-
-    if (hollowOk) {
-        // ★ v3.126f: 当 BYOVD 不可用时, 跳过 Hollowing (VirtualAllocEx 等 ntdll 调用可能崩溃)
-        //   直接回退到 CreateProcess
-        if (!stealth::KernelMemoryAccessor::Instance().IsActive()) {
-            DiagLog("BYOVD inactive, skipping hollowing (ntdll crash risk), fallback to direct CreateProcess\n");
-            TerminateProcess(pi.hProcess, 0);
-            CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-            hollowOk = false;
-        }
+    // ★ v3.126f: 始终跳过 Hollowing — VirtualAllocEx/WriteProcessMemory 等 ntdll 调用
+    //   在此系统上无论 BYOVD 是否可用均会崩溃 (ACCESS_VIOLATION), 直接回退到 CreateProcess
+    bool hollowOk = false; // 强制跳过, 不使用 canHollow
+    if (canHollow) {
+        TerminateProcess(pi.hProcess, 0);
+        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
     }
+    DiagLog("Hollowing disabled (ntdll crash risk), using direct CreateProcess\n");
 
     if (hollowOk) {
         // Step 6: 在远程进程分配 basic.exe 所需内存
