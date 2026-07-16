@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 451 (v3.127: 修复 IsAntiCheatDriverName BP→TPM 误伤致蓝屏)
+// BUILD: 452 (v3.128: 删除危险fallback匹配, 根除系统驱动误杀蓝屏)
 // ============================================================
 
 #include "stealth_core.h"

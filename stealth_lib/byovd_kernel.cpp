@@ -1835,9 +1835,8 @@ uint64_t EACCallbackDisabler::FindObpCallbackArrayHead(KernelMemoryAccessor& kma
     return kma.ResolveExport(ntBase, "ObpCallbackArrayHead");
 }
 
-// ★ v3.126h: 前向声明 — 反作弊模式匹配 fallback 函数 (实现在文件末尾)
-static bool IsAntiCheatDriverName(const char* name);
-static uint64_t FindAntiCheatDriverViaFallback();
+// ★ v3.126h: 前向声明 — PAC 驱动 fallback 匹配 (实现在文件末尾)
+static bool IsPacDriverName_Fallback(const char* name);
 
 int EACCallbackDisabler::DisableObCallbacks(const std::string& eacDriverName) {
     auto& kma = KernelMemoryAccessor::Instance();
@@ -1926,9 +1925,8 @@ int EACCallbackDisabler::DisableObCallbacks(const std::string& eacDriverName) {
                         kma.Write(current + 0x28, zero); // PostOperation
                         removed++;
                     }
-                    // ★ v3.126h: 名字模式匹配 fallback — 主检测名字未命中时启用
-                    //   防止 EAC 改名后无法识别, 同时不干扰主检测路径
-                    else if (!nameFound && !eacBase && IsAntiCheatDriverName(ansiName)) {
+                    // ★ v3.126h: PAC 模式匹配 fallback — 主检测未命中时用 IsPacPattern 验证
+                    else if (!nameFound && !eacBase && IsPacDriverName_Fallback(ansiName)) {
                         ByovdDiag("BYOVD:DisableObCallbacks: fallback matched '%s' (pattern)\n", ansiName);
                         uint64_t preOp = kma.Read<uint64_t>(current + 0x18);
                         uint64_t postOp = kma.Read<uint64_t>(current + 0x28);
@@ -1968,10 +1966,6 @@ int EACCallbackDisabler::DisableProcessNotifyCallbacks(const std::string& eacDri
 
     uint64_t ntBase = kma.GetNtoskrnlBase();
     uint64_t eacBase = kma.GetKernelModuleBase(eacDriverName + ".sys");
-    // ★ v3.126h: fallback — 名字匹配失败时扫描反作弊模式
-    if (!eacBase) {
-        eacBase = FindAntiCheatDriverViaFallback();
-    }
     if (!eacBase) return 0;
 
     // PsSetCreateProcessNotifyRoutine → sigscan 找到 PspCreateProcessNotifyRoutine 数组
@@ -2036,10 +2030,6 @@ int EACCallbackDisabler::DisableImageNotifyCallbacks(const std::string& eacDrive
 
     uint64_t ntBase = kma.GetNtoskrnlBase();
     uint64_t eacBase = kma.GetKernelModuleBase(eacDriverName + ".sys");
-    // ★ v3.126h: fallback — 名字匹配失败时扫描反作弊模式
-    if (!eacBase) {
-        eacBase = FindAntiCheatDriverViaFallback();
-    }
     if (!eacBase) return 0;
 
     // PsSetLoadImageNotifyRoutine → 找到 PspLoadImageNotifyRoutine 数组
@@ -3867,96 +3857,19 @@ void KernelDefense::RestoreAllCallbacks() {
     }
 }
 
-// ★ v3.126h: 不依赖精确名字的二次检测 — 检查驱动名是否匹配反作弊模式
-//   即使反作弊改名, 只要名字包含常见反作弊关键词就能识别
-//   用于 ObCallbackArray 遍历时的 fallback 匹配
-static bool IsAntiCheatDriverName(const char* name) {
+// ★ v3.127: PAC-only 驱动名 fallback — 仅用 IsPacPattern 做安全匹配
+//   删除原 IsAntiCheatDriverName (短子串误杀空间太大) 
+//   删除原 FindAntiCheatDriverViaFallback (遍历 275 个驱动做模糊匹配)
+//   DisableProcessNotify/ImageNotify 不再做 fallback — 找不到驱动就返回 0
+static bool IsPacDriverName_Fallback(const char* name) {
     if (!name || !*name) return false;
-    // 常见反作弊驱动名模式 (不区分大小写)
-    // 主检测已覆盖 EasyAntiCheat*, 这里只做二次保底
-    const char* patterns[] = {
-        "anticheat", "anti_cheat", "anti-cheat",
-        "battleye", "bedaisy",
-        "xigncode", "xhc",
-        "nprotect",
-        "gameguard",
-        "tenprotect",
-        "ace", "anti-cheat-expert",
-        "equ8",
-        "fate",
-        "bypass",
-        // ★ v3.126i: 完美世界 PAC (Perfect World Anti-Cheat)
-        "messagetransfer",
-        "pvpac", "pvp", "perfectworld",
-    };
-
-    // ★ v3.127: 系统驱动黑名单 — 防止短模式名误伤关键系统驱动
-    //   "ace"/"npf"/"tp" 等短子串可能误匹配 Windows 内置驱动,
-    //   在模式匹配之后做精确排除
-    static const char* g_systemDriverBlocklist[] = {
-        "tpm.sys",      // Trusted Platform Module — BSOD 根因
-        "npfs.sys",     // Named Pipe File System
-        "msfs.sys",     // Mailslot File System
-        "dfsc.sys",     // DFS Namespace Client
-        "cldflt.sys",   // Cloud Files Mini Filter
-        "fileinfo.sys", // File Information Mini Filter
-        "wof.sys",      // Windows Overlay Filter
-        "luafv.sys",    // LUA File Virtualization
-        "wcifs.sys",    // Windows Container Isolation
-        "bindflt.sys",  // Bind Filter
-        "bfs.sys",      // Boot File System
-        "storqosflt.sys", // Storage QoS Filter
-        "iorate.sys",   // IO Rate Control
-        "fsdepends.sys", // File System Dependency
-        "fltmgr.sys",   // Filter Manager
-        "npsvctrig.sys", // Named Pipe Service Triggers
-        "win32k.sys",   // Win32k
-        "win32kfull.sys", // Win32k Full
-        "win32kbase.sys", // Win32k Base
-        "hal.sys",      // Hardware Abstraction Layer
-        "clipsp.sys",   // Client License Service
-        "cmimcext.sys", // CMI MCE Extension
-        nullptr
-    };
-    char lower[64] = {};
-    size_t len = strlen(name);
-    if (len >= sizeof(lower)) len = sizeof(lower) - 1;
-    for (size_t i = 0; i < len; i++) {
-        char c = name[i];
-        lower[i] = (c >= 'A' && c <= 'Z') ? (c - 'A' + 'a') : c;
-    }
-    lower[len] = '\0';
-
-    // ★ v3.127 fix: 先精确排除系统关键驱动, 再做模式匹配
-    //   防止短模式名 (如 "ace"/"npf") 误伤内核安全驱动
-    for (const char** bl = g_systemDriverBlocklist; *bl; bl++) {
-        if (_stricmp(name, *bl) == 0) return false;
-    }
-
-    for (const char* pat : patterns) {
-        if (strstr(lower, pat)) return true;
-    }
-    return false;
+    // 转为宽字符调用 IsPacPattern (已有系统 minifilter 白名单)
+    wchar_t wide[128] = {};
+    for (int i = 0; i < 127 && name[i]; i++)
+        wide[i] = (wchar_t)(unsigned char)name[i];
+    return IsPacPattern(wide);
 }
 
-// ★ v3.126h: 扫描所有已加载内核驱动, 返回第一个匹配 PAC 模式的驱动基址
-//   用于 DisableProcessNotifyCallbacks / DisableImageNotifyCallbacks 的 fallback
-static uint64_t FindAntiCheatDriverViaFallback() {
-    LPVOID drivers[1024];
-    DWORD cbNeeded = 0;
-    if (EnumDeviceDrivers(drivers, sizeof(drivers), &cbNeeded)) {
-        int driverCount = cbNeeded / sizeof(LPVOID);
-        for (int i = 0; i < driverCount; i++) {
-            char baseName[256] = {};
-            DWORD nameLen = GetDeviceDriverBaseNameA(drivers[i], baseName, sizeof(baseName));
-            if (nameLen > 0 && IsAntiCheatDriverName(baseName)) {
-                ByovdDiag("BYOVD:FindAntiCheatDriverViaFallback: found '%s' at 0x%p\n", baseName, drivers[i]);
-                return (uint64_t)drivers[i];
-            }
-        }
-    }
-    return 0;
-}
 
 // ★ v3.126g: 重新摘除所有反作弊回调 — 周期性监控用
 //   注意: 不检查 HasRemovedCallbacks(), 始终尝试重新摘除,
