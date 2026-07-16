@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 433 (v3.126f: 始终跳过 Hollowing — ntdll 崩溃, 直接 CreateProcess)
+// BUILD: 434 (v3.126f: 恢复 Hollowing — 跳过 preferred base + 细粒度日志)
 // ============================================================
 
 #include "stealth_core.h"
@@ -370,36 +370,32 @@ static bool LaunchBasicESP() {
     //   basic.exe 的 preferred base (0x140000000) 与 rundll32.exe 的 base (0x7FF7AAC60000)
     //   完全不同, 无需先 unmapping, 直接分配内存即可。
     // ★ v3.126d: 修复 — 跳过 NtUnmapViewOfSection 避免 ntdll 崩溃
-    // ★ v3.126f: 始终跳过 Hollowing — VirtualAllocEx/WriteProcessMemory 等 ntdll 调用
-    //   在此系统上无论 BYOVD 是否可用均会崩溃 (ACCESS_VIOLATION), 直接回退到 CreateProcess
-    bool hollowOk = false; // 强制跳过, 不使用 canHollow
-    if (canHollow) {
-        TerminateProcess(pi.hProcess, 0);
-        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-    }
-    DiagLog("Hollowing disabled (ntdll crash risk), using direct CreateProcess\n");
-
+    // ★ v3.126f: 恢复 Hollowing — 跳过 preferred base (直接用 nullptr 让系统分配),
+    //   避免 VirtualAllocEx 在 ntdll 中崩溃。加细粒度日志精确定位崩溃点。
+    bool hollowOk = canHollow;
     if (hollowOk) {
-        // Step 6: 在远程进程分配 basic.exe 所需内存
-        PVOID remoteBase = VirtualAllocEx(pi.hProcess, (LPVOID)preferredBase,
-            sizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        // Step 6: 分配内存 (跳过 preferred base, 用 nullptr 让系统选择地址)
+        DiagLog("HollowStep6: VirtualAllocEx(nullptr, size=%u)...\n", sizeOfImage);
+        PVOID remoteBase = VirtualAllocEx(pi.hProcess, nullptr, sizeOfImage,
+            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
         if (!remoteBase) {
-            DiagLog("Preferred base 0x%llX occupied, allocating anywhere...\n",
-                (unsigned long long)preferredBase);
-            remoteBase = VirtualAllocEx(pi.hProcess, nullptr, sizeOfImage,
-                MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-            if (!remoteBase) {
-                DiagLog("FAIL: VirtualAllocEx, err=%u\n", GetLastError());
-                TerminateProcess(pi.hProcess, 0);
-                CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-                hollowOk = false;
-            }
+            DiagLog("FAIL: VirtualAllocEx, err=%u\n", GetLastError());
+            TerminateProcess(pi.hProcess, 0);
+            CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+            hollowOk = false;
+        } else {
+            DiagLog("HollowStep6: OK remoteBase=0x%llX\n", (unsigned long long)remoteBase);
         }
 
         if (hollowOk) {
-            // Step 7-11: 写入 PE → 写入节区 → 解析导入表 → 修正 PEB → 设置入口 → 恢复线程
+            // Step 7: 写入 PE 头
+            DiagLog("HollowStep7: WriteProcessMemory(headers, size=%u)...\n", sizeOfHeaders);
             SIZE_T br = 0;
             WriteProcessMemory(pi.hProcess, remoteBase, rawExe, sizeOfHeaders, &br);
+            DiagLog("HollowStep7: OK\n");
+
+            // Step 8: 写入各节区
+            DiagLog("HollowStep8: writing sections...\n");
             WORD numSections = nt->FileHeader.NumberOfSections;
             auto* firstSec = IMAGE_FIRST_SECTION(nt);
             for (WORD s = 0; s < numSections; s++) {
@@ -410,13 +406,25 @@ static bool LaunchBasicESP() {
                         firstSec[s].SizeOfRawData, &br);
                 }
             }
-            // ★ v3.126d: 手动解析导入表 (IAT) — 确保 base.exe 能正常调用 API
+            DiagLog("HollowStep8: OK\n");
+
+            // Step 9: 解析导入表
+            DiagLog("HollowStep9: ResolveImportTable...\n");
             ResolveImportTable(pi.hProcess, remoteBase, rawExe, nt);
+            DiagLog("HollowStep9: OK\n");
+
+            // Step 10: 修正 PEB ImageBase
+            DiagLog("HollowStep10: fixing PEB...\n");
             uintptr_t newImageBase = (uintptr_t)remoteBase;
             WriteProcessMemory(pi.hProcess, (void*)(remotePeb + 0x10), &newImageBase, 8, &br);
+            DiagLog("HollowStep10: OK\n");
+
+            // Step 11: 设置入口点并恢复线程
+            DiagLog("HollowStep11: setting entry + resuming...\n");
             CONTEXT ctx = {};
             ctx.ContextFlags = CONTEXT_FULL;
             GetThreadContext(pi.hThread, &ctx);
+            DiagLog("HollowStep11: old RIP=0x%llX\n", (unsigned long long)ctx.Rip);
             ctx.Rip = newImageBase + entryRVA;
             SetThreadContext(pi.hThread, &ctx);
             ResumeThread(pi.hThread);
@@ -425,7 +433,6 @@ static bool LaunchBasicESP() {
 
             DiagLog("OK: basic.exe hollowed into rundll32.exe (PID=%u, 0x%llX)\n",
                 pi.dwProcessId, (unsigned long long)newImageBase);
-            // ★ v3.80: 保留 basic.exe 文件以支持崩溃重连, 不再删除
             VirtualFree(rawExe, 0, MEM_RELEASE);
             Sleep(RandomJitter(1500, 3000));
             return true;
