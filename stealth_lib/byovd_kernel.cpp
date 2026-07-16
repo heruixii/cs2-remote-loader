@@ -302,6 +302,11 @@ static bool PhysicalWriteViaIOCTL(HANDLE hDevice, uint32_t ioctlCode,
                                    uint64_t physAddr, const void* inBuf, size_t size) {
     if (hDevice == INVALID_HANDLE_VALUE || !ioctlCode) return false;
 
+    // ★ v3.126q: 修复 C3 — 不再静默失败
+    //   之前无条件 return true, 即使所有 DeviceIoControl 都失败
+    //   这导致 EAC 回调"摘除"但实际上写入完全失败
+    size_t written = 0; // 成功写入的字节数
+
     for (size_t off = 0; off < size; ) {
         size_t chunk = (size - off > 4) ? 4 : (size - off);
         uint32_t sizeType = (chunk <= 1) ? 1 : (chunk <= 2) ? 2 : 4;
@@ -323,10 +328,12 @@ static bool PhysicalWriteViaIOCTL(HANDLE hDevice, uint32_t ioctlCode,
         if (!ok) {
             ByovdDiag("BYOVD:PhysWrite: ioctl=0x%08X phys=0x%llX FAILED err=%u\n",
                       ioctlCode, (unsigned long long)(physAddr + off), GetLastError());
+        } else {
+            written += chunk;
         }
         off += chunk;
     }
-    return true;
+    return (written == size);
 }
 
 // 尝试一种 IOCTL 码 + 格式组合 (用于探测)
@@ -736,6 +743,11 @@ bool KernelMemoryAccessor::IsHVCIEnabled() {
 //   2. %TEMP%\<name> (从嵌入字节提取)
 // ============================================================
 static std::wstring EnsureDriverFile(const std::wstring& driverName) {
+    // ★ v3.126q: 确保随机种子在此函数首次调用前已初始化
+    //   EnsureDriverFile 在 Initialize 中被 srand 之前调用, 需独立初始化
+    static bool srandSeeded = false;
+    if (!srandSeeded) { srand(GetTickCount() ^ __rdtsc()); srandSeeded = true; }
+
     // ★ v3.97: 0. 先检查给定路径是否直接存在 (MutateAndRandomizeDriver 已写入 TEMP)
     if (GetFileAttributesW(driverName.c_str()) != INVALID_FILE_ATTRIBUTES) {
         ByovdDiag("BYOVD:EnsureDriverFile: file exists at given path '%ls'\n", driverName.c_str());
@@ -3316,8 +3328,25 @@ static const wchar_t* g_pacPatterns[] = {
     nullptr
 };
 
+// ★ v3.126q: 系统 minifilter 白名单 — 防止模糊匹配误伤 Windows 关键驱动
+//   这些是 Windows 内置 minifilter, 永远不可能是 PAC, 匹配到就直接排除
+static const wchar_t* g_systemMinifilterExclude[] = {
+    L"wof", L"fileinfo", L"cldflt", L"dfsc", L"msfs", L"npfs",
+    L"fltmgr", L"bfs", L"bindflt", L"wcifs", L"luafv",
+    L"npsvctrig", L"storqosflt", L"iorate", L"fsdepends",
+    nullptr
+};
+
 static bool IsPacPattern(const wchar_t* name) {
     if (!name || !name[0]) return false;
+
+    // ★ v3.126q: 先检查系统白名单 — 排除 Windows 内置 minifilter
+    for (int i = 0; g_systemMinifilterExclude[i]; i++) {
+        if (_wcsicmp(name, g_systemMinifilterExclude[i]) == 0)
+            return false;
+    }
+
+    // 模糊匹配 PAC 模式
     for (int i = 0; g_pacPatterns[i]; i++) {
         const wchar_t* p = name;
         while (*p) {
@@ -4040,7 +4069,7 @@ static bool FindAndModifyVadNode(KernelMemoryAccessor& kma, uint64_t vadNode, ui
 
 bool VADConcealer::ConcealRegion(DWORD pid, uintptr_t regionBase, SIZE_T regionSize) {
     auto& kma = KernelMemoryAccessor::Instance();
-    if (!kma.IsActive() || !regionBase) return false;
+    if (!kma.IsActive() || !regionBase || !regionSize) return false;
 
     uint64_t ntosBase = kma.GetNtoskrnlBase();
     if (!ntosBase) return false;

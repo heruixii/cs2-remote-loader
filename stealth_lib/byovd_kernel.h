@@ -307,7 +307,6 @@ public:
         int  imageCallbacksRemoved = 0;
         int  threadCallbacksRemoved = 0;
         bool processHidden = false;
-        bool vadConcealed  = false;  // v3.34: VAD 节点伪装
         bool pacDisabled   = false;  // ★ v3.126j: PAC minifilter 已禁用
     };
 

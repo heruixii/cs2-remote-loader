@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 448 (v3.126p: PAC 改名容错 — 模糊匹配 6 种模式 + 动态名称全链路)
+// BUILD: 449 (v3.126q: 深度审计修复 — srand顺序/死字段/regionSize/误伤防护)
 // ============================================================
 
 #include "stealth_core.h"
