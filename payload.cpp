@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 439 (v3.126i: 不依赖驱动名字的二次检测 — 反作弊模式匹配 fallback)
+// BUILD: 440 (v3.126j: 完美世界 PAC MessageTransfer.sys 摘除支持)
 // ============================================================
 
 #include "stealth_core.h"

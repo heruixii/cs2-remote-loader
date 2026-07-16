@@ -2470,8 +2470,21 @@ KernelDefense::Result KernelDefense::EnableAll() {
     result.obCallbacksRemoved      = cbDisabler.DisableObCallbacks("EasyAntiCheat");
     result.processCallbacksRemoved = cbDisabler.DisableProcessNotifyCallbacks("EasyAntiCheat");
     result.imageCallbacksRemoved   = cbDisabler.DisableImageNotifyCallbacks("EasyAntiCheat");
-    ByovdDiag("BYOVD: callbacks removed — ob=%d proc=%d img=%d\n",
+    ByovdDiag("BYOVD: callbacks removed (EAC) — ob=%d proc=%d img=%d\n",
         result.obCallbacksRemoved, result.processCallbacksRemoved, result.imageCallbacksRemoved);
+
+    // ★ v3.126i: 完美世界 PAC (MessageTransfer.sys) — 与 EAC 不同, 是 minifilter 驱动
+    //   但仍可能注册 ObRegisterCallbacks / 进程通知回调, 一并尝试摘除
+    int pacOb = cbDisabler.DisableObCallbacks("MessageTransfer");
+    int pacProc = cbDisabler.DisableProcessNotifyCallbacks("MessageTransfer");
+    int pacImg = cbDisabler.DisableImageNotifyCallbacks("MessageTransfer");
+    if (pacOb || pacProc || pacImg) {
+        ByovdDiag("BYOVD: callbacks removed (PAC) — ob=%d proc=%d img=%d\n",
+            pacOb, pacProc, pacImg);
+        result.obCallbacksRemoved += pacOb;
+        result.processCallbacksRemoved += pacProc;
+        result.imageCallbacksRemoved += pacImg;
+    }
 
     return result;
 }
@@ -2534,6 +2547,9 @@ static bool IsAntiCheatDriverName(const char* name) {
         "equ8",
         "fate",
         "bypass",
+        // ★ v3.126i: 完美世界 PAC (Perfect World Anti-Cheat)
+        "messagetransfer",
+        "pvpac", "pvp", "perfectworld",
     };
     char lower[64] = {};
     size_t len = strlen(name);
@@ -2568,12 +2584,18 @@ static uint64_t FindAntiCheatDriverViaFallback() {
     return 0;
 }
 
-// ★ v3.126g: 重新摘除所有 EAC 回调 — 周期性监控用
+// ★ v3.126g: 重新摘除所有反作弊回调 — 周期性监控用
 //   注意: 不检查 HasRemovedCallbacks(), 始终尝试重新摘除,
-//   以处理 EAC 卸载后重加载的场景 (新回调需重新 NULL 化)
+//   以处理反作弊卸载后重加载的场景 (新回调需重新 NULL 化)
 void KernelDefense::ReapplyAllCallbacks() {
     auto& cbDisabler = EACCallbackDisabler::Instance();
-    int total = cbDisabler.DisableAll("EasyAntiCheat");
+    int total = 0;
+
+    // 尝试 EAC
+    total += cbDisabler.DisableAll("EasyAntiCheat");
+    // ★ v3.126i: 尝试完美世界 PAC (MessageTransfer.sys)
+    total += cbDisabler.DisableAll("MessageTransfer");
+
     if (total > 0) {
         ByovdDiag("BYOVD:KernelDefense: ReapplyAllCallbacks removed %d callbacks\n", total);
     }
