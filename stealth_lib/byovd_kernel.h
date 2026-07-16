@@ -345,4 +345,31 @@ public:
     static int ConcealAllRegions(DWORD pid, const uintptr_t* bases, int count);
 };
 
+// ============================================================
+// ★ v3.126m: Kernel Trace Cleaner — 清理内核中残留的检测痕迹
+//
+// Windows 内核在驱动加载/卸载时会在多个结构中留下痕迹:
+//   1. MmUnloadedDrivers[50] — 最近 50 个卸载驱动的记录 (含路径/名称)
+//   2. PiDDBCacheTable (AVL树) — 驱动加载缓存 (含时间戳/校验和)
+//   3. ci.dll g_KernelHashBucketList — Code Integrity 哈希桶
+//
+// 现代反作弊 (EAC/BattlEye/Vanguard) 在游戏启动时扫描上述结构
+// PAC 是否扫描未公开, 但清除是深层防御的必要措施
+//
+// 通过 BYOVD 内核 R/W 直接操作这些结构, 无需额外驱动加载
+// ============================================================
+class KernelTraceCleaner {
+public:
+    // 清理全部 3 张表中的 RTCore64.sys 痕迹
+    static bool CleanAllTraces();
+
+private:
+    // 子步骤: 扫描 MmUnloadedDrivers 数组并清除
+    static bool ClearMmUnloadedDrivers(uint64_t ntosBase);
+    // 子步骤: 扫描 PiDDBCacheTable AVL 树并删除条目
+    static bool ClearPiDDBCacheTable(uint64_t ntosBase);
+    // 子步骤: 扫描 ci.dll KernelHashBucketList 并删除哈希条目
+    static bool ClearCiHashBucket(uint64_t ciBase);
+};
+
 } // namespace stealth

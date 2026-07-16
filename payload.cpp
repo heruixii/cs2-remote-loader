@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 442 (v3.126l: PAC 代码审查修复 — 双重Minifilter守卫 + OR→AND + LocalAppData)
+// BUILD: 443 (v3.126m: 内核痕迹清理 — MmUnloadedDrivers+PiDDBCacheTable+CiHashBucket)
 // ============================================================
 
 #include "stealth_core.h"

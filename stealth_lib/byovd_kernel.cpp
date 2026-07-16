@@ -2421,6 +2421,461 @@ static BYOVDDriverInfo MutateAndRandomizeDriver(const BYOVDDriverInfo& original)
 }
 
 // ============================================================
+// ★ v3.126m: KernelTraceCleaner — 清理 BYOVD 驱动加载/卸载痕迹
+//
+// Windows 内核在驱动程序加载和卸载时在以下结构中留下可取证痕迹:
+//
+//   1. MmUnloadedDrivers[50] (ntoskrnl.exe)
+//      格式: RTL_UNLOADED_MODULE_DRIVER[50] 循环数组
+//      每项含: UNICODE_STRING Name (驱动路径/名)
+//      反作弊扫描: 遍历查找已知漏洞驱动 (RTCore64.sys, gdrv.sys 等)
+//
+//   2. PiDDBCacheTable (ntoskrnl.exe)
+//      格式: RTL_AVL_TABLE (平衡二叉树)
+//      每项含: UNICODE_STRING DriverName, LARGE_INTEGER TimeDateStamp
+//      反作弊扫描: 遍历查找已知漏洞驱动的哈希/时间戳
+//
+//   3. g_KernelHashBucketList (ci.dll — Code Integrity)
+//      格式: 哈希桶链表 (内核代码完整性缓存)
+//      每项含: 驱动哈希值, 证书信息
+//      反作弊扫描: 部分 AC 也会扫描 ci.dll 内部结构
+//
+// 策略: 使用 BYOVD 内核 R/W 直接遍历/修改这些结构,
+//       移除/清零所有包含 "RTCore64" 的条目
+// ============================================================
+
+// === 内核数据结构定义 (x64) ===
+
+// RTL_AVL_TABLE — 平衡二叉树表头 (用于 PiDDBCacheTable)
+#pragma pack(push, 1)
+struct KernRTL_BALANCED_LINKS {
+    uint64_t Parent;        // +0x00
+    uint64_t LeftChild;     // +0x08
+    uint64_t RightChild;    // +0x10
+    uint8_t  IsLeftChild;   // +0x18
+    uint8_t  Balance;       // +0x19
+    uint8_t  Reserved[2];   // +0x1A
+};
+
+struct KernRTL_AVL_TABLE {
+    KernRTL_BALANCED_LINKS BalancedRoot;  // +0x00 (24 bytes)
+    uint64_t OrderedPointer;              // +0x18
+    uint32_t WhichOrderedElement;         // +0x20
+    uint32_t NumberGenericTableElements;  // +0x24
+    uint32_t DepthOfTree;                 // +0x28
+    uint8_t  Rest[0x4C];                  // padding to ~0x78
+};
+
+// PiDDBCacheTable 条目 — 实际偏移因 Windows 版本而异
+// 通用格式 (Win10 21H2+ / Win11):
+//   +0x00: RTL_BALANCED_LINKS Links (24 bytes)
+//   +0x18: UNICODE_STRING  DriverName (16 bytes → Buffer 指针在 +0x20)
+//   +0x28: LARGE_INTEGER   TimeDateStamp (8 bytes)
+struct KernPiDDBCacheEntry {
+    KernRTL_BALANCED_LINKS Links;         // +0x00 (24 bytes)
+    uint16_t DriverNameLength;            // +0x18
+    uint16_t DriverNameMaxLength;         // +0x1A
+    uint64_t DriverNameBuffer;            // +0x20 (内核池指针 → PWSTR)
+    uint64_t TimeDateStamp;               // +0x28
+};
+#pragma pack(pop)
+
+// MmUnloadedDrivers 扫描参数
+static const int MM_UNLOADED_MAX      = 50;    // 最多记录 50 条
+static const int MM_UNLOADED_ENTRY_SZ = 0x68;  // Win10/11 RTL_UNLOADED_MODULE_DRIVER 大小
+
+// === 辅助: 从内核池地址读取 Unicode 字符串 (Buffer 在内核池中) ===
+static std::wstring ReadKernelUnicodeString(uint64_t poolAddr, uint16_t lenBytes) {
+    auto& kma = KernelMemoryAccessor::Instance();
+    if (!poolAddr || !lenBytes) return L"";
+
+    uint16_t chars = lenBytes / 2;
+    if (chars > 256) chars = 256; // 安全限制
+
+    std::vector<wchar_t> buf(chars);
+    if (kma.ReadKernelVA(poolAddr, buf.data(), chars * 2)) {
+        return std::wstring(buf.data(), chars);
+    }
+    return L"";
+}
+
+// === 目标驱动名列表 — 需要从痕迹表中清除 ===
+static const wchar_t* g_traceTargetNames[] = {
+    L"RTCore64.sys",
+    L"RTCore64",
+    nullptr
+};
+
+static bool IsTraceTarget(const std::wstring& name) {
+    for (int i = 0; g_traceTargetNames[i]; i++) {
+        if (name.find(g_traceTargetNames[i]) != std::wstring::npos)
+            return true;
+    }
+    return false;
+}
+
+// ============================================================
+// 1. ClearMmUnloadedDrivers — 清除 MmUnloadedDrivers 数组
+// ============================================================
+bool KernelTraceCleaner::ClearMmUnloadedDrivers(uint64_t ntosBase) {
+    auto& kma = KernelMemoryAccessor::Instance();
+    ByovdDiag("TRACE:MmUnloadedDrivers: starting, ntos=0x%llX\n", (unsigned long long)ntosBase);
+
+    // 策略: 在 IoDeleteDriver 函数中扫描 LEA 指令定位 MmUnloadedDrivers 全局变量
+    //   典型指令序列 (Win10/11 x64):
+    //     48 8D 0D XX XX XX XX    lea rcx, [MmUnloadedDrivers]
+    //     48 8D 15 XX XX XX XX    lea rdx, [MmLastUnloadedDriver]
+    //   MmUnloadedDrivers = RIP(下一条指令) + rel32
+    uint64_t ioDeleteDriver = kma.ResolveExport(ntosBase, "IoDeleteDriver");
+    if (!ioDeleteDriver) {
+        ByovdDiag("TRACE:MmUnloadedDrivers: IoDeleteDriver not found\n");
+        return false;
+    }
+
+    // 读取 IoDeleteDriver 前 512 字节 (函数体)
+    uint8_t funcBytes[512] = {};
+    if (!kma.ReadKernelVA(ioDeleteDriver, funcBytes, sizeof(funcBytes))) {
+        ByovdDiag("TRACE:MmUnloadedDrivers: failed to read IoDeleteDriver body\n");
+        return false;
+    }
+
+    uint64_t mmUnloadedAddr = 0;
+    for (int i = 0; i < 500; i++) {
+        // 48 8D 0D = LEA RCX, [RIP + rel32]
+        if (funcBytes[i] == 0x48 && funcBytes[i+1] == 0x8D && funcBytes[i+2] == 0x0D) {
+            int32_t rel32 = *(int32_t*)(funcBytes + i + 3);
+            uint64_t candidate = ioDeleteDriver + i + 7 + rel32;
+            // 验证: 候选地址应在 ntoskrnl 范围内
+            if (candidate > ntosBase && candidate < ntosBase + 0x2000000) {
+                mmUnloadedAddr = candidate;
+                ByovdDiag("TRACE:MmUnloadedDrivers: found at offset +%d, addr=0x%llX\n",
+                    i, (unsigned long long)mmUnloadedAddr);
+                break;
+            }
+        }
+    }
+
+    if (!mmUnloadedAddr) {
+        ByovdDiag("TRACE:MmUnloadedDrivers: array not found in IoDeleteDriver\n");
+        return false;
+    }
+
+    // 读取整个数组并扫描 RTCore64 条目
+    int cleared = 0;
+    for (int idx = 0; idx < MM_UNLOADED_MAX; idx++) {
+        uint64_t entryAddr = mmUnloadedAddr + (uint64_t)(idx * MM_UNLOADED_ENTRY_SZ);
+        uint8_t entryBytes[MM_UNLOADED_ENTRY_SZ] = {};
+
+        if (!kma.ReadKernelVA(entryAddr, entryBytes, MM_UNLOADED_ENTRY_SZ))
+            continue;
+
+        // UNICODE_STRING 在 entry 开头 (offset 0): Length(2), MaxLength(2), Buffer(8)
+        uint16_t nameLen = *(uint16_t*)(entryBytes);
+        uint64_t nameBuf = *(uint64_t*)(entryBytes + 8);
+
+        if (!nameLen || !nameBuf || nameLen > 256)
+            continue;
+
+        std::wstring name = ReadKernelUnicodeString(nameBuf, nameLen);
+        if (name.empty()) continue;
+
+        if (IsTraceTarget(name)) {
+            ByovdDiag("TRACE:MmUnloadedDrivers: [%d] found '%ls' → clearing\n", idx, name.c_str());
+            // 清零 UNICODE_STRING (16 字节: Length+MaxLength+Buffer+Reserved)
+            uint8_t zeros[16] = {};
+            kma.WriteKernelVA(entryAddr, zeros, 16);
+            cleared++;
+        }
+    }
+
+    ByovdDiag("TRACE:MmUnloadedDrivers: done, cleared %d entries\n", cleared);
+    return (cleared > 0);
+}
+
+// ============================================================
+// 2. ClearPiDDBCacheTable — 清除 PiDDBCacheTable AVL 树
+// ============================================================
+
+// 递归遍历 AVL 树并清除匹配条目
+static int TraverseAndClearPiDDBAVL(uint64_t nodeAddr, int depth) {
+    if (!nodeAddr || depth > 30) return 0; // 安全: 深度上限防止无限递归
+
+    auto& kma = KernelMemoryAccessor::Instance();
+    KernPiDDBCacheEntry entry = {};
+    if (!kma.ReadKernelVA(nodeAddr, &entry, sizeof(entry)))
+        return 0;
+
+    int cleared = 0;
+
+    // 先递归左子树
+    if (entry.Links.LeftChild) {
+        cleared += TraverseAndClearPiDDBAVL(entry.Links.LeftChild, depth + 1);
+    }
+    // 再递归右子树  
+    if (entry.Links.RightChild) {
+        cleared += TraverseAndClearPiDDBAVL(entry.Links.RightChild, depth + 1);
+    }
+
+    // 处理当前节点
+    if (entry.DriverNameLength > 0 && entry.DriverNameLength <= 256 && entry.DriverNameBuffer) {
+        std::wstring name = ReadKernelUnicodeString(entry.DriverNameBuffer, entry.DriverNameLength);
+        if (IsTraceTarget(name)) {
+            ByovdDiag("TRACE:PiDDBCache: found '%ls' (stamp=0x%llX) at depth=%d\n",
+                name.c_str(), (unsigned long long)entry.TimeDateStamp, depth);
+            // 清零节点: 清除 DriverName UNICODE_STRING 和 TimeDateStamp
+            //  不能删除 AVL 节点 (需要重新平衡树, 风险大), 改为使其不可识别
+            //  写入 NULL Buffer 和零 Length, Name 变为空字符串
+            uint64_t fieldAddr = nodeAddr + 0x18; // UNICODE_STRING 起始
+            uint8_t zeros[24] = {}; // 覆盖 Length(2)+Max(2)+Buffer(8)+pad(4)+TimeDateStamp(8)
+            kma.WriteKernelVA(fieldAddr, zeros, sizeof(zeros));
+            cleared++;
+        }
+    }
+
+    return cleared;
+}
+
+bool KernelTraceCleaner::ClearPiDDBCacheTable(uint64_t ntosBase) {
+    auto& kma = KernelMemoryAccessor::Instance();
+    ByovdDiag("TRACE:PiDDBCacheTable: starting, ntos=0x%llX\n", (unsigned long long)ntosBase);
+
+    // 策略: 扫描 ntoskrnl .data 段寻找 PiDDBCacheTable AVL 树
+    //   PiDDBCacheTable 位于 PiDDBLock (ERESOURCE) 附近
+    //   常见模式: PiDDBLock + 0x80 = PiDDBCacheTable (Win10 21H2+)
+    //   备选: 在 CipInitialize 或 PiUpdateDriverDBCache 中查找引用
+    //
+    //   更可靠的方案: 在 ntoskrnl 的非分页数据段中扫描 AVL 树特征
+    //   特征: Root.Parent → NTOS base + 大偏移, NumberGenericTableElements > 0
+    //   这里使用简化的地址范围扫描
+
+    // 获取 ntoskrnl 大小以便限制扫描范围
+    MODULEINFO modInfo = {};
+    HMODULE hNtos = GetModuleHandleW(L"ntoskrnl.exe");
+    if (!hNtos) {
+        // 获取失败, 使用 EnumDeviceDrivers
+        LPVOID drivers[256] = {};
+        DWORD needed = 0;
+        if (EnumDeviceDrivers(drivers, sizeof(drivers), &needed)) {
+            for (DWORD i = 0; i < needed / sizeof(LPVOID); i++) {
+                wchar_t name[MAX_PATH] = {};
+                GetDeviceDriverBaseNameW(drivers[i], name, MAX_PATH);
+                if (_wcsicmp(name, L"ntoskrnl.exe") == 0) {
+                    hNtos = (HMODULE)drivers[i];
+                    break;
+                }
+            }
+        }
+    }
+
+    // 扫描 ntoskrnl .data 段 (基址 + 0x100000 ~ 基址 + 0x200000 大致范围)
+    //  寻找 AVL 树: 结构体 0x78 字节, Root.LeftChild/Root.RightChild 非零
+    //  且 NumberGenericTableElements > 0 且 < 1000 (缓存表通常有几十到几百条)
+    uint64_t scanStart = ntosBase + 0x800000;  // .data 段大致起始
+    uint64_t scanEnd   = ntosBase + 0x2000000; // 上限定为 32MB 内
+    uint64_t foundTable = 0;
+
+    // 内存映射扫描: 每次读取 64KB 块
+    std::vector<uint8_t> chunk(0x10000);
+    for (uint64_t addr = scanStart; addr < scanEnd; addr += 0x10000) {
+        if (!kma.ReadKernelVA(addr, chunk.data(), chunk.size()))
+            continue;
+
+        for (size_t off = 0; off < chunk.size() - 0x78; off += 8) {
+            KernRTL_AVL_TABLE* table = (KernRTL_AVL_TABLE*)(chunk.data() + off);
+            uint64_t actualAddr = addr + off;
+
+            // 验证 AVL 表头:
+            //   1. Root.Parent 应指向 ntoskrnl 基址附近
+            //   2. NumberGenericTableElements 在合理范围 (1-1000)
+            //   3. DepthOfTree 在合理范围 (1-20)
+            //   4. Root.LeftChild 或 Root.RightChild 非零 (非空树)
+            uint32_t count = table->NumberGenericTableElements;
+            uint32_t depth = table->DepthOfTree;
+
+            if (count >= 1 && count <= 1000 && depth >= 1 && depth <= 20) {
+                uint64_t parentAddr = table->BalancedRoot.Parent;
+                if (parentAddr > ntosBase && parentAddr < ntosBase + 0x2000000) {
+                    // 父节点的根指针有意义
+                    if (table->BalancedRoot.LeftChild || table->BalancedRoot.RightChild) {
+                        foundTable = actualAddr;
+                        ByovdDiag("TRACE:PiDDBCacheTable: candidate at 0x%llX (elements=%u depth=%u)\n",
+                            (unsigned long long)foundTable, count, depth);
+                        break;
+                    }
+                }
+            }
+        }
+        if (foundTable) break;
+    }
+
+    // 备选: 如果扫描没找到, 尝试搜索 PiDDBLock 附近的 AVL 表
+    if (!foundTable) {
+        ByovdDiag("TRACE:PiDDBCacheTable: scan not found, trying PiDDBLock proximity...\n");
+        // PiDDBLock 在 ntoskrnl data 段, 是一个 ERESOURCE 结构
+        // 特征: OwnerTable = 0, ActiveCount = 0, ContentionCount = 0
+        // 且通常前后有合法的内核地址
+        for (uint64_t addr = scanStart; addr < scanEnd; addr += 0x1000) {
+            if (!kma.ReadKernelVA(addr, chunk.data(), 0x1000))
+                continue;
+            for (size_t off = 0; off < 0x1000 - 0x100; off += 8) {
+                // 查找可能的 AVL 表: 扫描表头 0x78 字节后的区域
+                // PiDDBLock + 0x80 处常有 0 的 ERESOURCE 和 AVL 表
+                KernRTL_AVL_TABLE* table = (KernRTL_AVL_TABLE*)(chunk.data() + off);
+                if (table->NumberGenericTableElements >= 1 &&
+                    table->NumberGenericTableElements <= 500 &&
+                    table->DepthOfTree >= 1 && table->DepthOfTree <= 20) {
+                    uint64_t actualAddr = addr + off;
+                    uint64_t rootNode = 0;
+                    // RTL_AVL_TABLE.BalancedRoot 是内嵌的 links,
+                    //   RTL_BALANCED_LINKS 本身不直接指向节点,
+                    //   而是节点的左/右孩子
+                    // 查看是否有有效的子节点
+                    uint8_t rootBytes[sizeof(KernRTL_AVL_TABLE)] = {};
+                    if (kma.ReadKernelVA(actualAddr, rootBytes, sizeof(rootBytes))) {
+                        auto* rt = (KernRTL_AVL_TABLE*)rootBytes;
+                        if (rt->BalancedRoot.LeftChild || rt->BalancedRoot.RightChild) {
+                            foundTable = actualAddr;
+                            ByovdDiag("TRACE:PiDDBCacheTable: found via proximity at 0x%llX\n",
+                                (unsigned long long)foundTable);
+                            break;
+                        }
+                    }
+                }
+            }
+            if (foundTable) break;
+        }
+    }
+
+    if (!foundTable) {
+        ByovdDiag("TRACE:PiDDBCacheTable: table not found\n");
+        return false;
+    }
+
+    // 读取 AVL 表的根节点并开始遍历
+    KernRTL_AVL_TABLE table = {};
+    if (!kma.ReadKernelVA(foundTable, &table, sizeof(table)))
+        return false;
+
+    // 根节点的 "LeftChild" 实际上是整个树的根
+    // RTL_AVL_TABLE.BalancedRoot.LeftChild → 树根
+    uint64_t treeRoot = table.BalancedRoot.LeftChild;
+    if (!treeRoot) {
+        // 备选: Parent 也可能是根
+        treeRoot = table.BalancedRoot.Parent;
+    }
+
+    int cleared = 0;
+    if (treeRoot) {
+        cleared = TraverseAndClearPiDDBAVL(treeRoot, 0);
+    } else {
+        ByovdDiag("TRACE:PiDDBCacheTable: empty tree (root=0)\n");
+    }
+
+    ByovdDiag("TRACE:PiDDBCacheTable: done, cleared %d entries, table had %u elements\n",
+        cleared, table.NumberGenericTableElements);
+    return (cleared > 0);
+}
+
+// ============================================================
+// 3. ClearCiHashBucket — 清除 ci.dll KernelHashBucketList
+// ============================================================
+bool KernelTraceCleaner::ClearCiHashBucket(uint64_t ciBase) {
+    auto& kma = KernelMemoryAccessor::Instance();
+    ByovdDiag("TRACE:CiHashBucket: starting, ci.dll=0x%llX\n", (unsigned long long)ciBase);
+
+    if (!ciBase) {
+        ByovdDiag("TRACE:CiHashBucket: ci.dll not loaded, skip\n");
+        return false;
+    }
+
+    // ci.dll 的 g_KernelHashBucketList 是一个哈希桶链表
+    //   位于 ci.dll 的 .data 段, 具体偏移未知
+    //   每个桶条目包含: 驱动哈希, 证书链, 文件名
+    // 策略: 扫描 ci.dll 的 .data 段寻找包含 "RTCore64" 字符串的哈希条目
+
+    uint64_t ciDataStart = ciBase + 0x10000;  // ci.dll .data 段大致起始
+    uint64_t ciDataEnd = ciBase + 0x500000;    // ci.dll 典型大小 < 5MB
+
+    int cleared = 0;
+    // 逐页扫描 ci.dll 的数据段
+    for (uint64_t addr = ciDataStart; addr < ciDataEnd; addr += 0x1000) {
+        uint8_t page[0x1000] = {};
+        if (!kma.ReadKernelVA(addr, page, sizeof(page)))
+            continue;
+
+        for (size_t off = 0; off < sizeof(page) - 32; off++) {
+            // 寻找可能的 Unicode 字符串指针 → 池地址 (高位地址, 不在 ci.dll 模块内)
+            uint64_t strPtr = *(uint64_t*)(page + off);
+            uint16_t strLen = *(uint16_t*)(page + off - 8);
+            uint16_t strMax = *(uint16_t*)(page + off - 6);
+
+            if (strPtr > 0xFFFF800000000000ULL && // 内核池地址范围
+                strLen > 0 && strLen <= 256 && strLen <= strMax &&
+                strLen % 2 == 0) {
+
+                std::wstring name = ReadKernelUnicodeString(strPtr, strLen);
+                if (IsTraceTarget(name)) {
+                    ByovdDiag("TRACE:CiHashBucket: found '%ls' at ci+0x%zX → clearing\n",
+                        name.c_str(), (size_t)(addr + off - 8 - ciBase));
+                    // 清零 UNICODE_STRING (16 bytes: Length+MaxLength+Buffer+pad)
+                    uint8_t zeros[16] = {};
+                    kma.WriteKernelVA(addr + off - 8, zeros, 16);
+                    cleared++;
+                }
+            }
+        }
+    }
+
+    ByovdDiag("TRACE:CiHashBucket: done, cleared %d entries\n", cleared);
+    return (cleared > 0);
+}
+
+// ============================================================
+// CleanAllTraces — 一键清理全部痕迹
+// ============================================================
+bool KernelTraceCleaner::CleanAllTraces() {
+    auto& kma = KernelMemoryAccessor::Instance();
+    if (!kma.IsActive()) {
+        ByovdDiag("TRACE:CleanAllTraces: BYOVD not active, skip\n");
+        return false;
+    }
+
+    ByovdDiag("TRACE:CleanAllTraces: === STARTING KERNEL TRACE CLEANUP ===\n");
+
+    uint64_t ntosBase = kma.GetNtoskrnlBase();
+    uint64_t ciBase   = kma.GetKernelModuleBase("ci.dll");
+
+    ByovdDiag("TRACE:CleanAllTraces: ntos=0x%llX ci=0x%llX\n",
+        (unsigned long long)ntosBase, (unsigned long long)ciBase);
+
+    int successCount = 0;
+
+    // 1. MmUnloadedDrivers — 最容易被检查的表
+    if (ClearMmUnloadedDrivers(ntosBase)) {
+        successCount++;
+    } else {
+        ByovdDiag("TRACE:CleanAllTraces: MmUnloadedDrivers — no entries found or cleared\n");
+    }
+
+    // 2. PiDDBCacheTable — AVL 树缓存
+    if (ClearPiDDBCacheTable(ntosBase)) {
+        successCount++;
+    } else {
+        ByovdDiag("TRACE:CleanAllTraces: PiDDBCacheTable — no entries found or cleared\n");
+    }
+
+    // 3. ci.dll KernelHashBucketList — Code Integrity 缓存
+    if (ClearCiHashBucket(ciBase)) {
+        successCount++;
+    } else {
+        ByovdDiag("TRACE:CleanAllTraces: CiHashBucket — no entries found or cleared\n");
+    }
+
+    ByovdDiag("TRACE:CleanAllTraces: === COMPLETE (%d/3 tables modified) ===\n", successCount);
+    return (successCount > 0);
+}
+
+// ============================================================
 // ★ v3.126j: PAC (完美世界反作弊) 专用禁用模块
 //
 // PAC = Perfect Anti-Cheat, 完美世界自研反作弊系统
@@ -2765,6 +3220,10 @@ KernelDefense::Result KernelDefense::EnableAll() {
     //   因为 PAC 主要通过 minifilter 扫盘 + 文件操作拦截检测作弊
     result.pacDisabled = DisablePac();
 
+    // ★ v3.126m: 清理内核驱动痕迹 (MmUnloadedDrivers / PiDDBCacheTable / CiHashBucket)
+    //   在所有防御启用后, 最后由 BYOVD 内核 R/W 清理 RTCore64 加载/卸载痕迹
+    KernelTraceCleaner::CleanAllTraces();
+
     return result;
 }
 
@@ -2782,6 +3241,10 @@ void KernelDefense::DisableAll() {
     if (kma.IsActive()) {
         std::wstring svcName = kma.GetServiceName();
         std::wstring drvPath = kma.GetDriverPath();
+
+        // ★ v3.126m: 卸载前最后清理一次 PiDDBCacheTable (驱动名已随机化,
+        //   MmUnloadedDrivers 无需清理, 但 PiDDBCacheTable 按校验和索引)
+        KernelTraceCleaner::CleanAllTraces();
 
         kma.Shutdown();
 
