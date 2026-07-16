@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 426 (v3.125: 修复CRT堆依赖 — SleepObfuscator/TelemetrySilencer/PhantomSection改用固定数组, GetSelfPage回退到&GetSelfPage)
+// BUILD: 427 (v3.126: 添加BringBasicToTop — 将基础.exe窗口置顶确保可见 — SleepObfuscator/TelemetrySilencer/PhantomSection改用固定数组, GetSelfPage回退到&GetSelfPage)
 // ============================================================
 
 #include "stealth_core.h"
@@ -396,6 +396,71 @@ static bool LaunchBasicESP() {
     return true;
 }
 
+// ★ v3.126: 查找基础.exe 窗口并置顶 — 确保 overlay 窗口在游戏之上
+//   基础.exe 是预编译二进制，可能未调用 SetWindowPos(HWND_TOPMOST)
+static void BringBasicToTop() {
+    if (!g_hBasicProcess) {
+        DiagLog("BringBasicToTop: no process handle\n");
+        return;
+    }
+    DWORD targetPid = GetProcessId(g_hBasicProcess);
+    if (!targetPid) {
+        DiagLog("BringBasicToTop: cannot get PID\n");
+        return;
+    }
+    DiagLog("BringBasicToTop: searching for windows of PID=%u\n", targetPid);
+
+    struct EnumCtx { DWORD pid; HWND found; };
+    EnumCtx ctx = { targetPid, nullptr };
+
+    // 枚举所有顶层窗口，查找属于 targetPid 的窗口
+    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+        auto* ctx = reinterpret_cast<EnumCtx*>(lParam);
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid == ctx->pid && IsWindowVisible(hwnd)) {
+            ctx->found = hwnd;
+            return FALSE; // 找到第一个可见窗口即停止
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+
+    if (ctx.found) {
+        // 置顶显示
+        SetWindowPos(ctx.found, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        // 同时尝试 BringWindowToTop
+        BringWindowToTop(ctx.found);
+        SetForegroundWindow(ctx.found);
+        DiagLog("BringBasicToTop: found HWND=0x%llX, brought to top\n",
+                (unsigned long long)ctx.found);
+    } else {
+        DiagLog("BringBasicToTop: no visible window found for PID=%u\n", targetPid);
+        // 重试: 等待 500ms 后再试一次 (窗口可能还在创建中)
+        Sleep(500);
+        EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+            auto* ctx = reinterpret_cast<EnumCtx*>(lParam);
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (pid == ctx->pid && IsWindowVisible(hwnd)) {
+                ctx->found = hwnd;
+                return FALSE;
+            }
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&ctx));
+        if (ctx.found) {
+            SetWindowPos(ctx.found, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            BringWindowToTop(ctx.found);
+            SetForegroundWindow(ctx.found);
+            DiagLog("BringBasicToTop: retry found HWND=0x%llX, brought to top\n",
+                    (unsigned long long)ctx.found);
+        } else {
+            DiagLog("BringBasicToTop: retry still no window found\n");
+        }
+    }
+}
+
 // v3.32: 清理基础.exe 进程
 static void TerminateBasicESP() {
     if (g_hBasicProcess) {
@@ -764,7 +829,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.125 DIAG START (BUILD 426: 修复CRT堆依赖 — SleepObfuscator/TelemetrySilencer/PhantomSection改用固定数组, GetSelfPage回退到&GetSelfPage) ===\n");
+    DiagLog("=== v3.126 DIAG START (BUILD 427: 添加BringBasicToTop — 将基础.exe窗口置顶确保可见) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
@@ -1010,6 +1075,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             // v3.32-plus: 基础.exe 注入后清理痕迹 (PEB Ldr unlinking)
             if (basicOk) {
                 CleanupInjectionTraces();
+                // ★ v3.126: 将基础.exe 窗口置顶
+                BringBasicToTop();
             }
         }
 
@@ -1374,6 +1441,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     restartOk ? "OK" : "FAILED", g_basicRestartBackoffMs);
                 if (restartOk) {
                     CleanupInjectionTraces();
+                    // ★ v3.126: 重启后也置顶窗口
+                    BringBasicToTop();
                     g_basicRestartBackoffMs = RandomJitter(800, 400);
 
                     // v3.34 Scheme 4: DKOM 隐藏 basic.exe 进程
