@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 430 (v3.126d: 恢复Hollowing + 手动解析IAT — base.exe窗口正常显示 — SleepObfuscator/TelemetrySilencer/PhantomSection改用固定数组, GetSelfPage回退到&GetSelfPage)
+// BUILD: 431 (v3.126e: 跳过NtUnmapViewOfSection + VEH崩溃范围检查 + 崩溃计数 — 防止无限循环 — SleepObfuscator/TelemetrySilencer/PhantomSection改用固定数组, GetSelfPage回退到&GetSelfPage)
 // ============================================================
 
 #include "stealth_core.h"
@@ -68,6 +68,9 @@ void* g_vehHandlerPageVA = nullptr; // ★ v3.78: VEH handler 所在页 VA (exte
 
 // ★ v3.82: VEH 重入防护 — 防止恢复过程中自身触发异常导致无限递归
 static volatile LONG g_vehRestoring = 0;
+// ★ v3.126d: 崩溃计数 — 防止自愈后同一指令再次崩溃导致的无限循环
+static volatile LONG g_vehCrashCount = 0;
+static constexpr LONG MAX_VEH_RETRIES = 3;
 
 static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     uint64_t crashAddr = (uint64_t)ep->ExceptionRecord->ExceptionAddress;
@@ -84,12 +87,29 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     bool isPrivInstr = (code == 0xC0000096);
     bool isAccessViol = (code == 0xC0000005);
     if ((isPrivInstr || isAccessViol) && g_backupBuf && g_backupCodeBase && g_backupLen > 0) {
+        // ★ v3.126d: 检查崩溃地址是否在备份范围内 — 不在范围内则不自愈
+        uintptr_t backupStart = (uintptr_t)g_backupCodeBase;
+        uintptr_t backupEnd   = backupStart + g_backupLen;
+        if (crashAddr < backupStart || crashAddr >= backupEnd) {
+            // 崩溃不在 payload 代码区域, 不自愈 (可能是系统 DLL 或栈)
+            DiagLog("VEH: crash outside backup range [0x%llX-0x%llX), skipping self-heal\n",
+                (unsigned long long)backupStart, (unsigned long long)backupEnd);
+            goto veh_fatal;
+        }
+
         // ★ v3.82: 重入检测 — 如果已经在恢复中又触发异常, 说明恢复过程本身
         //   有页面无法正常操作 (PTE 损坏 / 栈被污染), 放弃恢复避免无限递归
         if (InterlockedExchange(&g_vehRestoring, 1)) {
             DiagLog("VEH-SELFHEAL: RECURSIVE! aborting restore, re-crash at off=0x%llX code=0x%08X\n",
                 offset, code);
             // 放弃自愈, 让 MessageBox 弹出通知用户
+            g_vehRestoring = 0;
+            goto veh_fatal;
+        }
+
+        // ★ v3.126d: 自愈计数 — 同一指令连续崩溃超过 MAX_VEH_RETRIES 次即放弃
+        if (InterlockedIncrement(&g_vehCrashCount) > MAX_VEH_RETRIES) {
+            DiagLog("VEH-SELFHEAL: EXCEEDED MAX_RETRIES (%d), aborting\n", MAX_VEH_RETRIES);
             g_vehRestoring = 0;
             goto veh_fatal;
         }
@@ -346,18 +366,11 @@ static bool LaunchBasicESP() {
     }
     DiagLog("Original ImageBase: 0x%llX\n", (unsigned long long)origImageBase);
 
-    // Step 5: NtUnmapViewOfSection 卸载原始镜像
-    bool hollowOk = false;
-    if (canHollow) {
-        LONG unmapStatus = g_pNtUnmapViewOfSection(pi.hProcess, (PVOID)origImageBase);
-        if (unmapStatus < 0) {
-            DiagLog("WARN: NtUnmapViewOfSection failed (0x%X), falling back...\n", unmapStatus);
-            TerminateProcess(pi.hProcess, 0);
-            CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-        } else {
-            hollowOk = true;
-        }
-    }
+    // Step 5: 跳过 NtUnmapViewOfSection (该函数在 ntdll 中崩溃)
+    //   basic.exe 的 preferred base (0x140000000) 与 rundll32.exe 的 base (0x7FF7AAC60000)
+    //   完全不同, 无需先 unmapping, 直接分配内存即可。
+    // ★ v3.126d: 修复 — 跳过 NtUnmapViewOfSection 避免 ntdll 崩溃
+    bool hollowOk = canHollow; // 不 unmapping, 直接进行后续分配
 
     if (hollowOk) {
         // Step 6: 在远程进程分配 basic.exe 所需内存
@@ -869,7 +882,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.126d DIAG START (BUILD 430: 恢复Hollowing + 手动解析IAT — base.exe窗口正常显示) ===\n");
+    DiagLog("=== v3.126e DIAG START (BUILD 431: 跳过NtUnmapViewOfSection + VEH崩溃范围检查 + 崩溃计数) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
