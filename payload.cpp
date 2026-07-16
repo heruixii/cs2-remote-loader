@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 424 (v3.124: 改用PhysicalReadViaIOCTL 0x80002048 — 虚拟IOCTL 0x80002000不支持)
+// BUILD: 425 (v3.124: 修复StealthSleep崩溃 — 仅使用EkkoSleep, 移除EncryptAll直接调用)
 // ============================================================
 
 #include "stealth_core.h"

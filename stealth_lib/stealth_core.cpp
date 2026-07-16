@@ -296,76 +296,15 @@ void StealthEngine::StealthSleep(DWORD milliseconds) {
             lastCloakToggle = now;
         }
 
-        // v3.50: 5种休眠方法轮换, 破坏EAC时序特征指纹
-        //   EAC通过WaitableTimer创建模式检测EkkoSleep,
-        //   轮换方法使EAC无法建立单一检测模型
-        static int sleepMethodCounter = 0;
-        int method = (sleepMethodCounter++ + (rand() % 3)) % 5;
-
-        switch (method) {
-        case 0:
-            // Method 1: 原始 EkkoSleep — WaitableTimer 加密休眠
-            SleepObfuscator::Instance().EkkoSleep(milliseconds);
-            break;
-        case 1:
-            // Method 2: NtDelayExecution syscall — 绕过 Win32 Sleep Hook
-            {
-                LARGE_INTEGER delay;
-                delay.QuadPart = -(LONGLONG)(milliseconds * 10000); // 100ns units
-                using NtDelayExecution_t = NTSTATUS(NTAPI*)(BOOL, PLARGE_INTEGER);
-                static auto NtDelayExec = (NtDelayExecution_t)GetProcAddress(
-                    GetModuleHandleW(L"ntdll.dll"), "NtDelayExecution");
-                if (NtDelayExec) {
-                    SleepObfuscator::Instance().EncryptAll();
-                    NtDelayExec(FALSE, &delay);
-                    SleepObfuscator::Instance().DecryptAll();
-                } else {
-                    SleepObfuscator::Instance().EkkoSleep(milliseconds);
-                }
-            }
-            break;
-        case 2:
-            // Method 3: 分片 Sleep — 将大休眠拆成小片, 避开时序特征
-            {
-                DWORD remaining = milliseconds;
-                SleepObfuscator::Instance().EncryptAll();
-                while (remaining > 0) {
-                    DWORD chunk = min(remaining, (DWORD)(10 + (rand() % 20))); // 10-30ms chunks
-                    Sleep(chunk);
-                    if (remaining > chunk) remaining -= chunk; else break;
-                }
-                SleepObfuscator::Instance().DecryptAll();
-            }
-            break;
-        case 3:
-            // Method 4: SleepEx alertable — 不同于 Sleep 的等待路径
-            {
-                SleepObfuscator::Instance().EncryptAll();
-                SleepEx(milliseconds, TRUE); // Alertable
-                SleepObfuscator::Instance().DecryptAll();
-            }
-            break;
-        case 4:
-            // Method 5: WaitableTimer + 随机 handle 名 — 反句柄枚举
-            {
-                // 使用随机名而非匿名的 WaitableTimer
-                wchar_t timerName[32];
-                swprintf_s(timerName, L"Global\\Tmr%d", rand() & 0xFFFF);
-                HANDLE hTimer = CreateWaitableTimerW(nullptr, FALSE, timerName);
-                if (hTimer) {
-                    SleepObfuscator::Instance().EncryptAll();
-                    LARGE_INTEGER due;
-                    due.QuadPart = -(LONGLONG)(milliseconds * 10000);
-                    SetWaitableTimer(hTimer, &due, 0, nullptr, nullptr, FALSE);
-                    WaitForSingleObject(hTimer, milliseconds + 500);
-                    CloseHandle(hTimer);
-                    SleepObfuscator::Instance().DecryptAll();
-                } else {
-                    SleepObfuscator::Instance().EkkoSleep(milliseconds);
-                }
-            }
-            break;
-        }
+        // ★ v3.124: 仅使用 EkkoSleep (方法0)
+        //   移除方法1-4 (NtDelayExecution/分片Sleep/SleepEx/WaitableTimer)，
+        //   因为这些方法直接调用 EncryptAll()/DecryptAll()，
+        //   而 StealthSleep 函数本身的代码页也在加密范围内，
+        //   导致 EncryptAll() 返回后执行已加密的代码 → 崩溃。
+        //   只有 EkkoSleep 内部通过 GetSelfPage() 豁免了自身代码页，是安全的。
+        //   反检测方面: 仅使用 WaitableTimer 模式, 但 byovd 已移除 EAC 内核回调,
+        //   无需担心 EAC 时序特征检测。
+        SleepObfuscator::Instance().EkkoSleep(milliseconds);
 
         if (shouldToggleETW) {
             TelemetrySilencer::SilenceAll();
