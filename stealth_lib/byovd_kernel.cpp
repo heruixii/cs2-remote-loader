@@ -4,7 +4,7 @@
 // 技术栈:
 //   1. RTCore64.sys BYOVD 加载 (合法签名漏洞驱动)
 //   2. CR3 页表遍历: VA→PA 转换 (PML4→PDPT→PD→PT)
-//   3. 物理内存 R/W: IOCTL 0x80002048/0x4C 读写任意物理地址 (CVE-2022-22077)
+//   3. 物理内存 R/W: IOCTL 0x80002048/0x4C 读写任意物理地址 (CVE-2022-22077, FMT_48B_PA_AT_00)
 //   4. Sigscan ObRegisterCallbacks → 定位 ObpCallbackArrayHead
 //   5. 遍历回调数组 → NULL EAC 的所有注册回调
 //   6. DKOM EPROCESS 断链 (可选, 触发 PatchGuard)
@@ -146,22 +146,52 @@ static RTCore64Format g_probedIoctlFormat = RTCore64Format::FMT_32B_RAW;
 static uint32_t g_probedReadIoctl  = 0;
 static uint32_t g_probedWriteIoctl = 0;
 
-// ★ v3.104: 直接物理内存读取 — 通过 IOCTL 读取物理内存数据
-//   RTCore64 驱动 (0x80002048) 内部使用 MmMapIoSpace 映射物理内存,
-//   然后将数据复制到 output buffer 返回给用户态。
-//   它不会返回映射后的 VA, 而是直接返回数据!
-//   之前的 TryMapPhysical 错误地将返回数据当作 VA 使用 → crash。
+// ★ v3.106: 前向声明 — TryMapPhysical 定义在 PhysicalReadViaIOCTL 之后
+static bool TryMapPhysical(HANDLE hDevice, uint32_t ioctlCode, uint64_t physAddr,
+                           RTCore64Format fmt, uint8_t** outVirtAddr, DWORD* outErr);
+
+// ★ v3.106: 物理内存读取 — 根据探测到的格式选择读取方式
+//   探测结果: FMT_48B_PA_AT_00 格式驱动返回映射VA, 需要先从映射VA读取数据
+//   FMT_32B_RAW 格式驱动直接返回数据在 output buffer 中
 static bool PhysicalReadViaIOCTL(HANDLE hDevice, uint32_t ioctlCode,
                                   uint64_t physAddr, void* outBuf, size_t size) {
     if (hDevice == INVALID_HANDLE_VALUE || !ioctlCode) return false;
 
-    // 页对齐地址和大小
     uint64_t alignedAddr = physAddr & ~0xFFFULL;
     uint32_t offsetInPage = (uint32_t)(physAddr - alignedAddr);
     uint32_t readSize = (uint32_t)((offsetInPage + size + 0xFFF) & ~0xFFF);
     if (readSize < 0x1000) readSize = 0x1000;
 
-    // 使用 FMT_48B_PA_AT_00: physAddr@+0x00, size@+0x10
+    // ★ v3.106: FMT_48B_PA_AT_00 格式 — 驱动返回映射VA, 需要逐页映射并读取
+    if (g_probedIoctlFormat == RTCore64Format::FMT_48B_PA_AT_00) {
+        uint32_t pages = readSize / 0x1000;
+        if (readSize % 0x1000) pages++;
+        size_t remaining = size;
+        size_t outOffset = 0;
+        for (uint32_t p = 0; p < pages; p++) {
+            uint64_t pagePA = alignedAddr + p * 0x1000;
+            uint8_t* mappedVA = nullptr;
+            DWORD mapErr = 0;
+            if (!TryMapPhysical(hDevice, ioctlCode, pagePA,
+                               RTCore64Format::FMT_48B_PA_AT_00, &mappedVA, &mapErr)) {
+                ByovdDiag("BYOVD:PhysicalRead: map page %u phys=0x%llX FAILED err=%u\n",
+                          p, (unsigned long long)pagePA, mapErr);
+                return false;
+            }
+            uint32_t readStart = (p == 0) ? offsetInPage : 0;
+            size_t toRead = (remaining > 0x1000 - readStart) ? (0x1000 - readStart) : remaining;
+            if (toRead > 0) {
+                memcpy((uint8_t*)outBuf + outOffset, mappedVA + readStart, toRead);
+                outOffset += toRead;
+                remaining -= toRead;
+            }
+            if (remaining == 0) break;
+        }
+        return true;
+    }
+
+    // ★ v3.104: 原生格式 — 驱动直接返回数据在 output buffer
+    //   使用 FMT_48B_PA_AT_00: physAddr@+0x00, size@+0x10
     uint8_t inBuf[48] = {};
     *(uint64_t*)(inBuf + 0x00) = alignedAddr;
     *(uint32_t*)(inBuf + 0x10) = readSize;
@@ -182,7 +212,6 @@ static bool PhysicalReadViaIOCTL(HANDLE hDevice, uint32_t ioctlCode,
         ByovdDiag("BYOVD:PhysicalRead: short read got=%u need=%u (phys=0x%llX)\n",
                   bytesRet, offsetInPage + (uint32_t)size, (unsigned long long)physAddr);
         if (bytesRet <= offsetInPage) return false;
-        // copy partial data
         size_t avail = bytesRet - offsetInPage;
         memcpy(outBuf, outBufVec.data() + offsetInPage, (avail < size) ? avail : size);
         return true;

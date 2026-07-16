@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 403 (v3.105: 修复默认IOCTL码+僵尸设备探测逻辑)
+// BUILD: 404 (v3.106: 修复PhysicalReadViaIOCTL — 正确处理FMT_48B_PA_AT_00映射格式)
 // ============================================================
 
 #include "stealth_core.h"
@@ -757,7 +757,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.105 DIAG START (BUILD 403: fixed IOCTL probe + zombie detection) ===\n");
+    DiagLog("=== v3.106 DIAG START (BUILD 404: fix PhysicalReadViaIOCTL for FMT_48B mapping format) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
