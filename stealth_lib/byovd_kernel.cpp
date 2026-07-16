@@ -1816,6 +1816,10 @@ uint64_t EACCallbackDisabler::FindObpCallbackArrayHead(KernelMemoryAccessor& kma
     return kma.ResolveExport(ntBase, "ObpCallbackArrayHead");
 }
 
+// ★ v3.126h: 前向声明 — 反作弊模式匹配 fallback 函数 (实现在文件末尾)
+static bool IsAntiCheatDriverName(const char* name);
+static uint64_t FindAntiCheatDriverViaFallback();
+
 int EACCallbackDisabler::DisableObCallbacks(const std::string& eacDriverName) {
     auto& kma = KernelMemoryAccessor::Instance();
     if (!kma.IsActive()) return 0;
@@ -1835,12 +1839,13 @@ int EACCallbackDisabler::DisableObCallbacks(const std::string& eacDriverName) {
             return 0;
     }
 
-    // 获取 EAC 驱动基址
+    // 获取 EAC 驱动基址 (主检测: 精确名字匹配)
+    // ★ v3.126h: 即使名字匹配失败, 仍继续扫描回调数组 + 模式匹配 fallback
     uint64_t eacBase = kma.GetKernelModuleBase(eacDriverName + ".sys");
     if (!eacBase) {
         eacBase = kma.GetKernelModuleBase("EasyAntiCheat_EOS.sys");
     }
-    if (!eacBase) return 0;
+    bool nameFound = (eacBase != 0);
 
     // 遍历 CALLBACK_ENTRY 数组
     // ★ v3.68: 先检测链表形式 (Flink!=自身), 若有效则走链表遍历;
@@ -1903,6 +1908,24 @@ int EACCallbackDisabler::DisableObCallbacks(const std::string& eacDriverName) {
                         kma.Write(current + 0x28, zero); // PostOperation
                         removed++;
                     }
+                    // ★ v3.126h: 名字模式匹配 fallback — 主检测名字未命中时启用
+                    //   防止 EAC 改名后无法识别, 同时不干扰主检测路径
+                    else if (!nameFound && !eacBase && IsAntiCheatDriverName(ansiName)) {
+                        ByovdDiag("BYOVD:DisableObCallbacks: fallback matched '%s' (pattern)\n", ansiName);
+                        uint64_t preOp = kma.Read<uint64_t>(current + 0x18);
+                        uint64_t postOp = kma.Read<uint64_t>(current + 0x28);
+                        if ((preOp || postOp) && m_savedObCallbackCount < MAX_SAVED_OB_CALLBACKS) {
+                            SavedObEntry& saved = m_savedObCallbacks[m_savedObCallbackCount];
+                            saved.address = current;
+                            saved.preOp = preOp;
+                            saved.postOp = postOp;
+                            m_savedObCallbackCount++;
+                        }
+                        uint64_t zero = 0;
+                        kma.Write(current + 0x18, zero);
+                        kma.Write(current + 0x28, zero);
+                        removed++;
+                    }
                 }
             }
         }
@@ -1927,6 +1950,10 @@ int EACCallbackDisabler::DisableProcessNotifyCallbacks(const std::string& eacDri
 
     uint64_t ntBase = kma.GetNtoskrnlBase();
     uint64_t eacBase = kma.GetKernelModuleBase(eacDriverName + ".sys");
+    // ★ v3.126h: fallback — 名字匹配失败时扫描反作弊模式
+    if (!eacBase) {
+        eacBase = FindAntiCheatDriverViaFallback();
+    }
     if (!eacBase) return 0;
 
     // PsSetCreateProcessNotifyRoutine → sigscan 找到 PspCreateProcessNotifyRoutine 数组
@@ -1991,6 +2018,10 @@ int EACCallbackDisabler::DisableImageNotifyCallbacks(const std::string& eacDrive
 
     uint64_t ntBase = kma.GetNtoskrnlBase();
     uint64_t eacBase = kma.GetKernelModuleBase(eacDriverName + ".sys");
+    // ★ v3.126h: fallback — 名字匹配失败时扫描反作弊模式
+    if (!eacBase) {
+        eacBase = FindAntiCheatDriverViaFallback();
+    }
     if (!eacBase) return 0;
 
     // PsSetLoadImageNotifyRoutine → 找到 PspLoadImageNotifyRoutine 数组
@@ -2482,6 +2513,59 @@ void KernelDefense::RestoreAllCallbacks() {
         ByovdDiag("BYOVD:KernelDefense: RestoreAllCallbacks (temp restore for EAC heartbeat)\n");
         cbDisabler.RestoreAll();
     }
+}
+
+// ★ v3.126h: 不依赖精确名字的二次检测 — 检查驱动名是否匹配反作弊模式
+//   即使 EAC 改名, 只要名字包含常见反作弊关键词就能识别
+//   用于 ObpCallbackArray 遍历时的 fallback 匹配
+//   注意: 不含 EasyAntiCheat/EasyAntiCheat_EOS, 那由主检测路径处理
+static bool IsAntiCheatDriverName(const char* name) {
+    if (!name || !*name) return false;
+    // 常见反作弊驱动名模式 (不区分大小写)
+    // 主检测已覆盖 EasyAntiCheat*, 这里只做二次保底
+    const char* patterns[] = {
+        "anticheat", "anti_cheat", "anti-cheat",
+        "battleye", "bedaisy",
+        "xigncode", "xhc",
+        "nprotect", "npf",
+        "gameguard",
+        "tenprotect", "tp",
+        "ace", "anti-cheat-expert",
+        "equ8",
+        "fate",
+        "bypass",
+    };
+    char lower[64] = {};
+    size_t len = strlen(name);
+    if (len >= sizeof(lower)) len = sizeof(lower) - 1;
+    for (size_t i = 0; i < len; i++) {
+        char c = name[i];
+        lower[i] = (c >= 'A' && c <= 'Z') ? (c - 'A' + 'a') : c;
+    }
+    lower[len] = '\0';
+    for (const char* pat : patterns) {
+        if (strstr(lower, pat)) return true;
+    }
+    return false;
+}
+
+// ★ v3.126h: 扫描所有已加载内核驱动, 返回第一个匹配反作弊模式名字的驱动基址
+//   用于 DisableProcessNotifyCallbacks / DisableImageNotifyCallbacks 的 fallback
+static uint64_t FindAntiCheatDriverViaFallback() {
+    LPVOID drivers[1024];
+    DWORD cbNeeded = 0;
+    if (EnumDeviceDrivers(drivers, sizeof(drivers), &cbNeeded)) {
+        int driverCount = cbNeeded / sizeof(LPVOID);
+        for (int i = 0; i < driverCount; i++) {
+            char baseName[256] = {};
+            DWORD nameLen = GetDeviceDriverBaseNameA(drivers[i], baseName, sizeof(baseName));
+            if (nameLen > 0 && IsAntiCheatDriverName(baseName)) {
+                ByovdDiag("BYOVD:FindAntiCheatDriverViaFallback: found '%s' at 0x%p\n", baseName, drivers[i]);
+                return (uint64_t)drivers[i];
+            }
+        }
+    }
+    return 0;
 }
 
 // ★ v3.126g: 重新摘除所有 EAC 回调 — 周期性监控用
