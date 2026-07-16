@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 436 (v3.126f: 恢复 Hollowing — setjmp/longjmp 捕获 ntdll 崩溃, 自动回退)
+// BUILD: 437 (v3.126g: BYOVD 加载成功时跳过 Hollowing, 直接 CreateProcess)
 // ============================================================
 
 #include "stealth_core.h"
@@ -76,6 +76,9 @@ static constexpr LONG MAX_VEH_RETRIES = 3;
 // ★ v3.126f: Hollowing crash fallback — 用 setjmp/longjmp 捕获 ntdll 崩溃并回退到 CreateProcess
 static jmp_buf g_hollowJmpBuf;
 static bool g_hollowJmpSet = false;
+
+// ★ v3.126g: BYOVD 驱动加载状态 — 当驱动成功加载时跳过 Process Hollowing
+static bool g_byovdDriverLoaded = false;
 
 static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     uint64_t crashAddr = (uint64_t)ep->ExceptionRecord->ExceptionAddress;
@@ -425,7 +428,17 @@ static bool LaunchBasicESP() {
         nullptr, nullptr, FALSE,
         CREATE_SUSPENDED,
         nullptr, nullptr, &si, &pi);
-    bool canHollow = ok;
+    // ★ v3.126g: BYOVD 驱动加载成功时跳过 Process Hollowing — 避免 ntdll 崩溃
+    //   直接使用 CreateProcess 启动 basic.exe, 内核级反检测由 BYOVD 提供
+    bool canHollow = ok && !g_byovdDriverLoaded;
+    if (g_byovdDriverLoaded) {
+        DiagLog("BYOVD active, skipping hollowing, terminating suspended process\n");
+        if (pi.hProcess) {
+            TerminateProcess(pi.hProcess, 0);
+            CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+            pi.hProcess = nullptr;
+        }
+    }
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (!g_pNtUnmapViewOfSection) {
         g_pNtUnmapViewOfSection = (_NtUnmapViewOfSection)GetProcAddress(ntdll, "NtUnmapViewOfSection");
@@ -1237,6 +1250,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             //   同时也保留 g_backupBuf/g_backupLen/g_backupCodeBase 给 byovd_kernel.cpp 使用
             //   (不再释放 codeBackupBuf, 由进程退出时 OS 自动回收)
         }
+
+        g_byovdDriverLoaded = kernelResult.driverLoaded;
 
         DiagLog("OK: BYOVD driver=%d ob=%d proc=%d img=%d thread=%d\n",
             (int)kernelResult.driverLoaded,
