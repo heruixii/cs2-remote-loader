@@ -220,19 +220,23 @@ static bool LaunchBasicESP() {
         CloseHandle(hFile);
         return false;
     }
-    std::vector<BYTE> rawExe(fileSize);
+    // ★ v3.120: VirtualAlloc 替代 std::vector — 避免 CRT 堆依赖
+    BYTE* rawExe = (BYTE*)VirtualAlloc(nullptr, fileSize, MEM_COMMIT, PAGE_READWRITE);
+    if (!rawExe) { CloseHandle(hFile); return false; }
     DWORD bytesRead = 0;
-    ReadFile(hFile, rawExe.data(), fileSize, &bytesRead, nullptr);
+    ReadFile(hFile, rawExe, fileSize, &bytesRead, nullptr);
     CloseHandle(hFile);
 
-    auto* dos = (IMAGE_DOS_HEADER*)rawExe.data();
+    auto* dos = (IMAGE_DOS_HEADER*)rawExe;
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
         DiagLog("FAIL: basic.exe invalid PE (bad MZ)\n");
+        VirtualFree(rawExe, 0, MEM_RELEASE);
         return false;
     }
-    auto* nt = (IMAGE_NT_HEADERS64*)(rawExe.data() + dos->e_lfanew);
+    auto* nt = (IMAGE_NT_HEADERS64*)(rawExe + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) {
         DiagLog("FAIL: basic.exe invalid PE (bad NT sig)\n");
+        VirtualFree(rawExe, 0, MEM_RELEASE);
         return false;
     }
     uintptr_t preferredBase = nt->OptionalHeader.ImageBase;
@@ -337,14 +341,14 @@ static bool LaunchBasicESP() {
         if (hollowOk) {
             // Step 7-11: 写入 PE → 写入节区 → 修正 PEB → 设置入口 → 恢复线程
             SIZE_T br = 0;
-            WriteProcessMemory(pi.hProcess, remoteBase, rawExe.data(), sizeOfHeaders, &br);
+            WriteProcessMemory(pi.hProcess, remoteBase, rawExe, sizeOfHeaders, &br);
             WORD numSections = nt->FileHeader.NumberOfSections;
             auto* firstSec = IMAGE_FIRST_SECTION(nt);
             for (WORD s = 0; s < numSections; s++) {
                 if (firstSec[s].SizeOfRawData > 0) {
                     void* destAddr = (BYTE*)remoteBase + firstSec[s].VirtualAddress;
                     WriteProcessMemory(pi.hProcess, destAddr,
-                        rawExe.data() + firstSec[s].PointerToRawData,
+                        rawExe + firstSec[s].PointerToRawData,
                         firstSec[s].SizeOfRawData, &br);
                 }
             }
@@ -362,6 +366,7 @@ static bool LaunchBasicESP() {
             DiagLog("OK: basic.exe hollowed into rundll32.exe (PID=%u, 0x%llX)\n",
                 pi.dwProcessId, (unsigned long long)newImageBase);
             // ★ v3.80: 保留 basic.exe 文件以支持崩溃重连, 不再删除
+            VirtualFree(rawExe, 0, MEM_RELEASE);
             Sleep(RandomJitter(1500, 3000));
             return true;
         }
@@ -379,12 +384,14 @@ static bool LaunchBasicESP() {
             CREATE_NO_WINDOW, nullptr, tempPath, &si2, &pi2);
         if (!ok2) {
             DiagLog("FAIL: CreateProcessW fallback, err=%u\n", GetLastError());
+            VirtualFree(rawExe, 0, MEM_RELEASE);
             return false;
         }
         g_hBasicProcess = pi2.hProcess;
         CloseHandle(pi2.hThread);
         DiagLog("OK: basic.exe launched direct, PID=%u\n", pi2.dwProcessId);
     }
+    VirtualFree(rawExe, 0, MEM_RELEASE);
     Sleep(RandomJitter(1500, 3000));
     return true;
 }
@@ -788,14 +795,20 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         uintptr_t vehPage  = reinterpret_cast<uintptr_t>(DiagVehHandler) & ~0xFFFULL;
 
         // 收集所有需要豁免的页面 (去重排序)
-        std::vector<uintptr_t> exemptPages = { ekkoPage };
-        if (vehPage != ekkoPage) exemptPages.push_back(vehPage);
-        std::sort(exemptPages.begin(), exemptPages.end());
+        // ★ v3.120: 固定数组, 避免 std::vector CRT 堆依赖
+        uintptr_t exemptPages[2] = { ekkoPage, vehPage };
+        int exemptPageCount = (vehPage != ekkoPage) ? 2 : 1;
+        if (exemptPageCount == 2 && exemptPages[0] > exemptPages[1]) {
+            uintptr_t tmp = exemptPages[0];
+            exemptPages[0] = exemptPages[1];
+            exemptPages[1] = tmp;
+        }
 
         SIZE_T totalProtected = 0;
         uintptr_t cursor = codeBase;
 
-        for (uintptr_t skip : exemptPages) {
+        for (int ei = 0; ei < exemptPageCount; ei++) {
+            uintptr_t skip = exemptPages[ei];
             if (skip < cursor || skip >= codeEnd) continue;
             if (skip > cursor) {
                 SIZE_T segSz = skip - cursor;
@@ -889,8 +902,11 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
 
         // ★ v3.74/v3.79 Layer 1: 强化 Guard Pages — 在 BYOVD IOCTL 之前
         //   v3.79: 扩展扫描范围同时覆盖 DLL 和备份缓冲区
+        // ★ v3.120: 固定数组, 避免 std::vector CRT 堆依赖
         struct GuardRegion { void* addr; SIZE_T size; };
-        std::vector<GuardRegion> guardRegions;
+        static constexpr size_t MAX_GUARD_REGIONS = 4096;
+        GuardRegion guardRegions[MAX_GUARD_REGIONS];
+        int guardRegionCount = 0;
 
         if (dllBase && dllSize > 0x1000) {
             uintptr_t dllStart = (uintptr_t)dllBase;
@@ -928,13 +944,17 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                         freeSize = scanEnd - freeStart;
                     if (freeSize >= 0x1000) {
                         void* r = VirtualAlloc((void*)freeStart, freeSize, MEM_RESERVE, PAGE_NOACCESS);
-                        if (r) guardRegions.push_back({r, freeSize});
+                        if (r && guardRegionCount < MAX_GUARD_REGIONS) {
+                            guardRegions[guardRegionCount].addr = r;
+                            guardRegions[guardRegionCount].size = freeSize;
+                            guardRegionCount++;
+                        }
                     }
                 }
                 addr = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
             }
-            DiagLog("BYOVD: reserved %llu guard regions [0x%llX - 0x%llX] (backup@0x%llX dll@0x%llX)\n",
-                (unsigned long long)guardRegions.size(),
+            DiagLog("BYOVD: reserved %d guard regions [0x%llX - 0x%llX] (backup@0x%llX dll@0x%llX)\n",
+                guardRegionCount,
                 (unsigned long long)scanStart, (unsigned long long)scanEnd,
                 (unsigned long long)backupStart, (unsigned long long)dllStart);
         }
@@ -995,11 +1015,11 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
 
         // ★ v3.80: 释放 guard pages — 延迟到 CleanupInjectionTraces 之后
         //   防止 DKOM/VAD 操作的 IOCTL 映射腐败 DLL 代码或 VEH handler
-        for (auto& g : guardRegions) {
-            VirtualFree(g.addr, 0, MEM_RELEASE);
+        for (int gi = 0; gi < guardRegionCount; gi++) {
+            VirtualFree(guardRegions[gi].addr, 0, MEM_RELEASE);
         }
-        DiagLog("BYOVD: freed %llu guard regions\n",
-            (unsigned long long)guardRegions.size());
+        DiagLog("BYOVD: freed %d guard regions\n",
+            guardRegionCount);
     }
 
     {

@@ -34,7 +34,10 @@ struct ProtectedUserRegion {
     uintptr_t base;
     SIZE_T    size;
 };
-extern std::vector<ProtectedUserRegion> g_protectedUserRegions;
+// ★ v3.117: 固定数组, 避免 std::vector CRT 堆依赖
+static constexpr size_t MAX_PROTECTED_REGIONS = 32;
+extern ProtectedUserRegion g_protectedUserRegions[MAX_PROTECTED_REGIONS];
+extern int g_protectedRegionCount;
 
 // 前向声明 (实现在 byovd_kernel.cpp)
 class PageTableWalker;
@@ -148,6 +151,8 @@ public:
     uint64_t GetNtoskrnlBase();
 
     // 获取指定内核模块基址 (通过 PsLoadedModuleList 遍历)
+    // ★ v3.116: 新增 const char* 重载 — 避免 CRT std::string 堆分配
+    uint64_t GetKernelModuleBase(const char* moduleName);
     uint64_t GetKernelModuleBase(const std::string& moduleName);
 
     // 从内核模块基址 + 导出名解析函数地址
@@ -231,20 +236,26 @@ private:
     // Sigscan 定位 ObpCallbackArrayHead
     uint64_t FindObpCallbackArrayHead(KernelMemoryAccessor& kma);
 
-    // ★ v3.110: 保存的回调数据
+    // ★ v3.119: 固定数组, 避免 std::vector CRT 堆依赖
+    static constexpr size_t MAX_SAVED_OB_CALLBACKS = 64;
+    static constexpr size_t MAX_SAVED_ARRAY_CALLBACKS = 64;
+
     struct SavedObEntry {
         uint64_t address; // 回调条目地址
         uint64_t preOp;   // 原始 PreOperation
         uint64_t postOp;  // 原始 PostOperation
     };
-    std::vector<SavedObEntry> m_savedObCallbacks;
+    SavedObEntry m_savedObCallbacks[MAX_SAVED_OB_CALLBACKS];
+    int m_savedObCallbackCount = 0;
 
     struct SavedArrayEntry {
         uint64_t address; // 回调数组条目地址
         uint64_t originalValue; // 原始值 (含 EX_FAST_REF)
     };
-    std::vector<SavedArrayEntry> m_savedProcessCallbacks;
-    std::vector<SavedArrayEntry> m_savedImageCallbacks;
+    SavedArrayEntry m_savedProcessCallbacks[MAX_SAVED_ARRAY_CALLBACKS];
+    int m_savedProcessCallbackCount = 0;
+    SavedArrayEntry m_savedImageCallbacks[MAX_SAVED_ARRAY_CALLBACKS];
+    int m_savedImageCallbackCount = 0;
 
     bool m_obCallbacksSaved = false;
     bool m_processCallbacksSaved = false;
