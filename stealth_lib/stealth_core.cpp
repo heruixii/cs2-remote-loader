@@ -160,8 +160,34 @@ bool StealthEngine::AttachToProcess(const wchar_t* processName) {
     CoreDiag("AttachToProcess: Enumerating '%ls'...\n", processName);
     auto processes = StealthProcess::EnumerateProcesses(processName);
     if (processes.empty()) {
-        CoreDiag("AttachToProcess: process not found\n");
-        return false;
+        CoreDiag("AttachToProcess: process not found via enumeration\n");
+
+        // ★ v3.112: 回退 — 通过 FindWindowW 查找 CS2 主窗口
+        //   当 syscall 方式枚举进程失败时, 用 Win32 API 直接找窗口
+        CoreDiag("AttachToProcess: trying FindWindowW fallback...\n");
+        DWORD pidByWindow = 0;
+        // 尝试 Valve001 窗口类 (CS2 主窗口)
+        pidByWindow = StealthProcess::FindProcessByWindow(
+            L"Valve001", L"Counter-Strike 2");
+        if (pidByWindow == 0) {
+            // 再试一次只匹配窗口标题 (不限制类名)
+            pidByWindow = StealthProcess::FindProcessByWindow(nullptr, L"Counter-Strike 2");
+        }
+        if (pidByWindow == 0) {
+            CoreDiag("AttachToProcess: FindWindowW fallback FAILED\n");
+            return false;
+        }
+
+        CoreDiag("AttachToProcess: FindWindowW found PID=%u\n", pidByWindow);
+        m_pid = pidByWindow;
+
+        // 直接尝试打开进程
+        m_hProcess = eac::HandleBypass::ViaExistingHandle(m_pid);
+        if (m_hProcess) return true;
+        m_hProcess = StealthProcess::OpenProcessStealth(m_pid);
+        if (m_hProcess) return true;
+        m_hProcess = StealthProcess::OpenProcessMinimal(m_pid);
+        return m_hProcess != nullptr;
     }
 
     auto& target = processes[0];

@@ -120,11 +120,11 @@ bool CheatOverlay::Create(const OverlayConfig& cfg) {
     m_oldBmp     = (HBITMAP)SelectObject(m_backDC, m_backBmp);  // ★ 保存原始位图以便清理时恢复
     ReleaseDC(nullptr, screenDC);
 
-    m_running = true;
-
     // 生成随机抖动种子 (避免 EAC 检测到确定性周期模式)
     m_jitterSeed = GetTickCount() % 0xFFFF;
     srand(m_jitterSeed);
+
+    m_running = true;
 
     return true;
 }

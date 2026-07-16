@@ -8,8 +8,30 @@
 #include <winternl.h>
 #include <TlHelp32.h>
 #include <algorithm>
+#include <cstdio>
+#include <cstdarg>
 
 namespace stealth {
+
+// 本地诊断日志 — 写 %TEMP%\stealth_diag.log (与 payload.cpp 的 DiagLog 同一文件)
+static void ProcDiag(const char* fmt, ...) {
+    char buf[256];
+    va_list args;
+    va_start(args, fmt);
+    int len = vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    if (len < 0) return;
+    wchar_t path[MAX_PATH];
+    GetTempPathW(MAX_PATH, path);
+    wcscat_s(path, L"stealth_diag.log");
+    HANDLE h = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD w;
+        WriteFile(h, buf, (DWORD)len, &w, 0);
+        FlushFileBuffers(h);
+        CloseHandle(h);
+    }
+}
 
 // ============================================================
 // NtQuerySystemInformation 类型定义
@@ -51,7 +73,11 @@ std::vector<StealthProcess::ProcessInfo>
 StealthProcess::EnumerateProcesses(const wchar_t* targetName) {
     std::vector<ProcessInfo> results;
 
-    // 使用 NtQuerySystemInformation 替代 CreateToolhelp32Snapshot
+    ProcDiag("EnumerateProcesses: target='%ls'\n", targetName ? targetName : L"(null)");
+
+    // ============================================================
+    // 方法1: NtQuerySystemInformation syscall (绕过 EAC 用户态 Hook)
+    // ============================================================
     ULONG bufferSize = 0x100000; // 1MB 初始
     std::vector<BYTE> buffer(bufferSize);
     ULONG returnLength = 0;
@@ -66,44 +92,106 @@ StealthProcess::EnumerateProcesses(const wchar_t* targetName) {
             bufferSize,
             &returnLength
         );
+        ProcDiag("  NtQSI: bufSize=%u status=0x%08X retLen=%u\n",
+            bufferSize, (unsigned)status, returnLength);
         if (status == STATUS_INFO_LENGTH_MISMATCH) {
             bufferSize *= 2;
         }
         if (--maxRetries <= 0 && status != 0) break;
     } while (status == STATUS_INFO_LENGTH_MISMATCH);
 
-    if (!NT_SUCCESS(status)) return results;
+    if (NT_SUCCESS(status)) {
+        PSYSTEM_PROCESS_INFO entry = reinterpret_cast<PSYSTEM_PROCESS_INFO>(buffer.data());
+        int totalProcesses = 0;
+        int matchedProcesses = 0;
 
-    PSYSTEM_PROCESS_INFO entry = reinterpret_cast<PSYSTEM_PROCESS_INFO>(buffer.data());
+        while (true) {
+            if (entry->ImageName.Buffer && entry->UniqueProcessId) {
+                std::wstring procName(entry->ImageName.Buffer,
+                    entry->ImageName.Length / sizeof(WCHAR));
 
-    while (true) {
-        if (entry->ImageName.Buffer && entry->UniqueProcessId) {
-            std::wstring procName(entry->ImageName.Buffer,
-                entry->ImageName.Length / sizeof(WCHAR));
+                // 不区分大小写匹配
+                std::wstring lowerName = procName;
+                std::wstring lowerTarget = targetName ? targetName : L"";
+                std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+                std::transform(lowerTarget.begin(), lowerTarget.end(), lowerTarget.begin(), ::towlower);
 
-            // 不区分大小写匹配
+                totalProcesses++;
+                // 记录前10个进程名和所有匹配的进程
+                if (totalProcesses <= 10 || lowerName.find(lowerTarget) != std::wstring::npos) {
+                    ProcDiag("  PROC[%d]: PID=%u name='%ls'\n",
+                        totalProcesses,
+                        static_cast<DWORD>(reinterpret_cast<uintptr_t>(entry->UniqueProcessId)),
+                        procName.c_str());
+                }
+
+                if (!targetName || lowerName.find(lowerTarget) != std::wstring::npos) {
+                    ProcessInfo info;
+                    info.pid = static_cast<DWORD>(reinterpret_cast<uintptr_t>(entry->UniqueProcessId));
+                    wcscpy_s(info.name, procName.c_str());
+                    info.handle = nullptr;
+                    results.push_back(info);
+                    matchedProcesses++;
+                }
+            }
+
+            if (entry->NextEntryOffset == 0) break;
+            entry = reinterpret_cast<PSYSTEM_PROCESS_INFO>(
+                reinterpret_cast<BYTE*>(entry) + entry->NextEntryOffset);
+        }
+
+        ProcDiag("EnumerateProcesses(NtQSI): total=%d matched=%d\n",
+            totalProcesses, matchedProcesses);
+        if (!results.empty()) return results;
+        ProcDiag("EnumerateProcesses(NtQSI): no match, trying fallback...\n");
+    } else {
+        ProcDiag("EnumerateProcesses(NtQSI): FAILED status=0x%08X, trying fallback...\n",
+            (unsigned)status);
+    }
+
+    // ============================================================
+    // 方法2: CreateToolhelp32Snapshot 回退 (当 syscall 方式失败时)
+    // ============================================================
+    ProcDiag("EnumerateProcesses: fallback to CreateToolhelp32Snapshot\n");
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) {
+        ProcDiag("  CreateToolhelp32Snapshot: FAILED err=%u\n", GetLastError());
+        return results;
+    }
+
+    PROCESSENTRY32W pe = { sizeof(pe) };
+    int totalProcesses = 0;
+    int matchedProcesses = 0;
+
+    if (Process32FirstW(hSnap, &pe)) {
+        do {
+            totalProcesses++;
+            std::wstring procName(pe.szExeFile);
             std::wstring lowerName = procName;
             std::wstring lowerTarget = targetName ? targetName : L"";
             std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
             std::transform(lowerTarget.begin(), lowerTarget.end(), lowerTarget.begin(), ::towlower);
 
+            // 记录前10个进程名和所有匹配的
+            if (totalProcesses <= 10 || lowerName.find(lowerTarget) != std::wstring::npos) {
+                ProcDiag("  SNAP[%d]: PID=%u name='%ls'\n",
+                    totalProcesses, pe.th32ProcessID, pe.szExeFile);
+            }
+
             if (!targetName || lowerName.find(lowerTarget) != std::wstring::npos) {
                 ProcessInfo info;
-                info.pid = static_cast<DWORD>(reinterpret_cast<uintptr_t>(entry->UniqueProcessId));
-                wcscpy_s(info.name, procName.c_str());
+                info.pid = pe.th32ProcessID;
+                wcscpy_s(info.name, pe.szExeFile);
                 info.handle = nullptr;
                 results.push_back(info);
+                matchedProcesses++;
             }
-        }
-
-        // 检查是否到达链表末尾 (NextEntryOffset = 0)
-        if (entry->NextEntryOffset == 0) break;
-
-        // 前进到下一个条目
-        entry = reinterpret_cast<PSYSTEM_PROCESS_INFO>(
-            reinterpret_cast<BYTE*>(entry) + entry->NextEntryOffset);
+        } while (Process32NextW(hSnap, &pe));
     }
 
+    CloseHandle(hSnap);
+    ProcDiag("EnumerateProcesses(SNAP): total=%d matched=%d\n",
+        totalProcesses, matchedProcesses);
     return results;
 }
 

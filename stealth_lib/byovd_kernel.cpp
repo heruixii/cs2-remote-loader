@@ -155,7 +155,6 @@ static bool KernelVAReadViaIOCTL(HANDLE hDevice, uint32_t ioctlCode,
                                   uint64_t kernelVA, void* outBuf, size_t size) {
     if (hDevice == INVALID_HANDLE_VALUE || !ioctlCode) return false;
 
-    uint8_t outBufLocal[128] = {};
     size_t bytesRead = 0;
 
     for (size_t off = 0; off < size; ) {
