@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 529 (v3.187: E+G 测试模式 — PAC PROBE 废弃, flag 触发跳过 CS2+basic.exe 仅运行 E+G 保护层, 防封号)
+// BUILD: 530 (v3.188: GuardPac 废弃 — SCM 操作在 manual-mapped DLL 上下文导致 ntdll 崩溃, PAC 中和已废弃 GuardPac 无意义)
 // ============================================================
 
 #include "stealth_core.h"

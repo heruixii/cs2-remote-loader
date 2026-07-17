@@ -5532,6 +5532,16 @@ KernelDefense::PacStatus KernelDefense::DisablePac() {
 }
 
 void KernelDefense::GuardPac() {
+    // ★ BUILD 530: GuardPac 整体废弃 — SCM 操作 (OpenSCManagerW/OpenServiceW/
+    //   QueryServiceStatusEx) 在 manual-mapped DLL 上下文中导致 ntdll 崩溃
+    //   (CRASH: 0xC0000005 in ntdll +0x127D29, ReapplyAllCallbacks → GuardPac → OpenSCManagerW).
+    //   且 BUILD 528 PAC minifilter 中和已废弃 (DisablePac 注释掉), GuardPac 即使
+    //   检测到 PAC 重新启用也无法中和. ObCallbacks 持续移除由 ReDisablePacCallbacks
+    //   在主循环中独立处理 (每 4-6s), 不依赖 GuardPac.
+    //   (memory 约束: "All SCM operations must be replaced with direct registry
+    //    deletion to avoid ntdll crashes in manual-mapped DLL context")
+    return;
+#if 0
     // ★ v3.126n: 三重检查 — 服务 + minifilter 存在性 + 回调完整性
     bool needReDisable = false;
 
@@ -5577,6 +5587,7 @@ void KernelDefense::GuardPac() {
         ByovdDiag("PAC:GuardPac: PAC re-enabled! disabling again...\n");
         DisablePac();
     }
+#endif
 }
 
 // ============================================================
