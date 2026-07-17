@@ -2451,7 +2451,7 @@ static BYOVDDriverInfo MutateAndRandomizeDriver(const BYOVDDriverInfo& original)
         VirtualFree(driverData, 0, MEM_RELEASE);
         if (bytesWritten != fileSize) return original;
     } else {
-        // 直接写入原始嵌入数据 (不做任何修改)
+        // 直接写入原始嵌入数据
         HANDLE hOut = CreateFileW(tempPath, GENERIC_WRITE, 0, nullptr,
             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hOut == INVALID_HANDLE_VALUE) return original;
@@ -2465,12 +2465,64 @@ static BYOVDDriverInfo MutateAndRandomizeDriver(const BYOVDDriverInfo& original)
         ByovdDiag("BYOVD:Mutate: wrote original driver %u bytes to %ls\n", bytesWritten, tempPath);
     }
 
+    // ★ BUILD 468: 设备名随机化 — 避免 \Device\RTCore64 残留冲突
+    WORD devSeed = (WORD)(GetTickCount64() ^ (GetCurrentProcessId() & 0xFFF) ^ (GetCurrentThreadId() << 2));
+    wchar_t devRand[9] = {};
+    wsprintfW(devRand, L"RT%04Xxx", devSeed); // "RT" + 4 hex + "xx" = 8 chars
+    char randomDeviceA[9] = {};
+    for (int ci = 0; ci < 8; ci++) randomDeviceA[ci] = (char)devRand[ci];
+
+    // 对 tempPath 二进制打补丁 (仅 embed 路径; 文件系统路径不处理)
+    if (original.driverPath == L"RTCore64.sys") {
+        HANDLE hPatch = CreateFileW(tempPath, GENERIC_READ | GENERIC_WRITE, 0,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hPatch != INVALID_HANDLE_VALUE) {
+            DWORD fs = GetFileSize(hPatch, nullptr);
+            std::vector<uint8_t> patchBuf(fs);
+            DWORD rd = 0;
+            if (ReadFile(hPatch, patchBuf.data(), fs, &rd, nullptr) && rd == fs) {
+                int replaced = 0;
+                // ASCII: "RTCore64"
+                for (size_t pos = 0; pos + 8 <= fs; pos++) {
+                    if (memcmp(patchBuf.data() + pos, "RTCore64", 8) == 0) {
+                        memcpy(patchBuf.data() + pos, randomDeviceA, 8);
+                        replaced++;
+                        pos += 7;
+                    }
+                }
+                // Wide-char: "R\0T\0C\0o\0r\0e\06\04\0"
+                const uint8_t RTCore64W[] = {
+                    'R',0, 'T',0, 'C',0, 'o',0, 'r',0, 'e',0, '6',0, '4',0
+                };
+                uint8_t randomDeviceW[16] = {};
+                for (int ci = 0; ci < 8; ci++) randomDeviceW[ci*2] = (uint8_t)randomDeviceA[ci];
+                for (size_t pos = 0; pos + 16 <= fs; pos++) {
+                    if (memcmp(patchBuf.data() + pos, RTCore64W, 16) == 0) {
+                        memcpy(patchBuf.data() + pos, randomDeviceW, 16);
+                        replaced++;
+                        pos += 15;
+                    }
+                }
+                if (replaced > 0) {
+                    SetFilePointer(hPatch, 0, nullptr, FILE_BEGIN);
+                    SetEndOfFile(hPatch);
+                    DWORD wr = 0;
+                    WriteFile(hPatch, patchBuf.data(), fs, &wr, nullptr);
+                    ByovdDiag("BYOVD:Mutate: patched %d occurrences of 'RTCore64' -> '%s'\n",
+                        replaced, randomDeviceA);
+                }
+            }
+            CloseHandle(hPatch);
+        }
+    }
+
     if (GetFileAttributesW(tempPath) == INVALID_FILE_ATTRIBUTES) return original;
 
-    // 构建驱动信息: 使用原始设备名 \\.\RTCore64 (驱动内部硬编码),
-    //   仅服务名随机化以避免注册表冲突
+    // ★ BUILD 468: 使用随机化后的设备名
     BYOVDDriverInfo mutated;
-    mutated.devicePath = original.devicePath;     // ★ 保持原始 \\.\RTCore64
+    wchar_t randomDevice2[16] = {};
+    wsprintfW(randomDevice2, L"\\\\.\\%s", devRand);
+    mutated.devicePath = randomDevice2; // e.g. \\.\RT55BDxx
     mutated.ioctlCode = original.ioctlCode;
     mutated.needsMemoryMap = original.needsMemoryMap;
     mutated.driverPath = tempPath;
