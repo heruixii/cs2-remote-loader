@@ -1883,8 +1883,9 @@ int EACCallbackDisabler::DisableObCallbacks(const std::string& eacDriverName) {
 
     int removed = 0;
     uint64_t current = cbArrayHead;
+    uint32_t i = 0;
 
-    for (uint32_t i = 0; i < MAX_CALLBACKS; i++) {
+    for (i = 0; i < MAX_CALLBACKS; i++) {
         // ★ v3.68: 每个条目读取前验证 current 仍在有效内核范围
         if (current < 0xFFFF800000000000ULL || current > 0xFFFFFFFFFFFFFF00ULL)
             break;
@@ -1957,6 +1958,11 @@ int EACCallbackDisabler::DisableObCallbacks(const std::string& eacDriverName) {
     }
 
     m_obCallbacksSaved = (m_savedObCallbackCount > 0);
+    // BUILD 456: 自体验证 — PAC 未装时也证明数组遍历正常
+    if (removed == 0 && cbArrayHead) {
+        ByovdDiag("VERIFY:ObCallbacks: scan OK — %u entries walked, 0 matched '%s' (driver not loaded)\n",
+            i, eacDriverName.c_str());
+    }
     return removed;
 }
 
@@ -1966,7 +1972,12 @@ int EACCallbackDisabler::DisableProcessNotifyCallbacks(const std::string& eacDri
 
     uint64_t ntBase = kma.GetNtoskrnlBase();
     uint64_t eacBase = kma.GetKernelModuleBase(eacDriverName + ".sys");
-    if (!eacBase) return 0;
+    if (!eacBase) {
+        // BUILD 456: 自体验证
+        ByovdDiag("VERIFY:ProcessNotify: '%s.sys' not loaded — skip scan (would scan if driver loaded)\n",
+            eacDriverName.c_str());
+        return 0;
+    }
 
     // PsSetCreateProcessNotifyRoutine → sigscan 找到 PspCreateProcessNotifyRoutine 数组
     uint64_t psSetNotify = kma.ResolveExport(ntBase, "PsSetCreateProcessNotifyRoutine");
@@ -2030,7 +2041,12 @@ int EACCallbackDisabler::DisableImageNotifyCallbacks(const std::string& eacDrive
 
     uint64_t ntBase = kma.GetNtoskrnlBase();
     uint64_t eacBase = kma.GetKernelModuleBase(eacDriverName + ".sys");
-    if (!eacBase) return 0;
+    if (!eacBase) {
+        // BUILD 456: 自体验证
+        ByovdDiag("VERIFY:ImageNotify: '%s.sys' not loaded — skip scan (would scan if driver loaded)\n",
+            eacDriverName.c_str());
+        return 0;
+    }
 
     // PsSetLoadImageNotifyRoutine → 找到 PspLoadImageNotifyRoutine 数组
     uint64_t psSetLoadImg = kma.ResolveExport(ntBase, "PsSetLoadImageNotifyRoutine");

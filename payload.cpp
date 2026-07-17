@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 455 (v3.131: minifilter FltGlobals 多函数 fallback, 覆盖所有 Win10/11 版本)
+// BUILD: 456 (v3.132: 自体验证 — PAC 未装时证明 ObCallbacks/FltGlobals/ProcessNotify 机制有效)
 // ============================================================
 
 #include "stealth_core.h"
