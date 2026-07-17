@@ -1,10 +1,9 @@
-#pragma once
+﻿#pragma once
 // ============================================================
 // game_esp.h — ESP 渲染配置与接口
 // ============================================================
 
 #include "cs2_memory.h"
-#include <vector>
 
 namespace cs2 {
 
@@ -28,7 +27,7 @@ public:
     const ESPConfig& GetConfig() const { return m_config; }
 
     // 主渲染入口
-    void Render(const Entity& local, const std::vector<Entity>& players);
+    void Render(const Entity& local, const Entity* players, int playerCount);
 
 private:
     ESP() = default;

@@ -5,8 +5,6 @@
 // ============================================================
 
 #include <Windows.h>
-#include <string>
-#include <random>
 
 namespace cs2 {
 
@@ -65,7 +63,7 @@ private:
     CheatOverlay() = default;
 
     // 生成随机窗口类名 (检测规避)
-    static std::wstring GenerateRandomClassName();
+    static void GenerateRandomClassName(wchar_t* outBuf, int bufSize);
 
     // 规避辅助
     LONG GetCloakedExStyle() const;
@@ -84,7 +82,7 @@ private:
     int           m_cloakCounter = 0; // 降低 CloakStyle 频率
     int           m_jitterSeed = 0;  // 随机抖动种子, 初始化时生成
     OverlayConfig m_config;
-    std::wstring  m_className;
+    wchar_t m_className[64];
 };
 
 } // namespace cs2

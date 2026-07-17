@@ -1,4 +1,4 @@
-// ============================================================
+﻿// ============================================================
 // stealth_process.cpp — 隐蔽进程/内存操作实现
 #include "platform.h"
 // ============================================================
@@ -7,7 +7,6 @@
 #include "syscall_direct.h"
 #include <winternl.h>
 #include <TlHelp32.h>
-#include <algorithm>
 #include <cstdio>
 #include <cstdarg>
 
@@ -30,6 +29,15 @@ static void ProcDiag(const char* fmt, ...) {
         WriteFile(h, buf, (DWORD)len, &w, 0);
         FlushFileBuffers(h);
         CloseHandle(h);
+    }
+}
+
+// 手动转小写辅助函数 (避免 CRT 依赖)
+static void MakeLowerW(wchar_t* str, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        if (str[i] >= L'A' && str[i] <= L'Z') {
+            str[i] = str[i] + (L'a' - L'A');
+        }
     }
 }
 
@@ -69,26 +77,34 @@ typedef struct _SYSTEM_PROCESS_INFO {
 // StealthProcess
 // ============================================================
 
-std::vector<StealthProcess::ProcessInfo>
-StealthProcess::EnumerateProcesses(const wchar_t* targetName) {
-    std::vector<ProcessInfo> results;
+int StealthProcess::EnumerateProcesses(const wchar_t* targetName, ProcessInfo* outBuf, int maxResults) {
+    int count = 0;
 
     ProcDiag("EnumerateProcesses: target='%ls'\n", targetName ? targetName : L"(null)");
+
+    // 准备小写目标名 (用于不区分大小写匹配)
+    WCHAR lowerTarget[MAX_PATH] = {};
+    if (targetName) {
+        wcscpy_s(lowerTarget, targetName);
+        MakeLowerW(lowerTarget, wcslen(lowerTarget));
+    }
 
     // ============================================================
     // 方法1: NtQuerySystemInformation syscall (绕过 EAC 用户态 Hook)
     // ============================================================
     ULONG bufferSize = 0x100000; // 1MB 初始
-    std::vector<BYTE> buffer(bufferSize);
+    BYTE* buffer = nullptr;
     ULONG returnLength = 0;
 
     NTSTATUS status;
     int maxRetries = 5;
     do {
-        buffer.resize(bufferSize);
+        if (buffer) VirtualFree(buffer, 0, MEM_RELEASE);
+        buffer = (BYTE*)VirtualAlloc(nullptr, bufferSize, MEM_COMMIT, PAGE_READWRITE);
+        if (!buffer) break;
         status = SysQuerySystemInformation(
             SystemProcessInformation,
-            buffer.data(),
+            buffer,
             bufferSize,
             &returnLength
         );
@@ -100,37 +116,43 @@ StealthProcess::EnumerateProcesses(const wchar_t* targetName) {
         if (--maxRetries <= 0 && status != 0) break;
     } while (status == STATUS_INFO_LENGTH_MISMATCH);
 
-    if (NT_SUCCESS(status)) {
-        PSYSTEM_PROCESS_INFO entry = reinterpret_cast<PSYSTEM_PROCESS_INFO>(buffer.data());
+    if (buffer && NT_SUCCESS(status)) {
+        PSYSTEM_PROCESS_INFO entry = reinterpret_cast<PSYSTEM_PROCESS_INFO>(buffer);
         int totalProcesses = 0;
         int matchedProcesses = 0;
 
         while (true) {
             if (entry->ImageName.Buffer && entry->UniqueProcessId) {
-                std::wstring procName(entry->ImageName.Buffer,
-                    entry->ImageName.Length / sizeof(WCHAR));
+                // 提取进程名到 wchar_t 数组
+                WCHAR procName[MAX_PATH] = {};
+                SIZE_T nameLen = entry->ImageName.Length / sizeof(WCHAR);
+                if (nameLen >= MAX_PATH) nameLen = MAX_PATH - 1;
+                if (nameLen > 0) {
+                    memcpy(procName, entry->ImageName.Buffer, nameLen * sizeof(WCHAR));
+                }
 
-                // 不区分大小写匹配
-                std::wstring lowerName = procName;
-                std::wstring lowerTarget = targetName ? targetName : L"";
-                std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
-                std::transform(lowerTarget.begin(), lowerTarget.end(), lowerTarget.begin(), ::towlower);
+                // 手动转小写比较
+                WCHAR lowerName[MAX_PATH] = {};
+                wcscpy_s(lowerName, procName);
+                MakeLowerW(lowerName, wcslen(lowerName));
 
                 totalProcesses++;
                 // 记录前10个进程名和所有匹配的进程
-                if (totalProcesses <= 10 || lowerName.find(lowerTarget) != std::wstring::npos) {
+                if (totalProcesses <= 10 || (targetName && wcsstr(lowerName, lowerTarget))) {
                     ProcDiag("  PROC[%d]: PID=%u name='%ls'\n",
                         totalProcesses,
                         static_cast<DWORD>(reinterpret_cast<uintptr_t>(entry->UniqueProcessId)),
-                        procName.c_str());
+                        procName);
                 }
 
-                if (!targetName || lowerName.find(lowerTarget) != std::wstring::npos) {
-                    ProcessInfo info;
-                    info.pid = static_cast<DWORD>(reinterpret_cast<uintptr_t>(entry->UniqueProcessId));
-                    wcscpy_s(info.name, procName.c_str());
-                    info.handle = nullptr;
-                    results.push_back(info);
+                if (!targetName || wcsstr(lowerName, lowerTarget)) {
+                    if (count < maxResults) {
+                        ProcessInfo& info = outBuf[count];
+                        info.pid = static_cast<DWORD>(reinterpret_cast<uintptr_t>(entry->UniqueProcessId));
+                        wcscpy_s(info.name, procName);
+                        info.handle = nullptr;
+                        count++;
+                    }
                     matchedProcesses++;
                 }
             }
@@ -142,9 +164,15 @@ StealthProcess::EnumerateProcesses(const wchar_t* targetName) {
 
         ProcDiag("EnumerateProcesses(NtQSI): total=%d matched=%d\n",
             totalProcesses, matchedProcesses);
-        if (!results.empty()) return results;
+        VirtualFree(buffer, 0, MEM_RELEASE);
+        buffer = nullptr;
+        if (count > 0) return count;
         ProcDiag("EnumerateProcesses(NtQSI): no match, trying fallback...\n");
     } else {
+        if (buffer) {
+            VirtualFree(buffer, 0, MEM_RELEASE);
+            buffer = nullptr;
+        }
         ProcDiag("EnumerateProcesses(NtQSI): FAILED status=0x%08X, trying fallback...\n",
             (unsigned)status);
     }
@@ -156,7 +184,7 @@ StealthProcess::EnumerateProcesses(const wchar_t* targetName) {
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) {
         ProcDiag("  CreateToolhelp32Snapshot: FAILED err=%u\n", GetLastError());
-        return results;
+        return count;
     }
 
     PROCESSENTRY32W pe = { sizeof(pe) };
@@ -166,24 +194,26 @@ StealthProcess::EnumerateProcesses(const wchar_t* targetName) {
     if (Process32FirstW(hSnap, &pe)) {
         do {
             totalProcesses++;
-            std::wstring procName(pe.szExeFile);
-            std::wstring lowerName = procName;
-            std::wstring lowerTarget = targetName ? targetName : L"";
-            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
-            std::transform(lowerTarget.begin(), lowerTarget.end(), lowerTarget.begin(), ::towlower);
+
+            // 手动转小写比较
+            WCHAR lowerName[MAX_PATH] = {};
+            wcscpy_s(lowerName, pe.szExeFile);
+            MakeLowerW(lowerName, wcslen(lowerName));
 
             // 记录前10个进程名和所有匹配的
-            if (totalProcesses <= 10 || lowerName.find(lowerTarget) != std::wstring::npos) {
+            if (totalProcesses <= 10 || (targetName && wcsstr(lowerName, lowerTarget))) {
                 ProcDiag("  SNAP[%d]: PID=%u name='%ls'\n",
                     totalProcesses, pe.th32ProcessID, pe.szExeFile);
             }
 
-            if (!targetName || lowerName.find(lowerTarget) != std::wstring::npos) {
-                ProcessInfo info;
-                info.pid = pe.th32ProcessID;
-                wcscpy_s(info.name, pe.szExeFile);
-                info.handle = nullptr;
-                results.push_back(info);
+            if (!targetName || wcsstr(lowerName, lowerTarget)) {
+                if (count < maxResults) {
+                    ProcessInfo& info = outBuf[count];
+                    info.pid = pe.th32ProcessID;
+                    wcscpy_s(info.name, pe.szExeFile);
+                    info.handle = nullptr;
+                    count++;
+                }
                 matchedProcesses++;
             }
         } while (Process32NextW(hSnap, &pe));
@@ -192,7 +222,7 @@ StealthProcess::EnumerateProcesses(const wchar_t* targetName) {
     CloseHandle(hSnap);
     ProcDiag("EnumerateProcesses(SNAP): total=%d matched=%d\n",
         totalProcesses, matchedProcesses);
-    return results;
+    return count;
 }
 
 DWORD StealthProcess::FindProcessByWindow(const wchar_t* className, const wchar_t* windowName) {
@@ -256,8 +286,9 @@ HANDLE StealthProcess::DuplicateHandleFromLowRisk(DWORD pid) {
     // 规避: 从我们的进程直接 OpenProcess 的痕迹
 
     // 简化实现: 找 explorer.exe 作为中间进程
-    auto processes = EnumerateProcesses(L"explorer.exe");
-    if (processes.empty()) return nullptr;
+    ProcessInfo processes[16];
+    int procCount = EnumerateProcesses(L"explorer.exe", processes, 16);
+    if (procCount == 0) return nullptr;
 
     HANDLE hMediator = OpenProcess(PROCESS_DUP_HANDLE, FALSE, processes[0].pid);
     if (!hMediator) return nullptr;
@@ -302,17 +333,35 @@ bool StealthProcess::EnsureDebugPrivilegeSilent() {
     // 检查现有权限
     DWORD size = 0;
     GetTokenInformation(hToken, TokenPrivileges, nullptr, 0, &size);
-    std::vector<BYTE> buffer(size);
-    if (GetTokenInformation(hToken, TokenPrivileges, buffer.data(), size, &size)) {
-        auto* privileges = reinterpret_cast<TOKEN_PRIVILEGES*>(buffer.data());
+    if (size == 0) {
+        CloseHandle(hToken);
+        return false;
+    }
+
+    BYTE* buffer = (BYTE*)VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_READWRITE);
+    if (!buffer) {
+        CloseHandle(hToken);
+        return false;
+    }
+
+    bool alreadyHavePrivilege = false;
+    if (GetTokenInformation(hToken, TokenPrivileges, buffer, size, &size)) {
+        auto* privileges = reinterpret_cast<TOKEN_PRIVILEGES*>(buffer);
         for (DWORD i = 0; i < privileges->PrivilegeCount; i++) {
             if (privileges->Privileges[i].Luid.LowPart == luid.LowPart &&
                 privileges->Privileges[i].Luid.HighPart == luid.HighPart &&
                 (privileges->Privileges[i].Attributes & SE_PRIVILEGE_ENABLED)) {
-                CloseHandle(hToken);
-                return true; // 已有权限, 无需调用 AdjustTokenPrivileges
+                alreadyHavePrivilege = true;
+                break;
             }
         }
+    }
+
+    VirtualFree(buffer, 0, MEM_RELEASE);
+
+    if (alreadyHavePrivilege) {
+        CloseHandle(hToken);
+        return true; // 已有权限, 无需调用 AdjustTokenPrivileges
     }
 
     // 仅在确实需要时才调用 AdjustTokenPrivileges
@@ -350,9 +399,8 @@ bool StealthProcess::BypassPrivilegeCheck() {
     return false;
 }
 
-std::vector<StealthProcess::ModuleInfo>
-StealthProcess::GetProcessModules(HANDLE hProcess) {
-    std::vector<ModuleInfo> results;
+int StealthProcess::GetProcessModules(HANDLE hProcess, ModuleInfo* outBuf, int maxResults) {
+    int count = 0;
 
     // 使用 NtQueryInformationProcess 获取 PEB -> LDR
     // 规避 Module32First/Next
@@ -371,16 +419,17 @@ StealthProcess::GetProcessModules(HANDLE hProcess) {
     if (!NT_SUCCESS(status) || !pbi.PebBaseAddress) {
         // 回退: 使用 Module32First (仅当直接方法失败时)
         HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetProcessId(hProcess));
-        if (hSnap == INVALID_HANDLE_VALUE) return results;
+        if (hSnap == INVALID_HANDLE_VALUE) return 0;
 
         MODULEENTRY32W me32 = { sizeof(me32) };
         if (Module32FirstW(hSnap, &me32)) {
             do {
-                ModuleInfo info;
-                info.name = me32.szModule;
+                if (count >= maxResults) break;
+                ModuleInfo& info = outBuf[count];
+                wcscpy_s(info.name, me32.szModule);
                 info.baseAddress = reinterpret_cast<uintptr_t>(me32.modBaseAddr);
                 info.size = me32.modBaseSize;
-                results.push_back(info);
+                count++;
             } while (Module32NextW(hSnap, &me32));
         }
         CloseHandle(hSnap);
@@ -394,7 +443,7 @@ StealthProcess::GetProcessModules(HANDLE hProcess) {
             BYTE ldrBuf[0x40] = {};
             if (!NT_SUCCESS(SysReadVirtualMemory(hProcess, remotePeb.Ldr,
                 ldrBuf, sizeof(ldrBuf), &bytesRead, SyscallMethod::Indirect)))
-                return results;
+                return count;
 
             auto* headInLdr = reinterpret_cast<PLIST_ENTRY>(
                 reinterpret_cast<uintptr_t>(remotePeb.Ldr) + 0x10);
@@ -402,7 +451,7 @@ StealthProcess::GetProcessModules(HANDLE hProcess) {
             LIST_ENTRY headEntry = {};
             if (!NT_SUCCESS(SysReadVirtualMemory(hProcess, headInLdr,
                 &headEntry, sizeof(LIST_ENTRY), &bytesRead, SyscallMethod::Indirect)))
-                return results;
+                return count;
 
             LIST_ENTRY next = headEntry;
             int safety = 0;
@@ -419,20 +468,25 @@ StealthProcess::GetProcessModules(HANDLE hProcess) {
                     break;
 
                 if (entry.DllBase && entry.SizeOfImage) {
-                    ModuleInfo info;
+                    if (count >= maxResults) break;
+                    ModuleInfo& info = outBuf[count];
                     info.baseAddress = reinterpret_cast<uintptr_t>(entry.DllBase);
                     info.size = entry.SizeOfImage;
+                    info.name[0] = L'\0';
 
                     if (entry.BaseDllName.Buffer && entry.BaseDllName.Length > 0 &&
                         entry.BaseDllName.Length < MAX_PATH * 2) {
-                        std::vector<WCHAR> nameBuf(entry.BaseDllName.Length / 2 + 1);
+                        WCHAR nameBuf[260] = {};
+                        USHORT readLen = entry.BaseDllName.Length;
+                        if (readLen > (USHORT)(sizeof(nameBuf) - sizeof(WCHAR)))
+                            readLen = (USHORT)(sizeof(nameBuf) - sizeof(WCHAR));
                         if (NT_SUCCESS(SysReadVirtualMemory(hProcess, entry.BaseDllName.Buffer,
-                            nameBuf.data(), entry.BaseDllName.Length, &bytesRead,
+                            nameBuf, readLen, &bytesRead,
                             SyscallMethod::Indirect))) {
-                            info.name = nameBuf.data();
+                            wcscpy_s(info.name, nameBuf);
                         }
                     }
-                    results.push_back(info);
+                    count++;
                 }
 
                 if (!NT_SUCCESS(SysReadVirtualMemory(hProcess, next.Flink,
@@ -442,13 +496,14 @@ StealthProcess::GetProcessModules(HANDLE hProcess) {
         }
     }
 
-    return results;
+    return count;
 }
 
 bool StealthProcess::IsModuleLoaded(HANDLE hProcess, const wchar_t* moduleName) {
-    auto modules = GetProcessModules(hProcess);
-    for (auto& mod : modules) {
-        if (_wcsicmp(mod.name.c_str(), moduleName) == 0) {
+    ModuleInfo modules[256];
+    int modCount = GetProcessModules(hProcess, modules, 256);
+    for (int i = 0; i < modCount; i++) {
+        if (_wcsicmp(modules[i].name, moduleName) == 0) {
             return true;
         }
     }
@@ -520,30 +575,31 @@ bool StealthMemory::SetupShadowPage(HANDLE hProcess, uintptr_t targetAddr, SIZE_
 StealthMemory::TransactionalWrite::TransactionalWrite(
     HANDLE hProcess, uintptr_t addr, SIZE_T size)
     : m_process(hProcess), m_addr(addr), m_size(size) {
-    // 备份原始数据
-    m_original.resize(size);
-    StealthMemory::Read(hProcess, addr, m_original.data(), size);
+    // 备份原始数据 (固定数组, 最多 4096 字节)
+    if (size > 0 && size <= sizeof(m_original)) {
+        StealthMemory::Read(hProcess, addr, m_original, size);
+    }
 }
 
 StealthMemory::TransactionalWrite::~TransactionalWrite() {
-    if (!m_committed && !m_original.empty()) {
+    if (!m_committed && m_size > 0) {
         // 析构时自动恢复
         Rollback();
     }
 }
 
 bool StealthMemory::TransactionalWrite::Commit() {
-    if (m_modified.empty()) return false;
+    if (m_size == 0) return false;
 
-    bool ok = StealthMemory::Write(m_process, m_addr, m_modified.data(), m_size);
+    bool ok = StealthMemory::Write(m_process, m_addr, m_modified, m_size);
     if (ok) m_committed = true;
     return ok;
 }
 
 bool StealthMemory::TransactionalWrite::Rollback() {
-    if (m_original.empty()) return false;
+    if (m_size == 0) return false;
 
-    return StealthMemory::Write(m_process, m_addr, m_original.data(), m_size);
+    return StealthMemory::Write(m_process, m_addr, m_original, m_size);
 }
 
 bool StealthMemory::TransactionalWrite::IsVACScanning() {

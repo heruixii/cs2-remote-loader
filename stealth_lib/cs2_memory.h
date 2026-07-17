@@ -7,10 +7,6 @@
 
 #include "cs2_offsets.h"
 #include "stealth_core.h"
-#include <vector>
-#include <string>
-#include <unordered_map>
-#include <memory>
 #include <cstring>
 
 namespace cs2 {
@@ -44,12 +40,12 @@ struct Entity {
     Vector2   screenFeet;        // 脚部屏幕坐标
 
     // 名称
-    std::string name;
+    char name[64];
 
     // 武器
     uintptr_t weaponAddress;
     int       weaponId;
-    std::string weaponName;
+    char weaponName[32];
 
     // 距离
     float     distance;
@@ -78,7 +74,7 @@ public:
     ViewMatrix GetViewMatrix();
 
     // 实体迭代
-    std::vector<Entity> GetAllPlayers(bool onlyAlive = true);
+    int GetAllPlayers(Entity* outBuf, int maxEntities, bool onlyAlive = true);
 
     // 局部玩家
     Entity GetLocalPlayer();
@@ -90,7 +86,7 @@ public:
     bool WorldToScreen(const Vector3& world, Vector2& screen);
     template<typename T> T Read(uintptr_t addr);
     template<typename T> bool Write(uintptr_t addr, T value);
-    std::string ReadString(uintptr_t addr, size_t maxLen = 128);
+    void ReadString(uintptr_t addr, char* outBuf, size_t maxLen);
 
     // 配置
     const Offsets& GetOffsets() const { return m_offsets; }

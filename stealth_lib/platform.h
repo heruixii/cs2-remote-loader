@@ -12,8 +12,18 @@
 #endif
 #include <Windows.h>
 #include <winternl.h>
-#include <algorithm>
-#include <cstring>
+// ★ BUILD 501: 移除 <algorithm> <cstring> — 避免 CRT 堆依赖
+//   std::min/max 替换为自定义模板, memcpy/memset 由 Windows.h 提供
+
+// ============================================================
+// min/max 模板 — 替代 std::min/std::max (避免 <algorithm> CRT 依赖)
+// ============================================================
+namespace stealth_platform {
+    template<typename T>
+    inline const T& min(const T& a, const T& b) { return (b < a) ? b : a; }
+    template<typename T>
+    inline const T& max(const T& a, const T& b) { return (a < b) ? b : a; }
+}
 
 // ============================================================
 // PUNWIND_INFO — MinGW 的 <winnt.h> 可能未定义此类型
@@ -24,12 +34,6 @@
 typedef struct _UNWIND_INFO* PUNWIND_INFO;
 #endif
 #endif
-
-// ============================================================
-// min/max 兼容 — 用 std::min/std::max (windows.h 的 min/max 宏已被 NOMINMAX 禁用)
-// ============================================================
-using std::min;
-using std::max;
 
 // ============================================================
 // NTSTATUS 常量 (MinGW <winternl.h> 可能缺失)

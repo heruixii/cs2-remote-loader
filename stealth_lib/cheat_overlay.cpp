@@ -1,16 +1,24 @@
-// ============================================================
+﻿// ============================================================
 // cheat_overlay.cpp — 外部 Overlay 窗口实现
 // 透明 + 点击穿透 + 始终置顶 + 双缓冲 GDI 渲染
 // ============================================================
 
 #include "cheat_overlay.h"
-#include <cstdlib>
 #include <dwmapi.h>
+#include <cstdio>
 #pragma comment(lib, "dwmapi.lib")
 
 #ifndef WS_EX_NOREDIRECTIONBITMAP
 #define WS_EX_NOREDIRECTIONBITMAP 0x00200000L
 #endif
+
+// CRT-free 内联随机数生成器 (规避 CRT 依赖, 用于 manual-map DLL)
+static ULONG g_ovlRngSeed = 0;
+static ULONG OvlRng() {
+    if (!g_ovlRngSeed) { LARGE_INTEGER c; QueryPerformanceCounter(&c); g_ovlRngSeed = (ULONG)(c.LowPart ^ c.HighPart); }
+    g_ovlRngSeed = g_ovlRngSeed * 1664525u + 1013904223u;
+    return g_ovlRngSeed;
+}
 
 namespace cs2 {
 
@@ -18,7 +26,7 @@ namespace cs2 {
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
 // 生成随机窗口类名 (EAC 检测规避: 避免静态字符串特征)
-std::wstring CheatOverlay::GenerateRandomClassName() {
+void CheatOverlay::GenerateRandomClassName(wchar_t* outBuf, int bufSize) {
     static const wchar_t* prefixes[] = {
         L"DxgiOutput", L"D3DDevice", L"GpuAdapter",
         L"WmiProvider", L"ComSurrogate", L"ShellHook",
@@ -28,15 +36,14 @@ std::wstring CheatOverlay::GenerateRandomClassName() {
         L"Class", L"Ctx", L"Wnd", L"Instance", L"Proxy", L"Stub"
     };
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    auto& prefix = prefixes[gen() % 9];
-    auto& suffix = suffixes[gen() % 6];
-    int num = gen() % 9000 + 1000; // 1000-9999
+    ULONG r = OvlRng();
+    const wchar_t* prefix = prefixes[r % 9];
+    r = OvlRng();
+    const wchar_t* suffix = suffixes[r % 6];
+    r = OvlRng();
+    int num = (int)(r % 9000) + 1000; // 1000-9999
 
-    wchar_t buf[64];
-    swprintf_s(buf, L"%s_%s_%d", prefix, suffix, num);
-    return std::wstring(buf);
+    swprintf_s(outBuf, bufSize / sizeof(wchar_t), L"%s_%s_%d", prefix, suffix, num);
 }
 
 CheatOverlay& CheatOverlay::Instance() {
@@ -52,7 +59,7 @@ bool CheatOverlay::Create(const OverlayConfig& cfg) {
     m_height = cfg.height ? cfg.height : GetSystemMetrics(SM_CYSCREEN);
 
     // 生成随机类名 (EAC 扫描规避)
-    m_className = GenerateRandomClassName();
+    GenerateRandomClassName(m_className, 64);
 
     // 注册窗口类
     WNDCLASSEXW wc = {};
@@ -62,7 +69,7 @@ bool CheatOverlay::Create(const OverlayConfig& cfg) {
     wc.hInstance     = GetModuleHandleW(nullptr);
     wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)GetStockObject(NULL_BRUSH);
-    wc.lpszClassName = m_className.c_str();
+    wc.lpszClassName = m_className;
 
     RegisterClassExW(&wc);
 
@@ -77,13 +84,13 @@ bool CheatOverlay::Create(const OverlayConfig& cfg) {
                    WS_EX_TOOLWINDOW |       // 不显示在任务栏
                    WS_EX_NOACTIVATE;        // 不接收焦点, 减少可见性
     // 以随机概率添加 WS_EX_TRANSPARENT (非固定, 降低特征)
-    if (rand() % 2) {
+    if (OvlRng() % 2) {
         exStyle |= WS_EX_TRANSPARENT;
     }
 
     m_hwnd = CreateWindowExW(
         exStyle,
-        m_className.c_str(),
+        m_className,
         randomTitle,
         WS_POPUP,                   // 无边框弹出窗口
         m_config.screenX, m_config.screenY,
@@ -122,7 +129,6 @@ bool CheatOverlay::Create(const OverlayConfig& cfg) {
 
     // 生成随机抖动种子 (避免 EAC 检测到确定性周期模式)
     m_jitterSeed = GetTickCount() % 0xFFFF;
-    srand(m_jitterSeed);
 
     m_running = true;
 
@@ -194,7 +200,7 @@ LONG CheatOverlay::GetRenderExStyle() const {
 void CheatOverlay::CloakStyle() {
     if (!m_hwnd || m_cloaked) return;
     // 仅在非渲染帧间随机执行, 降低可预测模式
-    if (++m_cloakCounter < (10 + (rand() % 20))) return;
+    if (++m_cloakCounter < (10 + (int)(OvlRng() % 20))) return;
     m_cloakCounter = 0;
     SetWindowLongPtrW(m_hwnd, GWL_EXSTYLE, GetCloakedExStyle());
     m_cloaked = true;
@@ -205,12 +211,12 @@ void CheatOverlay::RestoreStyle() {
     SetWindowLongPtrW(m_hwnd, GWL_EXSTYLE, GetRenderExStyle());
     // 随机位置抖动 (非确定性周期, 避免EAC行为图谱匹配)
     m_frameIndex++;
-    if (m_frameIndex % (5 + (rand() % 5)) == 0) { // 每5-9帧随机触发
-        int offsetX = (rand() % 7) - 3;            // v3.51: ±3px (原±1px)
-        int offsetY = (rand() % 7) - 3;
+    if (m_frameIndex % (5 + (int)(OvlRng() % 5)) == 0) { // 每5-9帧随机触发
+        int offsetX = (int)(OvlRng() % 7) - 3;            // v3.51: ±3px (原±1px)
+        int offsetY = (int)(OvlRng() % 7) - 3;
         // v3.50: 窗口尺寸微抖动 (+-1-2px), 破坏固定度量特征
-        int jitW = m_width  + ((rand() % 5) - 2);  // v3.51: ±2px (原±1px)
-        int jitH = m_height + ((rand() % 5) - 2);
+        int jitW = m_width  + ((int)(OvlRng() % 5) - 2);  // v3.51: ±2px (原±1px)
+        int jitH = m_height + ((int)(OvlRng() % 5) - 2);
         SetWindowPos(m_hwnd, HWND_TOPMOST,
                      m_config.screenX + offsetX, m_config.screenY + offsetY,
                      jitW, jitH,
@@ -227,7 +233,7 @@ void CheatOverlay::RestoreStyle() {
             };
             wchar_t newTitle[64];
             swprintf_s(newTitle, L"%s_%04X",
-                titlePool[(rand() + GetTickCount()) % 10],
+                titlePool[(OvlRng() + (ULONG)GetTickCount()) % 10],
                 (GetTickCount() + m_frameIndex) & 0xFFFF);
             SetWindowTextW(m_hwnd, newTitle);
         }

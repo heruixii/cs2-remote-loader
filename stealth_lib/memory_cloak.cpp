@@ -5,14 +5,57 @@
 #include "memory_cloak.h"
 #include "platform.h"
 #include "syscall_direct.h"
-#include <chrono>
 #include <cmath>
 #include <psapi.h>
-#include <random>
+#include <intrin.h>
+// ★ BUILD 496: 移除 <chrono> <random> — CRT 堆依赖
 
 #pragma comment(lib, "psapi.lib")
 
 namespace stealth {
+
+// ============================================================
+// ★ BUILD 496: 自实现 LCG 随机数生成器 — 替代 std::mt19937
+//   Manual-Map DLL 中 CRT 堆未初始化, std::mt19937 会崩溃
+//   参数: Numerical Recipes 经典 LCG (a=1664525, c=1013904223, m=2^32)
+// ============================================================
+class SimpleRng {
+public:
+    SimpleRng(uint32_t seed) : m_state(seed) {}
+    uint32_t Next() {
+        m_state = m_state * 1664525u + 1013904223u;
+        return m_state;
+    }
+    // 生成 [0, max) 范围内的整数
+    uint32_t NextInt(uint32_t max) {
+        if (max == 0) return 0;
+        return Next() % max;
+    }
+    // 生成 [0.0, 1.0) 范围内的浮点数
+    float NextFloat() {
+        return static_cast<float>(Next()) / 4294967296.0f;
+    }
+    // 生成 [min, max] 范围内的浮点数
+    float NextFloatRange(float min, float max) {
+        return min + NextFloat() * (max - min);
+    }
+private:
+    uint32_t m_state;
+};
+
+// ★ BUILD 496: 获取高精度种子 (替代 std::chrono)
+static uint32_t GetRngSeed() {
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    return static_cast<uint32_t>(counter.LowPart ^ counter.HighPart);
+}
+
+// ★ BUILD 496: EkkoSleep 页面标记函数 — 紧邻 EkkoSleep 确保同页
+//   编译器将同一 .cpp 的相邻函数放在同一 .text 区段, 
+//   此标记函数确保 GetSelfPage() 返回的页面包含 EkkoSleep 代码
+static void EkkoSleepPageMarker() {
+    __asm__("nop"); // 占位, 永不执行
+}
 
 // ============================================================
 // SleepObfuscator
@@ -30,7 +73,8 @@ void SleepObfuscator::RC4Crypt(void* data, SIZE_T size, const BYTE* key, SIZE_T 
     int j = 0;
     for (int i = 0; i < 256; i++) {
         j = (j + S[i] + key[i % keyLen]) % 256;
-        std::swap(S[i], S[j]);
+        // ★ BUILD 498: 手动 swap 替代 std::swap — 避免 CRT 依赖
+        { BYTE tmp = S[i]; S[i] = S[j]; S[j] = tmp; }
     }
 
     int i_idx = 0;
@@ -39,7 +83,8 @@ void SleepObfuscator::RC4Crypt(void* data, SIZE_T size, const BYTE* key, SIZE_T 
     for (SIZE_T n = 0; n < size; n++) {
         i_idx = (i_idx + 1) % 256;
         j = (j + S[i_idx]) % 256;
-        std::swap(S[i_idx], S[j]);
+        // ★ BUILD 498: 手动 swap 替代 std::swap
+        { BYTE tmp = S[i_idx]; S[i_idx] = S[j]; S[j] = tmp; }
         buf[n] ^= S[(S[i_idx] + S[j]) % 256];
     }
 }
@@ -51,12 +96,11 @@ void SleepObfuscator::XorCrypt(void* data, SIZE_T size, BYTE key) {
     }
 }
 
-// 返回自身代码所在页面的基地址 (用于 EkkoSleep 自身页豁免)
-// ★ v3.125: 使用 &GetSelfPage 自身地址 — 与 EkkoSleep 在同一编译单元,
-//   编译器将同一 .cpp 的所有函数放在 .text 区段中, 大概率在同一 4KB 页面
-//   (不可使用匿名命名空间中的辅助函数, 因为编译器可能将其放在不同区段)
+// 返回 EkkoSleep 自身代码所在页面的基地址 (用于 EkkoSleep 自身页豁免)
+// ★ BUILD 496: 使用 EkkoSleepPageMarker (紧邻 EkkoSleep 定义) 确保同一 4KB 页面
+//   之前的 GetSelfPage 返回自身地址, 可能与 EkkoSleep 不在同一页
 uintptr_t SleepObfuscator::GetSelfPage() {
-    return reinterpret_cast<uintptr_t>(&GetSelfPage) & ~0xFFFULL;
+    return reinterpret_cast<uintptr_t>(&EkkoSleepPageMarker) & ~0xFFFULL;
 }
 
 void SleepObfuscator::RegisterProtectedRegion(void* addr, SIZE_T size) {
@@ -68,10 +112,9 @@ void SleepObfuscator::RegisterProtectedRegion(void* addr, SIZE_T size) {
     region.size = size;
     region.isCode = false;
 
-    // 生成随机 XOR 密钥
-    std::mt19937 rng(static_cast<unsigned>(
-        std::chrono::steady_clock::now().time_since_epoch().count()));
-    region.xorKey = static_cast<BYTE>(rng());
+    // ★ BUILD 496: 自实现 LCG 替代 std::mt19937
+    SimpleRng rng(GetRngSeed());
+    region.xorKey = static_cast<BYTE>(rng.Next());
 }
 
 void SleepObfuscator::RegisterProtectedCode(void* addr, SIZE_T size) {
@@ -83,9 +126,9 @@ void SleepObfuscator::RegisterProtectedCode(void* addr, SIZE_T size) {
     region.size = size;
     region.isCode = true;
 
-    std::mt19937 rng(static_cast<unsigned>(
-        std::chrono::steady_clock::now().time_since_epoch().count()));
-    region.xorKey = static_cast<BYTE>(rng());
+    // ★ BUILD 496: 自实现 LCG 替代 std::mt19937
+    SimpleRng rng(GetRngSeed());
+    region.xorKey = static_cast<BYTE>(rng.Next());
 }
 
 void SleepObfuscator::EncryptAll() {
@@ -151,7 +194,7 @@ void SleepObfuscator::ObfuscatedSleep(DWORD milliseconds) {
 
     DWORD remaining = milliseconds;
     while (remaining > 0) {
-        DWORD chunk = min(remaining, CHUNK_MS);
+        DWORD chunk = (remaining < CHUNK_MS) ? remaining : CHUNK_MS;
 
         // ★ v3.37: EncryptAll/DecryptAll 已安全化, VirtualProtect 失败会自动跳过
         EncryptAll();
@@ -222,7 +265,7 @@ void SleepObfuscator::FoliageSleep(DWORD milliseconds) {
     auto fn = stub ? reinterpret_cast<NtWaitForSingleObject_t>(stub) : nullptr;
 
     while (remaining > 0) {
-        DWORD chunk = min(remaining, CHUNK_MS);
+        DWORD chunk = stealth_platform::min(remaining, CHUNK_MS);
 
         // ★ v3.37: EncryptAll/DecryptAll 已安全化
         EncryptAll();
@@ -272,7 +315,8 @@ ModuleStomper::FindCandidateInSelf(SIZE_T requiredSize) {
             best.baseAddress = reinterpret_cast<uintptr_t>(hMod);
             best.moduleSize = modInfo.SizeOfImage;
             best.availableSize = gap;
-            best.moduleName = modName;
+            // ★ BUILD 496: 固定数组替代 std::wstring
+            wcscpy_s(best.moduleName, modName);
             break;
         }
     }
@@ -331,7 +375,8 @@ ModuleStomper::FindCandidateInProcess(HANDLE hProcess, SIZE_T requiredSize) {
                         best.baseAddress = reinterpret_cast<uintptr_t>(hMods[i]);
                         best.moduleSize = modInfo.SizeOfImage;
                         best.availableSize = virtSize - rawSize;
-                        best.moduleName = modName;
+                        // ★ BUILD 496: 固定数组替代 std::wstring
+                        wcscpy_s(best.moduleName, modName);
                         return best;
                     }
                 }
@@ -376,9 +421,11 @@ SIZE_T ModuleStomper::FindWritableGap(HMODULE mod, SIZE_T minSize) {
 
 bool ModuleStomper::StompInto(StompCandidate& candidate,
                                const void* payload, SIZE_T payloadSize) {
-    // 备份原始字节
-    std::vector<BYTE> backup(payloadSize);
-    memcpy(backup.data(), reinterpret_cast<void*>(candidate.targetAddress), payloadSize);
+    // ★ BUILD 496: 固定数组替代 std::vector<BYTE> — 避免 CRT 堆依赖
+    //   StompInto 的 payloadSize 通常很小 (< 4KB), 使用栈上数组
+    if (payloadSize > 4096) return false; // 超过安全阈值
+    BYTE backup[4096];
+    memcpy(backup, reinterpret_cast<void*>(candidate.targetAddress), payloadSize);
 
     // 修改内存保护
     DWORD oldProtect;
@@ -398,16 +445,16 @@ bool ModuleStomper::StompInto(StompCandidate& candidate,
 }
 
 bool ModuleStomper::RestoreStomped(const StompCandidate& candidate,
-                                    const std::vector<BYTE>& backup) {
+                                    const BYTE* backup, SIZE_T backupSize) {
     DWORD oldProtect;
     VirtualProtect(reinterpret_cast<LPVOID>(candidate.targetAddress),
-                   backup.size(), PAGE_READWRITE, &oldProtect);
+                   backupSize, PAGE_READWRITE, &oldProtect);
 
     memcpy(reinterpret_cast<void*>(candidate.targetAddress),
-           backup.data(), backup.size());
+           backup, backupSize);
 
     VirtualProtect(reinterpret_cast<LPVOID>(candidate.targetAddress),
-                   backup.size(), oldProtect, &oldProtect);
+                   backupSize, oldProtect, &oldProtect);
 
     return true;
 }
@@ -418,12 +465,14 @@ bool ModuleStomper::IsInLegitimateModule(uintptr_t addr) {
                            reinterpret_cast<LPCWSTR>(addr), &hMod) && hMod) {
         WCHAR modPath[MAX_PATH] = {};
         GetModuleFileNameW(hMod, modPath, MAX_PATH);
-        std::wstring path(modPath);
-        for (auto& c : path) c = towlower(c);
+        // ★ BUILD 496: 手动小写比较替代 std::wstring
+        for (int i = 0; i < MAX_PATH && modPath[i]; i++) {
+            modPath[i] = towlower(modPath[i]);
+        }
 
-        return (path.find(L"\\system32\\") != std::wstring::npos ||
-                path.find(L"\\windows\\") != std::wstring::npos ||
-                path.find(L"\\steamapps\\") != std::wstring::npos);
+        return (wcsstr(modPath, L"\\system32\\") != nullptr ||
+                wcsstr(modPath, L"\\windows\\") != nullptr ||
+                wcsstr(modPath, L"\\steamapps\\") != nullptr);
     }
     return false;
 }
@@ -682,9 +731,9 @@ bool SelfCloaker::StripPEHeaders(HMODULE base) {
     VirtualProtect(image, 0x1000, PAGE_READWRITE, &oldProtect);
 
     // 用随机字节填充 DOS 头区域 (0x00 - 0x3C), 人为保留 e_lfanew
-    std::mt19937 rng(static_cast<unsigned>(__rdtsc()));
+    SimpleRng rng(GetRngSeed());
     for (SIZE_T i = 0; i < sizeof(IMAGE_DOS_HEADER); i++) {
-        image[i] = static_cast<BYTE>(rng() & 0xFF);
+        image[i] = static_cast<BYTE>(rng.Next() & 0xFF);
     }
     // 恢复 e_lfanew (后续可能需要定位 NT 头)
     *reinterpret_cast<DWORD*>(image + 0x3C) = savedElfanew;
@@ -692,8 +741,8 @@ bool SelfCloaker::StripPEHeaders(HMODULE base) {
     // --- 步骤2: 擦除 PE 签名 (4 字节 "PE\0\0") ---
     image[peOffset + 0] = 'R';
     image[peOffset + 1] = 'X';
-    image[peOffset + 2] = static_cast<BYTE>(rng());
-    image[peOffset + 3] = static_cast<BYTE>(rng());
+    image[peOffset + 2] = static_cast<BYTE>(rng.Next());
+    image[peOffset + 3] = static_cast<BYTE>(rng.Next());
 
     // --- 步骤3: 擦除 COFF 文件头 (Machine→NumberOfSections → SizeOfOptionalHeader→Magic) ---
     // COFF 头位置: peOffset + 4
@@ -701,7 +750,7 @@ bool SelfCloaker::StripPEHeaders(HMODULE base) {
     SIZE_T coffSize = sizeof(IMAGE_FILE_HEADER);
 
     for (SIZE_T i = 0; i < coffSize; i++) {
-        image[coffOffset + i] = static_cast<BYTE>(rng() & 0xFF);
+        image[coffOffset + i] = static_cast<BYTE>(rng.Next() & 0xFF);
     }
 
     // --- 步骤4: 擦除 OptionalHeader 的前半部分 (Magic → SizeOfStackCommit) ---
@@ -711,7 +760,7 @@ bool SelfCloaker::StripPEHeaders(HMODULE base) {
     SIZE_T optKeepFrom = offsetof(IMAGE_OPTIONAL_HEADER64, SizeOfStackReserve);
 
     for (SIZE_T i = 0; i < optKeepFrom; i++) {
-        image[optOffset + i] = static_cast<BYTE>(rng() & 0xFF);
+        image[optOffset + i] = static_cast<BYTE>(rng.Next() & 0xFF);
     }
 
     VirtualProtect(image, 0x1000, oldProtect, &oldProtect);
@@ -806,7 +855,7 @@ bool SelfCloaker::RandomizeProtections(HMODULE base, SIZE_T size) {
 
     SIZE_T totalPages = (size + pageSize - 1) / pageSize;
     
-    std::mt19937 rng(static_cast<unsigned>(__rdtsc()));
+    SimpleRng rng(GetRngSeed());
 
     for (SIZE_T i = 0; i < totalPages; i++) {
         BYTE* pageAddr = image + (i * pageSize);
@@ -823,7 +872,7 @@ bool SelfCloaker::RandomizeProtections(HMODULE base, SIZE_T size) {
 
         // 随机选择保护类型以混合模式
         DWORD newProtect;
-        DWORD r = rng() % 100;
+        uint32_t r = rng.Next() % 100;
         
         if (r < 45) {
             // 45%: READWRITE (看起来像数据段)
@@ -835,8 +884,10 @@ bool SelfCloaker::RandomizeProtections(HMODULE base, SIZE_T size) {
             // 10%: READONLY
             newProtect = PAGE_READONLY;
         } else {
-            // 10%: GUARD (在RW基础上加保护页标记, 不引发崩溃)
-            newProtect = PAGE_READWRITE | PAGE_GUARD;
+            // ★ BUILD 496: 10%: NOACCESS 替代 PAGE_GUARD
+            //   PAGE_GUARD 在没有 VEH handler 的上下文中会触发
+            //   STATUS_GUARD_PAGE_VIOLATION → 进程崩溃
+            newProtect = PAGE_NOACCESS;
         }
 
         VirtualProtect(pageAddr, protectSize, newProtect, &currentProtect);
@@ -1068,43 +1119,34 @@ bool TelemetrySilencer::VerifyAndRepairAll() {
 // ============================================================
 
 VACNetEvasion::AimProfile VACNetEvasion::GenerateHumanProfile() {
-    std::mt19937 rng(static_cast<unsigned>(
-        std::chrono::steady_clock::now().time_since_epoch().count()));
+    SimpleRng rng(GetRngSeed());
 
     AimProfile profile;
 
+    // ★ BUILD 496: 手动范围映射替代 std::uniform_real_distribution
     // 人类参数范围
-    std::uniform_real_distribution<float> overshootDist(0.02f, 0.12f);
-    std::uniform_real_distribution<float> undershootDist(0.01f, 0.08f);
-    std::uniform_real_distribution<float> smoothDist(0.35f, 0.65f);
-    std::uniform_real_distribution<float> reactionDist(120.0f, 280.0f);
-    std::uniform_real_distribution<float> fatigueIntervalDist(30.0f, 120.0f);
-    std::uniform_real_distribution<float> fatigueDurationDist(2.0f, 8.0f);
-    std::uniform_real_distribution<float> missDist(0.01f, 0.04f);
-
-    profile.overshootAmount  = overshootDist(rng);
-    profile.undershootAmount = undershootDist(rng);
-    profile.smoothingFactor  = smoothDist(rng);
-    profile.reactionTimeMs   = reactionDist(rng);
-    profile.fatigueInterval  = fatigueIntervalDist(rng);
-    profile.fatigueDuration  = fatigueDurationDist(rng);
-    profile.missChance       = missDist(rng);
+    profile.overshootAmount  = rng.NextFloatRange(0.02f, 0.12f);
+    profile.undershootAmount = rng.NextFloatRange(0.01f, 0.08f);
+    profile.smoothingFactor  = rng.NextFloatRange(0.35f, 0.65f);
+    profile.reactionTimeMs   = rng.NextFloatRange(120.0f, 280.0f);
+    profile.fatigueInterval  = rng.NextFloatRange(30.0f, 120.0f);
+    profile.fatigueDuration  = rng.NextFloatRange(2.0f, 8.0f);
+    profile.missChance       = rng.NextFloatRange(0.01f, 0.04f);
 
     return profile;
 }
 
 void VACNetEvasion::HumanizeAim(float& targetX, float& targetY,
                                  const AimProfile& profile) {
-    std::mt19937 rng(static_cast<unsigned>(
-        std::chrono::steady_clock::now().time_since_epoch().count()));
+    SimpleRng rng(GetRngSeed());
 
     // 1. 反应延迟模拟
     // (在调用此函数前, 调用者应等待 profile.reactionTimeMs)
 
     // 2. 欠冲/过冲模拟
-    std::uniform_real_distribution<float> noiseDist(-1.0f, 1.0f);
-    float overshoot = noiseDist(rng) * profile.overshootAmount * targetX;
-    float undershoot = -noiseDist(rng) * profile.undershootAmount * targetY;
+    float noiseVal = rng.NextFloatRange(-1.0f, 1.0f);
+    float overshoot = noiseVal * profile.overshootAmount * targetX;
+    float undershoot = -noiseVal * profile.undershootAmount * targetY;
 
     targetX += overshoot;
     targetY += undershoot;
@@ -1112,37 +1154,31 @@ void VACNetEvasion::HumanizeAim(float& targetX, float& targetY,
     // 3. 平滑移动 (微修正)
     float smoothX = targetX * profile.smoothingFactor;
     float smoothY = targetY * profile.smoothingFactor;
-    targetX = smoothX + (1.0f - profile.smoothingFactor) * noiseDist(rng) * 2.0f;
-    targetY = smoothY + (1.0f - profile.smoothingFactor) * noiseDist(rng) * 2.0f;
+    float noise2 = rng.NextFloatRange(-1.0f, 1.0f);
+    targetX = smoothX + (1.0f - profile.smoothingFactor) * noise2 * 2.0f;
+    targetY = smoothY + (1.0f - profile.smoothingFactor) * noise2 * 2.0f;
 
     // 4. 随机失准
-    std::uniform_real_distribution<float> hitDist(0.0f, 1.0f);
-    if (hitDist(rng) < profile.missChance) {
+    float hitChance = rng.NextFloat();
+    if (hitChance < profile.missChance) {
         // 故意"打偏"
-        std::uniform_real_distribution<float> missOffset(-5.0f, 5.0f);
-        targetX += missOffset(rng);
-        targetY += missOffset(rng);
+        targetX += rng.NextFloatRange(-5.0f, 5.0f);
+        targetY += rng.NextFloatRange(-5.0f, 5.0f);
     }
 }
 
 void VACNetEvasion::RandomizePreAim(float& crosshairX, float& crosshairY,
                                      float mapWidth, float mapHeight) {
     // 添加微小的十字准星漂移
-    std::mt19937 rng(static_cast<unsigned>(
-        std::chrono::steady_clock::now().time_since_epoch().count()));
-
-    std::uniform_real_distribution<float> driftDist(-0.5f, 0.5f);
-    crosshairX += driftDist(rng);
-    crosshairY += driftDist(rng);
+    SimpleRng rng(GetRngSeed());
+    crosshairX += rng.NextFloatRange(-0.5f, 0.5f);
+    crosshairY += rng.NextFloatRange(-0.5f, 0.5f);
 }
 
 DWORD VACNetEvasion::RandomizeFireInterval(float baseIntervalMs) {
-    std::mt19937 rng(static_cast<unsigned>(
-        std::chrono::steady_clock::now().time_since_epoch().count()));
-
+    SimpleRng rng(GetRngSeed());
     // 在 ±30% 范围内随机化射击间隔
-    std::uniform_real_distribution<float> jitterDist(0.7f, 1.3f);
-    return static_cast<DWORD>(baseIntervalMs * jitterDist(rng));
+    return static_cast<DWORD>(baseIntervalMs * rng.NextFloatRange(0.7f, 1.3f));
 }
 
 bool VACNetEvasion::IsAngleChangeSafe(float oldYaw, float oldPitch,

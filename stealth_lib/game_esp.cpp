@@ -1,4 +1,4 @@
-// ============================================================
+﻿// ============================================================
 // game_esp.cpp — ESP 渲染实现
 // 方框 / 血条 / 玩家名 / 距离 / 武器 / 瞄准线
 // ============================================================
@@ -15,7 +15,7 @@ ESP& ESP::Instance() {
     return inst;
 }
 
-void ESP::Render(const Entity& local, const std::vector<Entity>& players) {
+void ESP::Render(const Entity& local, const Entity* players, int playerCount) {
     auto& overlay = CheatOverlay::Instance();
     HDC dc = overlay.GetBackDC();
     if (!dc) return;
@@ -25,7 +25,8 @@ void ESP::Render(const Entity& local, const std::vector<Entity>& players) {
     // AA 质量
     SetBkMode(dc, TRANSPARENT);
 
-    for (const auto& ent : players) {
+    for (int i = 0; i < playerCount; i++) {
+        const Entity& ent = players[i];
         if (!ent.isAlive || ent.isDormant) continue;
         if (ent.screenFeet.y < 0 || ent.screenHead.y < 0) continue;
         if (ent.boxHeight < 5.0f) continue;
@@ -96,19 +97,22 @@ void ESP::DrawHealthBar(HDC dc, const Entity& ent) {
 }
 
 void ESP::DrawName(HDC dc, const Entity& ent, COLORREF color) {
-    if (ent.name.empty()) return;
+    if (ent.name[0] == '\0') return;
 
-    std::string displayName = ent.name;
+    const char* displayName = ent.name;
     // 限制名称长度
-    if (displayName.length() > 16) {
-        displayName = displayName.substr(0, 15) + "...";
+    char displayBuf[20] = {};
+    if (strlen(displayName) > 16) {
+        strncpy_s(displayBuf, displayName, 15);
+        strcat_s(displayBuf, "...");
+        displayName = displayBuf;
     }
 
     SetTextColor(dc, color);
     float x = ent.screenHead.x + ent.boxWidth / 2 + 4;
     float y = ent.screenHead.y - 2;
 
-    TextOutA(dc, (int)x, (int)y, displayName.c_str(), (int)displayName.length());
+    TextOutA(dc, (int)x, (int)y, displayName, (int)strlen(displayName));
 }
 
 void ESP::DrawDistance(HDC dc, const Entity& ent, COLORREF color) {

@@ -20,8 +20,6 @@
 
 #include <Windows.h>
 #include <cstdint>
-#include <vector>
-#include <string>
 #include "platform.h"
 
 namespace stealth {
@@ -39,8 +37,9 @@ enum class DebugCheckResult {
 
 struct DebugDetectionReport {
     bool isBeingDebugged = false;
-    std::string triggerReason;
-    std::vector<std::string> allTriggers;
+    char triggerReason[256];
+    char allTriggers[32][128];
+    int allTriggerCount = 0;
 };
 
 // ============================================================
@@ -123,7 +122,7 @@ private:
     static NTSTATUS QueryProcessInfo(ULONG infoClass, PVOID buffer, ULONG size);
 
     // 辅助: 获取所有线程 ID
-    static std::vector<DWORD> EnumerateAllThreads();
+    static int EnumerateAllThreads(DWORD* outBuf, int maxThreads);
 };
 
 // ============================================================

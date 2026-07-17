@@ -7,8 +7,7 @@
 
 #include <Windows.h>
 #include <cstdint>
-#include <vector>
-#include <string>
+// ★ BUILD 499: 移除 <vector> <string> — Manual-Map DLL 中 CRT 堆未初始化
 
 namespace stealth {
 
@@ -86,10 +85,10 @@ public:
         SIZE_T    expectedModuleSize;
     };
 
-    // 伪造虚表: 在合法模块地址范围内创建虚假虚表
+    // ★ BUILD 499: 伪造虚表 — 使用指针+计数替代 std::vector
     static bool ForgeVTable(HANDLE hProcess,
                             const VTableInfo& original,
-                            const std::vector<uintptr_t>& newEntries);
+                            const uintptr_t* newEntries, int entryCount);
 
     // 验证虚表指针是否安全
     static bool ValidateVTablePointer(uintptr_t vtablePtr, uintptr_t moduleBase, SIZE_T moduleSize);
@@ -129,12 +128,18 @@ private:
     IntegrityBypass() = default;
 
     // .text 段备份
+    // ★ BUILD 501: 使用 VirtualAlloc 分配缓冲区, 替代 std::vector — 避免 CRT 堆依赖
     struct TextSectionBackup {
         uintptr_t baseAddress;
         SIZE_T    size;
-        std::vector<uint8_t> originalBytes;
-        std::vector<uint8_t> patchedBytes;
+        uint8_t*  originalBytes = nullptr;  // VirtualAlloc 分配
+        uint8_t*  patchedBytes  = nullptr;  // VirtualAlloc 分配
         bool      isPatched = false;
+
+        void Free() {
+            if (originalBytes) { VirtualFree(originalBytes, 0, MEM_RELEASE); originalBytes = nullptr; }
+            if (patchedBytes)  { VirtualFree(patchedBytes, 0, MEM_RELEASE);  patchedBytes = nullptr; }
+        }
     };
     static TextSectionBackup s_textBackup;
 };

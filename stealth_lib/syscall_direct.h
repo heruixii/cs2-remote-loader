@@ -15,7 +15,7 @@
 #include <Windows.h>
 #include <winternl.h>
 #include <cstdint>
-#include <vector>
+// ★ BUILD 496: 移除 <vector> — Manual-Map DLL 中 CRT 堆未初始化
 
 namespace stealth {
 
@@ -139,7 +139,7 @@ public:
     const CallStackSpoofContext& GetContext() const { return m_context; }
 
     // 获取已缓存的 Fat Frame 数量
-    size_t GetFatFrameCount() const { return m_fatFrames.size(); }
+    int GetFatFrameCount() const { return m_fatFrameCount; }
 
 private:
     CallStackSpoofer() = default;
@@ -147,8 +147,11 @@ private:
     // 解析 .pdata 获取函数栈大小
     SIZE_T GetFunctionStackSize(uintptr_t funcAddr);
 
+    // ★ BUILD 496: 固定数组替代 std::vector — 避免 CRT 堆依赖
+    static constexpr int MAX_FAT_FRAMES = 64;
     CallStackSpoofContext m_context = {};
-    std::vector<CallStackSpoofContext> m_fatFrames;
+    CallStackSpoofContext m_fatFrames[MAX_FAT_FRAMES];
+    int m_fatFrameCount = 0;
     bool m_initialized = false;
 };
 
@@ -157,8 +160,11 @@ private:
 // 用于构造多层伪造调用栈 (ret-sled)
 // RtlVirtualUnwind 回溯时将看到 ntdll→kernel32→user32 的合法调用链
 // ============================================================
-std::vector<uintptr_t> GetRetGadgets(size_t count = 32);
-bool FindRetGadgets(std::vector<uintptr_t>& outGadgets, size_t targetCount = 32);
+// ★ BUILD 496: 固定数组替代 std::vector — 避免 CRT 堆依赖
+static constexpr int MAX_RET_GADGETS = 64;
+bool FindRetGadgets(uintptr_t* outGadgets, int* outCount, int targetCount = 32);
+// 便捷函数: 返回缓存的 gadget 数量
+int GetRetGadgetCount();
 
 // ============================================================
 // Tartarus Gate — NtContinue 驱动的 syscall

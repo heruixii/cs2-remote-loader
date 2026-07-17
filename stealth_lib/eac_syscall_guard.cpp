@@ -17,78 +17,107 @@ bool HandleACLGuard::LockHandle(HANDLE hProcess) {
     if (!hProcess || hProcess == INVALID_HANDLE_VALUE)
         return false;
 
-    // 1. 获取当前进程的 SID (安全标识符)
+    // ★ BUILD 501: 所有变量前置声明, 避免 goto 跨初始化
+    typedef NTSTATUS(NTAPI* NtSetSecurityObject_t)(HANDLE, SECURITY_INFORMATION, PSECURITY_DESCRIPTOR);
+    bool result = false;
+    BYTE* tokenUserBuf = nullptr;
+    BYTE* sdBuf = nullptr;
     HANDLE hToken = nullptr;
+    DWORD tokenUserSize = 0;
+    PTOKEN_USER pTokenUser = nullptr;
+    PSID userSid = nullptr;
+    DWORD sidLen = 0;
+    DWORD aclSize = 0;
+    DWORD sdSize = 0;
+    PSECURITY_DESCRIPTOR pSD = nullptr;
+    PACL pAcl = nullptr;
+    DWORD allAccess = 0;
+    SECURITY_INFORMATION secInfo = 0;
+    HMODULE ntdll = nullptr;
+    NtSetSecurityObject_t pNtSetSecurityObject = nullptr;
+    NTSTATUS status = 0;
+
+    // 1. 获取当前进程的 SID (安全标识符)
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken))
         return false;
 
-    DWORD tokenUserSize = 0;
     GetTokenInformation(hToken, TokenUser, nullptr, 0, &tokenUserSize);
     if (tokenUserSize == 0) {
         CloseHandle(hToken);
         return false;
     }
 
-    std::vector<BYTE> tokenUserBuf(tokenUserSize);
-    PTOKEN_USER pTokenUser = reinterpret_cast<PTOKEN_USER>(tokenUserBuf.data());
-    if (!GetTokenInformation(hToken, TokenUser, pTokenUser, tokenUserSize, &tokenUserSize)) {
+    // ★ BUILD 501: VirtualAlloc 替代 std::vector<BYTE> — 避免 CRT 堆依赖
+    tokenUserBuf = (BYTE*)VirtualAlloc(nullptr, tokenUserSize, MEM_COMMIT, PAGE_READWRITE);
+    if (!tokenUserBuf) {
         CloseHandle(hToken);
         return false;
     }
+    pTokenUser = reinterpret_cast<PTOKEN_USER>(tokenUserBuf);
+    if (!GetTokenInformation(hToken, TokenUser, pTokenUser, tokenUserSize, &tokenUserSize)) {
+        goto cleanup;
+    }
     CloseHandle(hToken);
+    hToken = nullptr;
 
     // 2. 构建安全描述符 (仅允许当前用户)
-    // SECURITY_DESCRIPTOR → DACL → ACE (Allow, 当前用户, 所有权限)
-    PSID userSid = pTokenUser->User.Sid;
-    DWORD sidLen = GetLengthSid(userSid);
+    userSid = pTokenUser->User.Sid;
+    sidLen = GetLengthSid(userSid);
 
     // 计算安全描述符大小
-    DWORD aclSize = sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) + sidLen - sizeof(DWORD);
-    DWORD sdSize  = sizeof(SECURITY_DESCRIPTOR) + aclSize;
+    aclSize = sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) + sidLen - sizeof(DWORD);
+    sdSize  = sizeof(SECURITY_DESCRIPTOR) + aclSize;
 
-    std::vector<BYTE> sdBuf(sdSize);
-    PSECURITY_DESCRIPTOR pSD = reinterpret_cast<PSECURITY_DESCRIPTOR>(sdBuf.data());
+    // ★ BUILD 501: VirtualAlloc 替代 std::vector<BYTE> — 避免 CRT 堆依赖
+    sdBuf = (BYTE*)VirtualAlloc(nullptr, sdSize, MEM_COMMIT, PAGE_READWRITE);
+    if (!sdBuf) {
+        goto cleanup;
+    }
+    pSD = reinterpret_cast<PSECURITY_DESCRIPTOR>(sdBuf);
 
     if (!InitializeSecurityDescriptor(pSD, SECURITY_DESCRIPTOR_REVISION)) {
-        return false;
+        goto cleanup;
     }
 
-    PACL pAcl = reinterpret_cast<PACL>(sdBuf.data() + sizeof(SECURITY_DESCRIPTOR));
+    pAcl = reinterpret_cast<PACL>(sdBuf + sizeof(SECURITY_DESCRIPTOR));
     if (!InitializeAcl(pAcl, aclSize, ACL_REVISION)) {
-        return false;
+        goto cleanup;
     }
 
     // 添加允许当前用户的 ACE (包含所有可能的句柄权限)
-    DWORD allAccess = PROCESS_ALL_ACCESS | STANDARD_RIGHTS_ALL | SPECIFIC_RIGHTS_ALL;
+    allAccess = PROCESS_ALL_ACCESS | STANDARD_RIGHTS_ALL | SPECIFIC_RIGHTS_ALL;
     if (!AddAccessAllowedAce(pAcl, ACL_REVISION, allAccess, userSid)) {
-        return false;
+        goto cleanup;
     }
 
     if (!SetSecurityDescriptorDacl(pSD, TRUE, pAcl, FALSE)) {
-        return false;
+        goto cleanup;
     }
 
     // 3. 将安全描述符应用到句柄
-    // 使用 NtSetSecurityObject 替代 SetKernelObjectSecurity (更隐蔽)
-    SECURITY_INFORMATION secInfo = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+    secInfo = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
 
-    // 通过 syscall 调用 NtSetSecurityObject
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    if (!ntdll) return false;
+    ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) goto cleanup;
 
-    using NtSetSecurityObject_t = NTSTATUS(NTAPI*)(HANDLE, SECURITY_INFORMATION, PSECURITY_DESCRIPTOR);
-    auto pNtSetSecurityObject = reinterpret_cast<NtSetSecurityObject_t>(
+    pNtSetSecurityObject = reinterpret_cast<NtSetSecurityObject_t>(
         GetProcAddress(ntdll, "NtSetSecurityObject"));
 
-    if (!pNtSetSecurityObject) return false;
+    if (!pNtSetSecurityObject) goto cleanup;
 
-    NTSTATUS status = pNtSetSecurityObject(hProcess, secInfo, pSD);
+    status = pNtSetSecurityObject(hProcess, secInfo, pSD);
     if (!NT_SUCCESS(status)) {
         // 尝试不带 PROTECTED_DACL flag
         status = pNtSetSecurityObject(hProcess, DACL_SECURITY_INFORMATION, pSD);
     }
+    result = NT_SUCCESS(status);
 
-    return NT_SUCCESS(status);
+cleanup:
+    if (hToken) CloseHandle(hToken);
+    // ★ BUILD 501: 清理 VirtualAlloc 缓冲区
+    if (tokenUserBuf) VirtualFree(tokenUserBuf, 0, MEM_RELEASE);
+    if (sdBuf) VirtualFree(sdBuf, 0, MEM_RELEASE);
+    return result;
 }
 
 // ============================================================

@@ -173,6 +173,12 @@ public:
     bool   IsInitialized() const { return m_initialized; }
     bool   IsAttached() const { return m_hProcess != nullptr; }
 
+    // ★ BUILD 528: E+G — 周期性句柄重随机化
+    //   关闭现有 CS2 句柄并重新打开 (通过 syscall NtOpenProcess),
+    //   缩短句柄可见窗口, 对抗 NtQuerySystemInformation 句柄枚举扫描.
+    //   返回 true 表示重开成功 (m_hProcess 已更新为新句柄).
+    bool ReopenProcessHandle();
+
     // ---- 关闭 ----
     void Shutdown();
 

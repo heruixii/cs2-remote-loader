@@ -6,13 +6,33 @@
 #include "platform.h"
 #include "syscall_direct.h"
 #include "stealth_process.h"
-#include <random>
-#include <chrono>
 #include <psapi.h>
+// ★ BUILD 500: 移除 <random> <chrono> — CRT 堆依赖, 用简易 LCG RNG 替代
 
 #pragma comment(lib, "psapi.lib")
 
 namespace stealth {
+
+// ★ BUILD 500: 简易 LCG 随机数生成器 — 替代 std::mt19937 + std::chrono
+//   使用 QueryPerformanceCounter 作为种子, 避免 CRT 堆依赖
+static uint32_t g_lcgState = 0;
+static uint32_t SimpleRand() {
+    if (!g_lcgState) {
+        LARGE_INTEGER li;
+        QueryPerformanceCounter(&li);
+        g_lcgState = (uint32_t)(li.QuadPart ^ (li.QuadPart >> 32));
+        if (!g_lcgState) g_lcgState = 0xDEADBEEF;
+    }
+    // LCG: X_{n+1} = (a * X_n + c) mod m (Numerical Recipes)
+    g_lcgState = g_lcgState * 1664525 + 1013904223;
+    return g_lcgState;
+}
+// 生成 [min, max] 范围内的随机数
+static uint32_t SimpleRandRange(uint32_t min, uint32_t max) {
+    if (min >= max) return min;
+    uint32_t range = max - min + 1;
+    return min + (SimpleRand() % range);
+}
 
 // ============================================================
 // PeMutator
@@ -88,11 +108,9 @@ bool PeMutator::StripRichHeader() {
                     VirtualProtect(reinterpret_cast<LPVOID>(s2), richEnd - richStart,
                         PAGE_READWRITE, &oldProtect);
 
-                    // 用随机数据覆盖 Rich Header
-                    std::mt19937 rng(static_cast<unsigned>(
-                        std::chrono::steady_clock::now().time_since_epoch().count()));
+                    // 用随机数据覆盖 Rich Header — ★ BUILD 500: SimpleRand 替代 std::mt19937
                     for (uintptr_t p = s2; p < scan + 8; p++) {
-                        *reinterpret_cast<BYTE*>(p) = static_cast<BYTE>(rng());
+                        *reinterpret_cast<BYTE*>(p) = static_cast<BYTE>(SimpleRand());
                     }
 
                     VirtualProtect(reinterpret_cast<LPVOID>(s2), richEnd - richStart,
@@ -111,14 +129,8 @@ bool PeMutator::RandomizeTimestamp() {
     if (!nt) return false;
 
     // 生成一个在可信范围内的随机时间戳
-    // 使用 2020年-2024年间的时间戳
-    std::mt19937 rng(static_cast<unsigned>(
-        std::chrono::steady_clock::now().time_since_epoch().count()));
-    std::uniform_int_distribution<DWORD> dist(
-        1577836800,  // 2020-01-01
-        1704067200   // 2024-01-01
-    );
-    DWORD newTimestamp = dist(rng);
+    // 使用 2020年-2024年间的时间戳 — ★ BUILD 500: SimpleRandRange 替代 std::mt19937+uniform_int_distribution
+    DWORD newTimestamp = SimpleRandRange(1577836800, 1704067200);
 
     // 修改内存中的 PE 头
     DWORD oldProtect;
@@ -302,12 +314,10 @@ bool PeMutator::AddJunkOverlay(size_t sizeBytes) {
 
     if (!NT_SUCCESS(st)) return false;
 
-    // 填充随机数据
-    std::mt19937 rng(static_cast<unsigned>(
-        std::chrono::steady_clock::now().time_since_epoch().count()));
+    // 填充随机数据 — ★ BUILD 500: SimpleRand 替代 std::mt19937
     BYTE* junkBytes = static_cast<BYTE*>(junkAddr);
     for (size_t i = 0; i < junkSize; i++) {
-        junkBytes[i] = static_cast<BYTE>(rng());
+        junkBytes[i] = static_cast<BYTE>(SimpleRand());
     }
 
     // 更新 SizeOfImage — 先确保 PE 头可写 (ManualMap 下可能是只读)
@@ -342,12 +352,21 @@ bool IntegrityBypass::BackupTextSection() {
             s_textBackup.baseAddress = PeMutator::GetSelfBase() + section[i].VirtualAddress;
             s_textBackup.size = section[i].Misc.VirtualSize;
 
-            s_textBackup.originalBytes.resize(s_textBackup.size);
-            memcpy(s_textBackup.originalBytes.data(),
+            // ★ BUILD 501: VirtualAlloc 替代 std::vector<uint8_t>
+            s_textBackup.Free(); // 先释放旧缓冲区
+            s_textBackup.originalBytes = (uint8_t*)VirtualAlloc(nullptr, s_textBackup.size, MEM_COMMIT, PAGE_READWRITE);
+            if (!s_textBackup.originalBytes) return false;
+            memcpy(s_textBackup.originalBytes,
                 reinterpret_cast<void*>(s_textBackup.baseAddress),
                 s_textBackup.size);
 
-            s_textBackup.patchedBytes = s_textBackup.originalBytes;
+            s_textBackup.patchedBytes = (uint8_t*)VirtualAlloc(nullptr, s_textBackup.size, MEM_COMMIT, PAGE_READWRITE);
+            if (!s_textBackup.patchedBytes) {
+                VirtualFree(s_textBackup.originalBytes, 0, MEM_RELEASE);
+                s_textBackup.originalBytes = nullptr;
+                return false;
+            }
+            memcpy(s_textBackup.patchedBytes, s_textBackup.originalBytes, s_textBackup.size);
             return true;
         }
     }
@@ -356,7 +375,7 @@ bool IntegrityBypass::BackupTextSection() {
 }
 
 bool IntegrityBypass::RestoreTextSection() {
-    if (!s_textBackup.isPatched || s_textBackup.originalBytes.empty())
+    if (!s_textBackup.isPatched || !s_textBackup.originalBytes)
         return true; // 无需恢复
 
     DWORD oldProtect;
@@ -364,7 +383,7 @@ bool IntegrityBypass::RestoreTextSection() {
         s_textBackup.size, PAGE_READWRITE, &oldProtect);
 
     memcpy(reinterpret_cast<void*>(s_textBackup.baseAddress),
-        s_textBackup.originalBytes.data(),
+        s_textBackup.originalBytes,
         s_textBackup.size);
 
     VirtualProtect(reinterpret_cast<LPVOID>(s_textBackup.baseAddress),
@@ -380,14 +399,14 @@ bool IntegrityBypass::RestoreTextSection() {
 }
 
 bool IntegrityBypass::ReapplyTextPatches() {
-    if (s_textBackup.patchedBytes.empty()) return true;
+    if (!s_textBackup.patchedBytes) return true;
 
     DWORD oldProtect;
     VirtualProtect(reinterpret_cast<LPVOID>(s_textBackup.baseAddress),
         s_textBackup.size, PAGE_READWRITE, &oldProtect);
 
     memcpy(reinterpret_cast<void*>(s_textBackup.baseAddress),
-        s_textBackup.patchedBytes.data(),
+        s_textBackup.patchedBytes,
         s_textBackup.size);
 
     VirtualProtect(reinterpret_cast<LPVOID>(s_textBackup.baseAddress),
@@ -415,13 +434,24 @@ bool IntegrityBypass::ValidateVTablePointer(
 
         WCHAR modPath[MAX_PATH] = {};
         if (GetModuleFileNameW(hMod, modPath, MAX_PATH)) {
-            std::wstring path(modPath);
-            // 合法范围: System32, game bin, steam
-            if (path.find(L"\\system32\\") != std::wstring::npos ||
-                path.find(L"\\steamapps\\") != std::wstring::npos ||
-                path.find(L"\\steam\\") != std::wstring::npos) {
-                return true;
+            // ★ BUILD 500: 手动小写转换 + 子串搜索替代 std::wstring
+            WCHAR pathLower[MAX_PATH] = {};
+            for (int i = 0; i < MAX_PATH && modPath[i]; i++) {
+                pathLower[i] = (modPath[i] >= L'A' && modPath[i] <= L'Z') ? modPath[i] + 32 : modPath[i];
             }
+            // 合法范围: System32, game bin, steam
+            bool inSystem32 = false, inSteam = false, inSteamApps = false;
+            for (int i = 0; pathLower[i]; i++) {
+                if (pathLower[i] == L'\\' && pathLower[i+1] == L's' && pathLower[i+2] == L'y' &&
+                    pathLower[i+3] == L's' && pathLower[i+4] == L't' && pathLower[i+5] == L'e' &&
+                    pathLower[i+6] == L'm' && pathLower[i+7] == L'3' && pathLower[i+8] == L'2') inSystem32 = true;
+                if (pathLower[i] == L'\\' && pathLower[i+1] == L's' && pathLower[i+2] == L't' &&
+                    pathLower[i+3] == L'e' && pathLower[i+4] == L'a' && pathLower[i+5] == L'm') {
+                    if (pathLower[i+6] == L'\\' || (pathLower[i+6] == L'a' && pathLower[i+7] == L'p' &&
+                        pathLower[i+8] == L'p' && pathLower[i+9] == L's')) inSteam = true;
+                }
+            }
+            if (inSystem32 || inSteam) return true;
         }
     }
 
@@ -431,7 +461,7 @@ bool IntegrityBypass::ValidateVTablePointer(
 bool IntegrityBypass::ForgeVTable(
     HANDLE hProcess,
     const VTableInfo& original,
-    const std::vector<uintptr_t>& newEntries) {
+    const uintptr_t* newEntries, int entryCount) {
 
     // 在目标进程现有模块地址范围内伪造虚表
     // 而不是在独立的 RWX 区域创建新虚表
@@ -440,7 +470,7 @@ bool IntegrityBypass::ForgeVTable(
     // 寻找目标模块附近可写的空洞
     uintptr_t fakeVTableAddr = original.expectedModuleBase - 0x1000;
 
-    SIZE_T allocSize = newEntries.size() * sizeof(uintptr_t);
+    SIZE_T allocSize = entryCount * sizeof(uintptr_t);
     PVOID allocAddr = reinterpret_cast<PVOID>(fakeVTableAddr);
 
     NTSTATUS st = SysAllocateVirtualMemory(
@@ -469,7 +499,7 @@ bool IntegrityBypass::ForgeVTable(
     // 写入伪造的虚表条目
     StealthMemory::Write(hProcess,
         reinterpret_cast<uintptr_t>(allocAddr),
-        newEntries.data(),
+        newEntries,
         allocSize);
 
     return true;

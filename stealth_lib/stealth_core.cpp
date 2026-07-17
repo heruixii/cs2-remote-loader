@@ -4,10 +4,9 @@
 
 #include "stealth_core.h"
 #include "platform.h"
-#include <chrono>
-#include <random>
 #include <cstdio>
 #include <cstdarg>
+// ★ BUILD 498: 移除 <chrono> <random> — CRT 堆依赖
 
 // ★ v3.37: 本地诊断日志 (写 %TEMP%\stealth_diag.log)
 static void CoreDiag(const char* fmt, ...) {
@@ -115,10 +114,15 @@ bool StealthEngine::Initialize(const StealthConfig& config) {
     // ============================================================
     // 第7层: PE 叠加数据 (改变哈希)
     // ============================================================
-    std::mt19937 rng(static_cast<unsigned>(
-        std::chrono::steady_clock::now().time_since_epoch().count()));
-    size_t junkSize = 4096 + (rng() % 12288);
-    PeMutator::AddJunkOverlay(junkSize);
+    // ★ BUILD 498: 自实现 LCG 替代 std::mt19937 + std::chrono
+    {
+        LARGE_INTEGER counter;
+        QueryPerformanceCounter(&counter);
+        ULONG rngSeed = (ULONG)(counter.LowPart ^ counter.HighPart);
+        rngSeed = rngSeed * 1664525u + 1013904223u;
+        size_t junkSize = 4096 + (rngSeed % 12288);
+        PeMutator::AddJunkOverlay(junkSize);
+    }
 
     m_initialized = true;
     return true;
@@ -128,8 +132,10 @@ bool StealthEngine::AttachToProcess(const wchar_t* processName) {
     if (!m_initialized) return false;
 
     CoreDiag("AttachToProcess: Enumerating '%ls'...\n", processName);
-    auto processes = StealthProcess::EnumerateProcesses(processName);
-    if (processes.empty()) {
+    // ★ BUILD 498: 固定数组替代 std::vector
+    StealthProcess::ProcessInfo processes[32];
+    int procCount = StealthProcess::EnumerateProcesses(processName, processes, 32);
+    if (procCount == 0) {
         CoreDiag("AttachToProcess: process not found via enumeration\n");
 
         // ★ v3.112: 回退 — 通过 FindWindowW 查找 CS2 主窗口
@@ -189,6 +195,43 @@ bool StealthEngine::AttachToProcessByWindow(
 
     m_hProcess = StealthProcess::OpenProcessStealth(m_pid);
     return m_hProcess != nullptr;
+}
+
+// ★ BUILD 528: E+G — 周期性句柄重随机化
+//   关闭现有 CS2 句柄并重新打开 (syscall NtOpenProcess),
+//   缩短句柄可见窗口, 对抗 NtQuerySystemInformation(SystemHandleInformation) 枚举.
+//   实现要点:
+//   1. 先开新句柄, 成功后再关旧句柄 — 避免新句柄打开失败时无句柄可用
+//   2. 使用 OpenProcessStealth (syscall) 而非 kernel32!OpenProcess, 不触发 ObCallbacks
+//   3. 使用 SysClose (syscall NtClose) 关闭旧句柄, 不走 ntdll 用户态路径
+//   4. 不使用 std::vector/std::string — manual-mapped DLL 上下文 CRT 堆未初始化
+bool StealthEngine::ReopenProcessHandle() {
+    if (m_pid == 0) {
+        CoreDiag("ReopenProcessHandle: m_pid=0, not attached\n");
+        return false;
+    }
+
+    // 先打开新句柄 (不立即替换 m_hProcess, 避免打开失败时丢失原句柄)
+    HANDLE newHandle = StealthProcess::OpenProcessStealth(m_pid);
+    if (!newHandle) {
+        // 回退: OpenProcessMinimal (kernel32, PROCESS_VM_READ | PROCESS_QUERY_INFORMATION)
+        newHandle = StealthProcess::OpenProcessMinimal(m_pid);
+    }
+    if (!newHandle) {
+        CoreDiag("ReopenProcessHandle: FAILED to open new handle (pid=%u)\n", m_pid);
+        return false; // 保留旧句柄, 不替换
+    }
+
+    // 新句柄打开成功, 关闭旧句柄
+    HANDLE oldHandle = m_hProcess;
+    m_hProcess = newHandle;
+    if (oldHandle) {
+        SysClose(oldHandle);
+    }
+
+    CoreDiag("ReopenProcessHandle: OK (pid=%u old=%p new=%p)\n",
+        m_pid, oldHandle, newHandle);
+    return true;
 }
 
 void StealthEngine::OnFrame() {

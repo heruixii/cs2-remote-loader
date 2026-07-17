@@ -12,9 +12,6 @@
 
 #include <Windows.h>
 #include <cstdint>
-#include <vector>
-#include <string>
-#include <functional>
 
 namespace stealth {
 
@@ -54,8 +51,11 @@ public:
     static MapResult MapDllToSelf(const void* dllData, SIZE_T dllSize);
 
     // 执行 DllMain(DLL_PROCESS_ATTACH) 的 shellcode 生成器
-    static std::vector<BYTE> GenerateEntrypointShellcode(
-        uintptr_t dllMainAddr, uintptr_t imageBase, DWORD fdwReason);
+    // outBuf: 预分配缓冲区 (至少 34 字节)
+    // outLen: 输出实际 shellcode 长度
+    static void GenerateEntrypointShellcode(
+        uintptr_t dllMainAddr, uintptr_t imageBase, DWORD fdwReason,
+        BYTE* outBuf, int* outLen);
 
     // 在当前进程中执行 Reflective Loader
     // 优势: 可从内存中加载 DLL，加载完成后抹除 PE 头和 Loader 自身
@@ -85,7 +85,9 @@ class ReflectiveLoader {
 public:
     // 生成 ReflectiveLoader shellcode (位置无关代码)
     // 可作为独立 shellcode 注入到目标进程中
-    static std::vector<BYTE> GenerateLoaderStub();
+    // outBuf: 预分配缓冲区 (至少 34 字节)
+    // outLen: 输出实际 shellcode 长度
+    static void GenerateLoaderStub(BYTE* outBuf, int* outLen);
 
     // 执行 Reflective Load
     // 返回新映射的 DLL 基址
@@ -187,8 +189,9 @@ public:
 private:
     APCInjector() = default;
 
-    // 枚举进程中所有线程
-    static std::vector<DWORD> EnumerateThreads(DWORD processId);
+    // 枚举进程中所有线程, 返回线程数量
+    // outBuf: 预分配 DWORD 数组, maxThreads: 数组大小
+    static int EnumerateThreads(DWORD processId, DWORD* outBuf, int maxThreads);
 };
 
 // ============================================================

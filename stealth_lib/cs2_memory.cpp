@@ -1,4 +1,4 @@
-// ============================================================
+﻿// ============================================================
 // cs2_memory.cpp — CS2 游戏内存读写实现
 // ============================================================
 
@@ -17,12 +17,13 @@ bool Memory::ResolveModules() {
     HANDLE hProc = engine.GetProcessHandle();
     if (!hProc) return false;
 
-    auto modules = stealth::StealthProcess::GetProcessModules(hProc);
-    for (auto& mod : modules) {
-        if (mod.name == L"client.dll") {
-            m_clientBase = mod.baseAddress;
-        } else if (mod.name == L"engine2.dll") {
-            m_engineBase = mod.baseAddress;
+    stealth::StealthProcess::ModuleInfo modules[64];
+    int modCount = stealth::StealthProcess::GetProcessModules(hProc, modules, 64);
+    for (int i = 0; i < modCount; i++) {
+        if (wcscmp(modules[i].name, L"client.dll") == 0) {
+            m_clientBase = modules[i].baseAddress;
+        } else if (wcscmp(modules[i].name, L"engine2.dll") == 0) {
+            m_engineBase = modules[i].baseAddress;
         }
     }
     return m_clientBase != 0;
@@ -116,8 +117,8 @@ Vector3 Memory::GetBonePosition(uintptr_t pawn, BoneIndex bone) {
     return {origin.x + headOffset.x, origin.y + headOffset.y, origin.z + headOffset.z};
 }
 
-std::vector<Entity> Memory::GetAllPlayers(bool onlyAlive) {
-    std::vector<Entity> result;
+int Memory::GetAllPlayers(Entity* outBuf, int maxEntities, bool onlyAlive) {
+    int count = 0;
     uintptr_t localPawn = LocalPlayerPawn();
     int localTeam = -1;
     if (localPawn) {
@@ -126,11 +127,11 @@ std::vector<Entity> Memory::GetAllPlayers(bool onlyAlive) {
 
     // 获取实体列表
     uintptr_t elBase = EntityList();
-    if (!elBase) return result;
+    if (!elBase) return 0;
 
     // 缓存 chunk 0 指针
     uintptr_t chunk0 = Read<uintptr_t>(elBase + 16) & ~0xFULL;
-    if (!chunk0) return result;
+    if (!chunk0) return 0;
 
     constexpr int MAX_ENTRIES = 512;
     constexpr int IDENTITY_STRIDE = 120; // CEntityIdentity size
@@ -143,7 +144,7 @@ std::vector<Entity> Memory::GetAllPlayers(bool onlyAlive) {
     uintptr_t localController = LocalPlayerController();
 
     // CS2 实体列表: 遍历整个第一块 (0~511), 本地解析
-    // v3.31: 两阶段识别 — 先尝试 Controller→Pawn 链, 失败则尝试直接 Pawn
+    // v3.31: 两阶段识别 — 先尝试 Controller->Pawn 链, 失败则尝试直接 Pawn
     for (int i = 1; i < MAX_ENTRIES; i++) {
         uintptr_t entityPtr = *(uintptr_t*)(chunkBuf + i * IDENTITY_STRIDE);
         if (!entityPtr) continue;
@@ -152,7 +153,7 @@ std::vector<Entity> Memory::GetAllPlayers(bool onlyAlive) {
         uintptr_t pawn = 0;
         bool isDirectPawn = false;
 
-        // 阶段1: Controller→Pawn 链 (人类玩家路径)
+        // 阶段1: Controller->Pawn 链 (人类玩家路径)
         uint32_t pawnHandle = Read<uint32_t>(entityPtr + m_offsets.m_hPlayerPawn);
         if (pawnHandle && pawnHandle != 0xFFFFFFFF) {
             uintptr_t listEntry2 = Read<uintptr_t>(elBase + 8 * ((pawnHandle & 0x7FFF) >> 9) + 16);
@@ -250,9 +251,9 @@ std::vector<Entity> Memory::GetAllPlayers(bool onlyAlive) {
 
         // 名称 (Bot 直接从 pawn 读 m_iszPlayerName, 人类从 controller 读)
         if (isDirectPawn) {
-            ent.name = ReadString(pawn + m_offsets.m_iszPlayerName, 64);
+            ReadString(pawn + m_offsets.m_iszPlayerName, ent.name, 64);
         } else {
-            ent.name = ReadString(entityPtr + m_offsets.m_sSanitizedPlayerName, 64);
+            ReadString(entityPtr + m_offsets.m_sSanitizedPlayerName, ent.name, 64);
         }
 
         // 距离
@@ -281,10 +282,10 @@ std::vector<Entity> Memory::GetAllPlayers(bool onlyAlive) {
         // v3.29: 移除冗余 WorldToScreen(ent.origin, ent.screenPos)
         //       feetWorld==origin, ent.screenFeet 已包含脚部屏幕坐标
         //       ent.screenPos 在 ESP 渲染中从未被引用 — 纯死数据
-        result.push_back(ent);
+        if (count < maxEntities) outBuf[count++] = ent;
     }
 
-    return result;
+    return count;
 }
 
 Entity Memory::GetLocalPlayer() {
@@ -309,19 +310,23 @@ Entity Memory::GetLocalPlayer() {
     local.isScoped  = Read<bool>(pawn + m_offsets.m_bIsScoped);
 
     if (controller) {
-        local.name = ReadString(controller + m_offsets.m_sSanitizedPlayerName, 64);
+        ReadString(controller + m_offsets.m_sSanitizedPlayerName, local.name, 64);
     }
 
     return local;
 }
 
-std::string Memory::ReadString(uintptr_t addr, size_t maxLen) {
-    if (!addr) return "";
+void Memory::ReadString(uintptr_t addr, char* outBuf, size_t maxLen) {
+    if (!outBuf) return;
+    if (!addr) { outBuf[0] = '\0'; return; }
     size_t readLen = (maxLen < 255 ? maxLen : 255);
     char buf[256] = {};
     // 通过规避引擎 syscall 层读取, 避免 EAC Hook 检测
     bool ok = stealth::StealthEngine::Instance().ReadBytes(addr, buf, readLen);
-    return ok ? std::string(buf) : "";
+    if (ok)
+        strncpy_s(outBuf, maxLen, buf, maxLen - 1);
+    else
+        outBuf[0] = '\0';
 }
 
 } // namespace cs2

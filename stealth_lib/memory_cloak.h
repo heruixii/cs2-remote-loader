@@ -12,9 +12,7 @@
 #include <Windows.h>
 #include <winternl.h>
 #include <cstdint>
-#include <vector>
-#include <functional>
-#include <string>
+// ★ BUILD 496: 移除 <vector> <functional> <string> — Manual-Map DLL 中 CRT 堆未初始化
 
 namespace stealth {
 
@@ -104,7 +102,7 @@ public:
         SIZE_T   moduleSize;
         uintptr_t targetAddress;  // 可覆盖的地址
         SIZE_T   availableSize;   // 可覆盖的大小
-        std::wstring moduleName;
+        wchar_t  moduleName[260]; // ★ BUILD 496: 固定数组替代 std::wstring
     };
 
     // 在当前进程中查找 stomp 候选
@@ -119,7 +117,7 @@ public:
 
     // 恢复原始代码
     static bool RestoreStomped(const StompCandidate& candidate,
-                               const std::vector<BYTE>& backup);
+                               const BYTE* backup, SIZE_T backupSize);
 
     // 检查一个内存地址是否属于合法模块
     static bool IsInLegitimateModule(uintptr_t addr);

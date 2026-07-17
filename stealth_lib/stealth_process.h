@@ -5,8 +5,6 @@
 // ============================================================
 
 #include <Windows.h>
-#include <vector>
-#include <string>
 #include <cstdint>
 
 namespace stealth {
@@ -30,7 +28,8 @@ public:
 
     // 通过 SystemProcessInformation 枚举进程
     // 规避: 不走 CreateToolhelp32Snapshot 路径
-    static std::vector<ProcessInfo> EnumerateProcesses(const wchar_t* targetName);
+    // 返回匹配的进程数, 0 表示未找到
+    static int EnumerateProcesses(const wchar_t* targetName, ProcessInfo* outBuf, int maxResults);
 
     // 通过窗口名发现进程 (替代方案, 更隐蔽)
     // FindWindow + GetWindowThreadProcessId 调用量少
@@ -61,14 +60,15 @@ public:
 
     // ---- 模块信息 (替代 Module32First/Next) ----
     struct ModuleInfo {
-        std::wstring name;
-        uintptr_t    baseAddress;
-        SIZE_T       size;
+        WCHAR      name[MAX_PATH];
+        uintptr_t  baseAddress;
+        SIZE_T     size;
     };
 
     // 通过 NtQueryInformationProcess 获取进程模块列表
     // 规避: Module32First/Next 的监控
-    static std::vector<ModuleInfo> GetProcessModules(HANDLE hProcess);
+    // 返回获取的模块数, 0 表示未找到
+    static int GetProcessModules(HANDLE hProcess, ModuleInfo* outBuf, int maxResults);
 
     // 检查特定模块是否在目标进程中
     static bool IsModuleLoaded(HANDLE hProcess, const wchar_t* moduleName);
@@ -129,12 +129,12 @@ public:
         bool IsVACScanning();              // 检测 VAC 是否正在扫描
 
     private:
-        HANDLE   m_process;
+        HANDLE    m_process;
         uintptr_t m_addr;
-        SIZE_T   m_size;
-        std::vector<uint8_t> m_original;
-        std::vector<uint8_t> m_modified;
-        bool     m_committed = false;
+        SIZE_T    m_size;
+        uint8_t   m_original[4096];
+        uint8_t   m_modified[4096];
+        bool      m_committed = false;
     };
 
     // ---- 内存分配策略 ----

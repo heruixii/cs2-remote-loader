@@ -2,11 +2,9 @@
 #include "platform.h"
 
 #include "string_obfuscator.h"
-#include <string>
-#include <vector>
-#include <random>
 #include <winternl.h>
 #include <psapi.h>
+// ★ BUILD 499: 移除 <string> <vector> <random> — CRT 堆依赖
 #pragma comment(lib, "psapi.lib")
 
 namespace stealth {
@@ -15,12 +13,15 @@ namespace stealth {
 // StringObfuscator
 // ============================================================
 
-std::vector<uint8_t> StringObfuscator::Encrypt(const std::string& str, uint8_t key) {
-    std::vector<uint8_t> result(str.begin(), str.end());
-    for (size_t i = 0; i < result.size(); i++) {
-        result[i] ^= key ^ static_cast<uint8_t>(i * 0xAD);
+// ★ BUILD 499: 使用输出缓冲区替代 std::vector<uint8_t> 返回值
+int StringObfuscator::Encrypt(const char* str, uint8_t key, uint8_t* outBuf, int maxLen) {
+    if (!str || !outBuf || maxLen <= 0) return 0;
+    int len = 0;
+    while (str[len] && len < maxLen) {
+        outBuf[len] = static_cast<uint8_t>(str[len]) ^ key ^ static_cast<uint8_t>(len * 0xAD);
+        len++;
     }
-    return result;
+    return len;
 }
 
 // 使用 volatile 防止编译器将 memset 优化掉
@@ -110,6 +111,22 @@ HMODULE ApiResolver::GetModuleBase(const char* moduleName) {
     return nullptr;
 }
 
+// ★ BUILD 499: 手动 wchar_t 操作替代 std::wstring — 避免 CRT 堆依赖
+static bool WcsStr(const wchar_t* haystack, const wchar_t* needle) {
+    if (!haystack || !needle) return false;
+    size_t needleLen = 0;
+    while (needle[needleLen]) needleLen++;
+    if (needleLen == 0) return false;
+    for (size_t i = 0; haystack[i]; i++) {
+        bool match = true;
+        for (size_t j = 0; j < needleLen; j++) {
+            if (haystack[i + j] != needle[j]) { match = false; break; }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
 bool ApiResolver::IsAddressInLegitModule(uintptr_t addr) {
     // 获取地址所在模块信息
     HMODULE hMod = nullptr;
@@ -124,18 +141,17 @@ bool ApiResolver::IsAddressInLegitModule(uintptr_t addr) {
     WCHAR modPath[MAX_PATH] = {};
     GetModuleFileNameW(hMod, modPath, MAX_PATH);
 
-    // 验证路径在 System32 内 (合法系统模块)
-    // 规避: 外部注入 DLL 的 VTable Hook 往往不在 System32 范围内
-    std::wstring path(modPath);
-    for (auto& c : path) c = towlower(c);
+    // ★ BUILD 499: 手动小写转换 + 子串搜索替代 std::wstring
+    WCHAR pathLower[MAX_PATH] = {};
+    for (int i = 0; i < MAX_PATH && modPath[i]; i++) {
+        pathLower[i] = (modPath[i] >= L'A' && modPath[i] <= L'Z') ? modPath[i] + 32 : modPath[i];
+    }
 
-    bool inSystem32 = (path.find(L"\\system32\\") != std::wstring::npos ||
-                       path.find(L"\\syswow64\\") != std::wstring::npos);
+    bool inSystem32 = WcsStr(pathLower, L"\\system32\\");
+    bool inSysWow64 = WcsStr(pathLower, L"\\syswow64\\");
+    bool inKnownGood = WcsStr(pathLower, L"\\steam\\") || WcsStr(pathLower, L"\\counter-strike");
 
-    bool inKnownGood = (path.find(L"\\steam\\") != std::wstring::npos ||
-                        path.find(L"\\counter-strike") != std::wstring::npos);
-
-    return inSystem32 || inKnownGood;
+    return inSystem32 || inSysWow64 || inKnownGood;
 }
 
 FARPROC ApiResolver::ReloadFromDisk(const char* dllName, const char* funcName) {
@@ -145,15 +161,23 @@ FARPROC ApiResolver::ReloadFromDisk(const char* dllName, const char* funcName) {
     WCHAR sysPath[MAX_PATH];
     GetSystemDirectoryW(sysPath, MAX_PATH);
 
-    std::wstring fullPath(sysPath);
-    fullPath += L"\\";
+    // ★ BUILD 499: 手动构造完整路径替代 std::wstring 拼接
+    WCHAR fullPath[MAX_PATH];
+    wcscpy_s(fullPath, sysPath);
+    wcscat_s(fullPath, L"\\");
 
-    // 转换 DLL 名到宽字符
-    std::string dllNameStr(dllName);
-    fullPath += std::wstring(dllNameStr.begin(), dllNameStr.end());
+    // 转换 DLL 名到宽字符 (ASCII → WCHAR)
+    int dllNameLen = 0;
+    while (dllName[dllNameLen]) dllNameLen++;
+    int fullPathLen = 0;
+    while (fullPath[fullPathLen]) fullPathLen++;
+    for (int i = 0; i < dllNameLen && fullPathLen + i < MAX_PATH - 1; i++) {
+        fullPath[fullPathLen + i] = static_cast<WCHAR>(static_cast<unsigned char>(dllName[i]));
+    }
+    fullPath[fullPathLen + dllNameLen] = L'\0';
 
     // 映射文件到内存 (只读方式, 绕过任何运行时修改)
-    HANDLE hFile = CreateFileW(fullPath.c_str(), GENERIC_READ,
+    HANDLE hFile = CreateFileW(fullPath, GENERIC_READ,
         FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) return nullptr;
 

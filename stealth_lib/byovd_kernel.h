@@ -16,10 +16,7 @@
 
 #include <Windows.h>
 #include <cstdint>
-#include <string>
-#include <functional>
-#include <vector>
-#include <memory>
+// ★ BUILD 496: 移除 <string> <functional> <vector> <memory> — CRT 堆未初始化
 
 namespace stealth {
 
@@ -76,12 +73,12 @@ struct KernelOffsets {
 // BYOVD 驱动信息
 // ============================================================
 struct BYOVDDriverInfo {
-    std::wstring serviceName;    // 注册表服务名
-    std::wstring displayName;    // 显示名称
-    std::wstring devicePath;     // 设备路径 (如 \\.\RTCore64)
-    std::wstring driverPath;     // .sys 文件磁盘路径
-    uint32_t    ioctlCode;       // 内核R/W用IOCTL
-    bool        needsMemoryMap;  // 是否需要先映射物理内存
+    wchar_t    serviceName[128];  // ★ BUILD 496: 固定数组替代 std::wstring
+    wchar_t    displayName[128];
+    wchar_t    devicePath[128];   // 设备路径 (如 \\.\RTCore64)
+    wchar_t    driverPath[260];   // .sys 文件磁盘路径
+    uint32_t   ioctlCode;        // 内核R/W用IOCTL
+    bool       needsMemoryMap;   // 是否需要先映射物理内存
 };
 
 namespace BYOVDDrivers {
@@ -116,8 +113,8 @@ public:
     bool IsActive() const { return m_active; }
 
     // v3.49: 获取服务名和驱动路径 (用于一用即卸清理)
-    const std::wstring& GetServiceName() const { return m_actualServiceName; }
-    const std::wstring& GetDriverPath() const { return m_driverInfo.driverPath; }
+    const wchar_t* GetServiceName() const { return m_actualServiceName; }
+    const wchar_t* GetDriverPath() const { return m_driverInfo.driverPath; }
 
     // === 物理内存映射/读写原语 (通过 RTCore64 IOCTL) ===
 
@@ -157,9 +154,8 @@ public:
     uint64_t GetNtoskrnlBase();
 
     // 获取指定内核模块基址 (通过 PsLoadedModuleList 遍历)
-    // ★ v3.116: 新增 const char* 重载 — 避免 CRT std::string 堆分配
+    // ★ BUILD 496: 仅保留 const char* 重载, 移除 std::string 版本
     uint64_t GetKernelModuleBase(const char* moduleName);
-    uint64_t GetKernelModuleBase(const std::string& moduleName);
 
     // 从内核模块基址 + 导出名解析函数地址
     uint64_t ResolveExport(uint64_t moduleBase, const char* funcName);
@@ -181,16 +177,18 @@ public:
 private:
     KernelMemoryAccessor() = default;
 
-    bool LoadDriver(const std::wstring& serviceName, const std::wstring& driverPath);
-    bool UnloadDriver(const std::wstring& serviceName);
+    bool LoadDriver(const wchar_t* serviceName, const wchar_t* driverPath);
+    bool UnloadDriver(const wchar_t* serviceName);
     bool EnablePrivilege(const wchar_t* privilegeName);
 
     HANDLE     m_hDevice    = INVALID_HANDLE_VALUE;
     bool       m_active     = false;
     uint64_t   m_ntosBase   = 0;
     BYOVDDriverInfo m_driverInfo;
-    std::wstring m_actualServiceName;  // v3.60: 实际使用的服务名 (可能含随机后缀)
-    std::unique_ptr<PageTableWalker> m_pageTableWalker;
+    // ★ BUILD 496: 固定数组替代 std::wstring
+    wchar_t    m_actualServiceName[128] = {};  // v3.60: 实际使用的服务名 (可能含随机后缀)
+    // ★ BUILD 496: 移除 std::unique_ptr<PageTableWalker> — CRT 堆依赖
+    // PageTableWalker 已不再使用 (v3.84: IOCTL 扫描 PML4)
 
     // ★ v3.84: ReadCR3 需要通过 IOCTL 扫描 PML4, 需要访问 device handle
     friend uint64_t ReadCR3();
@@ -216,22 +214,30 @@ public:
 
     // 尝试摘除所有内核回调
     // 返回摘除成功的回调总数
-    int DisableAll(const std::string& acDriverName = "EasyAntiCheat");
+    // ★ BUILD 497: 签名统一为 const char* — 避免 std::string CRT 堆依赖
+    int DisableAll(const char* acDriverName = "EasyAntiCheat");
 
     // ★ v3.110: 恢复所有已保存的回调 (临时移除后恢复)
     int RestoreAll();
 
     // 单独摘除 ObRegisterCallbacks
-    int DisableObCallbacks(const std::string& eacDriverName);
+    // ★ BUILD 497: 签名统一为 const char* — 避免 std::string CRT 堆依赖
+    int DisableObCallbacks(const char* eacDriverName = "EasyAntiCheat");
 
     // 单独摘除进程通知回调
-    int DisableProcessNotifyCallbacks(const std::string& eacDriverName);
+    int DisableProcessNotifyCallbacks(const char* eacDriverName = "EasyAntiCheat");
 
     // 单独摘除模块加载通知回调
-    int DisableImageNotifyCallbacks(const std::string& eacDriverName);
+    int DisableImageNotifyCallbacks(const char* eacDriverName = "EasyAntiCheat");
 
     // ★ v3.110: 检查是否已摘除回调 (用于判断是否需要恢复)
     bool HasRemovedCallbacks() const { return m_obCallbacksSaved || m_processCallbacksSaved || m_imageCallbacksSaved; }
+
+    // ★ BUILD 528: E+G — 重新移除 PAC ObCallbacks (内部处理名称解析)
+    //   供 payload.cpp 主循环周期性调用, 对抗 PAC 重新注册回调.
+    //   内部调用 GetPacTargetName() + WStringToString() + DisableObCallbacks().
+    //   返回本次重新移除的回调数 (0 表示无需移除或移除失败).
+    int ReDisablePacCallbacks();
 
 private:
     EACCallbackDisabler() = default;
@@ -304,6 +310,13 @@ private:
 // ============================================================
 class KernelDefense {
 public:
+    // ★ BUILD 503: PAC 三态结果 — 区分"未安装"与"已中立化"
+    enum class PacStatus {
+        NotInstalled = 0,  // PAC 驱动未加载, 无需/无法中立化
+        Neutralized  = 1,  // PAC 已成功中立化
+        Failed       = 2,  // 中立化尝试失败, PAC 仍活跃
+    };
+
     // 顺序执行所有内核防御
     // 返回各项防御的成功标志
     struct Result {
@@ -313,14 +326,15 @@ public:
         int  imageCallbacksRemoved = 0;
         int  threadCallbacksRemoved = 0;
         bool processHidden = false;
-        bool pacDisabled   = false;  // ★ v3.126j: PAC minifilter 已禁用
+        PacStatus pacStatus = PacStatus::NotInstalled;  // ★ BUILD 503: PAC 三态
     };
 
     static Result EnableAll();
     static void DisableAll();
 
     // ★ v3.126j: PAC minifilter 禁用 (停止服务 + 卸载过滤器 + 删除驱动文件)
-    static bool DisablePac();
+    // ★ BUILD 503: 返回 PacStatus 三态 — NotInstalled/Neutralized/Failed
+    static PacStatus DisablePac();
     // ★ v3.126j: PAC 周期性守卫 — 检查 PAC 是否被重新安装/启动并重新禁用
     static void GuardPac();
 

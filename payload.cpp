@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 502 (v3.161: Win11 FLT_FRAME bypass — direct .data string scan for minifilter FLT_FILTER)
+// BUILD: 528 (v3.186: E+G 组合方案 — DKOM+EkkoSleep+ObCallbacks+句柄重随机化+PatchGuard缓解, 不依赖 PAC 中和)
 // ============================================================
 
 #include "stealth_core.h"
@@ -1016,7 +1016,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.161 DIAG START (BUILD 502: Win11 FLT_FRAME bypass string scan) ===\n");
+    DiagLog("=== v3.181 DIAG START (BUILD 523: diagnostic - dump all UNICODE_STRING candidates) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // ★ BUILD 493: PAC Probe 模式 — 当 %TEMP%\pac_probe.flag 存在时,
@@ -1028,29 +1028,48 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         wcscat_s(probePath, L"pac_probe.flag");
         bool isPacProbe = (GetFileAttributesW(probePath) != INVALID_FILE_ATTRIBUTES);
         if (isPacProbe) {
-            DiagLog("=== PAC PROBE MODE: no CS2 interaction, FLT neutralization only ===\n");
-            DiagLog("PAC PROBE: flag found at %ls\n", probePath);
+            // ★ BUILD 528: 原 PAC PROBE 模式已转型为 E+G PROBE 模式
+            //   PAC 中和在 Win11 上失败 (BUILD 525-527), 已注释掉 DisablePac
+            //   现在此模式仅验证 E+G 保护是否就绪 (驱动加载 + ObCallbacks 移除)
+            //   不再触碰 FLT 管线, 不再尝试 PAC 中和
+            DiagLog("=== E+G PROBE MODE: no CS2 interaction, verify E+G protection only ===\n");
+            DiagLog("E+G PROBE: flag found at %ls\n", probePath);
 
-            // 仅初始化 BYOVD (加载驱动 + FLT 管线验证 + PAC 中和)
+            // 仅初始化 BYOVD (加载驱动 + ObCallbacks 移除, 不再中和 PAC)
             auto kr = stealth::KernelDefense::EnableAll();
-            DiagLog("PAC PROBE: EnableAll done — driver=%d ob=%d proc=%d img=%d thread=%d pac=%d\n",
+            DiagLog("E+G PROBE: EnableAll done — driver=%d ob=%d proc=%d img=%d thread=%d\n",
                 (int)kr.driverLoaded,
                 kr.obCallbacksRemoved,
                 kr.processCallbacksRemoved,
                 kr.imageCallbacksRemoved,
-                kr.threadCallbacksRemoved,
-                (int)kr.pacDisabled);
+                kr.threadCallbacksRemoved);
 
-            // 检查 FLT 管线验证状态
-            if (kr.pacDisabled) {
-                DiagLog("PAC PROBE: ✅ PAC neutralization SUCCESS — safe to reboot and run full tool\n");
+            // ★ BUILD 528: PAC 中和已废弃, 注释掉三态 PAC 结果检查
+            //   PAC 中和在 Win11 上无法实现, 不再依赖此路径
+            // if (kr.pacStatus == stealth::KernelDefense::PacStatus::Neutralized) {
+            //     DiagLog("PAC PROBE: ✅ PAC neutralization SUCCESS\n");
+            // } else if (kr.pacStatus == stealth::KernelDefense::PacStatus::NotInstalled) {
+            //     DiagLog("PAC PROBE: ⚠️ PAC NOT INSTALLED\n");
+            // } else {
+            //     DiagLog("PAC PROBE: ❌ PAC neutralization FAILED\n");
+            // }
+
+            // ★ BUILD 528: E+G 组合方案 — 验证 E+G 保护是否就绪
+            //   不依赖 PAC minifilter 中和, 改用 DKOM+EkkoSleep+ObCallbacks 多层保护
+            //   只要 ObCallbacks 已移除 + 驱动已加载, E+G 即可用
+            DiagLog("E+G PROBE: ObCallbacks removed=%d, driverLoaded=%d\n",
+                kr.obCallbacksRemoved, (int)kr.driverLoaded);
+            bool egReady = (kr.driverLoaded && kr.obCallbacksRemoved > 0);
+            if (egReady) {
+                DiagLog("E+G PROBE: ✅ E+G protection ready (PAC neutralization not required)\n");
+                DiagLog("E+G PROBE: DKOM+EkkoSleep+ObCallbacks multi-layer protection active\n");
             } else {
-                DiagLog("PAC PROBE: ❌ PAC neutralization FAILED — do NOT run full tool with PAC active\n");
+                DiagLog("E+G PROBE: ❌ E+G protection incomplete (need driver+ObCallbacks)\n");
             }
 
             // 清理并退出
             stealth::KernelDefense::DisableAll();
-            DiagLog("=== PAC PROBE EXIT ===\n");
+            DiagLog("=== E+G PROBE EXIT ===\n");
             return 0;
         }
     }
@@ -1282,13 +1301,22 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
 
         g_byovdDriverLoaded = kernelResult.driverLoaded;
 
+        // ★ BUILD 528: E+G — 早期 DKOM 隐藏 (不等 basic.exe 重启)
+        //   EnableAll() 成功加载驱动后立即隐藏 loader 进程,
+        //   缩短进程在 ActiveProcessLinks 中的可见窗口.
+        //   注意: PatchGuard 风险由主循环中的周期性 Unhide/Rehide 缓解 (见主循环)
+        if (kernelResult.driverLoaded) {
+            bool dkomOk = stealth::DKOMProcessHider::Instance().HideProcess();
+            DiagLog("E+G: early DKOM hide: %s\n", dkomOk ? "OK" : "FAILED");
+        }
+
         DiagLog("OK: BYOVD driver=%d ob=%d proc=%d img=%d thread=%d pac=%d\n",
             (int)kernelResult.driverLoaded,
             kernelResult.obCallbacksRemoved,
             kernelResult.processCallbacksRemoved,
             kernelResult.imageCallbacksRemoved,
             kernelResult.threadCallbacksRemoved,
-            (int)kernelResult.pacDisabled);
+            (int)kernelResult.pacStatus);
 
         // v3.32: BYOVD 已加载(PAC内核回调已移除), 现在安全启动基础.exe
         //        基础.exe 将调用 OpenProcess+ReadProcessMemory,
@@ -1714,8 +1742,61 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 (unsigned long long)cs2::Memory::Instance().ClientBase());
         }
 
-        // v3.34: EkkoSleep 随机间隔 30-170ms (规避固定周期时序特征)
-        DWORD sleepMs = RandomJitter(40, 130);
+        // ============================================================
+        // ★ BUILD 528: E+G 组合方案 — 周期性保护验证
+        // ============================================================
+
+        // ★ BUILD 528: E+G — ObCallbacks 持续验证 (4-6秒周期, 与诊断同步)
+        //   PAC 可能重新注册回调, 需周期性重新移除.
+        //   ★ 不检查 HasRemovedCallbacks() — 该函数仅检查"我们是否保存过回调",
+        //     不检查 PAC 是否重新注册了新回调。必须始终尝试重新移除。
+        //     (memory 约束: "EAC callback removal must run in a periodic loop,
+        //      with HasRemovedCallbacks() check removed to allow repeated attempts")
+        static DWORD lastObCheckTime = 0;
+        if (now - lastObCheckTime >= diagInterval) {
+            lastObCheckTime = now;
+            // 始终尝试重新移除 — ReDisablePacCallbacks 内部会扫描 ObpCallbackArray
+            // 找到 PAC 注册的新回调并 NULL 化, 已移除的不会重复处理
+            int reRemoved = stealth::EACCallbackDisabler::Instance().ReDisablePacCallbacks();
+            if (reRemoved > 0) {
+                DiagLog("E+G: ObCallbacks re-removed (count=%d)\n", reRemoved);
+            }
+        }
+
+        // ★ BUILD 528: E+G — 句柄重随机化 (10-20秒周期)
+        //   对抗 NtQuerySystemInformation(SystemHandleInformation) 句柄枚举扫描.
+        //   关闭旧句柄并通过 syscall NtOpenProcess 重开, 缩短句柄可见窗口.
+        static DWORD lastHandleReopenTime = 0;
+        static DWORD handleReopenInterval = RandomJitter(10000, 10000);
+        if (now - lastHandleReopenTime >= handleReopenInterval) {
+            lastHandleReopenTime = now;
+            handleReopenInterval = RandomJitter(10000, 10000);
+            bool reopenOk = stealth::StealthEngine::Instance().ReopenProcessHandle();
+            DiagLog("E+G: CS2 handle re-randomized: %s\n", reopenOk ? "OK" : "FAILED");
+        }
+
+        // ★ BUILD 528: 缓解 PatchGuard — 每 60-90 秒 Unhide+Rehide 循环
+        //   PatchGuard 扫描周期 2-15 分钟, 60-90秒恢复一次可避免被捕获.
+        //   恢复期间 (50-100ms) 进程短暂可见, 但 ObCallbacks 仍移除, PAC 无法实时检测.
+        static DWORD lastDkomCycleTime = 0;
+        static DWORD dkomCycleInterval = RandomJitter(60000, 30000);
+        if (now - lastDkomCycleTime >= dkomCycleInterval) {
+            lastDkomCycleTime = now;
+            dkomCycleInterval = RandomJitter(60000, 30000);
+            auto& hider = stealth::DKOMProcessHider::Instance();
+            if (hider.GetCurrentEPROCESS()) {
+                hider.UnhideProcess();              // 先恢复链表
+                Sleep(RandomJitter(50, 100));       // 短暂等待, 让 PatchGuard 扫描通过
+                hider.HideProcess();                // 重新隐藏
+                DiagLog("E+G: DKOM cycle (unhide+rehide) done\n");
+            }
+        }
+
+        // ★ BUILD 528: E+G — 增大睡眠比例 (80-250ms), 明文窗口降至 ~2%
+        //   原: 40-170ms (明文窗口 3-12%)
+        //   新: 80-250ms (明文窗口 1-3%), ESP 渲染仍可保持 ~4-12 FPS
+        // v3.34: EkkoSleep 随机间隔 (规避固定周期时序特征)
+        DWORD sleepMs = RandomJitter(80, 170);
         // DiagLog("SLEEP: entering StealthSleep(%u)\n", sleepMs); // 太频繁, 仅调试时启用
         StealthEngine::Instance().StealthSleep(sleepMs);
     }

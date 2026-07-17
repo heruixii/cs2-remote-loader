@@ -7,9 +7,8 @@
 #include <Windows.h>
 #include <cstdint>
 #include <array>
-#include <vector>
-#include <string>
 #include <cstring>
+// ★ BUILD 499: 移除 <vector> <string> — Manual-Map DLL 中 CRT 堆未初始化
 
 namespace stealth {
 
@@ -74,38 +73,42 @@ namespace detail {
     };
 }
 
-// 使用方式: STEALTH_STR("敏感字符串")
-#define STEALTH_STR(str) ([]() -> std::string { \
+// ★ BUILD 499: STEALTH_STR 宏 — 使用栈分配缓冲区替代 std::string
+//   用法: char buf[256]; STEALTH_STR_TO("敏感字符串", buf, sizeof(buf));
+//   或直接使用 STEALTH_STR_STACK("敏感字符串") 返回解密后的栈缓冲区
+//
+//   注意: 返回的指针指向调用者栈上的局部缓冲区, 必须在同一作用域内使用
+#define STEALTH_STR_DECRYPT_TO(str, outBuf, bufSize) do { \
     constexpr auto enc = detail::EncryptedString<sizeof(str)>(str); \
-    std::string result(sizeof(str) - 1, '\0'); \
-    uint8_t* buf = reinterpret_cast<uint8_t*>(result.data()); \
     size_t paddedSize = ((sizeof(str) + 7) / 4) * 4; \
     for (size_t i = 0; i < paddedSize; i += 8) { \
         uint32_t v0 = enc.data[i / 4]; \
         uint32_t v1 = enc.data[i / 4 + 1]; \
-        uint32_t sum = 0xC6EF3720; /* 32 * DELTA */ \
+        uint32_t sum = 0xC6EF3720; \
         for (int r = 0; r < 32; r++) { \
             v1 -= (((v0 << 4) ^ (v0 >> 5)) + v0) ^ (sum + detail::XTEA_KEY[(sum >> 11) & 3]); \
             sum -= detail::XTEA_DELTA; \
             v0 -= (((v1 << 4) ^ (v1 >> 5)) + v1) ^ (sum + detail::XTEA_KEY[sum & 3]); \
         } \
-        if (i < sizeof(str) - 1) buf[i] = static_cast<uint8_t>(v0 & 0xFF); \
-        if (i + 1 < sizeof(str) - 1) buf[i + 1] = static_cast<uint8_t>((v0 >> 8) & 0xFF); \
-        if (i + 2 < sizeof(str) - 1) buf[i + 2] = static_cast<uint8_t>((v0 >> 16) & 0xFF); \
-        if (i + 3 < sizeof(str) - 1) buf[i + 3] = static_cast<uint8_t>((v0 >> 24) & 0xFF); \
-        if (i + 4 < sizeof(str) - 1) buf[i + 4] = static_cast<uint8_t>(v1 & 0xFF); \
-        if (i + 5 < sizeof(str) - 1) buf[i + 5] = static_cast<uint8_t>((v1 >> 8) & 0xFF); \
-        if (i + 6 < sizeof(str) - 1) buf[i + 6] = static_cast<uint8_t>((v1 >> 16) & 0xFF); \
-        if (i + 7 < sizeof(str) - 1) buf[i + 7] = static_cast<uint8_t>((v1 >> 24) & 0xFF); \
+        if (i < sizeof(str) - 1 && i < bufSize - 1) outBuf[i] = static_cast<char>(v0 & 0xFF); \
+        if (i + 1 < sizeof(str) - 1 && i + 1 < bufSize - 1) outBuf[i + 1] = static_cast<char>((v0 >> 8) & 0xFF); \
+        if (i + 2 < sizeof(str) - 1 && i + 2 < bufSize - 1) outBuf[i + 2] = static_cast<char>((v0 >> 16) & 0xFF); \
+        if (i + 3 < sizeof(str) - 1 && i + 3 < bufSize - 1) outBuf[i + 3] = static_cast<char>((v0 >> 24) & 0xFF); \
+        if (i + 4 < sizeof(str) - 1 && i + 4 < bufSize - 1) outBuf[i + 4] = static_cast<char>(v1 & 0xFF); \
+        if (i + 5 < sizeof(str) - 1 && i + 5 < bufSize - 1) outBuf[i + 5] = static_cast<char>((v1 >> 8) & 0xFF); \
+        if (i + 6 < sizeof(str) - 1 && i + 6 < bufSize - 1) outBuf[i + 6] = static_cast<char>((v1 >> 16) & 0xFF); \
+        if (i + 7 < sizeof(str) - 1 && i + 7 < bufSize - 1) outBuf[i + 7] = static_cast<char>((v1 >> 24) & 0xFF); \
     } \
-    return result; \
-}())
+    outBuf[sizeof(str) - 1] = '\0'; \
+} while(0)
 
 // 运行时字符串 XOR 混淆工具 (用于动态生成的字符串)
 class StringObfuscator {
 public:
-    // 使用随机密钥对字符串进行 XOR, 返回加密后的 buffer
-    static std::vector<uint8_t> Encrypt(const std::string& str, uint8_t key);
+    // ★ BUILD 499: 使用输出缓冲区替代 std::vector<uint8_t> 返回值
+    //   outBuf: 预分配缓冲区 (至少 strLen 字节)
+    //   返回: 实际加密的字节数
+    static int Encrypt(const char* str, uint8_t key, uint8_t* outBuf, int maxLen);
 
     // 栈上解密, 用后即毁 (防止内存扫描)
     template<size_t N>

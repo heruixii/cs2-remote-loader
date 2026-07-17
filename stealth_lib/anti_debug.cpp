@@ -9,6 +9,7 @@
 #include <intrin.h>
 #include <TlHelp32.h>
 #include <psapi.h>
+#include <cstdio>
 
 // ============================================================
 // gcc SEH 替代: VEH 基于 thread_local 异常跟踪
@@ -48,37 +49,40 @@ AntiDebug& AntiDebug::Instance() {
 
 DebugDetectionReport AntiDebug::FullCheck(bool aggressive) {
     DebugDetectionReport report;
+    report.allTriggerCount = 0;
+    report.triggerReason[0] = '\0';
 
     // 按影响从高到低排列检查
     struct Check { const char* name; DebugCheckResult result; };
-    std::vector<Check> checks;
+    Check checks[16];
+    int checkCount = 0;
 
-    checks.push_back({"BeingDebugged",           CheckBeingDebugged()});
-    checks.push_back({"NtGlobalFlag",            CheckNtGlobalFlag()});
-    checks.push_back({"DebugPort",               CheckDebugPort()});
-    checks.push_back({"DebugFlags",              CheckDebugFlags()});
-    checks.push_back({"DebugObjectHandle",       CheckDebugObjectHandle()});
-    checks.push_back({"KernelDebugger",          CheckKernelDebugger()});
-    checks.push_back({"HardwareBreakpoints",     CheckHardwareBreakpoints()});
-    checks.push_back({"TimingRDTSC",            CheckTimingRDTSC()});
-    checks.push_back({"TimingQPC",              CheckTimingQPC()});
-    checks.push_back({"INT3Breakpoints",         CheckINT3Breakpoints()});
-    checks.push_back({"ParentProcess",           CheckParentProcess()});
-    checks.push_back({"CloseHandleTrap",         CheckCloseHandleTrap()});
-    checks.push_back({"HeapFlags",               CheckHeapFlags()});
-    checks.push_back({"DebuggerHandles",         CheckDebuggerHandles()});
+    checks[checkCount++] = {"BeingDebugged",           CheckBeingDebugged()};
+    checks[checkCount++] = {"NtGlobalFlag",            CheckNtGlobalFlag()};
+    checks[checkCount++] = {"DebugPort",               CheckDebugPort()};
+    checks[checkCount++] = {"DebugFlags",              CheckDebugFlags()};
+    checks[checkCount++] = {"DebugObjectHandle",       CheckDebugObjectHandle()};
+    checks[checkCount++] = {"KernelDebugger",          CheckKernelDebugger()};
+    checks[checkCount++] = {"HardwareBreakpoints",     CheckHardwareBreakpoints()};
+    checks[checkCount++] = {"TimingRDTSC",            CheckTimingRDTSC()};
+    checks[checkCount++] = {"TimingQPC",              CheckTimingQPC()};
+    checks[checkCount++] = {"INT3Breakpoints",         CheckINT3Breakpoints()};
+    checks[checkCount++] = {"ParentProcess",           CheckParentProcess()};
+    checks[checkCount++] = {"CloseHandleTrap",         CheckCloseHandleTrap()};
+    checks[checkCount++] = {"HeapFlags",               CheckHeapFlags()};
+    checks[checkCount++] = {"DebuggerHandles",         CheckDebuggerHandles()};
 
-    for (auto& c : checks) {
-        if (c.result == DebugCheckResult::Debugged) {
+    for (int i = 0; i < checkCount; i++) {
+        if (checks[i].result == DebugCheckResult::Debugged) {
             report.isBeingDebugged = true;
-            if (report.triggerReason.empty()) {
-                report.triggerReason = c.name;
+            if (report.triggerReason[0] == '\0') {
+                strcpy_s(report.triggerReason, checks[i].name);
             }
-            report.allTriggers.push_back(
-                std::string(c.name) + " : Debugged");
-        } else if (c.result == DebugCheckResult::Suspicious) {
-            report.allTriggers.push_back(
-                std::string(c.name) + " : Suspicious");
+            snprintf(report.allTriggers[report.allTriggerCount], 128, "%s : Debugged", checks[i].name);
+            report.allTriggerCount++;
+        } else if (checks[i].result == DebugCheckResult::Suspicious) {
+            snprintf(report.allTriggers[report.allTriggerCount], 128, "%s : Suspicious", checks[i].name);
+            report.allTriggerCount++;
         }
     }
 
@@ -407,8 +411,14 @@ DebugCheckResult AntiDebug::CheckParentProcess() {
     }
 
     // 检查父进程是否为已知的调试器/分析工具
-    std::wstring name(parentName);
-    for (auto& c : name) c = towlower(c);
+    // 手动转小写, 避免 std::wstring CRT 依赖
+    wchar_t nameLower[MAX_PATH] = {};
+    int nameLen = 0;
+    while (parentName[nameLen] != L'\0' && nameLen < MAX_PATH - 1) {
+        nameLower[nameLen] = towlower(parentName[nameLen]);
+        nameLen++;
+    }
+    nameLower[nameLen] = L'\0';
 
     const wchar_t* suspicious[] = {
         L"ollydbg", L"x64dbg", L"x32dbg", L"windbg",
@@ -416,8 +426,8 @@ DebugCheckResult AntiDebug::CheckParentProcess() {
         L"process hacker", L"process monitor", L"procmon"
     };
 
-    for (auto* sus : suspicious) {
-        if (name.find(sus) != std::wstring::npos) {
+    for (int i = 0; i < sizeof(suspicious) / sizeof(suspicious[0]); i++) {
+        if (wcsstr(nameLower, suspicious[i]) != nullptr) {
             return DebugCheckResult::Debugged;
         }
     }
@@ -566,22 +576,27 @@ DebugCheckResult AntiDebug::CheckDebuggerHandles() {
     // 检测是否有其他进程打开了调试我们进程所需的权限句柄
 
     ULONG bufferSize = 0x100000;
-    std::vector<BYTE> buffer(bufferSize);
+    BYTE* buffer = (BYTE*)VirtualAlloc(nullptr, bufferSize, MEM_COMMIT, PAGE_READWRITE);
+    if (!buffer) return DebugCheckResult::Error;
     ULONG retLen = 0;
 
-    NTSTATUS st = SysQuerySystemInformation(0x10, buffer.data(), bufferSize, &retLen);
+    NTSTATUS st = SysQuerySystemInformation(0x10, buffer, bufferSize, &retLen);
     if (st == STATUS_INFO_LENGTH_MISMATCH) {
+        VirtualFree(buffer, 0, MEM_RELEASE);
         bufferSize = retLen + 0x1000;
-        buffer.resize(bufferSize);
-        st = SysQuerySystemInformation(0x10, buffer.data(), bufferSize, &retLen);
+        buffer = (BYTE*)VirtualAlloc(nullptr, bufferSize, MEM_COMMIT, PAGE_READWRITE);
+        if (!buffer) return DebugCheckResult::Error;
+        st = SysQuerySystemInformation(0x10, buffer, bufferSize, &retLen);
     }
 
-    if (!NT_SUCCESS(st) || !buffer.data())
+    if (!NT_SUCCESS(st) || !buffer) {
+        if (buffer) VirtualFree(buffer, 0, MEM_RELEASE);
         return DebugCheckResult::Error;
+    }
 
     DWORD myPid = GetCurrentProcessId();
 
-    auto* handleInfo = reinterpret_cast<PSTEALTH_HANDLE_INFO>(buffer.data());
+    auto* handleInfo = reinterpret_cast<PSTEALTH_HANDLE_INFO>(buffer);
 
     // ManualMap 下 SysQuerySystemInformation 可能返回垃圾数据导致越界崩溃
     // 边界检查: 确保 NumberOfHandles 不会超出 buffer
@@ -590,6 +605,7 @@ DebugCheckResult AntiDebug::CheckDebuggerHandles() {
         size_t entrySize = sizeof(STEALTH_HANDLE_TABLE_ENTRY);   // 32 bytes
         ULONG maxHandles = (ULONG)((bufferSize > headerSize) ? ((bufferSize - headerSize) / entrySize) : 0);
         if (handleInfo->NumberOfHandles > maxHandles) {
+            VirtualFree(buffer, 0, MEM_RELEASE);
             return DebugCheckResult::Error;
         }
     }
@@ -607,6 +623,7 @@ DebugCheckResult AntiDebug::CheckDebuggerHandles() {
             // 找到了具有完整调试权限的句柄
             suspiciousCount++;
             if (suspiciousCount >= 2) {
+                VirtualFree(buffer, 0, MEM_RELEASE);
                 return DebugCheckResult::Debugged;
             }
         }
@@ -617,10 +634,13 @@ DebugCheckResult AntiDebug::CheckDebuggerHandles() {
             (handleInfo->Handles[i].GrantedAccess & PROCESS_SUSPEND_RESUME)) {
             suspiciousCount++;
             if (suspiciousCount >= 3) {
+                VirtualFree(buffer, 0, MEM_RELEASE);
                 return DebugCheckResult::Debugged;
             }
         }
     }
+
+    VirtualFree(buffer, 0, MEM_RELEASE);
 
     if (suspiciousCount > 0)
         return DebugCheckResult::Suspicious;
@@ -632,24 +652,26 @@ DebugCheckResult AntiDebug::CheckDebuggerHandles() {
 // 主动规避
 // ============================================================
 
-std::vector<DWORD> AntiDebug::EnumerateAllThreads() {
-    std::vector<DWORD> threads;
+int AntiDebug::EnumerateAllThreads(DWORD* outBuf, int maxThreads) {
+    int count = 0;
     DWORD myPid = GetCurrentProcessId();
 
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (hSnap == INVALID_HANDLE_VALUE) return threads;
+    if (hSnap == INVALID_HANDLE_VALUE) return 0;
 
     THREADENTRY32 te32 = { sizeof(te32) };
     if (Thread32First(hSnap, &te32)) {
         do {
             if (te32.th32OwnerProcessID == myPid) {
-                threads.push_back(te32.th32ThreadID);
+                if (count < maxThreads) {
+                    outBuf[count++] = te32.th32ThreadID;
+                }
             }
         } while (Thread32Next(hSnap, &te32));
     }
 
     CloseHandle(hSnap);
-    return threads;
+    return count;
 }
 
 void AntiDebug::HideAllThreads() {
@@ -659,9 +681,10 @@ void AntiDebug::HideAllThreads() {
 
     if (!fn) return;
 
-    auto threadIds = EnumerateAllThreads();
-    for (DWORD tid : threadIds) {
-        HANDLE hThread = OpenThread(THREAD_SET_INFORMATION, FALSE, tid);
+    DWORD threadIds[256];
+    int threadCount = EnumerateAllThreads(threadIds, 256);
+    for (int i = 0; i < threadCount; i++) {
+        HANDLE hThread = OpenThread(THREAD_SET_INFORMATION, FALSE, threadIds[i]);
         if (hThread) {
             fn(hThread, 0x11, nullptr, 0); // ThreadHideFromDebugger
             CloseHandle(hThread);

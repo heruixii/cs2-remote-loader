@@ -11,9 +11,7 @@
 #include "game_esp.h"
 #include "eac_syscall_guard.h"
 #include "byovd_kernel.h"
-#include <thread>
-#include <chrono>
-#include <random>
+// ★ BUILD 500: 移除 <thread> <chrono> <random> — CRT 堆依赖, 用 Win32 API 替代
 
 namespace game_cheat {
 
@@ -111,9 +109,11 @@ public:
         auto& esp       = cs2::ESP::Instance();
         auto& engine    = stealth::StealthEngine::Instance();
 
-        // 时序随机化种子
-        std::random_device rd;
-        std::mt19937 rng(rd());
+        // 时序随机化种子 — ★ BUILD 500: QueryPerformanceCounter 替代 std::random_device+mt19937
+        LARGE_INTEGER li;
+        QueryPerformanceCounter(&li);
+        uint32_t rngSeed = (uint32_t)(li.QuadPart ^ (li.QuadPart >> 32));
+        if (!rngSeed) rngSeed = 0xDEADBEEF;
 
         int   targetFPS  = 144;
         DWORD frameTime  = 1000 / targetFPS;
@@ -127,10 +127,13 @@ public:
             overlay.PumpMessages();
 
             // 时序抖动 (±2ms), 破坏行为图谱的精确时间匹配
-            DWORD jitter = (rng() % 5); // 0-4ms
+            // ★ BUILD 500: LCG 替代 std::mt19937
+            rngSeed = rngSeed * 1664525 + 1013904223;
+            DWORD jitter = (rngSeed % 5); // 0-4ms
             DWORD adjustedFrameTime = frameTime + jitter - 2;
             if (now - lastFrame < adjustedFrameTime) {
-                std::this_thread::sleep_for(std::chrono::microseconds(500 + rng() % 1000));
+                // ★ BUILD 500: Sleep 替代 std::this_thread::sleep_for
+                Sleep(1);
                 continue;
             }
             lastFrame = now;
