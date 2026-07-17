@@ -1813,30 +1813,32 @@ uint64_t EACCallbackDisabler::FindObpCallbackArrayHead(KernelMemoryAccessor& kma
     uint64_t ntBase = kma.GetNtoskrnlBase();
     if (!ntBase) return 0;
 
-    // 解析 ObRegisterCallbacks 导出
-    uint64_t obRegAddr = kma.ResolveExport(ntBase, "ObRegisterCallbacks");
-    if (!obRegAddr) return 0;
-
-    // BUILD 457: 扩展 sigscan 范围 64→512 字节, 添加 MOV [RIP+rel32] 变体,
-    //   并搜索所有 LEA RXX 变体 (不仅是 RCX)
+    // BUILD 458: 分块读取 ObRegisterCallbacks + ObUnRegisterCallbacks 函数体
+    // 扩展到 1024 字节, 搜索 LEA/MOV [RIP+rel32] → ntoskrnl .data 段
+    const char* funcNames[] = { "ObRegisterCallbacks", "ObUnRegisterCallbacks" };
     uint8_t funcBody[512] = {};
-    if (!kma.ReadKernelVA(obRegAddr, funcBody, sizeof(funcBody))) return 0;
 
-    for (int i = 0; i < (int)sizeof(funcBody) - 7; i++) {
-        // LEA RXX, [RIP+rel32] — 48 8D (mod=00, r/m=101)
-        if (funcBody[i] == 0x48 && funcBody[i+1] == 0x8D && (funcBody[i+2] & 0xC7) == 0x05) {
-            int32_t disp = *(int32_t*)(funcBody + i + 3);
-            uint64_t target = obRegAddr + i + 7 + disp;
-            if (target > ntBase + 0x100000 && target < ntBase + 0x400000) {
-                return target;
-            }
-        }
-        // MOV RXX, [RIP+rel32] — 48 8B (mod=00, r/m=101)
-        if (funcBody[i] == 0x48 && funcBody[i+1] == 0x8B && (funcBody[i+2] & 0xC7) == 0x05) {
-            int32_t disp = *(int32_t*)(funcBody + i + 3);
-            uint64_t target = obRegAddr + i + 7 + disp;
-            if (target > ntBase + 0x100000 && target < ntBase + 0x400000) {
-                return target;
+    for (const char* funcName : funcNames) {
+        uint64_t funcAddr = kma.ResolveExport(ntBase, funcName);
+        if (!funcAddr) continue;
+
+        for (int chunk = 0; chunk < 2; chunk++) {
+            if (!kma.ReadKernelVA(funcAddr + chunk * 512, funcBody, sizeof(funcBody)))
+                break;
+
+            for (int i = 0; i < 500; i++) {
+                // LEA/MOV RXX, [RIP+rel32] → ntoskrnl .data
+                if ((funcBody[i] == 0x48 || funcBody[i] == 0x4C || funcBody[i] == 0x4D) &&
+                    (funcBody[i+1] == 0x8D || funcBody[i+1] == 0x8B) &&
+                    (funcBody[i+2] & 0xC7) == 0x05) {
+                    int32_t disp = *(int32_t*)(funcBody + i + 3);
+                    uint64_t target = funcAddr + chunk * 512 + i + 7 + disp;
+                    if (target > ntBase + 0x100000 && target < ntBase + 0x400000) {
+                        ByovdDiag("VERIFY:ObpCallbackArrayHead at 0x%llX (via %s)\n",
+                            (unsigned long long)target, funcName);
+                        return target;
+                    }
+                }
             }
         }
     }
@@ -3001,46 +3003,27 @@ static uint64_t FindRet0Stub(uint64_t fltmgrBase, uint64_t fltmgrSize) {
     return 0;
 }
 
-// BUILD 457: 辅助函数 — 从 fltmgr 函数体中 sigscan 查找 FltGlobals
+// BUILD 458: 辅助函数 — 从 fltmgr 函数体中 sigscan 查找 FltGlobals
 // 模式: LEA/MOV RXX, [RIP + xx xx xx xx] → 目标在 fltmgr .data 段
+// 分块读取 4096 字节 (部分 Windows 版本函数体超大, FltRegisterFilter 可达 2KB+)
 static uint64_t ScanFuncForFltGlobals(uint64_t fltmgrBase, uint64_t targetFunc) {
     auto& kma = KernelMemoryAccessor::Instance();
     uint8_t buf[512] = {};
-    if (!kma.ReadKernelVA(targetFunc, buf, sizeof(buf)))
-        return 0;
 
-    for (int i = 0; i < 500; i++) {
-        // LEA RXX, [RIP+rel32]: 48 8D (mod=00, r/m=101) — 所有 R64 寄存器
-        if (buf[i] == 0x48 && buf[i+1] == 0x8D && (buf[i+2] & 0xC7) == 0x05) {
-            int32_t rel32 = *(int32_t*)(buf + i + 3);
-            uint64_t candidate = targetFunc + i + 7 + rel32;
-            if (candidate > fltmgrBase + 0x100000 && candidate < fltmgrBase + 0x400000) {
-                return candidate;
-            }
-        }
-        // LEA R8/R9, [RIP+rel32]: 4C 8D (mod=00, r/m=101)
-        if (buf[i] == 0x4C && buf[i+1] == 0x8D && (buf[i+2] & 0xC7) == 0x05) {
-            int32_t rel32 = *(int32_t*)(buf + i + 3);
-            uint64_t candidate = targetFunc + i + 7 + rel32;
-            if (candidate > fltmgrBase + 0x100000 && candidate < fltmgrBase + 0x400000) {
-                return candidate;
-            }
-        }
-        // ★ BUILD 457: MOV RXX, [RIP+rel32]: 48 8B (mod=00, r/m=101)
-        //   某些 Windows 版本的 fltmgr 函数用 MOV 而非 LEA 引用 FltGlobals
-        if (buf[i] == 0x48 && buf[i+1] == 0x8B && (buf[i+2] & 0xC7) == 0x05) {
-            int32_t rel32 = *(int32_t*)(buf + i + 3);
-            uint64_t candidate = targetFunc + i + 7 + rel32;
-            if (candidate > fltmgrBase + 0x100000 && candidate < fltmgrBase + 0x400000) {
-                return candidate;
-            }
-        }
-        // MOV R8/R9, [RIP+rel32]: 4C 8B (mod=00, r/m=101)
-        if (buf[i] == 0x4C && buf[i+1] == 0x8B && (buf[i+2] & 0xC7) == 0x05) {
-            int32_t rel32 = *(int32_t*)(buf + i + 3);
-            uint64_t candidate = targetFunc + i + 7 + rel32;
-            if (candidate > fltmgrBase + 0x100000 && candidate < fltmgrBase + 0x400000) {
-                return candidate;
+    for (int chunk = 0; chunk < 8; chunk++) {
+        if (!kma.ReadKernelVA(targetFunc + chunk * 512, buf, sizeof(buf)))
+            break;
+
+        for (int i = 0; i < 500; i++) {
+            // LEA/MOV RXX, [RIP+rel32]: 48/4C/4D prefix
+            if ((buf[i] == 0x48 || buf[i] == 0x4C || buf[i] == 0x4D) &&
+                (buf[i+1] == 0x8D || buf[i+1] == 0x8B) &&
+                (buf[i+2] & 0xC7) == 0x05) {
+                int32_t rel32 = *(int32_t*)(buf + i + 3);
+                uint64_t candidate = targetFunc + chunk * 512 + i + 7 + rel32;
+                if (candidate > fltmgrBase + 0x100000 && candidate < fltmgrBase + 0x400000) {
+                    return candidate;
+                }
             }
         }
     }
