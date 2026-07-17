@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 528 (v3.186: E+G 组合方案 — DKOM+EkkoSleep+ObCallbacks+句柄重随机化+PatchGuard缓解, 不依赖 PAC 中和)
+// BUILD: 529 (v3.187: E+G 测试模式 — PAC PROBE 废弃, flag 触发跳过 CS2+basic.exe 仅运行 E+G 保护层, 防封号)
 // ============================================================
 
 #include "stealth_core.h"
@@ -206,6 +206,12 @@ veh_fatal:
 // v3.32: 基础.exe 进程句柄 (退出时清理)
 static HANDLE g_hBasicProcess = nullptr;
 static DWORD g_basicRestartBackoffMs = 1000;  // 退避时间, 防止快速重启循环
+
+// ★ BUILD 529: E+G 测试模式标志 — 由 %TEMP%\pac_probe.flag 触发
+//   测试模式: 跳过 CS2 附加 + basic.exe 启动, 仅运行 E+G 保护层 (驱动+ObCallbacks+DKOM+EkkoSleep)
+//   用于长时间运行验证无蓝屏 (测试2), 避免测试失败时 basic.exe 注入导致封号
+//   注入功能仅在测试3 (无 flag) 时启用
+static bool g_egTestMode = false;
 
 // v3.34: NtUnmapViewOfSection 函数指针 (用于 Process Hollowing)
 typedef LONG(NTAPI* _NtUnmapViewOfSection)(HANDLE, PVOID);
@@ -1016,61 +1022,29 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.181 DIAG START (BUILD 523: diagnostic - dump all UNICODE_STRING candidates) ===\n");
+    DiagLog("=== v3.187 DIAG START (BUILD 529: E+G test mode — flag triggers no-CS2 no-basic.exe endurance run) ===\n");
     DiagLog("BEFORE Init...\n");
 
-    // ★ BUILD 493: PAC Probe 模式 — 当 %TEMP%\pac_probe.flag 存在时,
-    //   仅加载驱动 + 验证 FLT 管线 + 尝试中和 PAC, 不触碰 CS2 任何内存/进程.
-    //   用于安全验证 PAC 拦截是否有效, 避免在未中和前触发反作弊检测.
+    // ★ BUILD 529: PAC PROBE 模式已废弃 — 改为 E+G 测试模式
+    //   原 PROBE 模式 (验证 ob>0 后 DisableAll 退出) 无意义: PAC 未注册 ObCallbacks 时
+    //   ob=0 是正常的, 不代表 E+G 保护失败; 且原模式会立即退出, 无法验证长时间运行稳定性.
+    //
+    //   BUILD 529 改造: flag 存在时设置 g_egTestMode=true, 不退出, fallthrough 到主流程.
+    //   主流程中 g_egTestMode 控制: 跳过 CS2 附加 + basic.exe 启动, 仅运行 E+G 保护层
+    //   (驱动+ObCallbacks+DKOM+EkkoSleep+周期性保护).
+    //   用于测试2: 无 CS2 长时间运行验证无蓝屏 (不下载 basic.exe, 防封号).
+    //   注入功能仅在测试3 (无 flag) 时启用.
     {
         wchar_t probePath[MAX_PATH];
         GetTempPathW(MAX_PATH, probePath);
         wcscat_s(probePath, L"pac_probe.flag");
-        bool isPacProbe = (GetFileAttributesW(probePath) != INVALID_FILE_ATTRIBUTES);
-        if (isPacProbe) {
-            // ★ BUILD 528: 原 PAC PROBE 模式已转型为 E+G PROBE 模式
-            //   PAC 中和在 Win11 上失败 (BUILD 525-527), 已注释掉 DisablePac
-            //   现在此模式仅验证 E+G 保护是否就绪 (驱动加载 + ObCallbacks 移除)
-            //   不再触碰 FLT 管线, 不再尝试 PAC 中和
-            DiagLog("=== E+G PROBE MODE: no CS2 interaction, verify E+G protection only ===\n");
-            DiagLog("E+G PROBE: flag found at %ls\n", probePath);
-
-            // 仅初始化 BYOVD (加载驱动 + ObCallbacks 移除, 不再中和 PAC)
-            auto kr = stealth::KernelDefense::EnableAll();
-            DiagLog("E+G PROBE: EnableAll done — driver=%d ob=%d proc=%d img=%d thread=%d\n",
-                (int)kr.driverLoaded,
-                kr.obCallbacksRemoved,
-                kr.processCallbacksRemoved,
-                kr.imageCallbacksRemoved,
-                kr.threadCallbacksRemoved);
-
-            // ★ BUILD 528: PAC 中和已废弃, 注释掉三态 PAC 结果检查
-            //   PAC 中和在 Win11 上无法实现, 不再依赖此路径
-            // if (kr.pacStatus == stealth::KernelDefense::PacStatus::Neutralized) {
-            //     DiagLog("PAC PROBE: ✅ PAC neutralization SUCCESS\n");
-            // } else if (kr.pacStatus == stealth::KernelDefense::PacStatus::NotInstalled) {
-            //     DiagLog("PAC PROBE: ⚠️ PAC NOT INSTALLED\n");
-            // } else {
-            //     DiagLog("PAC PROBE: ❌ PAC neutralization FAILED\n");
-            // }
-
-            // ★ BUILD 528: E+G 组合方案 — 验证 E+G 保护是否就绪
-            //   不依赖 PAC minifilter 中和, 改用 DKOM+EkkoSleep+ObCallbacks 多层保护
-            //   只要 ObCallbacks 已移除 + 驱动已加载, E+G 即可用
-            DiagLog("E+G PROBE: ObCallbacks removed=%d, driverLoaded=%d\n",
-                kr.obCallbacksRemoved, (int)kr.driverLoaded);
-            bool egReady = (kr.driverLoaded && kr.obCallbacksRemoved > 0);
-            if (egReady) {
-                DiagLog("E+G PROBE: ✅ E+G protection ready (PAC neutralization not required)\n");
-                DiagLog("E+G PROBE: DKOM+EkkoSleep+ObCallbacks multi-layer protection active\n");
-            } else {
-                DiagLog("E+G PROBE: ❌ E+G protection incomplete (need driver+ObCallbacks)\n");
-            }
-
-            // 清理并退出
-            stealth::KernelDefense::DisableAll();
-            DiagLog("=== E+G PROBE EXIT ===\n");
-            return 0;
+        g_egTestMode = (GetFileAttributesW(probePath) != INVALID_FILE_ATTRIBUTES);
+        if (g_egTestMode) {
+            DiagLog("=== E+G TEST MODE (BUILD 529): no CS2, no basic.exe, endurance run ===\n");
+            DiagLog("E+G TEST: flag found at %ls\n", probePath);
+            DiagLog("E+G TEST: will skip CS2 attach + basic.exe launch, run E+G protection only\n");
+        } else {
+            DiagLog("E+G TEST: no flag — normal mode (CS2 attach + basic.exe injection)\n");
         }
     }
 
@@ -1148,7 +1122,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     DiagLog("OK: CLOAK done\n");
 
     // --- 阶段3: 附加到 CS2 进程 ---
-    if (!StealthEngine::Instance().AttachToProcess(L"cs2.exe")) {
+    // ★ BUILD 529: 测试模式跳过 CS2 附加 (测试2 无 CS2 长时间运行验证 E+G 保护层)
+    if (!g_egTestMode && !StealthEngine::Instance().AttachToProcess(L"cs2.exe")) {
         DiagLog("FAIL: AttachToProcess\n");
         stealth::KernelDefense::DisableAll();
         StealthEngine::Instance().Shutdown();
@@ -1159,12 +1134,17 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             L"CS2 未运行", MB_OK | MB_ICONINFORMATION);
         return 2;
     }
-    DiagLog("OK: AttachToProcess, PID=%u HANDLE=%p\n",
-        StealthEngine::Instance().GetProcessId(),
-        StealthEngine::Instance().GetProcessHandle());
+    if (g_egTestMode) {
+        DiagLog("E+G TEST: skipping CS2 attach (test mode)\n");
+    } else {
+        DiagLog("OK: AttachToProcess, PID=%u HANDLE=%p\n",
+            StealthEngine::Instance().GetProcessId(),
+            StealthEngine::Instance().GetProcessHandle());
+    }
 
     // 封锁进程句柄 (DACL → 仅允许自身访问, 阻止反作弊通过NtQuerySystemInformation枚举)
-    {
+    // ★ BUILD 529: 测试模式跳过 (无 CS2 句柄)
+    if (!g_egTestMode) {
         HANDLE hGame = StealthEngine::Instance().GetProcessHandle();
         if (hGame) {
             stealth::HandleACLGuard::LockHandle(hGame);
@@ -1172,6 +1152,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         } else {
             DiagLog("WARN: HandleACLGuard skipped (no handle)\n");
         }
+    } else {
+        DiagLog("E+G TEST: skipping HandleACLGuard (test mode)\n");
     }
 
     // BYOVD 内核防御 — 加载漏洞驱动 + 摘除 PAC 内核回调 (Ring-0)
@@ -1323,7 +1305,9 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         //        这些操作不再被 PAC 内核回调监控
         // ★ v3.80: 移到 guard 释放之前, 确保 CleanupInjectionTraces 中的
         //   DKOM/VAD 操作受 guard pages 保护
-        {
+        // ★ BUILD 529: 测试模式跳过 basic.exe 启动 — 避免测试失败时 basic.exe 注入
+        //   CS2 导致封号. basic.exe 仅在测试3 (无 flag) 时启动.
+        if (!g_egTestMode) {
             bool basicOk = LaunchBasicESP();
             DiagLog("LaunchBasicESP: %s\n", basicOk ? "SUCCESS" : "FAILED");
             // v3.32-plus: 基础.exe 注入后清理痕迹 (PEB Ldr unlinking)
@@ -1332,6 +1316,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 // ★ v3.126: 将基础.exe 窗口置顶
                 BringBasicToTop();
             }
+        } else {
+            DiagLog("E+G TEST: skipping LaunchBasicESP (test mode, no injection to avoid ban)\n");
         }
 
         // ★ v3.80: 释放 guard pages — 延迟到 CleanupInjectionTraces 之后
@@ -1343,6 +1329,9 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             guardRegionCount);
     }
 
+    // ★ BUILD 529: 测试模式跳过所有 CS2 操作 (PEB/模块诊断/内存初始化/Overlay/EntityChain)
+    //   CS2 内存初始化失败会 return 3 退出, 测试模式下必须跳过避免退出
+    if (!g_egTestMode) {
     {
         HANDLE hProc = StealthEngine::Instance().GetProcessHandle();
 
@@ -1647,6 +1636,9 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         }
         DiagLog("--- End Entity Chain Trace ---\n");
     }
+    } else {
+        DiagLog("E+G TEST: skipping all CS2 operations (test mode)\n");
+    }
 
     DiagLog("=== MAIN LOOP START (v3.37: VirtualProtect fix + crash protection) ===\n");
     int frameCount = 0;
@@ -1706,7 +1698,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         }
 
         // 重试启动 (仅非正常退出时)
-        if (!g_hBasicProcess && !g_basicDone) {
+        // ★ BUILD 529: 测试模式跳过 basic.exe 重启 (不启动 basic.exe, 防封号)
+        if (!g_egTestMode && !g_hBasicProcess && !g_basicDone) {
             DWORD nowTick = GetTickCount();
             if (nowTick - lastRetryTime >= g_basicRestartBackoffMs) {
                 lastRetryTime = nowTick;
