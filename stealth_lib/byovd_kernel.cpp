@@ -3036,19 +3036,20 @@ static uint64_t FindRet0Stub(uint64_t fltmgrBase, uint64_t fltmgrSize) {
     return 0;
 }
 
-// BUILD 458: 辅助函数 — 从 fltmgr 函数体中 sigscan 查找 FltGlobals
-// 模式: LEA/MOV RXX, [RIP + xx xx xx xx] → 目标在 fltmgr .data 段
-// 分块读取 4096 字节 (部分 Windows 版本函数体超大, FltRegisterFilter 可达 2KB+)
+// BUILD 467: Win11 兼容 — 新增 MOV RXX, imm64 (绝对地址) 模式
+// 旧模式: LEA/MOV RXX, [RIP+rel32] (RIP-relative)
+// 新模式: MOV RXX, imm64      (Win11 用绝对地址编码全局变量引用)
+// 分块读取 8192 字节
 static uint64_t ScanFuncForFltGlobals(uint64_t fltmgrBase, uint64_t targetFunc) {
     auto& kma = KernelMemoryAccessor::Instance();
     uint8_t buf[512] = {};
 
-    for (int chunk = 0; chunk < 8; chunk++) {
+    for (int chunk = 0; chunk < 16; chunk++) {
         if (!kma.ReadKernelVA(targetFunc + chunk * 512, buf, sizeof(buf)))
             break;
 
         for (int i = 0; i < 500; i++) {
-            // LEA/MOV RXX, [RIP+rel32]: 48/4C/4D prefix
+            // 模式1: LEA/MOV RXX, [RIP+rel32]: 48/4C/4D prefix + 8D/8B + ModRM [RIP]
             if ((buf[i] == 0x48 || buf[i] == 0x4C || buf[i] == 0x4D) &&
                 (buf[i+1] == 0x8D || buf[i+1] == 0x8B) &&
                 (buf[i+2] & 0xC7) == 0x05) {
@@ -3056,6 +3057,14 @@ static uint64_t ScanFuncForFltGlobals(uint64_t fltmgrBase, uint64_t targetFunc) 
                 uint64_t candidate = targetFunc + chunk * 512 + i + 7 + rel32;
                 if (candidate > fltmgrBase + 0x2000 && candidate < fltmgrBase + 0x200000) {
                     return candidate;
+                }
+            }
+            // BUILD 467 模式2: MOV RXX, imm64 (Win11)
+            //   48 B8~BF + 8字节立即数 — 直接引用全局地址
+            else if (buf[i] == 0x48 && (buf[i+1] & 0xF8) == 0xB8 && i <= 492) {
+                uint64_t absAddr = *(uint64_t*)(buf + i + 2);
+                if (absAddr > fltmgrBase + 0x2000 && absAddr < fltmgrBase + 0x200000) {
+                    return absAddr;
                 }
             }
         }
