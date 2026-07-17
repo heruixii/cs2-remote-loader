@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 456 (v3.132: 自体验证 — PAC 未装时证明 ObCallbacks/FltGlobals/ProcessNotify 机制有效)
+// BUILD: 457 (v3.133: ObpCallbackArrayHead + FltGlobals sigscan 扩展 — MOV [RIP+rel32] 变体 + 512字节 + 11导出)
 // ============================================================
 
 #include "stealth_core.h"
@@ -1022,7 +1022,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.126e DIAG START (BUILD 431: 跳过NtUnmapViewOfSection + VEH崩溃范围检查 + 崩溃计数) ===\n");
+    DiagLog("=== v3.127 DIAG START (BUILD 457: ObpArray+FltGlobals sigscan MOV+LEA) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)

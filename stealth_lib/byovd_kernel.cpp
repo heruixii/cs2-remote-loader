@@ -1814,20 +1814,30 @@ uint64_t EACCallbackDisabler::FindObpCallbackArrayHead(KernelMemoryAccessor& kma
     if (!ntBase) return 0;
 
     // 解析 ObRegisterCallbacks 导出
-    // NT导出表 → 找到函数 RVA → 读取函数体
     uint64_t obRegAddr = kma.ResolveExport(ntBase, "ObRegisterCallbacks");
     if (!obRegAddr) return 0;
 
-    // 读取函数体前 64 字节, 搜索 lea rcx, [rip+offset] 模式
-    uint8_t funcBody[64] = {};
+    // BUILD 457: 扩展 sigscan 范围 64→512 字节, 添加 MOV [RIP+rel32] 变体,
+    //   并搜索所有 LEA RXX 变体 (不仅是 RCX)
+    uint8_t funcBody[512] = {};
     if (!kma.ReadKernelVA(obRegAddr, funcBody, sizeof(funcBody))) return 0;
 
     for (int i = 0; i < (int)sizeof(funcBody) - 7; i++) {
-        // 48 8D 0D = lea rcx, [rip + disp32]
-        if (funcBody[i] == 0x48 && funcBody[i+1] == 0x8D && funcBody[i+2] == 0x0D) {
+        // LEA RXX, [RIP+rel32] — 48 8D (mod=00, r/m=101)
+        if (funcBody[i] == 0x48 && funcBody[i+1] == 0x8D && (funcBody[i+2] & 0xC7) == 0x05) {
             int32_t disp = *(int32_t*)(funcBody + i + 3);
-            uint64_t target = obRegAddr + i + 7 + disp; // RIP-relative
-            return target;
+            uint64_t target = obRegAddr + i + 7 + disp;
+            if (target > ntBase + 0x100000 && target < ntBase + 0x400000) {
+                return target;
+            }
+        }
+        // MOV RXX, [RIP+rel32] — 48 8B (mod=00, r/m=101)
+        if (funcBody[i] == 0x48 && funcBody[i+1] == 0x8B && (funcBody[i+2] & 0xC7) == 0x05) {
+            int32_t disp = *(int32_t*)(funcBody + i + 3);
+            uint64_t target = obRegAddr + i + 7 + disp;
+            if (target > ntBase + 0x100000 && target < ntBase + 0x400000) {
+                return target;
+            }
         }
     }
 
@@ -2991,8 +3001,8 @@ static uint64_t FindRet0Stub(uint64_t fltmgrBase, uint64_t fltmgrSize) {
     return 0;
 }
 
-// BUILD 455: 辅助函数 — 从 fltmgr 函数体中 sigscan 查找 FltGlobals
-// 模式: LEA RXX, [RIP + xx xx xx xx] → 目标在 fltmgr .data 段
+// BUILD 457: 辅助函数 — 从 fltmgr 函数体中 sigscan 查找 FltGlobals
+// 模式: LEA/MOV RXX, [RIP + xx xx xx xx] → 目标在 fltmgr .data 段
 static uint64_t ScanFuncForFltGlobals(uint64_t fltmgrBase, uint64_t targetFunc) {
     auto& kma = KernelMemoryAccessor::Instance();
     uint8_t buf[512] = {};
@@ -3000,8 +3010,7 @@ static uint64_t ScanFuncForFltGlobals(uint64_t fltmgrBase, uint64_t targetFunc) 
         return 0;
 
     for (int i = 0; i < 500; i++) {
-        // 48 8D 0D (LEA RCX, [RIP+rel32]) — 最常见的 FltGlobals 引用
-        // 也匹配 48 8D 15 (LEA RDX) / 48 8D 1D (LEA RBX) / 48 8D 2D (LEA RBP) 等
+        // LEA RXX, [RIP+rel32]: 48 8D (mod=00, r/m=101) — 所有 R64 寄存器
         if (buf[i] == 0x48 && buf[i+1] == 0x8D && (buf[i+2] & 0xC7) == 0x05) {
             int32_t rel32 = *(int32_t*)(buf + i + 3);
             uint64_t candidate = targetFunc + i + 7 + rel32;
@@ -3009,8 +3018,25 @@ static uint64_t ScanFuncForFltGlobals(uint64_t fltmgrBase, uint64_t targetFunc) 
                 return candidate;
             }
         }
-        // 4C 8D 05 / 4C 8D 0D (LEA R8/R9, [RIP+rel32])
+        // LEA R8/R9, [RIP+rel32]: 4C 8D (mod=00, r/m=101)
         if (buf[i] == 0x4C && buf[i+1] == 0x8D && (buf[i+2] & 0xC7) == 0x05) {
+            int32_t rel32 = *(int32_t*)(buf + i + 3);
+            uint64_t candidate = targetFunc + i + 7 + rel32;
+            if (candidate > fltmgrBase + 0x100000 && candidate < fltmgrBase + 0x400000) {
+                return candidate;
+            }
+        }
+        // ★ BUILD 457: MOV RXX, [RIP+rel32]: 48 8B (mod=00, r/m=101)
+        //   某些 Windows 版本的 fltmgr 函数用 MOV 而非 LEA 引用 FltGlobals
+        if (buf[i] == 0x48 && buf[i+1] == 0x8B && (buf[i+2] & 0xC7) == 0x05) {
+            int32_t rel32 = *(int32_t*)(buf + i + 3);
+            uint64_t candidate = targetFunc + i + 7 + rel32;
+            if (candidate > fltmgrBase + 0x100000 && candidate < fltmgrBase + 0x400000) {
+                return candidate;
+            }
+        }
+        // MOV R8/R9, [RIP+rel32]: 4C 8B (mod=00, r/m=101)
+        if (buf[i] == 0x4C && buf[i+1] == 0x8B && (buf[i+2] & 0xC7) == 0x05) {
             int32_t rel32 = *(int32_t*)(buf + i + 3);
             uint64_t candidate = targetFunc + i + 7 + rel32;
             if (candidate > fltmgrBase + 0x100000 && candidate < fltmgrBase + 0x400000) {
@@ -3021,8 +3047,8 @@ static uint64_t ScanFuncForFltGlobals(uint64_t fltmgrBase, uint64_t targetFunc) 
     return 0;
 }
 
-// BUILD 455: 多函数 fallback 查找 FltGlobals
-// FltEnlistFilterForDriverInterface 不是所有 Windows 版本都导出
+// BUILD 455/457: 多函数 fallback 查找 FltGlobals + MOV 变体
+// 先 LEA 后 MOV 扫描 RIP-relative 指令 → fltmgr .data 段
 uint64_t MinifilterNeutralizer::FindFltGlobals(uint64_t fltmgrBase) {
     const char* exportNames[] = {
         "FltEnlistFilterForDriverInterface",  // Win10 21H2+ (主路径)
@@ -3030,13 +3056,18 @@ uint64_t MinifilterNeutralizer::FindFltGlobals(uint64_t fltmgrBase) {
         "FltGetVolumeFromFileObject",         // 所有版本通用
         "FltRegisterFilter",                  // 所有版本通用 (最可靠)
         "FltStartFiltering",                  // 所有版本通用
+        "FltUnregisterFilter",                // 所有版本通用
+        "FltGetFileNameInformation",          // 所有版本通用
+        "FltQueryInformationFile",           // 所有版本通用
+        "FltCreateFile",                      // 所有版本通用
+        "FltReadFile",                        // 所有版本通用
         "FltInitializePushLock",             // 所有版本通用
     };
 
     for (const char* exportName : exportNames) {
         uint64_t targetFunc = KernelMemoryAccessor::Instance().ResolveExport(fltmgrBase, exportName);
         if (!targetFunc) {
-            ByovdDiag("FLT:NTRL: %s not found\n", exportName);
+            ByovdDiag("FLT:NTRL: %s not exported\n", exportName);
             continue;
         }
         uint64_t candidate = ScanFuncForFltGlobals(fltmgrBase, targetFunc);
@@ -3045,6 +3076,7 @@ uint64_t MinifilterNeutralizer::FindFltGlobals(uint64_t fltmgrBase) {
                 (unsigned long long)candidate, exportName);
             return candidate;
         }
+        ByovdDiag("FLT:NTRL: %s found but no .data LEA/MOV ref\n", exportName);
     }
     ByovdDiag("FLT:NTRL: FltGlobals not found via any export\n");
     return 0;
