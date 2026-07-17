@@ -2648,6 +2648,9 @@ static int TraverseAndClearPiDDBAVL(uint64_t nodeAddr, int depth) {
 }
 
 bool KernelTraceCleaner::ClearPiDDBCacheTable(uint64_t ntosBase) {
+    ByovdDiag("TRACE:PiDDBCacheTable: DISABLED (BUILD 454) — heuristic AVL scan too risky\n");
+    return false;
+    /* ── v3.129: 禁用 — 24MB ntoskrnl 启发式扫描 + 硬编码偏移写零 → BSOD 风险 ──
     auto& kma = KernelMemoryAccessor::Instance();
     ByovdDiag("TRACE:PiDDBCacheTable: starting, ntos=0x%llX\n", (unsigned long long)ntosBase);
 
@@ -2786,6 +2789,7 @@ bool KernelTraceCleaner::ClearPiDDBCacheTable(uint64_t ntosBase) {
     ByovdDiag("TRACE:PiDDBCacheTable: done, cleared %d entries, table had %u elements\n",
         cleared, table.NumberGenericTableElements);
     return (cleared > 0);
+    ── v3.129 end ── */
 }
 
 // ============================================================

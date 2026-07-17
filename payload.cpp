@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 453 (v3.129: 禁用 ClearCiHashBucket + CleanAllTraces PAC守卫)
+// BUILD: 454 (v3.130: 禁用 ClearPiDDBCacheTable, CleanAllTraces 仅保留 MmUnloadedDrivers)
 // ============================================================
 
 #include "stealth_core.h"
