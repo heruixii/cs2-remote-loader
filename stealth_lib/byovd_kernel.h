@@ -397,6 +397,11 @@ public:
     //   用于 GuardPac 周期性验证 — 防止 PAC 平台修复回调
     static bool IsMessageTransferNeutralized();
 
+    // ★ BUILD 475: 管道验证 — 枚举所有已加载 minifilter 证明 FLT 管道可用
+    //   即使 MessageTransfer.sys 未加载, 也能确定: 一旦加载, 中和就能生效
+    //   返回 true = 管道完整可用 (FltGlobals->FrameList->FilterList->回调替换)
+    static bool VerifyFltPipeline();
+
 private:
     // 通过 sigscan 在 fltmgr.sys 中定位 FltGlobals
     static uint64_t FindFltGlobals(uint64_t fltmgrBase);

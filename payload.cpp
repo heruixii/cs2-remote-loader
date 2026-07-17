@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 475 (v3.140: Win11 FltGlobals .data section scan fallback for PAC minifilter neutralization)
+// BUILD: 476 (v3.141: FLT pipeline verification - LIST_ENTRY back-ref + cross-ref for Win11)
 // ============================================================
 
 #include "stealth_core.h"
@@ -1022,7 +1022,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.140 DIAG START (BUILD 475: Win11 FltGlobals .data section scan for PAC minifilter) ===\n");
+    DiagLog("=== v3.141 DIAG START (BUILD 476: FLT pipeline verify + .data section scan) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
