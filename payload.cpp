@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 479 (v3.144: multi-ActiveLink-offset + FltGlobals/Frame raw dump for Win11 layout)
+// BUILD: 480 (v3.145: pool FLTP_FRAME scan — skip FrameList, enumerate all LIST_ENTRYs for FilterList)
 // ============================================================
 
 #include "stealth_core.h"
@@ -1022,7 +1022,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.144 DIAG START (BUILD 479: multi-active-offset + FltGlobals dump) ===\n");
+    DiagLog("=== v3.145 DIAG START (BUILD 480: pool FLTP_FRAME scan — all LIST_ENTRYs) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
