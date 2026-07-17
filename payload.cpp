@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 490 (v3.155: PDFWKRNL only + EnablePrivilege syscall stubs)
+// BUILD: 491 (v3.156: PDFWKRNL syscall + permanent skip Hollowing)
 // ============================================================
 
 #include "stealth_core.h"
@@ -428,20 +428,13 @@ static bool LaunchBasicESP() {
         nullptr, nullptr, FALSE,
         CREATE_SUSPENDED,
         nullptr, nullptr, &si, &pi);
-    // ★ BUILD 487: BYOVD 失败时也跳过 Process Hollowing.
-    //   ResolveImportTable 在 Win11 manual-mapped DLL 上下文中始终 ACCESS_VIOLATION.
-    //   无论 BYOVD 是否加载, 直接使用 CreateProcess 启动 basic.exe.
-    bool canHollow = ok && g_byovdDriverLoaded;
-    if (!g_byovdDriverLoaded) {
-        DiagLog("BYOVD inactive, skipping hollowing (direct CreateProcess fallback)\n");
-        if (pi.hProcess) {
-            TerminateProcess(pi.hProcess, 0);
-            CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-            pi.hProcess = nullptr;
-        }
-    } else {
-        DiagLog("BYOVD active, will attempt hollowing\n");
-    }
+    // ★ BUILD 491: 永久跳过 Process Hollowing.
+    //   ResolveImportTable 在 Win11 manual-mapped DLL 上下文中始终 ACCESS_VIOLATION,
+    //   且 BYOVD 内核访问已可用, Hollowing 的隐蔽性无必要 (DKOM/回调移除更有效).
+    //   直接 CreateProcess 启动 basic.exe, 可靠且稳定.
+    bool canHollow = false;  // ★ BUILD 491: 永久禁用 Hollowing
+    DiagLog("BYOVD driver=%d, skipping hollowing (direct CreateProcess)\n",
+        g_byovdDriverLoaded ? 1 : 0);
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (!g_pNtUnmapViewOfSection) {
         g_pNtUnmapViewOfSection = (_NtUnmapViewOfSection)GetProcAddress(ntdll, "NtUnmapViewOfSection");
@@ -1025,7 +1018,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.155 DIAG START (BUILD 490: PDFWKRNL only, syscall EnablePrivilege) ===\n");
+    DiagLog("=== v3.156 DIAG START (BUILD 491: PDFWKRNL kernel OK, skip Hollowing) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
