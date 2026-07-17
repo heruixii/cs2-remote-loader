@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 530 (v3.188: GuardPac 废弃 — SCM 操作在 manual-mapped DLL 上下文导致 ntdll 崩溃, PAC 中和已废弃 GuardPac 无意义)
+// BUILD: 531 (v3.189: 测试模式跳过 StealthSleep — EkkoSleep 加密 EncryptAll/DecryptAll 所在页导致返回崩溃, 测试模式用普通 Sleep)
 // ============================================================
 
 #include "stealth_core.h"
@@ -1803,7 +1803,17 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         // v3.34: EkkoSleep 随机间隔 (规避固定周期时序特征)
         DWORD sleepMs = RandomJitter(80, 170);
         // DiagLog("SLEEP: entering StealthSleep(%u)\n", sleepMs); // 太频繁, 仅调试时启用
-        StealthEngine::Instance().StealthSleep(sleepMs);
+        // ★ BUILD 531: 测试模式跳过 StealthSleep (EkkoSleep) — EkkoSleep 的 EncryptAll
+        //   会加密自身代码页 (EncryptAll/DecryptAll 不在豁免页面 ekkoPage/vehPage 中),
+        //   导致 EncryptAll 返回时执行已加密代码 → 进程崩溃 (无 CRASH 日志, 因 DiagLog
+        //   所在页也被加密).
+        //   测试模式无 CS2 无反作弊扫描, 不需要内存加密; 用普通 Sleep 代替.
+        //   正常模式 (测试3) 仍需 EkkoSleep, 后续需修复豁免逻辑 (豁免 memory_cloak.cpp 所有代码页).
+        if (!g_egTestMode) {
+            StealthEngine::Instance().StealthSleep(sleepMs);
+        } else {
+            Sleep(sleepMs);
+        }
     }
 
     TerminateBasicESP();
