@@ -3112,7 +3112,10 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
         ByovdDiag("FLT:NTRL: cannot read FrameList from FltGlobals\n");
         return 0;
     }
-    if (!frameList || frameList < fltmgrBase || frameList > fltmgrBase + 0x500000) {
+    // ★ BUILD 462: FrameList 通常在 fltmgr .data 内 (Win10早期),
+    //   但在 Win10 22H2+ 可能是动态分配的池地址 (如 0xFFFFF807E40F1000),
+    //   只要不是 null/user-space 就有效
+    if (!frameList || frameList < 0xFFFF800000000000ULL) {
         ByovdDiag("FLT:NTRL: FrameList invalid 0x%llX\n", (unsigned long long)frameList);
         return 0;
     }
