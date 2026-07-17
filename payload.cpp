@@ -1022,7 +1022,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.128 DIAG START (BUILD 465: FLTP_FRAME 0x100-0x2C0 hexdump) ===\n");
+    DiagLog("=== v3.128 DIAG START (BUILD 466: try all 4 FltGlobals qwords as FrameList) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)

