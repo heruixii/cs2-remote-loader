@@ -1727,12 +1727,24 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         if (now - lastDiagTime >= diagInterval) {
             lastDiagTime = now;
             diagInterval = RandomJitter(4000, 2000);
-            uintptr_t elBase = cs2::Memory::Instance().EntityList();
-            DiagLog("F=%d basicAlive=%d elBase=0x%llX clientBase=0x%llX\n",
-                frameCount,
-                (g_hBasicProcess != nullptr) ? 1 : 0,
-                (unsigned long long)elBase,
-                (unsigned long long)cs2::Memory::Instance().ClientBase());
+            // ★ BUILD 529: 测试模式跳过 cs2::Memory 调用 — 测试模式下 cs2::Memory
+            //   未初始化 (Initialize 被跳过), m_clientBase=0, m_hProcess=nullptr.
+            //   EntityList() 会调用 Read<uintptr_t>(0 + dwEntityList) 通过 syscall
+            //   读取地址 0, 导致 ntdll 崩溃 (CRASH: code=0xC0000005 in ntdll).
+            //   ClientBase() 本身安全 (只返回成员变量), 但为统一性一并跳过.
+            if (!g_egTestMode) {
+                uintptr_t elBase = cs2::Memory::Instance().EntityList();
+                DiagLog("F=%d basicAlive=%d elBase=0x%llX clientBase=0x%llX\n",
+                    frameCount,
+                    (g_hBasicProcess != nullptr) ? 1 : 0,
+                    (unsigned long long)elBase,
+                    (unsigned long long)cs2::Memory::Instance().ClientBase());
+            } else {
+                // 测试模式: 只打印 E+G 保护层状态, 不访问 CS2 内存
+                DiagLog("F=%d [E+G TEST] basicAlive=%d (no CS2 memory access)\n",
+                    frameCount,
+                    (g_hBasicProcess != nullptr) ? 1 : 0);
+            }
         }
 
         // ============================================================
