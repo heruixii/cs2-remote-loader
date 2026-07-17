@@ -19,11 +19,7 @@
 #include <winsvc.h>
 #include <cstdio>
 #include <cstring>
-#include <algorithm>
-#include <fstream>
-#include <random>
-#include <ctime>
-#include <cstdarg>
+// ★ BUILD 501: 移除 <algorithm> <fstream> <random> <ctime> <cstdarg> — CRT 堆依赖
 #include <Psapi.h>
 #include <shlobj.h>
 #include "syscall_direct.h"  // ★ BUILD 484: TartarusGate::GenerateSyscallStub for NtLoadDriver
@@ -56,6 +52,7 @@ static void ByovdDiag(const char* fmt, ...) {
 //   v3.47: 始终嵌入, 移除 #ifdef 编译开关 — 驱动从 TEMP 提取
 #include "rtcore64_embed.h"
 #include "pdfwkrnl_embed.h"   // ★ BUILD 489: PDFWKRNL.sys 替代驱动
+#include <initializer_list>
 
 #pragma comment(lib, "advapi32.lib")
 
@@ -777,21 +774,25 @@ bool KernelMemoryAccessor::IsHVCIEnabled() {
 // ============================================================
 // 确保 BYOVD 驱动文件存在 (嵌入式提取回退)
 //
-// 优先级:
+// ★ BUILD 496: 返回 const wchar_t* (静态缓冲区), 替代 std::wstring
+//   优先级:
 //   0. 给定路径直接存在 (MutateAndRandomizeDriver 已写入 %TEMP%)
 //   1. System32\drivers\<name> (系统已安装)
 //   2. %TEMP%\<name> (从嵌入字节提取)
 // ============================================================
-static std::wstring EnsureDriverFile(const std::wstring& driverName) {
+static const wchar_t* EnsureDriverFile(const wchar_t* driverName) {
+    static wchar_t s_resultPath[MAX_PATH]; // 线程不安全, 但本模块单线程
+    s_resultPath[0] = 0;
+
     // ★ v3.126q: 确保随机种子在此函数首次调用前已初始化
-    //   EnsureDriverFile 在 Initialize 中被 srand 之前调用, 需独立初始化
     static bool srandSeeded = false;
     if (!srandSeeded) { srand(GetTickCount() ^ __rdtsc()); srandSeeded = true; }
 
-    // ★ v3.97: 0. 先检查给定路径是否直接存在 (MutateAndRandomizeDriver 已写入 TEMP)
-    if (GetFileAttributesW(driverName.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        ByovdDiag("BYOVD:EnsureDriverFile: file exists at given path '%ls'\n", driverName.c_str());
-        return driverName;
+    // ★ v3.97: 0. 先检查给定路径是否直接存在
+    if (GetFileAttributesW(driverName) != INVALID_FILE_ATTRIBUTES) {
+        ByovdDiag("BYOVD:EnsureDriverFile: file exists at given path '%ls'\n", driverName);
+        wcscpy_s(s_resultPath, driverName);
+        return s_resultPath;
     }
 
     wchar_t sysPath[MAX_PATH];
@@ -799,10 +800,11 @@ static std::wstring EnsureDriverFile(const std::wstring& driverName) {
     // 1. 检查 System32\drivers
     GetSystemDirectoryW(sysPath, MAX_PATH);
     wcscat_s(sysPath, L"\\drivers\\");
-    wcscat_s(sysPath, driverName.c_str());
+    wcscat_s(sysPath, driverName);
 
     if (GetFileAttributesW(sysPath) != INVALID_FILE_ATTRIBUTES) {
-        return std::wstring(sysPath); // 系统已安装
+        wcscpy_s(s_resultPath, sysPath);
+        return s_resultPath;
     }
 
     // 2. 从嵌入字节提取到 %TEMP%
@@ -810,8 +812,7 @@ static std::wstring EnsureDriverFile(const std::wstring& driverName) {
         const uint8_t* embedData = nullptr;
         size_t embedSize = 0;
 
-        // 匹配驱动文件名 (支持纯文件名和完整路径)
-        const wchar_t* baseName = driverName.c_str();
+        const wchar_t* baseName = driverName;
         const wchar_t* lastSlash = wcsrchr(baseName, L'\\');
         if (lastSlash) baseName = lastSlash + 1;
 
@@ -820,14 +821,10 @@ static std::wstring EnsureDriverFile(const std::wstring& driverName) {
             embedSize = stealth::embedded::RTCore64_size;
             ByovdDiag("BYOVD:EnsureDriverFile: matched RTCore64, embed=0x%p size=%zu\n", embedData, embedSize);
         } else {
-            ByovdDiag("BYOVD:EnsureDriverFile: driverName '%ls' != RTCore64.sys\n", driverName.c_str());
+            ByovdDiag("BYOVD:EnsureDriverFile: driverName '%ls' != RTCore64.sys\n", driverName);
         }
 
         if (embedData && embedSize > 0) {
-            wchar_t tempPath[MAX_PATH];
-            GetTempPathW(MAX_PATH, tempPath);
-
-            // ★ v3.110: 使用完全随机文件名, 不再使用 "RTCore64_XXXX.sys" 模式
             static const wchar_t* randomPrefixes[] = {
                 L"amdx", L"nvld", L"igfx", L"athw",
                 L"rtwl", L"btw", L"iwl", L"netw",
@@ -854,10 +851,8 @@ static std::wstring EnsureDriverFile(const std::wstring& driverName) {
                     FlushFileBuffers(hFile);
                     CloseHandle(hFile);
                     ByovdDiag("BYOVD:EnsureDriverFile: wrote %u/%zu to %ls (retry=%d)\n", written, embedSize, tryPath, retry);
-                    ByovdDiag("BYOVD:EnsureDriverFile: constructing wstring from '%ls'...\n", tryPath);
-                    std::wstring result(tryPath);
-                    ByovdDiag("BYOVD:EnsureDriverFile: wstring constructed OK (len=%zu)\n", result.length());
-                    return result;
+                    wcscpy_s(s_resultPath, tryPath);
+                    return s_resultPath;
                 }
                 ByovdDiag("BYOVD:EnsureDriverFile: CreateFileW FAILED for %ls (err=%u, retry=%d)\n", tryPath, GetLastError(), retry);
             }
@@ -866,7 +861,7 @@ static std::wstring EnsureDriverFile(const std::wstring& driverName) {
         }
     }
 
-    return L"";
+    return nullptr;
 }
 
 // ★ v3.75: 强制停止并删除所有残留 RTCore64 服务
@@ -914,8 +909,8 @@ static DWORD g_cachedSsnLoadDriver  = 0;
 static DWORD g_cachedSsnOpenProcessToken      = 0;
 static DWORD g_cachedSsnAdjustPrivilegesToken = 0;
 
-bool KernelMemoryAccessor::LoadDriver(const std::wstring& serviceName, 
-                                       const std::wstring& driverPath) {
+bool KernelMemoryAccessor::LoadDriver(const wchar_t* serviceName,
+                                       const wchar_t* driverPath) {
     // ★ BUILD 485: Win11 CFG 阻止 manual-mapped DLL 调用 advapi32→ntdll 包装.
     //   全部替换为 Nt* 直接 syscall stubs. SSN 已在 Initialize 中缓存.
     ByovdDiag("BYOVD:LoadDriver: ENTER (BUILD 490: PDFWKRNL.sys syscall stubs)\n");
@@ -945,15 +940,22 @@ bool KernelMemoryAccessor::LoadDriver(const std::wstring& serviceName,
 
     // 准备 NT 路径
     wchar_t fullPath[MAX_PATH];
-    if(driverPath.find(L'\\')==std::wstring::npos){GetSystemDirectoryW(fullPath,MAX_PATH);wcscat_s(fullPath,L"\\drivers\\");wcscat_s(fullPath,driverPath.c_str());}
-    else{wcscpy_s(fullPath,driverPath.c_str());}
+    // ★ BUILD 496: driverPath 现在是 const wchar_t*, 使用 wcschr 替代 std::wstring::find
+    if (!wcschr(driverPath, L'\\')) {
+        GetSystemDirectoryW(fullPath, MAX_PATH);
+        wcscat_s(fullPath, L"\\drivers\\");
+        wcscat_s(fullPath, driverPath);
+    } else {
+        wcscpy_s(fullPath, driverPath);
+    }
     wchar_t ntPath[MAX_PATH*2];
     if(fullPath[0]!=L'\\'||fullPath[1]!=L'\\')swprintf_s(ntPath,L"\\??\\%ls",fullPath);
     else wcscpy_s(ntPath,fullPath);
 
-    // 创建/打开注册表键 (NtCreateKey / NtOpenKey)
-    std::wstring knp=L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\"+serviceName;
-    UNICODE_STRING kus; kus.Buffer=knp.data(); kus.Length=(USHORT)(knp.size()*2);
+    // ★ BUILD 496: 手动构造注册表路径, 替代 std::wstring 拼接
+    wchar_t knpBuf[512];
+    swprintf_s(knpBuf, L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\%ls", serviceName);
+    UNICODE_STRING kus; kus.Buffer=knpBuf; kus.Length=(USHORT)(wcslen(knpBuf)*2);
     kus.MaximumLength=kus.Length+2;
     OBJECT_ATTRIBUTES oa={}; InitializeObjectAttributes(&oa,&kus,OBJ_CASE_INSENSITIVE,nullptr,nullptr);
 
@@ -981,9 +983,10 @@ bool KernelMemoryAccessor::LoadDriver(const std::wstring& serviceName,
     // ★ BUILD 489: 临时禁用漏洞驱动阻止列表 (Win11 可能拦截 RTCore64.sys, PDFWKRNL 不受影响)
     //   CI\Config\VulnerableDriverBlocklistEnable = 0 → 加载 → 恢复 = 1
     {
-        std::wstring ciPath = L"\\Registry\\Machine\\System\\CurrentControlSet\\Control\\CI\\Config";
-        UNICODE_STRING ciUs; ciUs.Buffer = ciPath.data();
-        ciUs.Length = (USHORT)(ciPath.size() * 2);
+        // ★ BUILD 496: 固定字符串替代 std::wstring
+        const wchar_t* ciPathStr = L"\\Registry\\Machine\\System\\CurrentControlSet\\Control\\CI\\Config";
+        UNICODE_STRING ciUs; ciUs.Buffer = const_cast<wchar_t*>(ciPathStr);
+        ciUs.Length = (USHORT)(wcslen(ciPathStr) * 2);
         ciUs.MaximumLength = ciUs.Length + 2;
         OBJECT_ATTRIBUTES ciOa = {}; InitializeObjectAttributes(&ciOa, &ciUs, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
 
@@ -1009,8 +1012,10 @@ bool KernelMemoryAccessor::LoadDriver(const std::wstring& serviceName,
         ByovdDiag("BYOVD:LoadDriver: EnablePrivilege(SeLoadDriverPrivilege) done\n");
 
         // 调用 NtLoadDriver
-        std::wstring rp = L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\" + serviceName;
-        UNICODE_STRING rus; rus.Buffer = rp.data(); rus.Length = (USHORT)(rp.size() * 2);
+        // ★ BUILD 497: 固定数组替代 std::wstring — 避免 CRT 堆依赖
+        wchar_t rp[512];
+        swprintf_s(rp, L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\%ls", serviceName);
+        UNICODE_STRING rus; rus.Buffer = rp; rus.Length = (USHORT)(wcslen(rp) * 2);
         rus.MaximumLength = rus.Length + 2;
         st = reinterpret_cast<FnLD>(stLD)(&rus);
         ByovdDiag("BYOVD:LoadDriver: NtLoadDriver(syscall) → 0x%08X\n", (uint32_t)st);
@@ -1034,7 +1039,7 @@ done:
     return NT_SUCCESS(st)||st==0xC000010E;
 }
 
-bool KernelMemoryAccessor::UnloadDriver(const std::wstring& serviceName) {
+bool KernelMemoryAccessor::UnloadDriver(const wchar_t* serviceName) {
     // ★ BUILD 474: 替换 NtUnloadDriver → RegDeleteTreeW
     //   manual-mapped DLL 上下文中 NtUnloadDriver = ACCESS_VIOLATION in ntdll
     //   只删除注册表键即可 (驱动代码未加载, 不存在卸载问题)
@@ -1043,10 +1048,10 @@ bool KernelMemoryAccessor::UnloadDriver(const std::wstring& serviceName) {
         L"SYSTEM\\CurrentControlSet\\Services", 0,
         KEY_ENUMERATE_SUB_KEYS | DELETE, &hServices) == ERROR_SUCCESS)
     {
-        LONG result = RegDeleteTreeW(hServices, serviceName.c_str());
+        LONG result = RegDeleteTreeW(hServices, (LPWSTR)serviceName);
         RegCloseKey(hServices);
         ByovdDiag("BYOVD:UnloadDriver: %ls -> RegDeleteTree=%d (BUILD 474 skip NtUnloadDriver)\n",
-            serviceName.c_str(), (int)(result == ERROR_SUCCESS));
+            serviceName, (int)(result == ERROR_SUCCESS));
         return result == ERROR_SUCCESS;
     }
     return false;
@@ -1471,10 +1476,8 @@ uint64_t KernelMemoryAccessor::GetKernelModuleBase(const char* moduleName) {
     return 0;
 }
 
-// ★ v3.116: std::string 重载 — 委托给 const char* 版本 (避免 CRT 堆分配)
-uint64_t KernelMemoryAccessor::GetKernelModuleBase(const std::string& moduleName) {
-    return GetKernelModuleBase(moduleName.c_str());
-}
+// ★ BUILD 496: 移除 std::string 重载 — 仅保留 const char* 版本
+// (原 std::string 重载已删除, 调用方直接传 const char*)
 
 // ============================================================
 // 初始化 / 清理
@@ -1482,7 +1485,7 @@ uint64_t KernelMemoryAccessor::GetKernelModuleBase(const std::string& moduleName
 
 bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     ByovdDiag("BYOVD:Init: ENTER (driverPath='%ls' svcName='%ls')\n",
-        driver.driverPath.c_str(), driver.serviceName.c_str());
+        driver.driverPath, driver.serviceName);
     m_driverInfo = driver;
     ByovdDiag("BYOVD:Init: m_driverInfo copied OK\n");
 
@@ -1502,9 +1505,9 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     //   - 修复: 先设置 IOCTL 码再 ReadKernelVA (BUILD 473 漏了这一步)
     //   - 修复: 即使 early probe 失败, 也不 fallthrough 到 stale 清理 — 跳过 NtUnloadDriver
     ByovdDiag("BYOVD:Init: BUILD 474 early probe for %ls...\n",
-        m_driverInfo.devicePath.c_str());
+        m_driverInfo.devicePath);
 
-    m_hDevice = CreateFileW(m_driverInfo.devicePath.c_str(),
+    m_hDevice = CreateFileW(m_driverInfo.devicePath,
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_EXISTING, 0, nullptr);
@@ -1577,15 +1580,13 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     }
 
     // 2. 确保驱动文件存在 (System32\drivers → 嵌入提取到 %TEMP%)
-    ByovdDiag("BYOVD:Init: calling EnsureDriverFile('%ls')...\n", driver.driverPath.c_str());
-    std::wstring resolvedPath = EnsureDriverFile(driver.driverPath);
-    ByovdDiag("BYOVD:Init: EnsureDriverFile returned, string length=%zu\n", resolvedPath.length());
-    ByovdDiag("BYOVD:Init: EnsureDriverFile returned '%ls'\n", resolvedPath.c_str());
-    const std::wstring& actualPath = resolvedPath.empty() ? driver.driverPath : resolvedPath;
+    ByovdDiag("BYOVD:Init: calling EnsureDriverFile('%ls')...\n", driver.driverPath);
+    const wchar_t* resolvedPath = EnsureDriverFile(driver.driverPath);
+    ByovdDiag("BYOVD:Init: EnsureDriverFile returned '%ls'\n", resolvedPath ? resolvedPath : L"(null)");
+    const wchar_t* actualPath = resolvedPath ? resolvedPath : driver.driverPath;
 
     // ★ v3.110: 彻底随机化服务名 — 使用完全随机的12字符名称
     //   不再使用 "RTCore64Svc_XXXX" 模式 (含 "RTCore64" 是强特征)
-    //   使用类似 "UxUpdateSvc" 的合法服务名风格
     static const wchar_t* svcPrefixes[] = {
         L"UxUpdateSvc", L"WdiService", L"FontCacheSvc",
         L"ProfSvc", L"WpnService", L"BthAvctpSvc",
@@ -1604,8 +1605,8 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     const wchar_t* chosenPrefix = svcPrefixes[rand() % svcPrefixCount];
     wchar_t svcName[64];
     swprintf_s(svcName, L"%ls_%04X", chosenPrefix, (rand() & 0xFFFF));
-    std::wstring actualServiceName(svcName);
-    m_actualServiceName = actualServiceName;  // store for cleanup
+    // ★ BUILD 496: 固定数组替代 std::wstring
+    wcscpy_s(m_actualServiceName, svcName);
 
     // v3.95: 扫描注册表, 卸载所有残留的 RTCore64/SysMon 服务
     //        避免 STATUS_OBJECT_NAME_COLLISION (0xC0000035)
@@ -1654,9 +1655,9 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
                     }
                 }
                 if (isStaleSvc) {
-                    std::wstring svcName(subKeyName);
+                    // ★ BUILD 497: wcscmp 替代 std::wstring 比较 — 避免 CRT 堆依赖
                     // 跳过当前要加载的服务名
-                    if (svcName == actualServiceName) { idx++; continue; }
+                    if (wcscmp(subKeyName, m_actualServiceName) == 0) { idx++; continue; }
                     // ★ v3.113: 检测是否反复处理同一个键, 防止无限循环
                     if (wcscmp(subKeyName, prevKey) == 0) {
                         sameKeyRetries++;
@@ -1688,9 +1689,9 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     // ★ v3.94: 先尝试直接打开已有设备 (可能是 zombie 但仍可用)
     //   避免 crashy 的 NtOpenDirectoryObject/NtQueryDirectoryObject 枚举
     ByovdDiag("BYOVD:Init: v3.94 probing for existing device %ls...\n",
-        m_driverInfo.devicePath.c_str());
+        m_driverInfo.devicePath);
 
-    m_hDevice = CreateFileW(m_driverInfo.devicePath.c_str(),
+    m_hDevice = CreateFileW(m_driverInfo.devicePath,
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_EXISTING, 0, nullptr);
@@ -1763,8 +1764,8 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     // ★ v3.96: 使用原始未修改驱动 + 原始设备名 \\.\RTCore64.
     //   僵尸设备检测后需重启系统清除, 正常流程通过 Shutdown() 的
     //   SERVICE_CONTROL_STOP 确保 DriverUnload → IoDeleteDevice 清理.
-    ByovdDiag("BYOVD:Init: loading %ls (path=%ls)\n", actualServiceName.c_str(), actualPath.c_str());
-    bool loadOk = LoadDriver(actualServiceName, actualPath);
+    ByovdDiag("BYOVD:Init: loading %ls (path=%ls)\n", m_actualServiceName, actualPath);
+    bool loadOk = LoadDriver(m_actualServiceName, actualPath);
     ByovdDiag("BYOVD:Init: LoadDriver → %d\n", (int)loadOk);
 
     if (!loadOk) {
@@ -1777,7 +1778,7 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
             DefineDosDeviceW(DDD_REMOVE_DEFINITION,
                 g_isPdfwKrnl ? L"PdfwKrnl" : L"RTCore64", nullptr);  // ★ BUILD 489
             Sleep(1000);
-            loadOk = LoadDriver(actualServiceName, actualPath);
+            loadOk = LoadDriver(m_actualServiceName, actualPath);
             ByovdDiag("BYOVD:Init: LoadDriver retry → %d\n", (int)loadOk);
         }
     }
@@ -1786,22 +1787,24 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
         // ★ v3.95: NtLoadDriver 失败 — 可能是僵尸设备名冲突
         //   尝试用 DefineDosDeviceW 重建符号链接后打开设备
         //   从 devicePath (如 \\.\RT64_A1B2) 提取 DOS 名和 NT 设备名
-        std::wstring devPath = m_driverInfo.devicePath;
-        std::wstring dosName, ntDevName;
-        if (devPath.size() > 4 && devPath.substr(0, 4) == L"\\\\.\\") {
-            dosName = devPath.substr(4);                // e.g. "RT64_A1B2"
-            ntDevName = L"\\Device\\" + dosName;        // e.g. "\\Device\\RT64_A1B2"
+        // ★ BUILD 497: 固定数组替代 std::wstring — 避免 CRT 堆依赖
+        const wchar_t* devPath = m_driverInfo.devicePath;
+        wchar_t dosName[128] = {};
+        wchar_t ntDevName[128] = {};
+        if (wcslen(devPath) > 4 && wcsncmp(devPath, L"\\\\.\\", 4) == 0) {
+            wcscpy_s(dosName, devPath + 4);              // e.g. "RT64_A1B2"
+            swprintf_s(ntDevName, L"\\Device\\%ls", dosName); // e.g. "\\Device\\RT64_A1B2"
         } else {
-            dosName = g_isPdfwKrnl ? L"PdfwKrnl" : L"RTCore64";          // ★ BUILD 489
-            ntDevName = g_isPdfwKrnl ? L"\\Device\\PdfwKrnl" : L"\\Device\\RTCore64";
+            wcscpy_s(dosName, g_isPdfwKrnl ? L"PdfwKrnl" : L"RTCore64");     // ★ BUILD 489
+            wcscpy_s(ntDevName, g_isPdfwKrnl ? L"\\Device\\PdfwKrnl" : L"\\Device\\RTCore64");
         }
 
         ByovdDiag("BYOVD:Init: LoadDriver FAILED, trying symlink fix: '%ls' → '%ls'\n",
-            dosName.c_str(), ntDevName.c_str());
+            dosName, ntDevName);
 
-        if (DefineDosDeviceW(DDD_RAW_TARGET_PATH, dosName.c_str(), ntDevName.c_str())) {
+        if (DefineDosDeviceW(DDD_RAW_TARGET_PATH, dosName, ntDevName)) {
             ByovdDiag("BYOVD:Init: DefineDosDeviceW OK, trying to open...\n");
-            m_hDevice = CreateFileW(m_driverInfo.devicePath.c_str(),
+            m_hDevice = CreateFileW(m_driverInfo.devicePath,
                 GENERIC_READ | GENERIC_WRITE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 nullptr, OPEN_EXISTING, 0, nullptr);
@@ -1846,14 +1849,14 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     ByovdDiag("BYOVD:Init: LoadDriver OK\n");
 
     // 5. 打开设备
-    m_hDevice = CreateFileW(m_driverInfo.devicePath.c_str(),
+    m_hDevice = CreateFileW(m_driverInfo.devicePath,
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_EXISTING, 0, nullptr);
 
     if (m_hDevice == INVALID_HANDLE_VALUE) {
         ByovdDiag("BYOVD:Init: CreateFileW FAILED for %ls (err=%u)\n",
-            m_driverInfo.devicePath.c_str(), GetLastError());
+            m_driverInfo.devicePath, GetLastError());
         UnloadDriver(m_actualServiceName);
         return false;
     }
@@ -1929,15 +1932,15 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     }
 
     // ★ v3.110: 驱动加载成功, 立即删除临时文件抹除磁盘痕迹
-    if (!actualPath.empty()) {
-        ByovdDiag("BYOVD:Init: STEP_C deleting temp file '%ls'...\n", actualPath.c_str());
-        if (DeleteFileW(actualPath.c_str())) {
+    if (actualPath && actualPath[0]) {
+        ByovdDiag("BYOVD:Init: STEP_C deleting temp file '%ls'...\n", actualPath);
+        if (DeleteFileW(actualPath)) {
             ByovdDiag("BYOVD:Init: STEP_C deleted OK\n");
         } else {
             // ★ v3.126o: 修复 — 检查删除失败 (AV 锁定 / 权限不足)
             DWORD err = GetLastError();
             ByovdDiag("BYOVD:Init: STEP_C delete FAILED err=%d, retrying with MOVEFILE_DELAY_UNTIL_REBOOT\n", (int)err);
-            MoveFileExW(actualPath.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+            MoveFileExW(actualPath, nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
         }
     }
 
@@ -1977,7 +1980,7 @@ void KernelMemoryAccessor::Shutdown() {
     //   不调用 IoDeleteDevice, 导致僵尸设备. 新策略: 驱动永久加载,
     //   每 session 的 Init 探测到已有设备直接复用 (probe + IOCTL test).
     m_active = false;
-    m_pageTableWalker.reset();
+    // ★ BUILD 497: m_pageTableWalker 已移除 (BUILD 496), 删除 .reset() 调用
     g_physMappingCount = 0;
 
     // BUILD 470: 仅关闭句柄, 不卸载驱动
@@ -2102,7 +2105,7 @@ uint64_t EACCallbackDisabler::FindObpCallbackArrayHead(KernelMemoryAccessor& kma
 // ★ v3.126h: 前向声明 — PAC 驱动 fallback 匹配 (实现在文件末尾)
 static bool IsPacDriverName_Fallback(const char* name);
 
-int EACCallbackDisabler::DisableObCallbacks(const std::string& eacDriverName) {
+int EACCallbackDisabler::DisableObCallbacks(const char* eacDriverName) {
     auto& kma = KernelMemoryAccessor::Instance();
     if (!kma.IsActive()) return 0;
 
@@ -2123,7 +2126,9 @@ int EACCallbackDisabler::DisableObCallbacks(const std::string& eacDriverName) {
 
     // 获取 EAC 驱动基址 (主检测: 精确名字匹配)
     // ★ v3.126h: 即使名字匹配失败, 仍继续扫描回调数组 + 模式匹配 fallback
-    uint64_t eacBase = kma.GetKernelModuleBase(eacDriverName + ".sys");
+    char eacSysName[128];
+    sprintf_s(eacSysName, "%s.sys", eacDriverName);
+    uint64_t eacBase = kma.GetKernelModuleBase(eacSysName);
     if (!eacBase) {
         eacBase = kma.GetKernelModuleBase("EasyAntiCheat_EOS.sys");
     }
@@ -2171,7 +2176,7 @@ int EACCallbackDisabler::DisableObCallbacks(const std::string& eacDriverName) {
                     // 比较文件名
                     char ansiName[64] = {};
                     WideCharToMultiByte(CP_ACP, 0, wname, -1, ansiName, 63, nullptr, nullptr);
-                    if (_stricmp(ansiName, (eacDriverName + ".sys").c_str()) == 0) {
+                    if (_stricmp(ansiName, eacSysName) == 0) {
 
                         // ★ v3.110: 先保存原始值再 NULL 化
                         uint64_t preOp = kma.Read<uint64_t>(current + 0x18);
@@ -2225,21 +2230,23 @@ int EACCallbackDisabler::DisableObCallbacks(const std::string& eacDriverName) {
     // BUILD 456: 自体验证 — PAC 未装时也证明数组遍历正常
     if (removed == 0 && cbArrayHead) {
         ByovdDiag("VERIFY:ObCallbacks: scan OK — %u entries walked, 0 matched '%s' (driver not loaded)\n",
-            i, eacDriverName.c_str());
+            i, eacDriverName);
     }
     return removed;
 }
 
-int EACCallbackDisabler::DisableProcessNotifyCallbacks(const std::string& eacDriverName) {
+int EACCallbackDisabler::DisableProcessNotifyCallbacks(const char* eacDriverName) {
     auto& kma = KernelMemoryAccessor::Instance();
     if (!kma.IsActive()) return 0;
 
     uint64_t ntBase = kma.GetNtoskrnlBase();
-    uint64_t eacBase = kma.GetKernelModuleBase(eacDriverName + ".sys");
+    char eacSysName[128];
+    sprintf_s(eacSysName, "%s.sys", eacDriverName);
+    uint64_t eacBase = kma.GetKernelModuleBase(eacSysName);
     if (!eacBase) {
         // BUILD 456: 自体验证
         ByovdDiag("VERIFY:ProcessNotify: '%s.sys' not loaded — skip scan (would scan if driver loaded)\n",
-            eacDriverName.c_str());
+            eacDriverName);
         return 0;
     }
 
@@ -2299,16 +2306,18 @@ int EACCallbackDisabler::DisableProcessNotifyCallbacks(const std::string& eacDri
     return removed;
 }
 
-int EACCallbackDisabler::DisableImageNotifyCallbacks(const std::string& eacDriverName) {
+int EACCallbackDisabler::DisableImageNotifyCallbacks(const char* eacDriverName) {
     auto& kma = KernelMemoryAccessor::Instance();
     if (!kma.IsActive()) return 0;
 
     uint64_t ntBase = kma.GetNtoskrnlBase();
-    uint64_t eacBase = kma.GetKernelModuleBase(eacDriverName + ".sys");
+    char eacSysName[128];
+    sprintf_s(eacSysName, "%s.sys", eacDriverName);
+    uint64_t eacBase = kma.GetKernelModuleBase(eacSysName);
     if (!eacBase) {
         // BUILD 456: 自体验证
         ByovdDiag("VERIFY:ImageNotify: '%s.sys' not loaded — skip scan (would scan if driver loaded)\n",
-            eacDriverName.c_str());
+            eacDriverName);
         return 0;
     }
 
@@ -2361,7 +2370,7 @@ int EACCallbackDisabler::DisableImageNotifyCallbacks(const std::string& eacDrive
     return removed;
 }
 
-int EACCallbackDisabler::DisableAll(const std::string& eacDriverName) {
+int EACCallbackDisabler::DisableAll(const char* eacDriverName) {
     int total = 0;
     total += DisableObCallbacks(eacDriverName);
     total += DisableProcessNotifyCallbacks(eacDriverName);
@@ -2551,12 +2560,12 @@ bool DKOMProcessHider::HideProcess() {
             if (flink < 0xFFFF800000000000ULL || blink < 0xFFFF800000000000ULL)
                 return false;
 
-            // 断链: Blink→Flink = 我们的Flink, Flink→Blink = 我们的Blink
-            // 即: 前一个节点的 Flink 指向后一个节点
-            //     后一个节点的 Blink 指向前一个节点
-            // 这样跳过了当前节点
-            kma.Write(blinkVA, flink);        // prev.Flink = next
-            kma.Write(flinkVA + 8, blink);    // next.Blink = prev
+            // ★ BUILD 497: 修复 DKOM 断链 — 写入邻居节点的 LIST_ENTRY, 而非自己的
+            //   blink 是前一个节点 ActiveProcessLinks 的地址 → blink 处即 prev.Flink
+            //   flink 是后一个节点 ActiveProcessLinks 的地址 → flink+8 处即 next.Blink
+            //   跳过当前节点: prev.Flink = next, next.Blink = prev
+            kma.Write(blink, flink);          // prev.Flink = next (blink 是 prev 的 LIST_ENTRY 地址)
+            kma.Write(flink + 8, blink);      // next.Blink = prev (flink+8 是 next 的 LIST_ENTRY.Blink)
 
             m_hidden = true;
             return true;
@@ -2628,10 +2637,10 @@ static BYOVDDriverInfo MutateAndRandomizeDriver(const BYOVDDriverInfo& original)
     // ★ 获取嵌入的原始驱动数据 (完全不修改)
     const uint8_t* embedData = nullptr;
     size_t embedSize = 0;
-    if (original.driverPath == L"RTCore64.sys") {
+    if (wcscmp(original.driverPath, L"RTCore64.sys") == 0) {
         embedData = stealth::embedded::RTCore64_data;
         embedSize = stealth::embedded::RTCore64_size;
-    } else if (original.driverPath == L"PDFWKRNL.sys") {
+    } else if (wcscmp(original.driverPath, L"PDFWKRNL.sys") == 0) {
         // ★ BUILD 489: PDFWKRNL.sys 嵌入支持
         embedData = stealth::embedded::PDFWKRNL_data;
         embedSize = stealth::embedded::PDFWKRNL_size;
@@ -2641,19 +2650,20 @@ static BYOVDDriverInfo MutateAndRandomizeDriver(const BYOVDDriverInfo& original)
     if (!embedData || embedSize == 0 || embedSize > 100 * 1024 * 1024) {
         ByovdDiag("BYOVD:Mutate: no embedded data, falling back to file system\n");
         // 回退到文件系统
-        std::wstring srcPath;
+        // ★ BUILD 497: 固定数组替代 std::wstring — 避免 CRT 堆依赖
+        wchar_t srcPath[MAX_PATH] = {};
         {
             wchar_t sysDir[MAX_PATH];
             GetSystemDirectoryW(sysDir, MAX_PATH);
             wcscat_s(sysDir, L"\\drivers\\");
-            wcscat_s(sysDir, original.driverPath.c_str());
+            wcscat_s(sysDir, original.driverPath);
             if (GetFileAttributesW(sysDir) == INVALID_FILE_ATTRIBUTES) {
-                srcPath = original.driverPath;
+                wcscpy_s(srcPath, original.driverPath);
             } else {
-                srcPath = sysDir;
+                wcscpy_s(srcPath, sysDir);
             }
         }
-        HANDLE hSrc = CreateFileW(srcPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+        HANDLE hSrc = CreateFileW(srcPath, GENERIC_READ, FILE_SHARE_READ,
             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hSrc == INVALID_HANDLE_VALUE) return original;
         DWORD fileSize = GetFileSize(hSrc, nullptr);
@@ -2696,20 +2706,21 @@ static BYOVDDriverInfo MutateAndRandomizeDriver(const BYOVDDriverInfo& original)
 
     // 构建驱动信息: 使用原始设备名 \\.\RTCore64 (驱动内部硬编码)
     BYOVDDriverInfo mutated;
-    mutated.devicePath = original.devicePath;     // ★ 保持原始 \\.\RTCore64
+    // ★ BUILD 501: 固定数组用 wcscpy_s 替代 operator= — 避免 CRT 堆依赖
+    wcscpy_s(mutated.devicePath, original.devicePath);     // ★ 保持原始 \\.\RTCore64
     mutated.ioctlCode = original.ioctlCode;
     mutated.needsMemoryMap = original.needsMemoryMap;
-    mutated.driverPath = tempPath;
+    wcscpy_s(mutated.driverPath, tempPath);
 
     wchar_t svcName[64] = {};
     wsprintfW(svcName, L"SysMon%s", randomHex);
-    mutated.serviceName = svcName;
+    wcscpy_s(mutated.serviceName, svcName);
     wchar_t dspName[64] = {};
     wsprintfW(dspName, L"System Monitor %s", randomHex);
-    mutated.displayName = dspName;
+    wcscpy_s(mutated.displayName, dspName);
 
     ByovdDiag("BYOVD:Mutate: device=%ls svc=%ls path=%ls\n",
-        mutated.devicePath.c_str(), mutated.serviceName.c_str(), mutated.driverPath.c_str());
+        mutated.devicePath, mutated.serviceName, mutated.driverPath);
 
     return mutated;
 }
@@ -2781,18 +2792,21 @@ static const int MM_UNLOADED_MAX      = 50;    // 最多记录 50 条
 static const int MM_UNLOADED_ENTRY_SZ = 0x68;  // Win10/11 RTL_UNLOADED_MODULE_DRIVER 大小
 
 // === 辅助: 从内核池地址读取 Unicode 字符串 (Buffer 在内核池中) ===
-static std::wstring ReadKernelUnicodeString(uint64_t poolAddr, uint16_t lenBytes) {
+// ★ BUILD 497: 固定缓冲区替代 std::wstring 返回值 — 避免 CRT 堆依赖
+//   返回 outBuf 中实际写入的字符数 (不含 null terminator)
+static int ReadKernelUnicodeString(uint64_t poolAddr, uint16_t lenBytes, wchar_t* outBuf, int outBufChars) {
     auto& kma = KernelMemoryAccessor::Instance();
-    if (!poolAddr || !lenBytes) return L"";
+    if (!poolAddr || !lenBytes || !outBuf || outBufChars <= 0) { outBuf[0] = 0; return 0; }
 
     uint16_t chars = lenBytes / 2;
-    if (chars > 256) chars = 256; // 安全限制
+    if (chars > (uint16_t)(outBufChars - 1)) chars = (uint16_t)(outBufChars - 1); // 安全限制
 
-    std::vector<wchar_t> buf(chars);
-    if (kma.ReadKernelVA(poolAddr, buf.data(), chars * 2)) {
-        return std::wstring(buf.data(), chars);
+    if (kma.ReadKernelVA(poolAddr, outBuf, chars * 2)) {
+        outBuf[chars] = 0;
+        return chars;
     }
-    return L"";
+    outBuf[0] = 0;
+    return 0;
 }
 
 // === 目标驱动名列表 — 需要从痕迹表中清除 ===
@@ -2802,11 +2816,12 @@ static const wchar_t* g_traceTargetNames[] = {
     nullptr
 };
 
-static bool IsTraceTarget(const std::wstring& name) {
+// ★ BUILD 497: 固定数组替代 std::wstring — 避免 CRT 堆依赖
+static bool IsTraceTarget(const wchar_t* name) {
     // ★ v3.126m-review: 修复 — 精确匹配 (wcsstr 包含匹配已足够, 但不误伤)
     //   只匹配全名中包含 RTCore64.sys 或 RTCore64 的条目
     for (int i = 0; g_traceTargetNames[i]; i++) {
-        if (name.find(g_traceTargetNames[i]) != std::wstring::npos)
+        if (wcsstr(name, g_traceTargetNames[i]) != nullptr)
             return true;
     }
     return false;
@@ -2874,11 +2889,12 @@ bool KernelTraceCleaner::ClearMmUnloadedDrivers(uint64_t ntosBase) {
         if (!nameLen || !nameBuf || nameLen > 256)
             continue;
 
-        std::wstring name = ReadKernelUnicodeString(nameBuf, nameLen);
-        if (name.empty()) continue;
+        wchar_t name[256] = {};
+        int nchars = ReadKernelUnicodeString(nameBuf, nameLen, name, 256);
+        if (nchars == 0) continue;
 
         if (IsTraceTarget(name)) {
-            ByovdDiag("TRACE:MmUnloadedDrivers: [%d] found '%ls' → clearing\n", idx, name.c_str());
+            ByovdDiag("TRACE:MmUnloadedDrivers: [%d] found '%ls' → clearing\n", idx, name);
             // 清零 UNICODE_STRING (16 字节: Length+MaxLength+Buffer+Reserved)
             uint8_t zeros[16] = {};
             kma.WriteKernelVA(entryAddr, zeros, 16);
@@ -2916,10 +2932,11 @@ static int TraverseAndClearPiDDBAVL(uint64_t nodeAddr, int depth) {
 
     // 处理当前节点
     if (entry.DriverNameLength > 0 && entry.DriverNameLength <= 256 && entry.DriverNameBuffer) {
-        std::wstring name = ReadKernelUnicodeString(entry.DriverNameBuffer, entry.DriverNameLength);
-        if (IsTraceTarget(name)) {
+        wchar_t name[256] = {};
+        int nchars = ReadKernelUnicodeString(entry.DriverNameBuffer, entry.DriverNameLength, name, 256);
+        if (nchars > 0 && IsTraceTarget(name)) {
             ByovdDiag("TRACE:PiDDBCache: found '%ls' (stamp=0x%llX) at depth=%d\n",
-                name.c_str(), (unsigned long long)entry.TimeDateStamp, depth);
+                name, (unsigned long long)entry.TimeDateStamp, depth);
             // 清零节点: 清除 DriverName UNICODE_STRING 和 TimeDateStamp
             //  不能删除 AVL 节点 (需要重新平衡树, 风险大), 改为使其不可识别
             //  写入 NULL Buffer 和零 Length, Name 变为空字符串
@@ -2977,13 +2994,15 @@ bool KernelTraceCleaner::ClearPiDDBCacheTable(uint64_t ntosBase) {
     uint64_t foundTable = 0;
 
     // 内存映射扫描: 每次读取 64KB 块
-    std::vector<uint8_t> chunk(0x10000);
+    // ★ BUILD 497: VirtualAlloc 替代 std::vector — 避免 CRT 堆依赖
+    uint8_t* chunk = (uint8_t*)VirtualAlloc(nullptr, 0x10000, MEM_COMMIT, PAGE_READWRITE);
+    if (!chunk) return false;
     for (uint64_t addr = scanStart; addr < scanEnd; addr += 0x10000) {
-        if (!kma.ReadKernelVA(addr, chunk.data(), chunk.size()))
+        if (!kma.ReadKernelVA(addr, chunk, 0x10000))
             continue;
 
-        for (size_t off = 0; off < chunk.size() - 0x78; off += 8) {
-            KernRTL_AVL_TABLE* table = (KernRTL_AVL_TABLE*)(chunk.data() + off);
+        for (size_t off = 0; off < 0x10000 - 0x78; off += 8) {
+            KernRTL_AVL_TABLE* table = (KernRTL_AVL_TABLE*)(chunk + off);
             uint64_t actualAddr = addr + off;
 
             // 验证 AVL 表头:
@@ -3017,12 +3036,12 @@ bool KernelTraceCleaner::ClearPiDDBCacheTable(uint64_t ntosBase) {
         // 特征: OwnerTable = 0, ActiveCount = 0, ContentionCount = 0
         // 且通常前后有合法的内核地址
         for (uint64_t addr = scanStart; addr < scanEnd; addr += 0x1000) {
-            if (!kma.ReadKernelVA(addr, chunk.data(), 0x1000))
+            if (!kma.ReadKernelVA(addr, chunk, 0x1000))
                 continue;
             for (size_t off = 0; off < 0x1000 - 0x100; off += 8) {
                 // 查找可能的 AVL 表: 扫描表头 0x78 字节后的区域
                 // PiDDBLock + 0x80 处常有 0 的 ERESOURCE 和 AVL 表
-                KernRTL_AVL_TABLE* table = (KernRTL_AVL_TABLE*)(chunk.data() + off);
+                KernRTL_AVL_TABLE* table = (KernRTL_AVL_TABLE*)(chunk + off);
                 if (table->NumberGenericTableElements >= 1 &&
                     table->NumberGenericTableElements <= 500 &&
                     table->DepthOfTree >= 1 && table->DepthOfTree <= 20) {
@@ -3050,13 +3069,16 @@ bool KernelTraceCleaner::ClearPiDDBCacheTable(uint64_t ntosBase) {
 
     if (!foundTable) {
         ByovdDiag("TRACE:PiDDBCacheTable: table not found\n");
+        VirtualFree(chunk, 0, MEM_RELEASE);
         return false;
     }
 
     // 读取 AVL 表的根节点并开始遍历
     KernRTL_AVL_TABLE table = {};
-    if (!kma.ReadKernelVA(foundTable, &table, sizeof(table)))
+    if (!kma.ReadKernelVA(foundTable, &table, sizeof(table))) {
+        VirtualFree(chunk, 0, MEM_RELEASE);
         return false;
+    }
 
     // 根节点的 "LeftChild" 实际上是整个树的根
     // RTL_AVL_TABLE.BalancedRoot.LeftChild → 树根
@@ -3075,6 +3097,7 @@ bool KernelTraceCleaner::ClearPiDDBCacheTable(uint64_t ntosBase) {
 
     ByovdDiag("TRACE:PiDDBCacheTable: done, cleared %d entries, table had %u elements\n",
         cleared, table.NumberGenericTableElements);
+    VirtualFree(chunk, 0, MEM_RELEASE);
     return (cleared > 0);
     ── v3.129 end ── */
 }
@@ -3121,10 +3144,11 @@ bool KernelTraceCleaner::ClearCiHashBucket(uint64_t ciBase) {
                 strLen > 0 && strLen <= 256 && strLen <= strMax &&
                 strLen % 2 == 0) {
 
-                std::wstring name = ReadKernelUnicodeString(strPtr, strLen);
-                if (IsTraceTarget(name)) {
+                wchar_t name[256] = {};
+                int nchars = ReadKernelUnicodeString(strPtr, strLen, name, 256);
+                if (nchars > 0 && IsTraceTarget(name)) {
                     ByovdDiag("TRACE:CiHashBucket: found '%ls' at ci+0x%zX → clearing\n",
-                        name.c_str(), (size_t)(addr + off - 8 - ciBase));
+                        name, (size_t)(addr + off - 8 - ciBase));
                     // 清零 UNICODE_STRING (16 bytes: Length+MaxLength+Buffer+pad)
                     uint8_t zeros[16] = {};
                     kma.WriteKernelVA(addr + off - 8, zeros, 16);
@@ -3195,9 +3219,10 @@ bool KernelTraceCleaner::CleanAllTraces() {
 // ★ v3.126n: MinifilterNeutralizer — 中和而非卸载 MessageTransfer
 
 // ★ v3.126p: 前向声明 — PAC 模块函数 (实现在 MinifilterNeutralizer 之后)
-static uint64_t FindPacFilterInKernel(uint64_t fltmgrBase, uint64_t fltGlobals, std::wstring& outName);
+// ★ BUILD 497: 固定数组替代 std::wstring — 避免 CRT 堆依赖
+static uint64_t FindPacFilterInKernel(uint64_t fltmgrBase, uint64_t fltGlobals, wchar_t* outName, int outNameChars);
 static bool IsPacPattern(const wchar_t* name);
-static std::wstring GetPacTargetName();
+static const wchar_t* GetPacTargetName();
 //
 // 此前方案: FilterUnload → 卸载 minifilter → PAC 客户端检测到缺失
 // 新方案:   不卸载, 用 BYOVD 内核 R/W 替换所有操作回调为无害 stub
@@ -3245,19 +3270,23 @@ static uint64_t FindRet0Stub(uint64_t fltmgrBase, uint64_t fltmgrSize) {
     uint64_t scanStart = fltmgrBase + 0x1000;
     uint64_t scanEnd = scanStart + (fltmgrSize > 0x300000 ? 0x300000 : fltmgrSize - 0x1000);
 
-    std::vector<uint8_t> chunk(0x10000);
+    // ★ BUILD 497: VirtualAlloc 替代 std::vector — 避免 CRT 堆依赖
+    uint8_t* chunk = (uint8_t*)VirtualAlloc(nullptr, 0x10000, MEM_COMMIT, PAGE_READWRITE);
+    if (!chunk) return 0;
     for (uint64_t addr = scanStart; addr < scanEnd; addr += 0x10000) {
-        if (!kma.ReadKernelVA(addr, chunk.data(), chunk.size()))
+        if (!kma.ReadKernelVA(addr, chunk, 0x10000))
             continue;
-        for (size_t off = 0; off < chunk.size() - 3; off++) {
+        for (size_t off = 0; off < 0x10000 - 3; off++) {
             if (chunk[off] == stub[0] && chunk[off+1] == stub[1] && chunk[off+2] == stub[2]) {
                 uint64_t stubAddr = addr + off;
                 ByovdDiag("FLT:NTRL: found ret0 stub at fltmgr+0x%llX\n",
                     (unsigned long long)(stubAddr - fltmgrBase));
+                VirtualFree(chunk, 0, MEM_RELEASE);
                 return stubAddr;
             }
         }
     }
+    VirtualFree(chunk, 0, MEM_RELEASE);
     ByovdDiag("FLT:NTRL: ret0 stub not found in fltmgr\n");
     return 0;
 }
@@ -3619,6 +3648,109 @@ uint64_t MinifilterNeutralizer::FindFltGlobals(uint64_t fltmgrBase) {
     return 0;
 }
 
+// ============================================================
+// ★ BUILD 502: Win11 直接字符串扫描 — 绕过 FrameList 依赖
+// ============================================================
+static uint64_t FindFilterByStringScan(uint64_t fltmgrBase, const wchar_t* targetName) {
+    auto& kma = KernelMemoryAccessor::Instance();
+    ByovdDiag("FLT:STRSCAN: === BUILD 502 direct string scan ===\n");
+    char drvName[64] = {};
+    int nameLen = 0;
+    while (targetName[nameLen] && nameLen < 60) nameLen++;
+    for (int i = 0; i < nameLen; i++) drvName[i] = (char)targetName[i];
+    drvName[nameLen] = '.'; drvName[nameLen+1] = 's'; drvName[nameLen+2] = 'y'; drvName[nameLen+3] = 's'; drvName[nameLen+4] = 0;
+    uint64_t mtBase = kma.GetKernelModuleBase(drvName);
+    if (!mtBase) { ByovdDiag("FLT:STRSCAN: %s not loaded\n", drvName); return 0; }
+    uint64_t mtSize = 0;
+    IMAGE_DOS_HEADER mtdos = {};
+    if (kma.ReadKernelVA(mtBase, &mtdos, sizeof(mtdos)) && mtdos.e_magic == IMAGE_DOS_SIGNATURE) {
+        IMAGE_NT_HEADERS64 mtnt = {};
+        if (kma.ReadKernelVA(mtBase + mtdos.e_lfanew, &mtnt, sizeof(mtnt)) && mtnt.Signature == IMAGE_NT_SIGNATURE)
+            mtSize = mtnt.OptionalHeader.SizeOfImage;
+    }
+    if (!mtSize) mtSize = 0x100000;
+    ByovdDiag("FLT:STRSCAN: %s at 0x%llX size=0x%llX\n", drvName, (unsigned long long)mtBase, (unsigned long long)mtSize);
+
+    IMAGE_DOS_HEADER dos = {};
+    if (!kma.ReadKernelVA(fltmgrBase, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    IMAGE_NT_HEADERS64 nt = {};
+    if (!kma.ReadKernelVA(fltmgrBase + dos.e_lfanew, &nt, sizeof(nt)) || nt.Signature != IMAGE_NT_SIGNATURE) return 0;
+    WORD numSections = nt.FileHeader.NumberOfSections;
+    DWORD secTableSize = numSections * sizeof(IMAGE_SECTION_HEADER);
+    IMAGE_SECTION_HEADER* sections = (IMAGE_SECTION_HEADER*)VirtualAlloc(nullptr, secTableSize, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+    if (!sections) return 0;
+    if (!kma.ReadKernelVA(fltmgrBase + dos.e_lfanew + sizeof(IMAGE_NT_HEADERS64), sections, secTableSize)) { VirtualFree(sections,0,MEM_RELEASE); return 0; }
+    uint64_t dataStart = 0, dataEnd = 0;
+    for (WORD i = 0; i < numSections; i++) {
+        if ((sections[i].Characteristics & (IMAGE_SCN_MEM_READ|IMAGE_SCN_MEM_WRITE)) == (IMAGE_SCN_MEM_READ|IMAGE_SCN_MEM_WRITE) &&
+            !(sections[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) {
+            uint64_t v = fltmgrBase + sections[i].VirtualAddress, e = v + sections[i].Misc.VirtualSize;
+            if ((e-v) > (dataEnd-dataStart)) { dataStart = v; dataEnd = e; }
+        }
+    }
+    if (!dataStart) { dataStart = fltmgrBase+0x2000; dataEnd = fltmgrBase+nt.OptionalHeader.SizeOfImage; }
+    ByovdDiag("FLT:STRSCAN: .data +0x%llX..+0x%llX (%llu KB)\n", dataStart-fltmgrBase, dataEnd-fltmgrBase, (dataEnd-dataStart)/1024);
+
+    uint8_t* chunk = (uint8_t*)VirtualAlloc(nullptr, 0x10000, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+    if (!chunk) { VirtualFree(sections,0,MEM_RELEASE); return 0; }
+    struct UHit { uint64_t uniAddr; uint64_t bufAddr; };
+    UHit hits[32] = {}; int hitCount = 0;
+    uint64_t mtEnd = mtBase + mtSize;
+    for (uint64_t addr = dataStart; addr < dataEnd; addr += 0x10000) {
+        uint64_t cEnd = (addr+0x10000 < dataEnd) ? addr+0x10000 : dataEnd;
+        if (!kma.ReadKernelVA(addr, chunk, cEnd-addr)) continue;
+        for (size_t off = 0; off+8 <= (cEnd-addr); off += 8) {
+            uint64_t ptr = *(uint64_t*)(chunk+off);
+            if (ptr < mtBase || ptr >= mtEnd) continue;
+            uint64_t uniAddr = addr+off-8;
+            if (uniAddr < dataStart) continue;
+            uint16_t uniLen = *(uint16_t*)(chunk+off-8);
+            if (uniLen==0 || uniLen>256 || (uniLen&1)) continue;
+            uint16_t uniMax = *(uint16_t*)(chunk+off-6);
+            if (uniMax < uniLen || uniMax > 512) continue;
+            wchar_t strBuf[128] = {};
+            if (!kma.ReadKernelVA(ptr, strBuf, (uniLen<254)?uniLen:254)) continue;
+            strBuf[(uniLen<254)?uniLen/2:127] = 0;
+            if (_wcsicmp(strBuf, targetName) != 0) continue;
+            ByovdDiag("FLT:STRSCAN: HIT '%ls' UNI at fltmgr+0x%llX buf=0x%llX len=%u\n", strBuf, uniAddr-fltmgrBase, (unsigned long long)ptr, uniLen);
+            if (hitCount < 32) { hits[hitCount].uniAddr=uniAddr; hits[hitCount].bufAddr=ptr; hitCount++; }
+        }
+    }
+    VirtualFree(chunk,0,MEM_RELEASE);
+    VirtualFree(sections,0,MEM_RELEASE);
+    if (hitCount == 0) { ByovdDiag("FLT:STRSCAN: no UNICODE_STRING for '%ls'\n", targetName); return 0; }
+    ByovdDiag("FLT:STRSCAN: %d hits for '%ls'\n", hitCount, targetName);
+
+    for (int hi = 0; hi < hitCount; hi++) {
+        uint64_t uniAddr = hits[hi].uniAddr;
+        for (uint64_t nameOff = 0x38; nameOff <= 0x300; nameOff += 8) {
+            uint64_t fb = uniAddr - nameOff;
+            if (fb < fltmgrBase || fb >= fltmgrBase + nt.OptionalHeader.SizeOfImage) continue;
+            uint64_t flink=0, blink=0; uint32_t flags=0;
+            if (!kma.ReadKernelVA(fb+0x08,&flink,8)) continue;
+            if (!kma.ReadKernelVA(fb+0x10,&blink,8)) continue;
+            if (!kma.ReadKernelVA(fb+0x00,&flags,4)) continue;
+            if (flink<0xFFFF800000000000ULL || blink<0xFFFF800000000000ULL) continue;
+            if (flags > 0x10000) continue;
+            uint64_t opsOffs[] = {0x228,0x238,0x248,0x258,0x268,0x278,0x288,0x298,0x2A0,0x2A8,0x2B0,0x2B8,0x2C0,0x2C8,0x2D0,0x2D8,0x2E0,0x2E8,0x2F0,0x2F8,0x300};
+            for (uint64_t oo : opsOffs) {
+                uint64_t val=0;
+                if (kma.ReadKernelVA(fb+oo,&val,8) && val>0xFFFF800000000000ULL) {
+                    uint8_t mj=0; uint64_t rp=0;
+                    if (kma.ReadKernelVA(val,&rp,8) && rp>0xFFFF800000000000ULL) {
+                        if (kma.ReadKernelVA(rp,&mj,1) && (mj<=0x1B||mj==0x80)) {
+                            ByovdDiag("FLT:STRSCAN: FLT_FILTER at fltmgr+0x%llX (nameOff=0x%llX opsOff=0x%llX ops=0x%llX)\n", fb-fltmgrBase, nameOff, oo, (unsigned long long)val);
+                            return fb;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ByovdDiag("FLT:STRSCAN: found UNICODE_STRING but could not validate FLT_FILTER\n");
+    return 0;
+}
+
 // 在 FilterList 中查找指定名称的 FLT_FILTER
 uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t fltGlobals, const wchar_t* name) {
     auto& kma = KernelMemoryAccessor::Instance();
@@ -3696,6 +3828,13 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
             }
             ByovdDiag("\n");
         }
+        // ★ BUILD 502: FrameList 失败 → 尝试字符串扫描
+        ByovdDiag("FLT:NTRL: FrameList failed, trying BUILD 502 string scan...\n");
+        uint64_t strScanResult = FindFilterByStringScan(fltmgrBase, name);
+        if (strScanResult) {
+            ByovdDiag("FLT:NTRL: BUILD 502 string scan SUCCESS at 0x%llX\n", (unsigned long long)strScanResult);
+            return strScanResult;
+        }
         return 0;
     }
 
@@ -3734,10 +3873,12 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
                 if (nameLen > 0 && nameLen <= 256 && nameLen % 2 == 0 &&
                     nameBuf > 0xFFFF800000000000ULL) {
 
-                    std::wstring filterName = ReadKernelUnicodeString(nameBuf, nameLen);
-                    if (_wcsicmp(filterName.c_str(), name) == 0) {
+                    // ★ BUILD 500: 固定数组替代 std::wstring — 避免 CRT 堆依赖
+                    wchar_t filterName[256] = {};
+                    ReadKernelUnicodeString(nameBuf, nameLen, filterName, 256);
+                    if (_wcsicmp(filterName, name) == 0) {
                         ByovdDiag("FLT:NTRL: found '%ls' at 0x%llX (nameOff=0x%llX)\n",
-                            filterName.c_str(), (unsigned long long)filterBase, nameOff);
+                            filterName, (unsigned long long)filterBase, nameOff);
                         return filterBase;
                     }
                 }
@@ -3837,6 +3978,13 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
     }
 
     ByovdDiag("FLT:NTRL: callback-range fallback also failed\n");
+    // ★ BUILD 502: 最后尝试字符串扫描
+    ByovdDiag("FLT:NTRL: last resort — BUILD 502 string scan...\n");
+    uint64_t strScanResult2 = FindFilterByStringScan(fltmgrBase, name);
+    if (strScanResult2) {
+        ByovdDiag("FLT:NTRL: BUILD 502 string scan SUCCESS at 0x%llX\n", (unsigned long long)strScanResult2);
+        return strScanResult2;
+    }
     return 0;
 }
 
@@ -3969,12 +4117,13 @@ bool MinifilterNeutralizer::NeutralizeMessageTransfer() {
     if (!fltGlobals) return false;
 
     // 2. 查找 PAC minifilter
-    std::wstring pacName = GetPacTargetName();
-    uint64_t filterAddr = FindFilterByName(fltmgrBase, fltGlobals, pacName.c_str());
+    // ★ BUILD 497: 固定数组替代 std::wstring — 避免 CRT 堆依赖
+    const wchar_t* pacName = GetPacTargetName();
+    uint64_t filterAddr = FindFilterByName(fltmgrBase, fltGlobals, pacName);
     if (!filterAddr) {
         // ★ v3.126p: 精确匹配失败 → 尝试内核模糊扫描
-        std::wstring kernName;
-        filterAddr = FindPacFilterInKernel(fltmgrBase, fltGlobals, kernName);
+        wchar_t kernName[256] = {};
+        filterAddr = FindPacFilterInKernel(fltmgrBase, fltGlobals, kernName, 256);
         if (!filterAddr) {
             ByovdDiag("FLT:NTRL: no PAC filter found in kernel\n");
             return false;
@@ -4133,12 +4282,14 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
                             kma.ReadKernelVA(uniAddr + 8, &nb, sizeof(nb))) {
                             if (nl > 0 && nl <= 256 && nl % 2 == 0 &&
                                 nb > 0xFFFF800000000000ULL) {
-                                std::wstring fn = ReadKernelUnicodeString(nb, nl);
-                                if (!fn.empty()) {
+                                // ★ BUILD 500: 固定数组替代 std::wstring — 避免 CRT 堆依赖
+                                wchar_t fn[256] = {};
+                                int fnChars = ReadKernelUnicodeString(nb, nl, fn, 256);
+                                if (fnChars > 0) {
                                     foundNamed++;
                                     if (foundNamed == 1) {
                                         ByovdDiag("FLT:VERIFY: found '%ls' via globQw[%d]+0x%llX (nameOff=0x%llX)\n",
-                                            fn.c_str(), qi, filterOffs[fi], nameOffs[ni]);
+                                            fn, qi, filterOffs[fi], nameOffs[ni]);
                                     }
                                 }
                             }
@@ -4180,6 +4331,20 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
     ByovdDiag("FLT:VERIFY: pool scan DISABLED for safety (PDFWKRNL IOCTL causes BSOD on bad ptr)\n");
 
     if (bestFilterCount == 0) {
+        // ★ BUILD 502: FrameList 失败 → 尝试字符串扫描系统 minifilter
+        ByovdDiag("FLT:VERIFY: trying BUILD 502 string scan for system minifilters...\n");
+        const wchar_t* testFilters[] = { L"FileInfo", L"WdFilter", L"Wof", L"luafv", nullptr };
+        for (int ti = 0; testFilters[ti]; ti++) {
+            uint64_t fAddr = FindFilterByStringScan(fltmgrBase, testFilters[ti]);
+            if (fAddr) {
+                ByovdDiag("FLT:VERIFY: BUILD 502 found '%ls' → FLT pipeline VERIFIED\n", testFilters[ti]);
+                bestFilterCount = 1;
+                bestListHead = fAddr + 0x008;
+                bestQi = -1;
+                bestFilterListOff = 0;
+                goto check3_done;
+            }
+        }
         ByovdDiag("FLT:VERIFY: FAIL — no FILTER_LIST with named minifilters found\n");
         ByovdDiag("FLT:VERIFY: RESULT: FAIL (%d/%d checks)\n", checksPassed, checksTotal);
         return false;
@@ -4225,11 +4390,11 @@ bool MinifilterNeutralizer::IsMessageTransferNeutralized() {
     uint64_t fltGlobals = FindFltGlobals(fltmgrBase);
     if (!fltGlobals) return true; // 找不到 Globals 不报错
 
-    uint64_t filterAddr = FindFilterByName(fltmgrBase, fltGlobals, GetPacTargetName().c_str());
+    uint64_t filterAddr = FindFilterByName(fltmgrBase, fltGlobals, GetPacTargetName());
     if (!filterAddr) {
         // ★ v3.126p: 精确匹配失败 → 模糊扫描
-        std::wstring kernName;
-        filterAddr = FindPacFilterInKernel(fltmgrBase, fltGlobals, kernName);
+        wchar_t kernName[256] = {};
+        filterAddr = FindPacFilterInKernel(fltmgrBase, fltGlobals, kernName, 256);
     }
     if (!filterAddr) {
         // minifilter 不在列表中 — 被卸载了, 需要重新安装假的存在性
@@ -4332,17 +4497,18 @@ static bool IsPacPattern(const wchar_t* name) {
 }
 
 // ★ v3.126p: 统一 PAC 目标名获取 — 支持改名容错
-static std::wstring g_cachedPacName;
-static DWORD     g_lastPacNameCheck = 0;
+// ★ BUILD 497: 固定数组替代 std::wstring — 避免 CRT 堆依赖
+static wchar_t g_cachedPacName[256] = {};
+static DWORD   g_lastPacNameCheck = 0;
 
-static std::wstring GetPacTargetName() {
+static const wchar_t* GetPacTargetName() {
     DWORD now = GetTickCount();
-    if (!g_cachedPacName.empty() && now - g_lastPacNameCheck < 30000)
+    if (g_cachedPacName[0] && now - g_lastPacNameCheck < 30000)
         return g_cachedPacName;
     g_lastPacNameCheck = now;
 
     // 枚举所有 minifilter, 找 PAC 匹配
-    std::wstring found;
+    wchar_t found[256] = {};
     HMODULE hFltLib = LoadLibraryW(L"fltlib.dll");
     if (hFltLib) {
         auto pFF = (HRESULT(WINAPI*)(DWORD,LPVOID,DWORD,LPDWORD,LPVOID))GetProcAddress(hFltLib,"FilterFindFirst");
@@ -4353,32 +4519,32 @@ static std::wstring GetPacTargetName() {
             HRESULT hr = pFF(0,buf,sizeof(buf),&br,&hF);
             while (SUCCEEDED(hr)) {
                 wchar_t* fn = (wchar_t*)(buf+8);
-                if (IsPacPattern(fn)) { found = fn; break; }
+                if (IsPacPattern(fn)) { wcscpy_s(found, fn); break; }
                 hr = pFN(hF,buf,sizeof(buf),&br);
             }
             if (hF) pFC(hF);
         }
         FreeLibrary(hFltLib);
     }
-    if (found.empty()) found = L"MessageTransfer"; // 回退默认
-    g_cachedPacName = found;
-    return found;
+    if (!found[0]) wcscpy_s(found, L"MessageTransfer"); // 回退默认
+    wcscpy_s(g_cachedPacName, found);
+    return g_cachedPacName;
 }
 
-static void RefreshPacName() { g_cachedPacName.clear(); g_lastPacNameCheck=0; GetPacTargetName(); }
+static void RefreshPacName() { g_cachedPacName[0] = 0; g_lastPacNameCheck=0; GetPacTargetName(); }
 
-// ★ v3.126p: wstring → string 辅助转换
-static std::string WStringToString(const std::wstring& ws) {
-    if (ws.empty()) return "";
-    int len = WideCharToMultiByte(CP_ACP, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    if (len <= 0) return "";
-    std::string result(len - 1, '\0');
-    WideCharToMultiByte(CP_ACP, 0, ws.c_str(), -1, &result[0], len, nullptr, nullptr);
-    return result;
+// ★ BUILD 497: 固定缓冲区替代 std::string — 避免 CRT 堆依赖
+//   返回 outBuf 中实际写入的字节数
+static int WStringToString(const wchar_t* ws, char* outBuf, int outBufSize) {
+    if (!ws || !ws[0] || !outBuf || outBufSize <= 0) { if (outBuf) outBuf[0] = 0; return 0; }
+    int len = WideCharToMultiByte(CP_ACP, 0, ws, -1, outBuf, outBufSize, nullptr, nullptr);
+    if (len <= 0) { outBuf[0] = 0; return 0; }
+    return len - 1; // 不包括 null terminator
 }
 
 // ★ v3.126p: 内核层模糊扫描 PAC minifilter (用于 Neutralize 失败后的回退)
-static uint64_t FindPacFilterInKernel(uint64_t fltmgrBase, uint64_t fltGlobals, std::wstring& outName) {
+// ★ BUILD 497: 固定数组替代 std::wstring& — 避免 CRT 堆依赖
+static uint64_t FindPacFilterInKernel(uint64_t fltmgrBase, uint64_t fltGlobals, wchar_t* outName, int outNameChars) {
     auto& kma = KernelMemoryAccessor::Instance();
     if (!kma.IsActive()) return 0;
 
@@ -4413,9 +4579,12 @@ static uint64_t FindPacFilterInKernel(uint64_t fltmgrBase, uint64_t fltGlobals, 
                 kma.ReadKernelVA(filterBase + nameOff + 8, &nameBuf, sizeof(nameBuf))) {
                 if (nameLen > 0 && nameLen <= 256 && nameLen % 2 == 0 &&
                     nameBuf > 0xFFFF800000000000ULL) {
-                    std::wstring filterName = ReadKernelUnicodeString(nameBuf, nameLen);
-                    if (IsPacPattern(filterName.c_str())) {
-                        outName = filterName;
+                    wchar_t filterName[256] = {};
+                    int nchars = ReadKernelUnicodeString(nameBuf, nameLen, filterName, 256);
+                    if (nchars > 0 && IsPacPattern(filterName)) {
+                        if (outName && outNameChars > 0) {
+                            wcsncpy_s(outName, outNameChars, filterName, (size_t)(outNameChars - 1));
+                        }
                         return filterBase;
                     }
                 }
@@ -4467,7 +4636,7 @@ static bool IsPacMinifilterLoaded() {
         auto* info = (BYTE*)buf;
         // FILTER_FULL_INFORMATION: Name is at offset 8 (wchar_t[256])
         const wchar_t* filterName = (const wchar_t*)(info + 8);
-        if (_wcsicmp(filterName, GetPacTargetName().c_str()) == 0) {
+        if (_wcsicmp(filterName, GetPacTargetName()) == 0) {
             found = true;
             break;
         }
@@ -4489,11 +4658,11 @@ static bool DisablePacService() {
         return false;
     }
 
-    std::wstring pacName = GetPacTargetName();
-    SC_HANDLE svc = OpenServiceW(scm, pacName.c_str(),
+    const wchar_t* pacName = GetPacTargetName();
+    SC_HANDLE svc = OpenServiceW(scm, pacName,
         SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE | SERVICE_START);
     if (!svc) {
-        ByovdDiag("PAC: SCM service '%ls' not found (may already be removed)\n", pacName.c_str());
+        ByovdDiag("PAC: SCM service '%ls' not found (may already be removed)\n", pacName);
         CloseServiceHandle(scm);
         return true; // 未找到 = 已经移除, 不算失败
     }
@@ -4556,8 +4725,8 @@ static bool UnloadPacMinifilter() {
         return false;
     }
 
-    std::wstring pacName = GetPacTargetName();
-    HRESULT hr = pFilterUnload(pacName.c_str());
+    const wchar_t* pacName = GetPacTargetName();
+    HRESULT hr = pFilterUnload(pacName);
     FreeLibrary(hFltLib);
 
     if (SUCCEEDED(hr)) {
@@ -4609,7 +4778,7 @@ static void DeletePacDriverFiles() {
                 if (GetFileAttributesW(pluginDir) != INVALID_FILE_ATTRIBUTES) {
                     // ★ v3.126p: 先搜索确切名称, 未找到则模糊扫描 *.sys
                     wchar_t drvFile[MAX_PATH] = {};
-                    wsprintfW(drvFile, L"%s\\%s.sys", pluginDir, GetPacTargetName().c_str());
+                    wsprintfW(drvFile, L"%s\\%s.sys", pluginDir, GetPacTargetName());
                     bool found = (GetFileAttributesW(drvFile) != INVALID_FILE_ATTRIBUTES);
 
                     if (!found) {
@@ -4646,7 +4815,7 @@ static void DeletePacDriverFiles() {
 
     // 2. system32\drivers 中的备份 (★ v3.126p: 动态名称)
     wchar_t sys32Drv[MAX_PATH] = {};
-    wsprintfW(sys32Drv, L"C:\\Windows\\System32\\drivers\\%s.sys", GetPacTargetName().c_str());
+    wsprintfW(sys32Drv, L"C:\\Windows\\System32\\drivers\\%s.sys", GetPacTargetName());
     if (!DeleteFileW(sys32Drv)) {
         DWORD err = GetLastError();
         if (err != ERROR_FILE_NOT_FOUND) {
@@ -4655,7 +4824,7 @@ static void DeletePacDriverFiles() {
         }
     } else {
         wchar_t sys32Bak[MAX_PATH] = {};
-        wsprintfW(sys32Bak, L"C:\\Windows\\System32\\drivers\\%s.sys.bak", GetPacTargetName().c_str());
+        wsprintfW(sys32Bak, L"C:\\Windows\\System32\\drivers\\%s.sys.bak", GetPacTargetName());
         DeleteFileW(sys32Bak);
     }
 }
@@ -4718,7 +4887,7 @@ void KernelDefense::GuardPac() {
     // 检查 1: SCM 服务状态
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (scm) {
-        SC_HANDLE svc = OpenServiceW(scm, GetPacTargetName().c_str(), SERVICE_QUERY_STATUS);
+        SC_HANDLE svc = OpenServiceW(scm, GetPacTargetName(), SERVICE_QUERY_STATUS);
         if (svc) {
             SERVICE_STATUS_PROCESS ssp = {};
             DWORD bytesNeeded = 0;
@@ -4773,7 +4942,7 @@ KernelDefense::Result KernelDefense::EnableAll() {
         const BYOVDDriverInfo* cand = g_driverCandidates[indices[ci]];
         // ★ v3.37: 诊断 — 每个驱动尝试日志
         wchar_t drvName[64] = {};
-        wcsncpy_s(drvName, cand->driverPath.c_str(), 63);
+        wcsncpy_s(drvName, cand->driverPath, 63);
         ByovdDiag("BYOVD: trying driver[%d/%d] = %ls ...\n", ci+1, candCount, drvName);
 
         BYOVDDriverInfo mutated = MutateAndRandomizeDriver(*cand);
@@ -4796,13 +4965,15 @@ KernelDefense::Result KernelDefense::EnableAll() {
 
     // ★ v3.126p: PAC 回调摘除 — 动态名称（唯一目标）
     auto& cbDisabler = EACCallbackDisabler::Instance();
-    std::string pacNameA = WStringToString(GetPacTargetName());
+    // ★ BUILD 501: 固定缓冲区替代 std::string — 避免 CRT 堆依赖
+    char pacNameA[256] = {};
+    WStringToString(GetPacTargetName(), pacNameA, 256);
     int pacOb = cbDisabler.DisableObCallbacks(pacNameA);
     int pacProc = cbDisabler.DisableProcessNotifyCallbacks(pacNameA);
     int pacImg = cbDisabler.DisableImageNotifyCallbacks(pacNameA);
     if (pacOb || pacProc || pacImg) {
         ByovdDiag("BYOVD: callbacks removed (PAC/%s) — ob=%d proc=%d img=%d\n",
-            pacNameA.c_str(), pacOb, pacProc, pacImg);
+            pacNameA, pacOb, pacProc, pacImg);
         result.obCallbacksRemoved += pacOb;
         result.processCallbacksRemoved += pacProc;
         result.imageCallbacksRemoved += pacImg;
@@ -4834,8 +5005,9 @@ void KernelDefense::DisableAll() {
 
     // v3.49: 一用即卸 — 卸载驱动 + 清除注册表 + 删除驱动文件
     if (kma.IsActive()) {
-        std::wstring svcName = kma.GetServiceName();
-        std::wstring drvPath = kma.GetDriverPath();
+        // ★ BUILD 501: 固定数组替代 std::wstring — 避免 CRT 堆依赖
+        const wchar_t* svcName = kma.GetServiceName();
+        const wchar_t* drvPath = kma.GetDriverPath();
 
         // ★ v3.126m: 卸载前最后清理一次 PiDDBCacheTable (驱动名已随机化,
         //   MmUnloadedDrivers 无需清理, 但 PiDDBCacheTable 按校验和索引)
@@ -4843,16 +5015,18 @@ void KernelDefense::DisableAll() {
 
         kma.Shutdown();
 
-        // 删除注册表服务键
-        std::wstring keyPath = L"SYSTEM\\CurrentControlSet\\Services\\" + svcName;
-        RegDeleteTreeW(HKEY_LOCAL_MACHINE, keyPath.c_str());
+        // 删除注册表服务键 — ★ BUILD 501: 手动构造路径替代 std::wstring 拼接
+        wchar_t keyPath[512] = {};
+        wcscpy_s(keyPath, L"SYSTEM\\CurrentControlSet\\Services\\");
+        wcscat_s(keyPath, svcName);
+        RegDeleteTreeW(HKEY_LOCAL_MACHINE, keyPath);
 
         // 删除 TEMP 中的驱动文件
-        if (!drvPath.empty()) {
-            DeleteFileW(drvPath.c_str());
+        if (drvPath && drvPath[0]) {
+            DeleteFileW(drvPath);
         }
 
-        ByovdDiag("BYOVD: %ls unloaded & cleaned.\n", svcName.c_str());
+        ByovdDiag("BYOVD: %ls unloaded & cleaned.\n", svcName);
     }
 }
 
@@ -4885,8 +5059,11 @@ void KernelDefense::ReapplyAllCallbacks() {
     auto& cbDisabler = EACCallbackDisabler::Instance();
     int total = 0;
 
-    // ★ v3.126p: PAC — 动态名称（唯一目标）
-    total += cbDisabler.DisableAll(WStringToString(GetPacTargetName()));
+    // ★ v3.126p: PAC — 动态名称
+    // ★ BUILD 501: 固定缓冲区替代 std::string — 避免 CRT 堆依赖
+    char pacNameBuf[256] = {};
+    WStringToString(GetPacTargetName(), pacNameBuf, 256);
+    total += cbDisabler.DisableAll(pacNameBuf);
 
     if (total > 0) {
         ByovdDiag("BYOVD:KernelDefense: ReapplyAllCallbacks removed %d callbacks\n", total);
