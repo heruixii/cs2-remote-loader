@@ -221,29 +221,9 @@ static bool TryDownloadUrl(const wchar_t* url, DWORD openType, std::vector<uint8
     return true;
 }
 
-// ★ v3.111: 多 URL + 多连接类型轮询下载
-//   顺序: 直连主URL → 直连镜像 → 走代理主URL → 走代理镜像
+// ★ v3.129: 本地 payload.dat 优先 (开发迭代), HTTP 作为降级
 static std::vector<uint8_t> DownloadPayload() {
-    // 尝试顺序: 直连(DIRECT) 优先, 再走系统代理(PRECONFIG)
-    static const DWORD openTypes[] = {
-        INTERNET_OPEN_TYPE_DIRECT,     // 绕过系统代理, 适合中国 DNS 污染场景
-        INTERNET_OPEN_TYPE_PRECONFIG,  // 走系统代理, 适合企业代理场景
-    };
-
-    for (auto openType : openTypes) {
-        for (int i = 0; i < PAYLOAD_URL_COUNT; i++) {
-            LoaderDiag("  DL: openType=%u url[%d]\n", openType, i);
-            std::vector<uint8_t> result;
-            if (TryDownloadUrl(PAYLOAD_URLS[i], openType, result)) {
-                LoaderDiag("  DL: SUCCESS (openType=%u url[%d])\n", openType, i);
-                return result;
-            }
-        }
-    }
-
-    LoaderDiag("  DL: ALL URLS FAILED\n");
-
-    // BUILD 465: 本地 payload.dat fallback (GitHub CDN 传播延迟时使用)
+    // BUILD 466: 本地文件优先 — 不受 GitHub CDN 缓存影响
     wchar_t localPath[MAX_PATH];
     GetModuleFileNameW(nullptr, localPath, MAX_PATH);
     wchar_t* lastSlash = wcsrchr(localPath, L'\\');
@@ -258,12 +238,31 @@ static std::vector<uint8_t> DownloadPayload() {
         DWORD rd = 0;
         if (ReadFile(hFile, buf.data(), sz, &rd, nullptr) && rd == sz) {
             CloseHandle(hFile);
-            LoaderDiag("  DL: local file SUCCESS (%u bytes)\n", sz);
+            LoaderDiag("  DL: LOCAL FILE SUCCESS (%u bytes)\n", sz);
             return buf;
         }
         CloseHandle(hFile);
     }
+    LoaderDiag("  DL: local file not found, trying HTTP...\n");
 
+    // ★ v3.111: 多 URL + 多连接类型轮询下载
+    static const DWORD openTypes[] = {
+        INTERNET_OPEN_TYPE_DIRECT,
+        INTERNET_OPEN_TYPE_PRECONFIG,
+    };
+
+    for (auto openType : openTypes) {
+        for (int i = 0; i < PAYLOAD_URL_COUNT; i++) {
+            LoaderDiag("  DL: openType=%u url[%d]\n", openType, i);
+            std::vector<uint8_t> result;
+            if (TryDownloadUrl(PAYLOAD_URLS[i], openType, result)) {
+                LoaderDiag("  DL: HTTP SUCCESS (openType=%u url[%d])\n", openType, i);
+                return result;
+            }
+        }
+    }
+
+    LoaderDiag("  DL: ALL FAILED\n");
     return {};
 }
 
