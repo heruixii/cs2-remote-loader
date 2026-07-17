@@ -3377,7 +3377,7 @@ static uint64_t ScanDataSectionForFltGlobals(uint64_t fltmgrBase) {
             }
         }
     }
-    VirtualFree(sections, 0, MEM_RELEASE);
+    // ★ BUILD 494: sections 延迟释放 — .text 段扫描还需要用它 (修复 USE-AFTER-FREE 崩溃)
 
     if (!dataStart || !dataEnd || dataEnd <= dataStart) {
         // 无法解析段 → 回退到估算范围
