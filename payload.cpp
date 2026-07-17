@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 531 (v3.189: 测试模式跳过 StealthSleep — EkkoSleep 加密 EncryptAll/DecryptAll 所在页导致返回崩溃, 测试模式用普通 Sleep)
+// BUILD: 532 (v3.190: PDFWKRNL IOCTL 超时保护 — overlapped I/O + 2s 超时 + 10s 冷却, 防止驱动卡死导致主循环永久阻塞)
 // ============================================================
 
 #include "stealth_core.h"
