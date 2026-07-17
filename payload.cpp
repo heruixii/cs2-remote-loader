@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 495 (v3.160: disable pool scan — PDFWKRNL IOCTL deref causes BSOD, Win11 FLT_FRAME layout mismatch)
+// BUILD: 502 (v3.161: Win11 FLT_FRAME bypass — direct .data string scan for minifilter FLT_FILTER)
 // ============================================================
 
 #include "stealth_core.h"
@@ -19,17 +19,15 @@
 #include "game_esp.h"
 #include "cs2_memory.h"
 
-#include <algorithm>
-#include <vector>
-#include <cstdlib>
-#include <ctime>
-#include <setjmp.h>
+// ★ BUILD 501: 移除 <algorithm> <vector> <cstdlib> <ctime> — CRT 堆依赖
+//   保留 <cstdio> <csetjmp> — DiagLog/Hollowing 回退需要
 #include "cs2_offsets.h"
 #include "syscall_direct.h"
 #include "eac_syscall_guard.h"
 #include "byovd_kernel.h"
-#include <cstdio>
 #include <cstdarg>
+#include <cstdio>
+#include <csetjmp>
 #include <tlhelp32.h>
 
 // ---- v3.34: 时序随机化 ----
@@ -1363,14 +1361,13 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
 
     // 诊断: 列出 CS2 进程模块
     {
-        auto modules = StealthProcess::GetProcessModules(
-            StealthEngine::Instance().GetProcessHandle());
-        DiagLog("GetProcessModules: %zu modules found\n", modules.size());
-        for (auto& m : modules) {
-            wchar_t buf[64];
-            wcsncpy_s(buf, m.name.c_str(), 63);
-            if (wcsstr(m.name.c_str(), L"client") || wcsstr(m.name.c_str(), L"engine"))
-                DiagLog("  %ls @ 0x%llX\n", buf, (unsigned long long)m.baseAddress);
+        StealthProcess::ModuleInfo modules[64];
+        int modCount = StealthProcess::GetProcessModules(
+            StealthEngine::Instance().GetProcessHandle(), modules, 64);
+        DiagLog("GetProcessModules: %d modules found\n", modCount);
+        for (int i = 0; i < modCount; i++) {
+            if (wcsstr(modules[i].name, L"client") || wcsstr(modules[i].name, L"engine"))
+                DiagLog("  %ls @ 0x%llX\n", modules[i].name, (unsigned long long)modules[i].baseAddress);
         }
     }
 
@@ -1393,10 +1390,14 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
 
         // 获取 client.dll 大小
         uintptr_t clientSize = 0;
-        for (auto& mod : stealth::StealthProcess::GetProcessModules(hProc)) {
-            if (mod.name == L"client.dll") {
-                clientSize = mod.size;
-                break;
+        {
+            StealthProcess::ModuleInfo modules[64];
+            int modCount = stealth::StealthProcess::GetProcessModules(hProc, modules, 64);
+            for (int i = 0; i < modCount; i++) {
+                if (wcscmp(modules[i].name, L"client.dll") == 0) {
+                    clientSize = modules[i].size;
+                    break;
+                }
             }
         }
         DiagLog("client.dll: base=0x%llX size=0x%llX (%lld MB) end=0x%llX\n",
