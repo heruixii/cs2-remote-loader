@@ -994,26 +994,21 @@ bool KernelMemoryAccessor::LoadDriver(const std::wstring& serviceName,
 }
 
 bool KernelMemoryAccessor::UnloadDriver(const std::wstring& serviceName) {
-    // ★ v3.87: NtUnloadDriver 需要 SeLoadDriverPrivilege, 否则静默失败
-    //         之前缺少此特权导致驱动无法卸载 → zombie \Device\RTCore64 残留
-    EnablePrivilege(L"SeLoadDriverPrivilege");
-
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    if (!ntdll) return false;
-
-    using NtUnloadDriver_t = NTSTATUS(NTAPI*)(PUNICODE_STRING);
-    auto pNtUnloadDriver = (NtUnloadDriver_t)GetProcAddress(ntdll, "NtUnloadDriver");
-    if (!pNtUnloadDriver) return false;
-
-    std::wstring regPath = L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\" + serviceName;
-    UNICODE_STRING us;
-    us.Buffer = regPath.data();
-    us.Length = (USHORT)(regPath.size() * sizeof(wchar_t));
-    us.MaximumLength = us.Length + sizeof(wchar_t);
-
-    NTSTATUS st = pNtUnloadDriver(&us);
-    ByovdDiag("BYOVD:UnloadDriver: %ls → 0x%08X\n", serviceName.c_str(), (uint32_t)st);
-    return NT_SUCCESS(st);
+    // ★ BUILD 474: 替换 NtUnloadDriver → RegDeleteTreeW
+    //   manual-mapped DLL 上下文中 NtUnloadDriver = ACCESS_VIOLATION in ntdll
+    //   只删除注册表键即可 (驱动代码未加载, 不存在卸载问题)
+    HKEY hServices;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Services", 0,
+        KEY_ENUMERATE_SUB_KEYS | DELETE, &hServices) == ERROR_SUCCESS)
+    {
+        LONG result = RegDeleteTreeW(hServices, serviceName.c_str());
+        RegCloseKey(hServices);
+        ByovdDiag("BYOVD:UnloadDriver: %ls -> RegDeleteTree=%d (BUILD 474 skip NtUnloadDriver)\n",
+            serviceName.c_str(), (int)(result == ERROR_SUCCESS));
+        return result == ERROR_SUCCESS;
+    }
+    return false;
 }
 
 bool KernelMemoryAccessor::EnablePrivilege(const wchar_t* privilegeName) {
@@ -1507,11 +1502,10 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
                         sameKeyRetries = 0;
                         wcscpy_s(prevKey, subKeyName);
                     }
-                    ByovdDiag("BYOVD:Init: found stale service '%ls', unloading...\n", subKeyName);
-                    // ★ 先卸载 (需要 registry key 存在)
-                    bool unloaded = UnloadDriver(svcName);
-                    ByovdDiag("BYOVD:Init: unload %ls → %d\n", subKeyName, (int)unloaded);
-                    // 卸载后删除注册表残留
+                    // ★ BUILD 474: 跳过 UnloadDriver — manual-mapped DLL 上下文中
+                    //   NtUnloadDriver 在 ntdll 中 ACCESS_VIOLATION, 无法安全调用.
+                    //   驱动已不在内核 (stale = 从未加载/已卸载), 直接删注册表即可.
+                    ByovdDiag("BYOVD:Init: found stale service '%ls', deleting registry key (skip UnloadDriver)\n", subKeyName);
                     RegDeleteTreeW(hServices, subKeyName);
                     // 不要 idx++ — 删除后索引会变, 重新从 idx 开始
                 } else {
