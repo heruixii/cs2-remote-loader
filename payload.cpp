@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 462 (v3.138: FrameList validation — accept kernel pool addresses)
+// BUILD: 463 (v3.139: NtMakeTemporaryObject zombie cleanup + FrameList pool addr)
 // ============================================================
 
 #include "stealth_core.h"
@@ -1022,7 +1022,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.128 DIAG START (BUILD 462: pool FrameList) ===\n");
+    DiagLog("=== v3.128 DIAG START (BUILD 463: NtMakeTemp zombie) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)

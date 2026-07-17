@@ -1510,10 +1510,18 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
             ByovdDiag("BYOVD:Init: existing device kernel read FAILED (magic=0x%04X)\n", magic);
         }
         // ★ v3.96: 僵尸设备 — IOCTL 不可用, 设备对象残留但无驱动
-        //   NtMakeTemporaryObject 对文件句柄无效 (需要设备对象句柄),
-        //   NtOpenDirectoryObject 枚举 \Device 目录在 manual-mapped DLL 中会崩溃.
-        // ★ BUILD 460: 主动清理僵尸 — 强制删除残留服务 + 移除符号链接 + 重试加载
+        // ★ BUILD 463: 四步彻底清理
         ByovdDiag("BYOVD:Init: ZOMBIE DEVICE DETECTED — attempting force cleanup...\n");
+
+        // 0. NtMakeTemporaryObject — 移除 OBJ_PERMANENT, 关闭句柄后设备对象自动释放
+        {
+            static auto pNtMakeTemp = (NTSTATUS(NTAPI*)(HANDLE))
+                GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtMakeTemporaryObject");
+            if (pNtMakeTemp) {
+                NTSTATUS st = pNtMakeTemp(m_hDevice);
+                ByovdDiag("BYOVD:Init: NtMakeTemporaryObject(zombie) → 0x%08X\n", (uint32_t)st);
+            }
+        }
         CloseHandle(m_hDevice);
         m_hDevice = INVALID_HANDLE_VALUE;
         m_active = false;
