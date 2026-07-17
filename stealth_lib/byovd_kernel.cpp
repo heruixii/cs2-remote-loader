@@ -1512,11 +1512,22 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
         // ★ v3.96: 僵尸设备 — IOCTL 不可用, 设备对象残留但无驱动
         //   NtMakeTemporaryObject 对文件句柄无效 (需要设备对象句柄),
         //   NtOpenDirectoryObject 枚举 \Device 目录在 manual-mapped DLL 中会崩溃.
-        //   唯一清理方式: 重启系统.
-        ByovdDiag("BYOVD:Init: ZOMBIE DEVICE DETECTED — reboot required to clear\n");
+        // ★ BUILD 460: 主动清理僵尸 — 强制删除残留服务 + 移除符号链接 + 重试加载
+        ByovdDiag("BYOVD:Init: ZOMBIE DEVICE DETECTED — attempting force cleanup...\n");
         CloseHandle(m_hDevice);
         m_hDevice = INVALID_HANDLE_VALUE;
         m_active = false;
+
+        // 1. 强制移除所有残留的 RTCore64/SysMon 服务
+        ForceRemoveRTCore64Services();
+
+        // 2. 删除 DOS 设备符号链接 \\.\RTCore64
+        DefineDosDeviceW(DDD_REMOVE_DEFINITION, L"RTCore64", nullptr);
+
+        // 3. 短暂等待内核释放设备对象
+        Sleep(500);
+
+        ByovdDiag("BYOVD:Init: zombie cleanup done, will retry load\n");
     } else {
         ByovdDiag("BYOVD:Init: no existing device (err=%u), will try to load\n", GetLastError());
     }
@@ -1535,6 +1546,20 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     ByovdDiag("BYOVD:Init: loading %ls (path=%ls)\n", actualServiceName.c_str(), actualPath.c_str());
     bool loadOk = LoadDriver(actualServiceName, actualPath);
     ByovdDiag("BYOVD:Init: LoadDriver → %d\n", (int)loadOk);
+
+    if (!loadOk) {
+        // ★ BUILD 460: 加载失败可能因为 zombie 清理后设备冲突,
+        //   再试一次 DefineDosDeviceW 清理 + 短延迟 + 重试
+        static bool zombieRetried = false;
+        if (!zombieRetried) {
+            zombieRetried = true;
+            ByovdDiag("BYOVD:Init: LoadDriver failed, trying zombie cleanup retry...\n");
+            DefineDosDeviceW(DDD_REMOVE_DEFINITION, L"RTCore64", nullptr);
+            Sleep(1000);
+            loadOk = LoadDriver(actualServiceName, actualPath);
+            ByovdDiag("BYOVD:Init: LoadDriver retry → %d\n", (int)loadOk);
+        }
+    }
 
     if (!loadOk) {
         // ★ v3.95: NtLoadDriver 失败 — 可能是僵尸设备名冲突
