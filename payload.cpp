@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 491 (v3.156: PDFWKRNL syscall + permanent skip Hollowing)
+// BUILD: 492 (v3.157: full .text scan for FltGlobals + honest PAC status)
 // ============================================================
 
 #include "stealth_core.h"
@@ -1018,7 +1018,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.156 DIAG START (BUILD 491: PDFWKRNL kernel OK, skip Hollowing) ===\n");
+    DiagLog("=== v3.157 DIAG START (BUILD 492: full .text FltGlobals scan, honest PAC) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
