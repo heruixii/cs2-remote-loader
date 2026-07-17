@@ -1833,7 +1833,7 @@ uint64_t EACCallbackDisabler::FindObpCallbackArrayHead(KernelMemoryAccessor& kma
                     (funcBody[i+2] & 0xC7) == 0x05) {
                     int32_t disp = *(int32_t*)(funcBody + i + 3);
                     uint64_t target = funcAddr + chunk * 512 + i + 7 + disp;
-                    if (target > ntBase + 0x100000 && target < ntBase + 0x400000) {
+                    if (target > ntBase + 0x3000 && target < ntBase + 0x2000000) {
                         ByovdDiag("VERIFY:ObpCallbackArrayHead at 0x%llX (via %s)\n",
                             (unsigned long long)target, funcName);
                         return target;
@@ -3021,7 +3021,7 @@ static uint64_t ScanFuncForFltGlobals(uint64_t fltmgrBase, uint64_t targetFunc) 
                 (buf[i+2] & 0xC7) == 0x05) {
                 int32_t rel32 = *(int32_t*)(buf + i + 3);
                 uint64_t candidate = targetFunc + chunk * 512 + i + 7 + rel32;
-                if (candidate > fltmgrBase + 0x100000 && candidate < fltmgrBase + 0x400000) {
+                if (candidate > fltmgrBase + 0x2000 && candidate < fltmgrBase + 0x200000) {
                     return candidate;
                 }
             }

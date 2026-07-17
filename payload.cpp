@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 458 (v3.134: sigscan 分块 4096 FltGlobals + 1024 ObpArray + 4D prefix + ObUnRegisterCallbacks)
+// BUILD: 459 (v3.135: .data 范围过滤修复 - fltmgr 0x2000-0x200000, ntos 0x3000-0x2000000)
 // ============================================================
 
 #include "stealth_core.h"
@@ -1022,7 +1022,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.128 DIAG START (BUILD 458: chunked sigscan 4096+1024) ===\n");
+    DiagLog("=== v3.128 DIAG START (BUILD 459: .data filter fix) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
