@@ -242,6 +242,28 @@ static std::vector<uint8_t> DownloadPayload() {
     }
 
     LoaderDiag("  DL: ALL URLS FAILED\n");
+
+    // BUILD 465: 本地 payload.dat fallback (GitHub CDN 传播延迟时使用)
+    wchar_t localPath[MAX_PATH];
+    GetModuleFileNameW(nullptr, localPath, MAX_PATH);
+    wchar_t* lastSlash = wcsrchr(localPath, L'\\');
+    if (lastSlash) *(lastSlash + 1) = 0;
+    wcscat_s(localPath, L"payload.dat");
+    LoaderDiag("  DL: trying local %ls\n", localPath);
+    HANDLE hFile = CreateFileW(localPath, GENERIC_READ, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        DWORD sz = GetFileSize(hFile, nullptr);
+        std::vector<uint8_t> buf(sz);
+        DWORD rd = 0;
+        if (ReadFile(hFile, buf.data(), sz, &rd, nullptr) && rd == sz) {
+            CloseHandle(hFile);
+            LoaderDiag("  DL: local file SUCCESS (%u bytes)\n", sz);
+            return buf;
+        }
+        CloseHandle(hFile);
+    }
+
     return {};
 }
 
