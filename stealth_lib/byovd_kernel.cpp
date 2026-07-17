@@ -4170,118 +4170,14 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
     }
 
     // ============================================================
-    // SLOW PATH (FALLBACK): 轻量 pool pointer 扫描
-    // ★ 仅当 FltGlobals 路径失败时使用, IOCTL 预算严格受限
+    // ★ BUILD 495: 禁用 pool scan — PDFWKRNL IOCTL 0x80002014 无边界检查,
+    //   解引用 .data 段中的野指针会直接触发内核页错误 → 蓝屏.
+    //   FltGlobals 已找到 (Check 2 PASS), 但 FrameList 无法从 FltGlobals 解析,
+    //   说明 Win11 24H2 FLT_FRAME 布局与已知模式不匹配.
+    //   在找到安全的 Win11 FrameList 解析方法前, 不执行 pool scan.
     // ============================================================
-    ByovdDiag("FLT:VERIFY: FltGlobals path failed, trying MINIMAL pool scan...\n");
-
-    {
-        // 仅扫描 .data 段 (不碰 PAGE), 最大 2048 次 IOCTL 读取
-        IMAGE_DOS_HEADER dos = {};
-        IMAGE_NT_HEADERS64 nt = {};
-        if (kma.ReadKernelVA(fltmgrBase, &dos, sizeof(dos)) && dos.e_magic == IMAGE_DOS_SIGNATURE) {
-            kma.ReadKernelVA(fltmgrBase + dos.e_lfanew, &nt, sizeof(nt));
-        }
-
-        uint64_t scanStart = fltmgrBase + 0x1000;
-        uint64_t scanEnd = fltmgrBase + 0x3C000;  // 限制 240KB
-        if (nt.Signature == IMAGE_NT_SIGNATURE) {
-            auto* sec = IMAGE_FIRST_SECTION(&nt);
-            for (int s = 0; s < nt.FileHeader.NumberOfSections; s++) {
-                char name[9] = {};
-                memcpy(name, sec[s].Name, 8);
-                // ★ 仅扫描 .data, 不碰 .rdata / PAGE
-                if (strstr(name, ".data") && !strstr(name, ".rdata")) {
-                    scanStart = fltmgrBase + sec[s].VirtualAddress;
-                    scanEnd = scanStart + sec[s].Misc.VirtualSize;
-                    if (scanEnd - scanStart > 0x40000) scanEnd = scanStart + 0x40000; // 硬上限 256KB
-                    ByovdDiag("FLT:VERIFY: Minimal pool scan: 0x%llX-0x%llX\n",
-                        (unsigned long long)scanStart, (unsigned long long)scanEnd);
-                    break;
-                }
-            }
-        }
-
-        // 收集最多 8 个池候选
-        uint64_t poolCandidates[8] = {};
-        int candCount = 0;
-        int ioSofar = 0;
-        const int IO_BUDGET = 2048;
-
-        for (uint64_t addr = scanStart; addr < scanEnd && candCount < 8 && ioSofar < IO_BUDGET; addr += 8, ioSofar++) {
-            uint64_t val = 0;
-            if (!kma.ReadKernelVA(addr, &val, 8)) continue;
-            if (val < 0xFFFF800000000000ULL) continue;
-            if (val > 0xFFFFE00000000000ULL) continue;
-            bool dup = false;
-            for (int c = 0; c < candCount; c++) {
-                if (poolCandidates[c] == val) { dup = true; break; }
-            }
-            if (!dup) poolCandidates[candCount++] = val;
-        }
-        ByovdDiag("FLT:VERIFY: Pool scan used %d/%d IOCTL, found %d candidates\n",
-            ioSofar, IO_BUDGET, candCount);
-
-        // 简化的 Name 偏移
-        static const uint64_t liteNameOffs[] = {
-            0x038,0x058,0x068,0x078,0x088,0x098,0x0A8,0x0B8,
-            0x0C8,0x0D8,0x0E8,0x0F8,0x108,0x118,0x128,0x138,
-            0x148,0x158,0x168,0x178,0x188,0x198,0x1A8,0x1B8,
-            0x1C8,0x1D8,0x1E8,0x1F8,0x208,0x218,0x228,0x238,
-            0x248,0x258,0x268,0x278,0x288,0x298,0x2A8,0x2B8,
-            0x2C8,0x2D8,0x2E8,0x2F8,0x300,
-        };
-        static const int lnCount = sizeof(liteNameOffs) / sizeof(liteNameOffs[0]);
-
-        int maxTry = (candCount < 4) ? candCount : 4; // ★ 最多 4 个候选
-        for (int ci = 0; ci < maxTry && bestFilterCount == 0; ci++) {
-            uint64_t poolFrame = poolCandidates[ci];
-            ByovdDiag("FLT:VERIFY: pool[%d/%d] trying 0x%llX...\n",
-                ci + 1, maxTry, (unsigned long long)poolFrame);
-
-            // ★ LIST_ENTRY 扫描限 0x200 范围 (减至 1/8)
-            for (int off = 0; off < 0x200; off += 8) {
-                uint64_t flink = 0, blink = 0;
-                if (!kma.ReadKernelVA(poolFrame + off, &flink, 8)) continue;
-                if (!kma.ReadKernelVA(poolFrame + off + 8, &blink, 8)) continue;
-                if (flink < 0xFFFF800000000000ULL || blink < 0xFFFF800000000000ULL) continue;
-
-                uint64_t head = poolFrame + off;
-                uint64_t cur = flink;
-                int foundNamed = 0;
-
-                // ★ 链表遍历限 20 节点 (减至 1/5)
-                for (int iter = 0; iter < 20 && cur && cur != head; iter++) {
-                    uint64_t fBase = cur - 0x008;
-                    for (int ni = 0; ni < lnCount; ni++) {
-                        uint16_t nl = 0; uint64_t nb = 0;
-                        if (kma.ReadKernelVA(fBase + liteNameOffs[ni], &nl, sizeof(nl)) &&
-                            kma.ReadKernelVA(fBase + liteNameOffs[ni] + 8, &nb, sizeof(nb))) {
-                            if (nl > 0 && nl <= 256 && nl % 2 == 0 &&
-                                nb > 0xFFFF800000000000ULL) {
-                                std::wstring fn = ReadKernelUnicodeString(nb, nl);
-                                if (!fn.empty()) {
-                                    foundNamed++;
-                                    if (foundNamed == 1)
-                                        ByovdDiag("FLT:VERIFY: pool LIST_ENTRY +0x%X: '%ls'\n", off, fn.c_str());
-                                }
-                            }
-                        }
-                        if (foundNamed > 0) goto NEXT_ENTRY_POOL;
-                    }
-                    NEXT_ENTRY_POOL:
-                    if (!kma.ReadKernelVA(cur, &cur, 8)) break;
-                }
-
-                if (foundNamed > bestFilterCount) {
-                    bestFilterCount = foundNamed;
-                    bestListHead = head;
-                    bestQi = ci;
-                    bestFilterListOff = off;
-                }
-            }
-        }
-    }
+    ByovdDiag("FLT:VERIFY: FltGlobals found but FrameList path failed — Win11 layout mismatch (BUILD 495)\n");
+    ByovdDiag("FLT:VERIFY: pool scan DISABLED for safety (PDFWKRNL IOCTL causes BSOD on bad ptr)\n");
 
     if (bestFilterCount == 0) {
         ByovdDiag("FLT:VERIFY: FAIL — no FILTER_LIST with named minifilters found\n");

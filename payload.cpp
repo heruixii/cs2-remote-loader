@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 494 (v3.159: fix UAF crash in FltGlobals .text scan — sections freed too early)
+// BUILD: 495 (v3.160: disable pool scan — PDFWKRNL IOCTL deref causes BSOD, Win11 FLT_FRAME layout mismatch)
 // ============================================================
 
 #include "stealth_core.h"
