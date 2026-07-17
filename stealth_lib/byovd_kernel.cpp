@@ -2792,6 +2792,9 @@ bool KernelTraceCleaner::ClearPiDDBCacheTable(uint64_t ntosBase) {
 // 3. ClearCiHashBucket — 清除 ci.dll KernelHashBucketList
 // ============================================================
 bool KernelTraceCleaner::ClearCiHashBucket(uint64_t ciBase) {
+    ByovdDiag("TRACE:CiHashBucket: DISABLED (BUILD 453) — heuristic scan too risky\n");
+    return false;
+    /* ── v3.128: 禁用 — 启发式扫描 ci.dll 数据段 + 写零导致 BSOD ──
     auto& kma = KernelMemoryAccessor::Instance();
     ByovdDiag("TRACE:CiHashBucket: starting, ci.dll=0x%llX\n", (unsigned long long)ciBase);
 
@@ -2842,6 +2845,7 @@ bool KernelTraceCleaner::ClearCiHashBucket(uint64_t ciBase) {
 
     ByovdDiag("TRACE:CiHashBucket: done, cleared %d entries\n", cleared);
     return (cleared > 0);
+    ── v3.128 end ── */
 }
 
 // ============================================================
@@ -2851,6 +2855,13 @@ bool KernelTraceCleaner::CleanAllTraces() {
     auto& kma = KernelMemoryAccessor::Instance();
     if (!kma.IsActive()) {
         ByovdDiag("TRACE:CleanAllTraces: BYOVD not active, skip\n");
+        return false;
+    }
+
+    // ★ v3.128: PAC 未加载则跳过所有痕迹清理 — 没有反作弊驱动可以检测我们
+    uint64_t pacBase = kma.GetKernelModuleBase("MessageTransfer.sys");
+    if (!pacBase) {
+        ByovdDiag("TRACE:CleanAllTraces: PAC driver not loaded, skip all trace cleaning\n");
         return false;
     }
 
