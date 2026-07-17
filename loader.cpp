@@ -293,10 +293,21 @@ static void SelfDelete() {
                   &written, nullptr);
         CloseHandle(hBat);
 
-        // 以隐藏窗口启�?
+        // ★ BUILD 471: CreateProcess + CREATE_NO_WINDOW — 真正无窗口自删
+        //   ShellExecuteW(SW_HIDE) 在某些 Windows 版本仍会闪 cmd 窗口
         wchar_t cmdLine[512];
-        swprintf_s(cmdLine, L"/c \"\"%s\" \"%s\"\"", batPath, selfPath);
-        ShellExecuteW(nullptr, L"open", L"cmd.exe", cmdLine, nullptr, SW_HIDE);
+        swprintf_s(cmdLine, L"cmd.exe /c \"\"%s\" \"%s\"\"", batPath, selfPath);
+
+        STARTUPINFOW si = { sizeof(si) };
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+        PROCESS_INFORMATION pi = {};
+
+        if (CreateProcessW(nullptr, cmdLine, nullptr, nullptr, FALSE,
+            CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        }
     }
 }
 

