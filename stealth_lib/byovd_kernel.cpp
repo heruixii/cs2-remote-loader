@@ -836,73 +836,31 @@ static std::wstring EnsureDriverFile(const std::wstring& driverName) {
 //   通过 SCM ControlService(SERVICE_CONTROL_STOP) 触发 DriverUnload,
 //   然后 NtUnloadDriver + DeleteService 彻底清理
 static void ForceRemoveRTCore64Services() {
-    SC_HANDLE hSCM = OpenSCManagerW(nullptr, nullptr,
-        SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
-    if (!hSCM) return;
-
-    DWORD bytesNeeded = 0, serviceCount = 0, resumeHandle = 0;
-    // 第一次调用获取所需缓冲区大小
-    EnumServicesStatusExW(hSCM, SC_ENUM_PROCESS_INFO, SERVICE_DRIVER,
-        SERVICE_STATE_ALL, nullptr, 0, &bytesNeeded,
-        &serviceCount, &resumeHandle, nullptr);
-    if (bytesNeeded == 0) { CloseServiceHandle(hSCM); return; }
-
-    // ★ v3.120: VirtualAlloc 替代 std::vector — 避免 CRT 堆依赖
-    BYTE* buf = (BYTE*)VirtualAlloc(nullptr, bytesNeeded + 0x100, MEM_COMMIT, PAGE_READWRITE);
-    if (!buf) { CloseServiceHandle(hSCM); return; }
-    auto* services = (ENUM_SERVICE_STATUS_PROCESSW*)buf;
-    if (!EnumServicesStatusExW(hSCM, SC_ENUM_PROCESS_INFO, SERVICE_DRIVER,
-        SERVICE_STATE_ALL, buf, (DWORD)(bytesNeeded + 0x100), &bytesNeeded,
-        &serviceCount, &resumeHandle, nullptr)) {
-        VirtualFree(buf, 0, MEM_RELEASE);
-        CloseServiceHandle(hSCM);
+    // ★ BUILD 474: 替换 SCM 为纯注册表清理 — OpenSCManagerW 在手动映射 DLL 中崩溃
+    HKEY hServices;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Services", 0,
+        KEY_ENUMERATE_SUB_KEYS | DELETE, &hServices) != ERROR_SUCCESS)
         return;
-    }
 
-    for (DWORD i = 0; i < serviceCount; i++) {
-        bool isOurSvc = (wcsstr(services[i].lpServiceName, L"RTCore64") == services[i].lpServiceName)
-                     || (wcsstr(services[i].lpServiceName, L"SysMon") == services[i].lpServiceName);
-        if (!isOurSvc)
-            continue;
-
-        ByovdDiag("BYOVD:ForceRemove: found stale service '%ls' (state=%u)\n",
-            services[i].lpServiceName, services[i].ServiceStatusProcess.dwCurrentState);
-
-        SC_HANDLE hSvc = OpenServiceW(hSCM, services[i].lpServiceName,
-            SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE);
-        if (!hSvc) continue;
-
-        // 发送 STOP 控制码 → 触发驱动的 DriverUnload 例程
-        SERVICE_STATUS svcStatus;
-        if (ControlService(hSvc, SERVICE_CONTROL_STOP, &svcStatus)) {
-            // 等待驱动完全卸载 (最多等 3 秒)
-            for (int wait = 0; wait < 30; wait++) {
-                if (!QueryServiceStatus(hSvc, &svcStatus)) break;
-                if (svcStatus.dwCurrentState == SERVICE_STOPPED) break;
-                Sleep(100);
-            }
-        }
-
-        // 删除服务
-        DeleteService(hSvc);
-        CloseServiceHandle(hSvc);
-
-        // ★ 兜底: 用 NtUnloadDriver 再试一次 (确保内核对象释放)
-        std::wstring regPath = L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\";
-        regPath += services[i].lpServiceName;
-        UNICODE_STRING us;
-        us.Buffer = regPath.data();
-        us.Length = (USHORT)(regPath.size() * sizeof(wchar_t));
-        us.MaximumLength = us.Length + sizeof(wchar_t);
-        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-        if (ntdll) {
-            using NtUnloadDriver_t = NTSTATUS(NTAPI*)(PUNICODE_STRING);
-            auto pNtUnloadDriver = (NtUnloadDriver_t)GetProcAddress(ntdll, "NtUnloadDriver");
-            if (pNtUnloadDriver) pNtUnloadDriver(&us);
+    DWORD idx = 0;
+    while (idx < 512) {
+        wchar_t name[256];
+        DWORD nameLen = 256;
+        if (RegEnumKeyExW(hServices, idx, name, &nameLen,
+            nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
+            break;
+        bool isOurs = (wcsstr(name, L"RTCore64") == name)
+                   || (wcsstr(name, L"SysMon") == name);
+        if (isOurs) {
+            ByovdDiag("BYOVD:ForceRemove: deleting stale service '%ls' (registry only, BUILD 474)\n", name);
+            RegDeleteTreeW(hServices, name);
+            // 不idx++ — 删除后索引变化
+        } else {
+            idx++;
         }
     }
-    VirtualFree(buf, 0, MEM_RELEASE);
-    CloseServiceHandle(hSCM);
+    RegCloseKey(hServices);
 }
 
 bool KernelMemoryAccessor::LoadDriver(const std::wstring& serviceName, 
@@ -3903,6 +3861,15 @@ bool KernelDefense::DisablePac() {
 void KernelDefense::GuardPac() {
     // ★ v3.126n: 三重检查 — 服务 + minifilter 存在性 + 回调完整性
     bool needReDisable = false;
+
+    // ★ BUILD 474: 先检查 MessageTransfer 是否加载 — 否则 SCM 崩溃
+    {
+        uint64_t mtBase = KernelMemoryAccessor::Instance().GetKernelModuleBase(
+            "MessageTransfer.sys");
+        if (!mtBase) {
+            return;  // 驱动未加载, 无需检查 SCM
+        }
+    }
 
     // 检查 1: SCM 服务状态
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
