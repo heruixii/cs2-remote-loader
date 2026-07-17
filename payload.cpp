@@ -1022,7 +1022,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.128 DIAG START (BUILD 468: device name randomize + Win11 MOV imm64) ===\n");
+    DiagLog("=== v3.128 DIAG START (BUILD 469: PE cert strip after device name patch) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)

