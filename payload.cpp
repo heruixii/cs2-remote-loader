@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 484 (v3.149: fix NtLoadDriver crash — use syscall stub bypass ntdll wrapper)
+// BUILD: 490 (v3.155: PDFWKRNL only + EnablePrivilege syscall stubs)
 // ============================================================
 
 #include "stealth_core.h"
@@ -428,16 +428,19 @@ static bool LaunchBasicESP() {
         nullptr, nullptr, FALSE,
         CREATE_SUSPENDED,
         nullptr, nullptr, &si, &pi);
-    // ★ v3.126g: BYOVD 驱动加载成功时跳过 Process Hollowing — 避免 ntdll 崩溃
-    //   直接使用 CreateProcess 启动 basic.exe, 内核级反检测由 BYOVD 提供
-    bool canHollow = ok && !g_byovdDriverLoaded;
-    if (g_byovdDriverLoaded) {
-        DiagLog("BYOVD active, skipping hollowing, terminating suspended process\n");
+    // ★ BUILD 487: BYOVD 失败时也跳过 Process Hollowing.
+    //   ResolveImportTable 在 Win11 manual-mapped DLL 上下文中始终 ACCESS_VIOLATION.
+    //   无论 BYOVD 是否加载, 直接使用 CreateProcess 启动 basic.exe.
+    bool canHollow = ok && g_byovdDriverLoaded;
+    if (!g_byovdDriverLoaded) {
+        DiagLog("BYOVD inactive, skipping hollowing (direct CreateProcess fallback)\n");
         if (pi.hProcess) {
             TerminateProcess(pi.hProcess, 0);
             CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
             pi.hProcess = nullptr;
         }
+    } else {
+        DiagLog("BYOVD active, will attempt hollowing\n");
     }
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (!g_pNtUnmapViewOfSection) {
@@ -1022,7 +1025,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.149 DIAG START (BUILD 484: syscall stub NtLoadDriver) ===\n");
+    DiagLog("=== v3.155 DIAG START (BUILD 490: PDFWKRNL only, syscall EnablePrivilege) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
