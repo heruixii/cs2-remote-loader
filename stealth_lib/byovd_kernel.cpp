@@ -1373,6 +1373,40 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     }
     ByovdDiag("BYOVD:Init: HVCI check done\n");
 
+    // ★ BUILD 473: 优先复用已有驱动 — 在 stale service 清理之前
+    //   BUILD 472 在卸载旧服务调用 NtUnloadDriver 时崩溃 (手动映射 DLL 上下文),
+    //   根本原因: 驱动已由之前 session 加载, 应直接复用跳过所有清理.
+    //   此前置 probe 执行 0 次清理, 消除崩溃源.
+    ByovdDiag("BYOVD:Init: BUILD 473 early probe for %ls...\n",
+        m_driverInfo.devicePath.c_str());
+
+    m_hDevice = CreateFileW(m_driverInfo.devicePath.c_str(),
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_EXISTING, 0, nullptr);
+
+    if (m_hDevice != INVALID_HANDLE_VALUE) {
+        ByovdDiag("BYOVD:Init: early probe opened, testing IOCTL 0x%08X...\n",
+            m_driverInfo.ioctlCode);
+        m_active = true;
+        m_ntosBase = GetNtoskrnlBase();
+        if (m_ntosBase) {
+            uint16_t magic = 0;
+            bool probeOk = ReadKernelVA(m_ntosBase, &magic, 2);
+            if (probeOk && magic == 0x5A4D) {
+                ByovdDiag("BYOVD:Init: reusing existing device OK (ntos=0x%llX), skip cleanup+load\n",
+                    (unsigned long long)m_ntosBase);
+                return true;
+            }
+            ByovdDiag("BYOVD:Init: early probe IOCTL FAIL (magic=0x%04X), continue to load\n", magic);
+        }
+        CloseHandle(m_hDevice);
+        m_hDevice = INVALID_HANDLE_VALUE;
+        m_active = false;
+    } else {
+        ByovdDiag("BYOVD:Init: early probe no device (err=%u), will load fresh\n", GetLastError());
+    }
+
     // 2. 确保驱动文件存在 (System32\drivers → 嵌入提取到 %TEMP%)
     ByovdDiag("BYOVD:Init: calling EnsureDriverFile('%ls')...\n", driver.driverPath.c_str());
     std::wstring resolvedPath = EnsureDriverFile(driver.driverPath);
