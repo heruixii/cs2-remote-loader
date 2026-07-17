@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 492 (v3.157: full .text scan for FltGlobals + honest PAC status)
+// BUILD: 493 (v3.158: PAC probe mode + full .text FltGlobals scan)
 // ============================================================
 
 #include "stealth_core.h"
@@ -1018,8 +1018,44 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.157 DIAG START (BUILD 492: full .text FltGlobals scan, honest PAC) ===\n");
+    DiagLog("=== v3.158 DIAG START (BUILD 493: PAC probe mode, full .text FltGlobals scan) ===\n");
     DiagLog("BEFORE Init...\n");
+
+    // ★ BUILD 493: PAC Probe 模式 — 当 %TEMP%\pac_probe.flag 存在时,
+    //   仅加载驱动 + 验证 FLT 管线 + 尝试中和 PAC, 不触碰 CS2 任何内存/进程.
+    //   用于安全验证 PAC 拦截是否有效, 避免在未中和前触发反作弊检测.
+    {
+        wchar_t probePath[MAX_PATH];
+        GetTempPathW(MAX_PATH, probePath);
+        wcscat_s(probePath, L"pac_probe.flag");
+        bool isPacProbe = (GetFileAttributesW(probePath) != INVALID_FILE_ATTRIBUTES);
+        if (isPacProbe) {
+            DiagLog("=== PAC PROBE MODE: no CS2 interaction, FLT neutralization only ===\n");
+            DiagLog("PAC PROBE: flag found at %ls\n", probePath);
+
+            // 仅初始化 BYOVD (加载驱动 + FLT 管线验证 + PAC 中和)
+            auto kr = stealth::KernelDefense::EnableAll();
+            DiagLog("PAC PROBE: EnableAll done — driver=%d ob=%d proc=%d img=%d thread=%d pac=%d\n",
+                (int)kr.driverLoaded,
+                kr.obCallbacksRemoved,
+                kr.processCallbacksRemoved,
+                kr.imageCallbacksRemoved,
+                kr.threadCallbacksRemoved,
+                (int)kr.pacDisabled);
+
+            // 检查 FLT 管线验证状态
+            if (kr.pacDisabled) {
+                DiagLog("PAC PROBE: ✅ PAC neutralization SUCCESS — safe to reboot and run full tool\n");
+            } else {
+                DiagLog("PAC PROBE: ❌ PAC neutralization FAILED — do NOT run full tool with PAC active\n");
+            }
+
+            // 清理并退出
+            stealth::KernelDefense::DisableAll();
+            DiagLog("=== PAC PROBE EXIT ===\n");
+            return 0;
+        }
+    }
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
     srand((unsigned)(GetTickCount() ^ GetCurrentProcessId() ^ GetCurrentThreadId()));
