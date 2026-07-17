@@ -3861,6 +3861,18 @@ static void DeletePacDriverFiles() {
 bool KernelDefense::DisablePac() {
     ByovdDiag("PAC:DisablePac: starting...\n");
 
+    // ★ BUILD 474: 检查 MessageTransfer 是否加载 — 否则跳过 SCM (OpenSCManagerW 崩溃)
+    {
+        uint64_t mtBase = KernelMemoryAccessor::Instance().GetKernelModuleBase(
+            "MessageTransfer.sys");
+        if (!mtBase) {
+            ByovdDiag("PAC:DisablePac: MessageTransfer.sys not loaded, skip SCM (BUILD 474 guard)\n");
+            return true;  // 驱动未加载 = 不需要禁用
+        }
+        ByovdDiag("PAC:DisablePac: MessageTransfer.sys loaded at 0x%llX\n",
+            (unsigned long long)mtBase);
+    }
+
     // 1. 停止服务并删除
     bool svcOk = DisablePacService();
 
