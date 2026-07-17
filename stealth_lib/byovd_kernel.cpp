@@ -3863,18 +3863,35 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
             }
 
             if (!found) {
-                // ★ BUILD 477: dump unnamed filter 前 16 qword 诊断 Win11 FLT_FILTER 布局
-                ByovdDiag("FLT:VERIFY:   [%d] (unnamed) at 0x%llX — dump:\n",
+                // ★ BUILD 477: dump unnamed filter 前 64 qword (0x000-0x1F8)
+                //   + 扫描所有偏移报告 UNICODE_STRING 候选位置
+                ByovdDiag("FLT:VERIFY:   [%d] (unnamed) at 0x%llX:\n",
                     filterCount, (unsigned long long)filterBase);
-                for (int q = 0; q < 16; q++) {
+                for (int q = 0; q < 64; q++) {
                     uint64_t qw = 0;
                     uint64_t dumpAddr = filterBase + q * 8;
                     kma.ReadKernelVA(dumpAddr, &qw, sizeof(qw));
+                    // 每 8 个 qword 换行
                     if (q % 4 == 0) ByovdDiag("FLT:VERIFY:     +0x%03llX:", (unsigned long long)(q * 8));
                     ByovdDiag(" %016llX", (unsigned long long)qw);
                     if (q % 4 == 3) ByovdDiag("\n");
+                    // 检测 UNICODE_STRING: 前2字节(Length) 非零且≤256且偶数, 后2字节(MaxLen)非零, ptr是内核地址
+                    uint16_t usLen  = (uint16_t)(qw & 0xFFFF);
+                    uint16_t usMax  = (uint16_t)((qw >> 16) & 0xFFFF);
+                    bool isUniStr = (usLen > 0 && usLen <= 256 && usLen % 2 == 0 && usMax > 0);
+                    if (isUniStr) {
+                        // 读取 +8 的 Buffer 指针 (从下一个 qword)
+                        if (q + 1 < 64) {
+                            uint64_t nxtQw = 0;
+                            kma.ReadKernelVA(dumpAddr + 8, &nxtQw, sizeof(nxtQw));
+                            if (nxtQw > 0xFFFF800000000000ULL) {
+                                ByovdDiag("FLT:VERIFY:       ^^^ offset +0x%03llX MAY BE Name: Len=%u Max=%u Buf=0x%llX\n",
+                                    (unsigned long long)(q * 8), usLen, usMax, (unsigned long long)nxtQw);
+                            }
+                        }
+                    }
                 }
-                if (16 % 4 != 0) ByovdDiag("\n");
+                if (64 % 4 != 0) ByovdDiag("\n");
                 filterCount++;
             }
 

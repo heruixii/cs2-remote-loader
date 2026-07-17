@@ -11,7 +11,7 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 477 (v3.142: Win11 FLT_FILTER offset discovery + callback-range fallback)
+// BUILD: 478 (v3.143: extended FLT_FILTER dump 0x1F8 + UNICODE_STRING auto-detect)
 // ============================================================
 
 #include "stealth_core.h"
@@ -1022,7 +1022,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.142 DIAG START (BUILD 477: Win11 FLT offset discovery + callback-range) ===\n");
+    DiagLog("=== v3.143 DIAG START (BUILD 478: FLT dump 0x1F8 + UNICODE auto-detect) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
