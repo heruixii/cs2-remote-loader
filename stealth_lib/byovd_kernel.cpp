@@ -1726,47 +1726,20 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
 }
 
 void KernelMemoryAccessor::Shutdown() {
-    // ★ v3.96: 先发送 SERVICE_CONTROL_STOP 触发 DriverUnload → IoDeleteDevice,
-    //   再 NtUnloadDriver 彻底卸载。仅 NtUnloadDriver 可能不会触发 Unload 例程,
-    //   导致 \Device\RTCore64 设备对象残留 (僵尸设备)。
-    EnablePrivilege(L"SeLoadDriverPrivilege");
+    // ★ BUILD 470: 不卸载驱动 — 保留 \Device\RTCore64 给后续运行复用
+    //   旧代码 SCM STOP + NtUnloadDriver 触发 DriverUnload, 但驱动可能
+    //   不调用 IoDeleteDevice, 导致僵尸设备. 新策略: 驱动永久加载,
+    //   每 session 的 Init 探测到已有设备直接复用 (probe + IOCTL test).
     m_active = false;
     m_pageTableWalker.reset();
-    g_physMappingCount = 0; // ★ v3.118: 固定数组, 无需 clear()
+    g_physMappingCount = 0;
 
-    if (!m_actualServiceName.empty()) {
-        // ★ v3.96: SCM STOP → 触发驱动 Unload 例程 → IoDeleteDevice
-        SC_HANDLE hSCM = OpenSCManagerW(nullptr, nullptr,
-            SC_MANAGER_CONNECT);
-        if (hSCM) {
-            SC_HANDLE hSvc = OpenServiceW(hSCM, m_actualServiceName.c_str(),
-                SERVICE_STOP | SERVICE_QUERY_STATUS);
-            if (hSvc) {
-                SERVICE_STATUS svcStatus;
-                if (ControlService(hSvc, SERVICE_CONTROL_STOP, &svcStatus)) {
-                    ByovdDiag("BYOVD:Shutdown: SERVICE_CONTROL_STOP sent, waiting...\n");
-                    for (int wait = 0; wait < 30; wait++) {
-                        if (!QueryServiceStatus(hSvc, &svcStatus)) break;
-                        if (svcStatus.dwCurrentState == SERVICE_STOPPED) break;
-                        Sleep(100);
-                    }
-                    ByovdDiag("BYOVD:Shutdown: service state=%u\n", svcStatus.dwCurrentState);
-                } else {
-                    ByovdDiag("BYOVD:Shutdown: ControlService FAILED (err=%u)\n", GetLastError());
-                }
-                CloseServiceHandle(hSvc);
-            } else {
-                ByovdDiag("BYOVD:Shutdown: OpenService FAILED (err=%u)\n", GetLastError());
-            }
-            CloseServiceHandle(hSCM);
-        }
-        // NtUnloadDriver 作为兜底
-        UnloadDriver(m_actualServiceName);
-    }
+    // BUILD 470: 仅关闭句柄, 不卸载驱动
     if (m_hDevice != INVALID_HANDLE_VALUE) {
         CloseHandle(m_hDevice);
         m_hDevice = INVALID_HANDLE_VALUE;
     }
+    ByovdDiag("BYOVD:Shutdown: driver kept loaded for next reuse\n");
 }
 
 // ★ v3.69/v3.117: 注册 DLL 代码区域 (固定数组, 避免 CRT 堆)
@@ -2465,80 +2438,14 @@ static BYOVDDriverInfo MutateAndRandomizeDriver(const BYOVDDriverInfo& original)
         ByovdDiag("BYOVD:Mutate: wrote original driver %u bytes to %ls\n", bytesWritten, tempPath);
     }
 
-    // ★ BUILD 468: 设备名随机化 — 避免 \Device\RTCore64 残留冲突
-    WORD devSeed = (WORD)(GetTickCount64() ^ (GetCurrentProcessId() & 0xFFF) ^ (GetCurrentThreadId() << 2));
-    wchar_t devRand[9] = {};
-    wsprintfW(devRand, L"RT%04Xxx", devSeed); // "RT" + 4 hex + "xx" = 8 chars
-    char randomDeviceA[9] = {};
-    for (int ci = 0; ci < 8; ci++) randomDeviceA[ci] = (char)devRand[ci];
-
-    // 对 tempPath 二进制打补丁 (仅 embed 路径; 文件系统路径不处理)
-    if (original.driverPath == L"RTCore64.sys") {
-        HANDLE hPatch = CreateFileW(tempPath, GENERIC_READ | GENERIC_WRITE, 0,
-            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hPatch != INVALID_HANDLE_VALUE) {
-            DWORD fs = GetFileSize(hPatch, nullptr);
-            std::vector<uint8_t> patchBuf(fs);
-            DWORD rd = 0;
-            if (ReadFile(hPatch, patchBuf.data(), fs, &rd, nullptr) && rd == fs) {
-                int replaced = 0;
-                // ASCII: "RTCore64"
-                for (size_t pos = 0; pos + 8 <= fs; pos++) {
-                    if (memcmp(patchBuf.data() + pos, "RTCore64", 8) == 0) {
-                        memcpy(patchBuf.data() + pos, randomDeviceA, 8);
-                        replaced++;
-                        pos += 7;
-                    }
-                }
-                // Wide-char: "R\0T\0C\0o\0r\0e\06\04\0"
-                const uint8_t RTCore64W[] = {
-                    'R',0, 'T',0, 'C',0, 'o',0, 'r',0, 'e',0, '6',0, '4',0
-                };
-                uint8_t randomDeviceW[16] = {};
-                for (int ci = 0; ci < 8; ci++) randomDeviceW[ci*2] = (uint8_t)randomDeviceA[ci];
-                for (size_t pos = 0; pos + 16 <= fs; pos++) {
-                    if (memcmp(patchBuf.data() + pos, RTCore64W, 16) == 0) {
-                        memcpy(patchBuf.data() + pos, randomDeviceW, 16);
-                        replaced++;
-                        pos += 15;
-                    }
-                }
-                if (replaced > 0) {
-                    // BUILD 469: 剥离 PE 数字证书 — 补丁破坏了 Authenticode 哈希
-                    //   清零 Certificate Table 数据目录 → 内核跳过嵌入式签名验证
-                    if (fs >= 0x100 && patchBuf[0] == 'M' && patchBuf[1] == 'Z') {
-                        uint32_t peOff = *(uint32_t*)(patchBuf.data() + 0x3C);
-                        if (peOff + 4 <= fs && memcmp(patchBuf.data() + peOff, "PE\0\0", 4) == 0) {
-                            uint32_t ohOff = peOff + 24; // Optional Header
-                            if (ohOff + 2 <= fs) {
-                                uint16_t magic = *(uint16_t*)(patchBuf.data() + ohOff);
-                                uint32_t certOff = (magic == 0x20B) ? ohOff + 144 : ohOff + 128;
-                                if (certOff + 8 <= fs) {
-                                    *(uint64_t*)(patchBuf.data() + certOff) = 0; // zero entire data directory
-                                    ByovdDiag("BYOVD:Mutate: stripped PE cert table at +0x%X\n", certOff);
-                                }
-                            }
-                        }
-                    }
-                    SetFilePointer(hPatch, 0, nullptr, FILE_BEGIN);
-                    SetEndOfFile(hPatch);
-                    DWORD wr = 0;
-                    WriteFile(hPatch, patchBuf.data(), fs, &wr, nullptr);
-                    ByovdDiag("BYOVD:Mutate: patched %d occurrences of 'RTCore64' -> '%s'\n",
-                        replaced, randomDeviceA);
-                }
-            }
-            CloseHandle(hPatch);
-        }
-    }
+    // ★ BUILD 470: 不修改二进制 — patching 破坏签名导致 0xC0000428
+    //   策略改为复用已有驱动 (Init probing) + 不卸载 (Shutdown skip unload)
 
     if (GetFileAttributesW(tempPath) == INVALID_FILE_ATTRIBUTES) return original;
 
-    // ★ BUILD 468: 使用随机化后的设备名
+    // 构建驱动信息: 使用原始设备名 \\.\RTCore64 (驱动内部硬编码)
     BYOVDDriverInfo mutated;
-    wchar_t randomDevice2[16] = {};
-    wsprintfW(randomDevice2, L"\\\\.\\%s", devRand);
-    mutated.devicePath = randomDevice2; // e.g. \\.\RT55BDxx
+    mutated.devicePath = original.devicePath;     // ★ 保持原始 \\.\RTCore64
     mutated.ioctlCode = original.ioctlCode;
     mutated.needsMemoryMap = original.needsMemoryMap;
     mutated.driverPath = tempPath;
