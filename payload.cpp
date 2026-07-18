@@ -323,6 +323,11 @@ static bool g_halfTestMode = false;
 typedef LONG(NTAPI* _NtUnmapViewOfSection)(HANDLE, PVOID);
 static _NtUnmapViewOfSection g_pNtUnmapViewOfSection = nullptr;
 
+// ★ BUILD 549+: 前向声明 — ModNameHashRT/GetModuleBaseFromPEB 定义在后面 (L575/L589),
+//   但 ResolveImportTable (L328) 需要使用。如果不前向声明, 编译器在 L377 报 "not declared in this scope"
+static uint32_t ModNameHashRT(const wchar_t* s);
+static HMODULE GetModuleBaseFromPEB(uint32_t nameHash);
+
 // ★ v3.126f: 手动解析远程进程中的导入表 (IAT) — 批量写入, 减少 ntdll 调用
 //   避免逐个 WriteProcessMemory 在 ntdll 中崩溃的问题。
 static bool ResolveImportTable(HANDLE hProcess, void* remoteBase,
@@ -365,9 +370,18 @@ static bool ResolveImportTable(HANDLE hProcess, void* remoteBase,
         if (desc->Name == 0) break;
 
         const char* dllName = (const char*)(rawExe + desc->Name);
-        HMODULE hMod = GetModuleHandleA(dllName);
+        // ★ BUILD 549+: 通过 PEB Ldr 遍历获取 (替代 GetModuleHandleA, 规避 PAC hook)
+        //   dllName 是 char*, 先转 wchar_t 再用 ModNameHashRT 计算哈希
+        //   dllName 字符串本身不在 payload.dll 二进制中 (来自 rawExe), 所以无明文风险
+        wchar_t wideDllName[MAX_PATH] = {};
+        int wlen = 0;
+        for (; wlen < MAX_PATH - 1 && dllName[wlen]; wlen++) {
+            wideDllName[wlen] = (wchar_t)(unsigned char)dllName[wlen];
+        }
+        wideDllName[wlen] = L'\0';
+        HMODULE hMod = GetModuleBaseFromPEB(ModNameHashRT(wideDllName));
         if (!hMod) {
-            hMod = LoadLibraryA(dllName);
+            hMod = LoadLibraryA(dllName);  // 回退 (LoadLibraryA 仍可能被 hook, 但 dllName 不在二进制中)
             if (!hMod) continue;
         }
 
@@ -474,9 +488,23 @@ static uint8_t* g_patchAddr = nullptr;
 static bool g_cs2Patched = false;
 static bool g_shadowPageTried = false;  // ★ BUILD 549: 影子页尝试标志 (失败后不再重试)
 
+// ★ BUILD 549+: pattern XOR 加密常量 (避免明文特征码 0x32 0xc0 0x4c 0x8b ... 出现在二进制中)
+//   原始 pattern: 32 c0 4c 8b a4 24 c8 00 00 00 (xor al,ah; mov r12,[rsp+0xc8])
+//   编译期 XOR 加密, 运行时用 g_patKey 解密
+//   volatile g_patKey 防止编译器常量传播回原始字节 (强制运行时 XOR 操作)
+static volatile uint8_t g_patKey = 0x5A;
+constexpr uint8_t PAT_ENC[] = {
+    0x32 ^ 0x5A, 0xc0 ^ 0x5A, 0x4c ^ 0x5A, 0x8b ^ 0x5A,
+    0xa4 ^ 0x5A, 0x24 ^ 0x5A, 0xc8 ^ 0x5A, 0x00 ^ 0x5A,
+    0x00 ^ 0x5A, 0x00 ^ 0x5A
+};  // = { 0x68, 0x9A, 0x16, 0xD1, 0xFE, 0x7E, 0x92, 0x5A, 0x5A, 0x5A }
+constexpr size_t PAT_LEN = sizeof(PAT_ENC);
+
 // ★ BUILD 549: SYSTEM_PROCESS_INFO 结构 (用于 NtQuerySystemInformation syscall)
 //   避免依赖 stealth_process.cpp 内部结构
-#pragma pack(push, 4)
+// ★ BUILD 549+: 移除 #pragma pack(4), 改为自然对齐 (与真实 SYSTEM_PROCESS_INFORMATION 一致)
+//   原因: #pragma pack(4) 会让 HANDLE/PVOID/SIZE_T 字段对齐到 4 字节,
+//         导致 UniqueProcessId 在 +0x4c 而非真实的 +0x50, 读取错误数据
 typedef struct _B549_SYSTEM_PROCESS_INFO {
     ULONG NextEntryOffset;
     ULONG NumberOfThreads;
@@ -501,12 +529,113 @@ typedef struct _B549_SYSTEM_PROCESS_INFO {
     SIZE_T PeakPagefileUsage;
     SIZE_T PrivatePageCount;
     LARGE_INTEGER Reserved7[6];
+    // ★ BUILD 549+: SYSTEM_THREAD_INFORMATION 数组紧跟在此结构之后 (NumberOfThreads 个)
+    //   不在结构内声明 (C 不支持柔性数组 + 已命名字段), 用偏移计算访问
 } B549_SYSTEM_PROCESS_INFO;
-#pragma pack(pop)
+
+// ★ BUILD 549+: SYSTEM_THREAD_INFORMATION (x64, sizeof=0x50=80 字节)
+//   用于 NtQuerySystemInformation(SystemProcessInformation) 返回的线程数组
+//   每个 SYSTEM_PROCESS_INFORMATION 之后紧跟 NumberOfThreads 个此结构
+typedef struct _B549_SYSTEM_THREAD_INFO {
+    LARGE_INTEGER KernelTime;        // +0x00
+    LARGE_INTEGER UserTime;          // +0x08
+    LARGE_INTEGER CreateTime;        // +0x10
+    ULONG         WaitTime;          // +0x18
+    ULONG         Padding0;          // +0x1c (对齐到 8)
+    PVOID         StartAddress;      // +0x20
+    CLIENT_ID     ClientId;          // +0x28 (UniqueProcess 8 + UniqueThread 8)
+    LONG          Priority;          // +0x38
+    LONG          BasePriority;      // +0x3c
+    ULONG         ContextSwitches;   // +0x40
+    ULONG         ThreadState;       // +0x44
+    ULONG         WaitReason;        // +0x48
+    ULONG         Padding1;          // +0x4c (对齐到 8)
+} B549_SYSTEM_THREAD_INFO;  // sizeof = 0x50
+
+// ============================================================
+// ★ BUILD 549+: PEB Ldr 遍历 + 编译期模块名哈希 (替代 GetModuleHandleA/W)
+//   规避: PAC 用户态 hook GetModuleHandleA/W, 通过 PEB 直接读取模块基址
+//   二进制中: 不出现 "client.dll"/"ntdll.dll" 等明文模块名 (使用编译期 djb2 哈希)
+//
+//   x64 内存布局:
+//     GS:0x60              → PEB
+//     PEB+0x18             → PEB_LDR_DATA* Ldr
+//     Ldr+0x20             → LIST_ENTRY InMemoryOrderModuleList (Flink/Blink)
+//     LDR_DATA_TABLE_ENTRY+0x10  → InMemoryOrderLinks (Flink 指向此处)
+//     LDR_DATA_TABLE_ENTRY+0x30  → DllBase
+//     LDR_DATA_TABLE_ENTRY+0x58  → BaseDllName (UNICODE_STRING, Buffer@+0x08)
+// ============================================================
+
+// 编译期 djb2 哈希 (wchar_t, 不区分大小写)
+//   用法: constexpr uint32_t h = ModNameHash(L"client.dll"); // 编译期计算
+//         二进制中只出现 h 的常量值, 不出现 L"client.dll"
+constexpr uint32_t ModNameHash(const wchar_t* s, uint32_t h = 5381) {
+    return (!*s) ? h : ModNameHash(s + 1,
+        ((h << 5) + h) + (uint32_t)(
+            (*s >= L'A' && *s <= L'Z') ? (*s + (L'a' - L'A')) : *s
+        ));
+}
+
+// 运行时 djb2 哈希 (用于动态字符串, 如 ResolveImportTable 的 dllName)
+static uint32_t ModNameHashRT(const wchar_t* s) {
+    if (!s) return 0;
+    uint32_t h = 5381;
+    while (*s) {
+        wchar_t c = *s;
+        if (c >= L'A' && c <= L'Z') c = c + (L'a' - L'A');
+        h = ((h << 5) + h) + (uint32_t)c;
+        s++;
+    }
+    return h;
+}
+
+// 通过 PEB Ldr 遍历获取模块基址 (替代 GetModuleHandleA/W)
+//   nameHash: 编译期或运行时计算的 djb2 哈希 (不区分大小写)
+static HMODULE GetModuleBaseFromPEB(uint32_t nameHash) {
+    if (!nameHash) return nullptr;
+
+    // x64: PEB 在 GS:0x60 (TEB+0x60 = PEB)
+    uint64_t peb;
+    __asm__ __volatile__("movq %%gs:0x60, %0" : "=r"(peb));
+    if (!peb) return nullptr;
+
+    // PEB->Ldr (PEB+0x18)
+    uint8_t* ldr = *(uint8_t**)(peb + 0x18);
+    if (!ldr) return nullptr;
+
+    // Ldr->InMemoryOrderModuleList (Ldr+0x20) — LIST_ENTRY, Flink 指向下一个 entry 的 InMemoryOrderLinks
+    auto* listHead = (LIST_ENTRY*)(ldr + 0x20);
+    auto* entry = listHead->Flink;
+    if (!entry) return nullptr;
+
+    // 遍历链表 (InMemoryOrderLinks 在 LDR_DATA_TABLE_ENTRY+0x10)
+    while (entry != listHead) {
+        auto* dataTableEntry = (uint8_t*)entry - 0x10;  // 回退到 LDR_DATA_TABLE_ENTRY 起始
+        auto dllBase = *(HMODULE*)(dataTableEntry + 0x30);  // DllBase
+        auto* baseDllName = (UNICODE_STRING*)(dataTableEntry + 0x58);  // BaseDllName
+
+        if (dllBase && baseDllName->Buffer && baseDllName->Length > 0) {
+            // 运行时计算 djb2 哈希 (不区分大小写)
+            uint32_t hash = 5381;
+            USHORT nameLen = baseDllName->Length / sizeof(WCHAR);
+            for (USHORT i = 0; i < nameLen; i++) {
+                WCHAR c = baseDllName->Buffer[i];
+                if (c >= L'A' && c <= L'Z') c = c + (L'a' - L'A');
+                hash = ((hash << 5) + hash) + (uint32_t)c;
+            }
+            if (hash == nameHash) return dllBase;
+        }
+        entry = entry->Flink;
+    }
+
+    return nullptr;
+}
 
 static bool ApplyCs2Patch() {
     // 1. 获取 client.dll 基址
-    HMODULE hClient = GetModuleHandleA("client.dll");
+    // ★ BUILD 549+: 通过 PEB Ldr 遍历获取 (替代 GetModuleHandleA, 规避 PAC 用户态 hook)
+    //   ModNameHash(L"client.dll") 在编译期计算, 二进制中不出现 "client.dll" 明文
+    HMODULE hClient = GetModuleBaseFromPEB(ModNameHash(L"client.dll"));
     if (!hClient) {
         DiagLogEnc("c1");  // ★ BUILD 549: 加密 "mod not loaded"
         return false;
@@ -526,16 +655,18 @@ static bool ApplyCs2Patch() {
     uint8_t* base = (uint8_t*)hClient;
     size_t size = ntHdr->OptionalHeader.SizeOfImage;
 
-    // 3. 搜索特征码: 32 c0 4c 8b a4 24 c8 00 00 00
-    static const uint8_t pattern[] = {
-        0x32, 0xc0, 0x4c, 0x8b, 0xa4, 0x24, 0xc8, 0x00, 0x00, 0x00
-    };
-    static const size_t patternLen = sizeof(pattern);
+    // 3. 搜索特征码 (★ BUILD 549+: XOR 加密, 运行时解密到栈上, 避免明文特征码出现在二进制中)
+    //   PAT_ENC 是编译期 XOR 加密的 pattern, 运行时用 g_patKey (volatile) 解密
+    uint8_t pattern[PAT_LEN];
+    for (size_t i = 0; i < PAT_LEN; i++) {
+        pattern[i] = PAT_ENC[i] ^ g_patKey;
+    }
+    const size_t patternLen = PAT_LEN;
 
     uint8_t* found = nullptr;
     for (size_t i = 0; i + patternLen < size; i++) {
-        if (base[i] != 0x32) continue;
-        if (base[i+1] != 0xc0) continue;
+        if (base[i] != pattern[0]) continue;
+        if (base[i+1] != pattern[1]) continue;
         bool match = true;
         for (size_t j = 2; j < patternLen; j++) {
             if (base[i+j] != pattern[j]) { match = false; break; }
@@ -611,8 +742,10 @@ static void MaintainCs2Patch() {
         return;
     }
 
-    // ★ BUILD 549: 回退模式 — 检查补丁是否被 PAC 恢复, 重写
-    if (g_patchAddr[0] == 0x32 && g_patchAddr[1] == 0xc0) {
+    // ★ BUILD 549+: 回退模式 — 检查补丁是否被 PAC 恢复, 重写
+    //   用 XOR 比较避免明文 0x32 0xc0 出现在二进制中 (g_patKey 是 volatile 防止常量传播)
+    if ((uint8_t)(g_patchAddr[0] ^ g_patKey) == PAT_ENC[0] &&
+        (uint8_t)(g_patchAddr[1] ^ g_patKey) == PAT_ENC[1]) {
         DWORD oldProtect = 0;
         if (VirtualProtect(g_patchAddr, 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             g_patchAddr[0] = 0x90;
@@ -675,13 +808,22 @@ static void TemporarilyRevertPatch() {
     if (!g_patchAddr) return;
     DWORD oldProtect = 0;
     if (VirtualProtect(g_patchAddr, 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        g_patchAddr[0] = 0x32;
-        g_patchAddr[1] = 0xc0;
+        // ★ BUILD 549+: 用 XOR 解密写入原始字节 (避免明文 0x32 0xc0 出现在二进制中)
+        g_patchAddr[0] = (uint8_t)(PAT_ENC[0] ^ g_patKey);  // = 0x32
+        g_patchAddr[1] = (uint8_t)(PAT_ENC[1] ^ g_patKey);  // = 0xc0
         DWORD dummy = 0;
         VirtualProtect(g_patchAddr, 2, oldProtect, &dummy);
         DiagLogEnc("r1");  // ★ BUILD 549: 加密 "reverted"
     }
 }
+// ★ BUILD 549+: CleanupInjectionTraces 是 dead code (BUILD 548 不再注入独立模块)
+//   用 #if 0 包裹避免编译, 同时消除所有明文 CS2 模块名 (client.dll/engine2.dll/tier0/input)
+//   和明文日志字符串 (CleanupInjectionTraces: ...) 出现在二进制中
+//   如果未来需要恢复 (例如 BUILD 550+ 重新注入独立模块), 移除 #if 0 并:
+//     1. 用 ModNameHash 替代 L"client.dll" 明文
+//     2. 用 NtQuerySystemInformation 替代 CreateToolhelp32Snapshot (已实现, 见函数体)
+//     3. 用 STEALTH_STR_DECRYPT_TO 加密所有 DiagLog 字符串
+#if 0
 // v3.32-plus: 注入痕迹清理 — 基础.exe 注入到 cs2.exe 后, 从外部通过 handles
 // 清除 PEB Ldr 链表中的注入模块条目, 防止反作弊用户态模块枚举检测
 // 同时清理 VAD PE 头部 + 注入线程的 TEB Win32StartAddress
@@ -890,7 +1032,7 @@ static void CleanupInjectionTraces() {
         // 再计算 RVA
 
         // 获取本地 ntdll 的 RtlUserThreadStart 地址
-        HMODULE hLocalNtdll = GetModuleHandleW(L"ntdll.dll");
+        HMODULE hLocalNtdll = GetModuleBaseFromPEB(ModNameHash(L"ntdll.dll"));  // ★ BUILD 549+: PEB Ldr
         uint64_t localRtlUserThreadStart = 0;
         if (hLocalNtdll) {
             localRtlUserThreadStart = (uint64_t)GetProcAddress(hLocalNtdll, "RtlUserThreadStart");
@@ -938,79 +1080,117 @@ static void CleanupInjectionTraces() {
             (unsigned long long)localNtdllBase, (unsigned long long)localRtlUserThreadStart,
             (unsigned long long)rvaRtlUserStart, (unsigned long long)remoteRtlUserThreadStart);
 
-        // 枚举 cs2.exe 的所有线程
-        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if (hSnap != INVALID_HANDLE_VALUE) {
-            DWORD cs2Pid = GetProcessId(hProc);
-            THREADENTRY32 te = { sizeof(te) };
+        // ★ BUILD 549+: 用 NtQuerySystemInformation 替代 CreateToolhelp32Snapshot (规避 PAC hook)
+        //   SystemProcessInformation (class 5) 返回每个进程 + 其线程数组
+        //   遍历找到 cs2 pid 的进程, 从其线程数组中枚举所有 TID
+        DWORD cs2Pid = GetProcessId(hProc);
 
-            if (Thread32First(hSnap, &te)) {
-                do {
-                    if (te.th32OwnerProcessID != cs2Pid) continue;
+        ULONG qsiBufSize = 0x100000;  // 1MB 初始
+        BYTE* qsiBuf = (BYTE*)VirtualAlloc(nullptr, qsiBufSize, MEM_COMMIT, PAGE_READWRITE);
+        if (qsiBuf) {
+            ULONG retLen = 0;
+            // 5 = SystemProcessInformation
+            NTSTATUS qsiSt = stealth::SysQuerySystemInformation(5, qsiBuf, qsiBufSize, &retLen);
+            int qsiRetry = 0;
+            while (qsiSt == (NTSTATUS)0xC0000004 && qsiRetry < 3) {  // STATUS_INFO_LENGTH_MISMATCH
+                VirtualFree(qsiBuf, 0, MEM_RELEASE);
+                qsiBufSize *= 2;
+                qsiBuf = (BYTE*)VirtualAlloc(nullptr, qsiBufSize, MEM_COMMIT, PAGE_READWRITE);
+                if (!qsiBuf) break;
+                qsiSt = stealth::SysQuerySystemInformation(5, qsiBuf, qsiBufSize, &retLen);
+                qsiRetry++;
+            }
+            DiagLog("CleanupInjectionTraces: NtQSI status=0x%08X buf=%u cs2Pid=%u\n",
+                (unsigned)qsiSt, qsiBufSize, cs2Pid);
 
-                    HANDLE hTh = OpenThread(THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT, FALSE, te.th32ThreadID);
-                    if (!hTh) continue;
+            if (NT_SUCCESS(qsiSt) && qsiBuf) {
+                BYTE* ptr = qsiBuf;
+                while (true) {
+                    auto* proc = (B549_SYSTEM_PROCESS_INFO*)ptr;
+                    DWORD pid = proc->UniqueProcessId ? (DWORD)(uintptr_t)proc->UniqueProcessId : 0;
 
-                    // 查询 Win32StartAddress (class 9)
-                    PVOID startAddr = nullptr;
-                    ULONG ql = 0;
-                    HMODULE localNtdll2 = GetModuleHandleW(L"ntdll.dll");
-                    if (localNtdll2) {
-                        using NtQIT_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-                        auto pNtQIT = (NtQIT_t)GetProcAddress(localNtdll2, "NtQueryInformationThread");
-                        if (pNtQIT) {
-                            pNtQIT(hTh, 9, &startAddr, sizeof(startAddr), &ql);
-                        }
-                    }
+                    if (pid == cs2Pid) {
+                        DiagLog("CleanupInjectionTraces: CS2 found, threads=%u\n",
+                            proc->NumberOfThreads);
+                        // 找到 CS2 进程, 枚举其线程数组
+                        // B549_SYSTEM_THREAD_INFO 数组紧跟在 B549_SYSTEM_PROCESS_INFO 之后
+                        BYTE* threadPtr = ptr + sizeof(B549_SYSTEM_PROCESS_INFO);
+                        for (ULONG t = 0; t < proc->NumberOfThreads; t++) {
+                            auto* sti = (B549_SYSTEM_THREAD_INFO*)threadPtr;
+                            DWORD tid = sti->ClientId.UniqueThread
+                                      ? (DWORD)(uintptr_t)sti->ClientId.UniqueThread : 0;
 
-                    // 检查 startAddr 是否在注入模块范围内
-                    bool isInjected = false;
-                    if (startAddr) {
-                        uint64_t sa = (uint64_t)startAddr;
-                        // 排除 ntdll.dll 和 cs2.exe 自己
-                        if (remoteNtdllBase && sa >= remoteNtdllBase && sa < remoteNtdllBase + 0x300000) {
-                            // 在 ntdll 范围内 → 合法线程
-                        } else {
-                            for (int k = 0; k < numCleaned; k++) {
-                                if (sa >= cleanedBases[k] && sa < cleanedBases[k] + 0x2000000) {
-                                    isInjected = true;
-                                    break;
+                            HANDLE hTh = OpenThread(THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT, FALSE, tid);
+                            if (hTh) {
+                                // 查询 Win32StartAddress (class 9)
+                                PVOID startAddr = nullptr;
+                                ULONG ql = 0;
+                                HMODULE localNtdll2 = GetModuleBaseFromPEB(ModNameHash(L"ntdll.dll"));  // ★ BUILD 549+: PEB Ldr
+                                if (localNtdll2) {
+                                    using NtQIT_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+                                    auto pNtQIT = (NtQIT_t)GetProcAddress(localNtdll2, "NtQueryInformationThread");
+                                    if (pNtQIT) {
+                                        pNtQIT(hTh, 9, &startAddr, sizeof(startAddr), &ql);
+                                    }
                                 }
-                            }
-                        }
-                    }
 
-                    if (isInjected && remoteRtlUserThreadStart) {
-                        DiagLog("CleanupInjectionTraces: [THREAD] TID=%lu StartAddr=0x%llX → spoof=0x%llX\n",
-                            te.th32ThreadID, (unsigned long long)startAddr,
-                            (unsigned long long)remoteRtlUserThreadStart);
-
-                        // 写入 TEB->Win32StartAddress (偏移 0x1C8 in TEB)
-                        // 需要先获取线程的 TEB 地址
-                        // TEB 地址 = NtQueryInformationThread(ThreadBasicInformation) → TebBaseAddress
-                        THREAD_BASIC_INFORMATION tbi = {};
-                        ULONG tbiLen = 0;
-                        HMODULE localNtdll3 = GetModuleHandleW(L"ntdll.dll");
-                        if (localNtdll3) {
-                            using NtQIT_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-                            auto pNtQIT2 = (NtQIT_t)GetProcAddress(localNtdll3, "NtQueryInformationThread");
-                            if (pNtQIT2) {
-                                NTSTATUS tbiSt = pNtQIT2(hTh, 0, &tbi, sizeof(tbi), &tbiLen);
-                                if (NT_SUCCESS(tbiSt) && tbi.TebBaseAddress) {
-                                    SIZE_T wt = 0;
-                                    uintptr_t tebWin32StartAddr = (uintptr_t)tbi.TebBaseAddress + 0x1C8;
-                                    SysWriteVirtualMemory(hProc, (PVOID)tebWin32StartAddr,
-                                        &remoteRtlUserThreadStart, 8, &wt, SyscallMethod::Indirect);
+                                // 检查 startAddr 是否在注入模块范围内
+                                bool isInjected = false;
+                                if (startAddr) {
+                                    uint64_t sa = (uint64_t)startAddr;
+                                    // 排除 ntdll.dll 和 cs2.exe 自己
+                                    if (remoteNtdllBase && sa >= remoteNtdllBase && sa < remoteNtdllBase + 0x300000) {
+                                        // 在 ntdll 范围内 → 合法线程
+                                    } else {
+                                        for (int k = 0; k < numCleaned; k++) {
+                                            if (sa >= cleanedBases[k] && sa < cleanedBases[k] + 0x2000000) {
+                                                isInjected = true;
+                                                break;
+                                            }
+                                        }
+                                    }
                                 }
+
+                                if (isInjected && remoteRtlUserThreadStart) {
+                                    DiagLog("CleanupInjectionTraces: [THREAD] TID=%lu StartAddr=0x%llX → spoof=0x%llX\n",
+                                        tid, (unsigned long long)startAddr,
+                                        (unsigned long long)remoteRtlUserThreadStart);
+
+                                    // 写入 TEB->Win32StartAddress (偏移 0x1C8 in TEB)
+                                    // 需要先获取线程的 TEB 地址
+                                    // TEB 地址 = NtQueryInformationThread(ThreadBasicInformation) → TebBaseAddress
+                                    THREAD_BASIC_INFORMATION tbi = {};
+                                    ULONG tbiLen = 0;
+                                    HMODULE localNtdll3 = GetModuleBaseFromPEB(ModNameHash(L"ntdll.dll"));  // ★ BUILD 549+: PEB Ldr
+                                    if (localNtdll3) {
+                                        using NtQIT_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+                                        auto pNtQIT2 = (NtQIT_t)GetProcAddress(localNtdll3, "NtQueryInformationThread");
+                                        if (pNtQIT2) {
+                                            NTSTATUS tbiSt = pNtQIT2(hTh, 0, &tbi, sizeof(tbi), &tbiLen);
+                                            if (NT_SUCCESS(tbiSt) && tbi.TebBaseAddress) {
+                                                SIZE_T wt = 0;
+                                                uintptr_t tebWin32StartAddr = (uintptr_t)tbi.TebBaseAddress + 0x1C8;
+                                                SysWriteVirtualMemory(hProc, (PVOID)tebWin32StartAddr,
+                                                    &remoteRtlUserThreadStart, 8, &wt, SyscallMethod::Indirect);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                CloseHandle(hTh);
                             }
+
+                            threadPtr += sizeof(B549_SYSTEM_THREAD_INFO);  // 0x50
                         }
+                        break;  // 找到 CS2 进程后退出
                     }
 
-                    CloseHandle(hTh);
-                } while (Thread32Next(hSnap, &te));
+                    if (proc->NextEntryOffset == 0) break;
+                    ptr += proc->NextEntryOffset;
+                }
             }
 
-            CloseHandle(hSnap);
+            if (qsiBuf) VirtualFree(qsiBuf, 0, MEM_RELEASE);
         }
     }
 
@@ -1025,6 +1205,7 @@ static void CleanupInjectionTraces() {
 
     DiagLog("CleanupInjectionTraces: done (PE zero + thread spoof + VAD conceal)\n");
 }
+#endif  // ★ BUILD 549+: CleanupInjectionTraces dead code 包裹结束
 
 // ============================================================
 // 作弊主循环
@@ -1095,21 +1276,21 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     //   用于 VEH 捕获 worker 线程激活上下文栈 NULL 崩溃 (cmp [rax+0x38],9 解引用 NULL)
     g_mainThreadId = GetCurrentThreadId();
     {
-        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+        HMODULE hNtdll = GetModuleBaseFromPEB(ModNameHash(L"ntdll.dll"));  // ★ BUILD 549+: PEB Ldr
         if (hNtdll) {
             FARPROC pfn = GetProcAddress(hNtdll, "RtlDeactivateActivationContext");
             if (pfn) {
                 g_RtlDeactivateAddr = (uint64_t)pfn;
                 g_RtlDeactivateEnd  = (uint64_t)pfn + 0x800;  // 保守范围 2KB (函数通常 < 1KB)
-                DiagLog("BUILD 536: RtlDeactivateActivationContext range [0x%llX-0x%llX) mainTid=%u\n",
+                DiagLog("B549:36 RtlDeact range [0x%llX-0x%llX) tid=%u\n",  // ★ BUILD 549: 去特征化
                     (unsigned long long)g_RtlDeactivateAddr,
                     (unsigned long long)g_RtlDeactivateEnd,
                     g_mainThreadId);
             } else {
-                DiagLog("BUILD 536: GetProcAddress(RtlDeactivateActivationContext) FAILED\n");
+                DiagLog("B549:36 GPA RtlDeact FAIL\n");  // ★ BUILD 549: 去特征化
             }
         } else {
-            DiagLog("BUILD 536: GetModuleHandleW(ntdll.dll) FAILED\n");
+            DiagLog("B549:36 PEB Ldr ntdll FAIL\n");  // ★ BUILD 549: 去特征化 (原 GetModuleHandleW(ntdll.dll) FAILED)
         }
     }
 
@@ -1503,8 +1684,11 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         {
             StealthProcess::ModuleInfo modules[64];
             int modCount = stealth::StealthProcess::GetProcessModules(hProc, modules, 64);
+            // ★ BUILD 549+: 用 ModNameHash 比较替代 wcscmp(L"client.dll") (避免明文模块名)
+            //   ModNameHash(L"client.dll") 编译期计算, 二进制中只出现 hash 常量
+            constexpr uint32_t clientDllHash = ModNameHash(L"client.dll");
             for (int i = 0; i < modCount; i++) {
-                if (wcscmp(modules[i].name, L"client.dll") == 0) {
+                if (ModNameHashRT(modules[i].name) == clientDllHash) {
                     clientSize = modules[i].size;
                     break;
                 }
@@ -1645,7 +1829,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         // 方法4: GetProcAddress fallback
         {
             using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
-            auto fn = (Fn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtReadVirtualMemory");
+            auto fn = (Fn)GetProcAddress(GetModuleBaseFromPEB(ModNameHash(L"ntdll.dll")), "NtReadVirtualMemory");  // ★ BUILD 549+: PEB Ldr
             uint16_t magic = 0;
             SIZE_T bytesRead = 0;
             NTSTATUS st = fn ? fn(hProc, (PVOID)cb, &magic, 2, &bytesRead) : (NTSTATUS)0xC0000002;
