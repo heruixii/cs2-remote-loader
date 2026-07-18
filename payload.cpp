@@ -11,15 +11,26 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 541 (v3.199: 修复 DKOM 断链期间新进程插入导致 0x139 蓝屏 — UnhideProcess 链表一致性检查 + 自循环回退;
-//        根因: HideProcess 后 prev→next (current 断链), 运行期间新进程 C 创建被内核插入到
-//        prev 和 next 之间 → prev→C→next; 原 UnhideProcess 写 prev->Flink=&current,
-//        next->Blink=&current 覆盖了 C 的链表项 → C 退出时 RemoveEntryList 检查失败 → 0x139;
-//        三次蓝屏确认: 21:16:37, 21:42:37, 22:40:50, 参数地址与 loader2 EPROC 完全不同 → 证实是其他进程退出触发;
-//        修复: UnhideProcess 读取 prev->Flink 和 next->Blink 当前值, 若链表未被修改
-//        (prev->Flink==原next 且 next->Blink==原prev) 则原逻辑恢复; 若链表被修改
-//        (有新进程 C 插入) 则使用自循环 (current->Flink=&current, current->Blink=&current),
-//        不修改 prev/next 避免破坏 C 的链表项; 自循环通过 RemoveEntryList 调试检查;
+// BUILD: 542 (v3.200: 修复 ObCallbacks ob=0 — DisableObCallbacks 三个 bug 导致未匹配到 PAC 回调;
+//        根因1 (遍历 bug): 旧代码用 current += CB_ENTRY_SIZE 线性扫描, 但 ObpCallbackArrayHead
+//        是 LIST_ENTRY 链表头 (非连续数组), 线性扫描读到无效内存导致 IsKernelAddressValid 失败
+//        提前 break, 实际只走 10 个条目 (日志: "10 entries walked, 0 matched");
+//        根因2 (preOp 偏移 bug): 旧代码 preOp = current+0x18, 但 +0x18 是 CallbackContext (PVOID),
+//        不是 PreOperation. PreOperation 在 +0x28;
+//        根因3 (postOp 偏移 bug): 旧代码 postOp = current+0x28, 但 +0x28 是 PreOperation,
+//        不是 PostOperation. PostOperation 在 +0x30;
+//        CALLBACK_ENTRY_ITEM 结构 (Win11 24H2 build 26100, para0x0dise 逆向确认):
+//          +0x00 LIST_ENTRY Entry / +0x10 OB_OPERATION Operations / +0x14 ULONG Active
+//          +0x18 CallbackContext / +0x20 ObjectType
+//          +0x28 PreOperation ← 真正的 PreOp
+//          +0x30 PostOperation ← 真正的 PostOp
+//          +0x38 DriverObject / ObHandle; CB_ENTRY_ITEM_SIZE = 0x40
+//        修复: (1) 遍历改用 current = flink 链表遍历, 先 flink 跳过链表头到第一个条目;
+//        (2) preOp 偏移 +0x18 → +0x28; (3) postOp 偏移 +0x28 → +0x30;
+//        (4) NULL 化偏移 +0x18/+0x28 → +0x28/+0x30; (5) RestoreAll 同步修改偏移;
+//        (6) 添加 OBDEBUG 诊断日志打印每个条目的所有字段 (cur/flink/blink/ctx/objType/preOp/postOp/drvObj)
+//        便于后续验证偏移正确性;
+//        保留: BUILD 541 UnhideProcess 链表一致性检查 + 自循环回退;
 //        保留: BUILD 539 VEH fatal + DllMain DETACH + BUILD 540 CS2 退出检测)
 // ============================================================
 
@@ -1101,7 +1112,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.199 DIAG START (BUILD 541: UnhideProcess list-integrity check + self-loop fallback — fixes 0x139 BSOD when new process inserted during DKOM hide) ===\n");
+    DiagLog("=== v3.200 DIAG START (BUILD 542: fix ob=0 — DisableObCallbacks use Flink traversal + correct PreOp(+0x28)/PostOp(+0x30) offsets, was linear scan + wrong offsets) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // ★ BUILD 529: PAC PROBE 模式已废弃 — 改为 E+G 测试模式

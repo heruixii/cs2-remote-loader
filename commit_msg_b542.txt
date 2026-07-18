@@ -1,0 +1,44 @@
+BUILD 542 (v3.200): Fix ObCallbacks ob=0 — DisableObCallbacks three bugs
+
+Root cause analysis (three bugs all in DisableObCallbacks):
+
+1. Traversal bug: Old code used `current += CB_ENTRY_SIZE` linear scan,
+   but ObpCallbackArrayHead is a LIST_ENTRY linked-list head (not a
+   contiguous array). Linear scan read invalid memory causing
+   IsKernelAddressValid() to fail and break early — log showed only
+   "10 entries walked, 0 matched" even though PAC driver was loaded.
+
+2. preOp offset bug: Old code read preOp from current+0x18, but +0x18
+   is CallbackContext (PVOID), not PreOperation. PreOperation is at +0x28.
+
+3. postOp offset bug: Old code read postOp from current+0x28, but +0x28
+   is PreOperation, not PostOperation. PostOperation is at +0x30.
+
+CALLBACK_ENTRY_ITEM structure (Win11 24H2 build 26100, confirmed via
+para0x0dise reverse engineering):
+  +0x00 LIST_ENTRY Entry (Flink, Blink)
+  +0x10 OB_OPERATION Operations
+  +0x14 ULONG Active
+  +0x18 PVOID CallbackContext
+  +0x20 POBJECT_TYPE ObjectType
+  +0x28 POB_PRE_OPERATION PreOperation   <- real PreOp
+  +0x30 POB_POST_OPERATION PostOperation <- real PostOp
+  +0x38 PVOID DriverObject / ObHandle
+  CB_ENTRY_ITEM_SIZE = 0x40 (64 bytes)
+
+Fixes:
+1. Traversal: use `current = flink` linked-list traversal; first
+   iteration reads cbArrayHead->Flink to skip list head and jump to
+   first real CALLBACK_ENTRY_ITEM.
+2. preOp offset: +0x18 -> +0x28
+3. postOp offset: +0x28 -> +0x30
+4. NULL-out offsets: +0x18/+0x28 -> +0x28/+0x30
+5. RestoreAll: sync offset changes (+0x28/+0x30)
+6. Add OBDEBUG diagnostic log printing all 8-byte fields per entry
+   (cur/flink/blink/ctx/objType/preOp/postOp/drvObj) for offset
+   verification in production logs.
+
+Retained from previous builds:
+- BUILD 541: UnhideProcess list-integrity check + self-loop fallback
+- BUILD 539: VEH fatal path + DllMain DETACH UnhideProcess
+- BUILD 540: Main loop CS2 exit detection safe exit
