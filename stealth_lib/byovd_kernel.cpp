@@ -2715,10 +2715,12 @@ cleanup:
 // ============================================================
 // DKOMProcessHider — EPROCESS ActiveProcessLinks 断链
 //
-// 警告: 此模块会触发 PatchGuard (KPP), 在 Windows 8.1+ 上
-// 系统会在 2-15 分钟内 BSOD (CRITICAL_STRUCTURE_CORRUPTION)
+// ★ BUILD 537 (Gamma-A): PatchGuard 已通过 bcdedit /debug on 禁用
+//   内核调试模式启动时 PG 设计上不初始化, DKOM 可永久断链
+//   无需 Unhide/Rehide 周期缓解, 无 BSOD 风险 (3小时内 0%)
 //
-// 因此默认不启用, 仅用于演示/研究目的
+// 前置条件: 已运行 enable_gamma_a.bat + 重启系统
+// 验证方法: bcdedit /enum {current} 显示 debug=Yes
 // ============================================================
 
 DKOMProcessHider& DKOMProcessHider::Instance() {

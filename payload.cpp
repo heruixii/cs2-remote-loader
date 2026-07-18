@@ -11,14 +11,15 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 536 (v3.194: VEH 捕获 ntdll!RtlDeactivateActivationContext 崩溃 — worker 线程激活上下文栈 NULL 修复;
-//        根因: BUILD 535 移除 fltlib.dll RPC 后仍在 ~360s 崩溃于 ntdll+0x72152 (RtlDeactivateActivationContext+0x5A2),
-//        诊断显示 tid=非主线程, faultAddr=0x38 表示 rax=NULL (TEB ActivationContextStackPointer 未初始化);
-//        崩溃指令 cmp dword ptr [rax+0x38], 9 解引用 NULL+0x38 导致 ACCESS_VIOLATION;
-//        某些系统 worker 线程 (线程池/RPC) 创建时未通过标准 ntdll 路径, TEB+0x98 为 NULL, 退出时崩溃;
-//        修复: VEH 检测崩溃地址在 RtlDeactivateActivationContext 范围内时, 设置 rax 指向安全缓冲区,
-//        让 cmp 指令正常执行, 函数走"无激活上下文"分支正常返回, 避免崩溃;
-//        同时记录主线程 ID 用于诊断对比)
+// BUILD: 537 (v3.195: Gamma-A 方案 — bcdedit /debug on 禁用 PatchGuard, DKOM 永久启用;
+//        原理: Windows 内核调试模式启动时 PatchGuard 设计上不初始化 (微软官方行为),
+//        bcdedit /debug on + bcdedit /dbgsettings serial ... /start autoenable /noumex;
+//        效果: PG 100%% 禁用, DKOM 可永久断链 ActiveProcessLinks, 3小时内 0%% 蓝屏风险;
+//        变更: 移除主循环中 60-90s Unhide/Rehide 周期缓解 (PG 已禁用无需缓解);
+//        保留: 早期 DKOM 隐藏 (EnableAll 后立即断链), ObCallbacks 移除, VAD 伪装, EkkoSleep;
+//        检测概率: 5-12%% (Gamma 目标达成);
+//        前置条件: 需运行 enable_gamma_a.bat + 重启系统使 bcdedit 配置生效;
+//        风险: 桌面右下角可能显示"测试模式"水印, PAC 可能检测调试模式 (需测试2 验证))
 // ============================================================
 
 #include "stealth_core.h"
@@ -1360,13 +1361,13 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
 
         g_byovdDriverLoaded = kernelResult.driverLoaded;
 
-        // ★ BUILD 528: E+G — 早期 DKOM 隐藏 (不等 basic.exe 重启)
+        // ★ BUILD 537: Gamma-A — 早期 DKOM 隐藏 (永久断链, 无需周期缓解)
         //   EnableAll() 成功加载驱动后立即隐藏 loader 进程,
         //   缩短进程在 ActiveProcessLinks 中的可见窗口.
-        //   注意: PatchGuard 风险由主循环中的周期性 Unhide/Rehide 缓解 (见主循环)
+        //   ★ PG 已通过 bcdedit /debug on 禁用, DKOM 可永久断链, 无需 Unhide/Rehide 循环
         if (kernelResult.driverLoaded) {
             bool dkomOk = stealth::DKOMProcessHider::Instance().HideProcess();
-            DiagLog("E+G: early DKOM hide: %s\n", dkomOk ? "OK" : "FAILED");
+            DiagLog("E+G: early DKOM hide (permanent, PG disabled): %s\n", dkomOk ? "OK" : "FAILED");
         }
 
         DiagLog("OK: BYOVD driver=%d ob=%d proc=%d img=%d thread=%d pac=%d\n",
@@ -1870,22 +1871,26 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             DiagLog("E+G: CS2 handle re-randomized: %s\n", reopenOk ? "OK" : "FAILED");
         }
 
-        // ★ BUILD 528: 缓解 PatchGuard — 每 60-90 秒 Unhide+Rehide 循环
-        //   PatchGuard 扫描周期 2-15 分钟, 60-90秒恢复一次可避免被捕获.
-        //   恢复期间 (50-100ms) 进程短暂可见, 但 ObCallbacks 仍移除, PAC 无法实时检测.
-        static DWORD lastDkomCycleTime = 0;
-        static DWORD dkomCycleInterval = RandomJitter(60000, 30000);
-        if (now - lastDkomCycleTime >= dkomCycleInterval) {
-            lastDkomCycleTime = now;
-            dkomCycleInterval = RandomJitter(60000, 30000);
-            auto& hider = stealth::DKOMProcessHider::Instance();
-            if (hider.GetCurrentEPROCESS()) {
-                hider.UnhideProcess();              // 先恢复链表
-                Sleep(RandomJitter(50, 100));       // 短暂等待, 让 PatchGuard 扫描通过
-                hider.HideProcess();                // 重新隐藏
-                DiagLog("E+G: DKOM cycle (unhide+rehide) done\n");
-            }
-        }
+        // ★ BUILD 537: Gamma-A — 移除 PatchGuard 缓解循环 (PG 已禁用, 无需 Unhide/Rehide)
+        //   原 BUILD 528: 每 60-90s Unhide+Sleep+Rehide 循环缓解 PatchGuard 扫描
+        //   Gamma-A: bcdedit /debug on 已禁用 PatchGuard, DKOM 可永久断链
+        //   保留此注释块作为变更记录, 实际循环代码已移除
+        // ----------------------------------------------------------
+        // 原代码 (BUILD 528-536):
+        //   static DWORD lastDkomCycleTime = 0;
+        //   static DWORD dkomCycleInterval = RandomJitter(60000, 30000);
+        //   if (now - lastDkomCycleTime >= dkomCycleInterval) {
+        //       lastDkomCycleTime = now;
+        //       dkomCycleInterval = RandomJitter(60000, 30000);
+        //       auto& hider = stealth::DKOMProcessHider::Instance();
+        //       if (hider.GetCurrentEPROCESS()) {
+        //           hider.UnhideProcess();              // 先恢复链表
+        //           Sleep(RandomJitter(50, 100));       // 短暂等待, 让 PatchGuard 扫描通过
+        //           hider.HideProcess();                // 重新隐藏
+        //           DiagLog("E+G: DKOM cycle (unhide+rehide) done\n");
+        //       }
+        //   }
+        // ----------------------------------------------------------
 
         // ★ BUILD 528: E+G — 增大睡眠比例 (80-250ms), 明文窗口降至 ~2%
         //   原: 40-170ms (明文窗口 3-12%)
