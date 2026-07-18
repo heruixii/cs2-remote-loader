@@ -305,6 +305,17 @@ static bool g_egTestMode = false;
 //   用于阶段 A 测试: 验证 loader2 附加 CS2 不被踢 + ObCallbacks 移除有效
 static bool g_halfTestMode = false;
 
+// ★ BUILD 547: 禁用 basic.exe 标志 — 由 %TEMP%\disable_basic.flag 触发
+//   作用: 跳过 basic.exe 启动 (避免注入导致封号), 但保留所有其他保护层:
+//   - CS2 附加 ✅
+//   - BYOVD + DKOM + ObCallbacks ✅
+//   - EkkoSleep 内存加密 ✅
+//   - CS2 内存操作 (ESP 数据读取) ✅ (但无 ESP 渲染, 因 basic.exe 未启动)
+//   - 句柄重随机化 ✅
+//   用途: 在 PAC SHV 监控机制完全搞清楚之前, 长期禁用 basic.exe 防止封号.
+//   移除 flag 文件后, 下次运行 loader2.exe 即恢复 basic.exe 启动.
+static bool g_disableBasic = false;
+
 // v3.34: NtUnmapViewOfSection 函数指针 (用于 Process Hollowing)
 typedef LONG(NTAPI* _NtUnmapViewOfSection)(HANDLE, PVOID);
 static _NtUnmapViewOfSection g_pNtUnmapViewOfSection = nullptr;
@@ -1708,6 +1719,21 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 DiagLog("HALF TEST: will attach CS2 + run E+G protection, but skip basic.exe injection\n");
             }
         }
+
+        // ★ BUILD 547: 禁用 basic.exe 检查 — disable_basic.flag 存在时跳过 basic.exe 启动
+        //   与 half_test.flag 不同: 此 flag 只跳过 basic.exe, 保留 EkkoSleep + CS2 内存操作
+        //   用途: 在 PAC SHV 监控机制完全搞清楚之前, 长期禁用 basic.exe 防止封号
+        if (!g_egTestMode && !g_halfTestMode) {
+            wchar_t disableBasicPath[MAX_PATH];
+            GetTempPathW(MAX_PATH, disableBasicPath);
+            wcscat_s(disableBasicPath, L"disable_basic.flag");
+            g_disableBasic = (GetFileAttributesW(disableBasicPath) != INVALID_FILE_ATTRIBUTES);
+            if (g_disableBasic) {
+                DiagLog("=== DISABLE BASIC MODE (BUILD 547): basic.exe SKIPPED, all other protections ACTIVE ===\n");
+                DiagLog("DISABLE_BASIC: flag found at %ls\n", disableBasicPath);
+                DiagLog("DISABLE_BASIC: will skip basic.exe launch (ban safety), keep CS2 attach + BYOVD + DKOM + EkkoSleep\n");
+            }
+        }
     }
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
@@ -2042,7 +2068,9 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         //   CS2 导致封号. basic.exe 仅在测试3 (无 flag) 时启动.
         // ★ BUILD 537: 半测试模式 (half_test.flag) 也跳过 basic.exe 启动
         //   阶段 A: 附加 CS2 验证 ObCallbacks 移除, 但不启动 basic.exe (避免注入封号)
-        if (!g_egTestMode && !g_halfTestMode) {
+        // ★ BUILD 547: disable_basic.flag 也跳过 basic.exe 启动 — 长期禁用防封号
+        //   与 half_test.flag 不同: 保留 EkkoSleep + CS2 内存操作, 只跳过 basic.exe
+        if (!g_egTestMode && !g_halfTestMode && !g_disableBasic) {
             bool basicOk = LaunchBasicESP();
             DiagLog("LaunchBasicESP: %s\n", basicOk ? "SUCCESS" : "FAILED");
             // v3.32-plus: 基础.exe 注入后清理痕迹 (PEB Ldr unlinking)
@@ -2063,6 +2091,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             }
         } else if (g_halfTestMode) {
             DiagLog("HALF TEST: skipping LaunchBasicESP (half test mode, no injection to avoid ban)\n");
+        } else if (g_disableBasic) {
+            DiagLog("DISABLE_BASIC: skipping LaunchBasicESP (disable_basic.flag set, ban safety until PAC SHV analyzed)\n");
         } else {
             DiagLog("E+G TEST: skipping LaunchBasicESP (test mode, no injection to avoid ban)\n");
         }
@@ -2564,7 +2594,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         // 重试启动 (仅非正常退出时)
         // ★ BUILD 529: 测试模式跳过 basic.exe 重启 (不启动 basic.exe, 防封号)
         // ★ BUILD 537: 半测试模式也跳过 basic.exe 重启
-        if (!g_egTestMode && !g_halfTestMode && !g_hBasicProcess && !g_basicDone) {
+        // ★ BUILD 547: disable_basic.flag 也跳过 basic.exe 重启 — 长期禁用防封号
+        if (!g_egTestMode && !g_halfTestMode && !g_disableBasic && !g_hBasicProcess && !g_basicDone) {
             DWORD nowTick = GetTickCount();
             if (nowTick - lastRetryTime >= g_basicRestartBackoffMs) {
                 lastRetryTime = nowTick;
