@@ -11,14 +11,15 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 538 (v3.196: 修复 ObCallbacks 移除 bug — 代码范围匹配替代名称匹配;
-//        根因: 原 DisableObCallbacks 用 DriverObject+0x14 读取 DriverSection (x64 应为 +0x28),
-//        且把 BaseDllName (UNICODE_STRING 指针) 误作 inline wchar_t 读取 — 两个偏移 bug
-//        导致所有回调条目名称匹配失败, ob=0 (尽管驱动已找到 @ 0xfffff80580900000);
-//        修复: 读取 PE 头 SizeOfImage, 用 preOp/postOp 代码范围 [base, base+size) 匹配;
-//        优势: 最可靠 (直接验证回调代码是否在 PAC 驱动内), 仅读已知可信字段, 零蓝屏风险;
-//        保留: BUILD 537 Gamma-A 全部特性 (bcdedit /debug on, DKOM 永久断链, ObCallbacks, VAD, EkkoSleep);
-//        日志: 修正误导性 "(driver not loaded)" → "driver loaded, no ObCallbacks in range")
+// BUILD: 540 (v3.198: 主循环 CS2 退出检测安全网 — 防止 TerminateProcess 路径 0x139 蓝屏;
+//        根因: DKOM 永久断链后, 进程被 TerminateProcess(任务管理器) 终止时 PspExitProcess
+//        的 RemoveEntryList 调试检查失败 → BugCheck 0x139 参数 3;
+//        21:42:37 第二次蓝屏即此路径 — 进程卡死后用户强制终止, VEH 不触发, DllMain DETACH 不触发;
+//        修复: 主循环每次迭代用 GetExitCodeProcess 检测 CS2 是否退出, 若退出则主动调用
+//        DisableAll(含 UnhideProcess) → return 0 安全退出, 避免 TerminateProcess 路径;
+//        保留: BUILD 539 VEH fatal + DllMain DETACH 调用 UnhideProcess;
+//        安全性: g_egTestMode(pac_probe) 无 CS2 句柄跳过检测; GetExitCodeProcess 无 syscall 痕迹;
+//                句柄暂时无效(ReopenProcessHandle 窗口期)时返回 FALSE 不误退出)
 // ============================================================
 
 #include "stealth_core.h"
@@ -77,6 +78,10 @@ static volatile LONG g_vehRestoring = 0;
 // ★ v3.126d: 崩溃计数 — 防止自愈后同一指令再次崩溃导致的无限循环
 static volatile LONG g_vehCrashCount = 0;
 static constexpr LONG MAX_VEH_RETRIES = 3;
+
+// ★ BUILD 539: VEH fatal 路径 UnhideProcess 重入防护
+//   防止 VEH 中调用 UnhideProcess → IOCTL 二次崩溃 → 再次进入 VEH 的无限循环
+static volatile LONG g_vehUnhideDone = 0;
 
 // ★ v3.126f: Hollowing crash fallback — 用 setjmp/longjmp 捕获 ntdll 崩溃并回退到 CreateProcess
 static jmp_buf g_hollowJmpBuf;
@@ -232,6 +237,18 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     }
 
 veh_fatal:
+
+    // ★ BUILD 539: 进程崩溃/退出前必须挂回 ActiveProcessLinks — 防止 0x139 蓝屏
+    //   根因: DKOM 永久断链后 prev->Flink=next, 进程退出时 PspExitProcess 调用
+    //   RemoveEntryList 调试检查 prev->Flink==current 失败 → BugCheck 0x139 参数 3
+    //   两次蓝屏确认: 21:16:37 和 21:42:37, 均为 0x139 (3, addr1, addr2, 0)
+    //   修复: VEH fatal 路径前调用 UnhideProcess, 确保链表完整后退出
+    //   安全性: 原子标志 g_vehUnhideDone 防止重入 (VEH 中 IOCTL 可能二次崩溃);
+    //           UnhideProcess 内部检查 m_hidden (未隐藏时 no-op); IOCTL 有 2s 超时保护
+    if (!InterlockedExchange(&g_vehUnhideDone, 1)) {
+        DiagLog("VEH-FATAL: calling UnhideProcess before exit (prevent 0x139 BSOD on PspExitProcess)\n");
+        stealth::DKOMProcessHider::Instance().UnhideProcess();
+    }
 
     // ★ v3.126f: Hollowing crash — 用 longjmp 跳回 setjmp 点, 回退到 CreateProcess
     if (g_hollowJmpSet) {
@@ -1083,7 +1100,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.196 DIAG START (BUILD 538: ObCallbacks code-range matching — fixes DriverSection offset + UNICODE_STRING inline read bugs) ===\n");
+    DiagLog("=== v3.198 DIAG START (BUILD 540: Main-loop CS2 exit watchdog — prevents TerminateProcess path 0x139 BSOD) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // ★ BUILD 529: PAC PROBE 模式已废弃 — 改为 E+G 测试模式
@@ -1755,6 +1772,31 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     while (true) {
         frameCount++;
 
+        // ★ BUILD 540: CS2 退出检测安全网 — 防止 TerminateProcess 路径 0x139 蓝屏
+        //   根因: DKOM 永久断链后, 进程被 TerminateProcess(任务管理器) 终止时
+        //   PspExitProcess 的 RemoveEntryList 调试检查失败 → BugCheck 0x139 参数 3
+        //   21:42:37 第二次蓝屏即此路径 (用户强制终止卡死的 loader2.exe)
+        //   修复: 主循环每次迭代检测 CS2 是否退出, 若退出则主动调用
+        //         DisableAll(含 UnhideProcess) → return 0 安全退出
+        //   场景: CS2 被反作弊踢出 / 用户关闭 CS2 → 主循环检测到 → 安全退出
+        //   注意: g_egTestMode (pac_probe) 无 CS2 句柄, 跳过检测
+        //   安全性: GetExitCodeProcess 只读进程对象退出码字段, 无 syscall 痕迹;
+        //           ReopenProcessHandle 先开新句柄再关旧句柄, 无窗口期;
+        //           句柄暂时无效时 GetExitCodeProcess 返回 FALSE, 不误退出
+        if (!g_egTestMode) {
+            HANDLE hCs2 = StealthEngine::Instance().GetProcessHandle();
+            if (hCs2) {
+                DWORD cs2ExitCode = STILL_ACTIVE;
+                if (GetExitCodeProcess(hCs2, &cs2ExitCode) && cs2ExitCode != STILL_ACTIVE) {
+                    DiagLog("BUILD 540: CS2 exited (code=%u), safe exit (DisableAll→UnhideProcess)\n", cs2ExitCode);
+                    TerminateBasicESP();
+                    stealth::KernelDefense::DisableAll();  // 包含 UnhideProcess
+                    StealthEngine::Instance().Shutdown();
+                    return 0;
+                }
+            }
+        }
+
         // 隐身维护 (ETW/AMSI/VAC/Hook检测/NMI心跳)
         StealthEngine::Instance().OnFrame();
 
@@ -1958,6 +2000,17 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
 // ============================================================
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
+    // ★ BUILD 539: DLL_PROCESS_DETACH 时挂回 ActiveProcessLinks — 防止 0x139 蓝屏
+    //   根因: DKOM 永久断链后进程退出时 PspExitProcess 的 RemoveEntryList 调试检查失败
+    //   manual-mapped DLL 的 DETACH 通常不会被系统调用, 但 loader 可能手动调用.
+    //   正常退出路径 (CheatMainLoop return) 已调用 DisableAll→UnhideProcess.
+    //   这里作为双保险: 如果 DETACH 被触发, 确保链表挂回.
+    if (fdwReason == DLL_PROCESS_DETACH) {
+        DiagLog("DllMain: DETACH — calling UnhideProcess (prevent 0x139 BSOD)\n");
+        stealth::DKOMProcessHider::Instance().UnhideProcess();
+        return TRUE;
+    }
+
     if (fdwReason != DLL_PROCESS_ATTACH)
         return TRUE;
 
