@@ -302,6 +302,9 @@ private:
     uint64_t m_flinkBackup  = 0;
     uint64_t m_blinkBackup  = 0;
     bool     m_hidden       = false;
+    // ★ BUILD 537: 动态 EPROCESS 偏移 (运行时扫描确定, 适配 Win10/11/24H2)
+    uint32_t m_pidOffset    = 0;   // UniqueProcessId 偏移 (Win10/11 23H2 = 0x440, Win11 24H2 不同)
+    uint32_t m_linksOffset  = 0;   // ActiveProcessLinks 偏移 (Win10/11 23H2 = 0x448, Win11 24H2 不同)
 };
 
 // ============================================================
