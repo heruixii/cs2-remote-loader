@@ -11,25 +11,24 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 546 (v3.203: basic.exe 享受 loader2 同级保护 — 跨进程 EkkoSleep + 窗口防截图 + 文件不落盘
-//        1. 跨进程 EkkoSleep: EncryptBasicCode + DecryptBasicCode (核心突破)
-//           loader2 通过 OpenProcess(basic) + SuspendThread + VirtualProtectEx + WriteProcessMemory
-//           对 basic.exe 代码页加密/解密, 内存明文窗口从 100% 降至 5-10% (与 loader2 相同).
-//           主循环同步: EncryptBasicCode → StealthSleep → DecryptBasicCode (避免总睡眠翻倍).
-//        2. 窗口防截图: HideBasicExeWindow 应用 WDA_EXCLUDEFROMCAPTURE (Win10 2004+)
-//           阻止 BitBlt/PrintWindow/Direct3D 捕获, 失败回退 WDA_MONITOR.
-//           样式强化: WS_EX_TOOLWINDOW + WS_EX_NOACTIVATE + 随机窗口标题.
-//           主循环周期性调用 (5-10s) 防止 basic.exe 重新创建窗口.
-//        3. basic.exe 嵌入 payload.dll: g_basicExeData[51200] 字节数组 (basic_exe_embedded.h).
-//           LaunchBasicESP 从嵌入数据加载 → 写入随机临时文件 svc_XXXX_XXXX.exe →
-//           CreateProcess → 立即删除 (落盘时间 < 3 秒). 避免文件落盘被 PAC 检测.
-//        4. EkkoSleep 豁免扩展: exemptPages[8] → exemptPages[16], 新增 5 个豁免页:
-//           HideBasicExeWindow/EncryptBasicCode/DecryptBasicCode/InitBasicEkkoSleep/g_basicExeData.
-//        5. ResetBasicEkkoSleepState 集中清理辅助函数 — 避免句柄泄漏:
-//           调用点: TerminateBasicESP + 监控块(normal/crash 退出) + InitBasicEkkoSleep 失败路径.
-//           修复 BUG: 监控块 g_hBasicMainThread 句柄泄漏 + g_basicCodePageStart 残留旧值.
-//        保留: BUILD 544 DKOM 多 PID + BUILD 539 VEH fatal + BUILD 540 CS2 退出检测 +
-//              BUILD 541 自循环回退 + BUILD 543 ObCallbacks 线性扫描)
+// BUILD: 547 (v3.204: EPT 页表 dump 集成到 payload.dll — 复用 PDFWKRNL 句柄避免竞争
+//        1. 集成 RunEptDump() 函数 — 从 ept_dumper.cpp 移植 EPT 页表扫描逻辑
+//           扫描 PAC MessageTransfer.sys .data 段, 定位 EPTP + EPT 页表内核 VA,
+//           dump PML4E 项, 识别 SHV 监控目标.
+//        2. 触发机制: %TEMP%\ept_dump.flag 文件存在时, BYOVD 初始化完成后执行 dump
+//           dump 完成 → 删除 flag → DisableAll() 安全退出 (return 0, 不进入主循环)
+//        3. 根本修复: ept_dumper.exe 独立运行的根本缺陷 — PDFWKRNL 设备句柄被 loader2.exe 独占
+//           集成到 payload.dll 复用 KernelMemoryAccessor::Instance() 现有句柄, 避免竞争
+//        4. 安全设计:
+//           - 复用 BYOVD 句柄 (不调用 Initialize/Shutdown)
+//           - VirtualAlloc 替代 malloc (manual-mapped DLL CRT 堆未初始化)
+//           - CreateFileW 替代 fopen (避免 CRT 依赖)
+//           - IOCTL 限制 100 次 (避免 PDFWKRNL 超时 + PatchGuard 风险)
+//           - 不读取 .text 段 + 不读取 ntoskrnl 敏感地址 (避免 0x109 BSOD)
+//        5. 安全退出: 调用 DisableAll() (含 UnhideProcess 防 0x139 BSOD)
+//           绝对不能用任务管理器强制终止 loader2.exe — 会触发 0x139 蓝屏
+//        保留: BUILD 546 跨进程 EkkoSleep + BUILD 544 DKOM 多 PID + BUILD 539 VEH fatal +
+//              BUILD 540 CS2 退出检测 + BUILD 541 自循环回退 + BUILD 543 ObCallbacks 线性扫描)
 // ============================================================
 
 #include "stealth_core.h"
@@ -453,6 +452,402 @@ static bool ResolveImportTable(HANDLE hProcess, void* remoteBase,
 // ★ BUILD 546: 前向声明 — LaunchBasicESP 调用 InitBasicEkkoSleep,
 //   但 InitBasicEkkoSleep 定义在 LaunchBasicESP 之后 (L692+)
 static bool InitBasicEkkoSleep();
+
+// ============================================================
+// ★ BUILD 547: EPT 页表 dump (集成到 payload.dll)
+//
+// 目的: 通过 PDFWKRNL.sys 内核读写能力, 扫描 PAC MessageTransfer.sys
+//   驱动 .data 段, 定位 EPTP (Extended Page Table Pointer) 和
+//   EPT 页表内核虚拟地址, dump EPT 页表项, 识别 SHV 监控目标.
+//
+// 触发: %TEMP%\ept_dump.flag 文件存在时, BYOVD 初始化完成后执行 dump,
+//   dump 完成后删除 flag 并安全退出 (return 0, 不进入主循环).
+//
+// 设计要点:
+//   1. 复用 stealth::KernelMemoryAccessor::Instance() — 避免 PDFWKRNL 句柄竞争
+//      (ept_dumper.exe 独立运行的根本缺陷: 设备句柄被 loader2.exe 独占)
+//   2. 不调用 kma.Initialize/kma.Shutdown — 由 BYOVD 块统一管理生命周期
+//   3. 避免 malloc/free — manual-mapped DLL CRT 堆未初始化, 使用 VirtualAlloc
+//   4. 避免 fopen/fclose — 使用 CreateFileW/WriteFile/CloseHandle
+//   5. IOCTL 读取总量限制 < 100 次 (避免 PDFWKRNL 超时 + PatchGuard 风险)
+//   6. 不读取 .text 段 + 不读取 ntoskrnl 敏感地址 (避免 0x109 BSOD)
+// ============================================================
+
+// EPTP (Extended Page Table Pointer) 64-bit 格式:
+//   Bits 0-2:   Memory type (0=UC, 6=WB)
+//   Bits 3-5:   Page walk length - 1 (must be 3 for 4-level EPT)
+//   Bit 6:      Allow WB on large pages (1)
+//   Bits 7-11:  Reserved (0)
+//   Bits 12-51: EPT PML4 physical address (4 KB aligned)
+//   Bits 52-63: Reserved (0)
+struct EptpFormat {
+    uint64_t value;
+    uint64_t pml4Phys;
+    uint32_t memType;
+    uint32_t walkLength;
+    bool     allowWb;
+};
+
+static bool ParseEPTP(uint64_t val, EptpFormat* out) {
+    uint32_t low12 = (uint32_t)(val & 0xFFF);
+    uint32_t memType    = low12 & 0x7;
+    uint32_t walkLen    = (low12 >> 3) & 0x7;
+    uint32_t allowWb    = (low12 >> 6) & 0x1;
+    uint32_t reservedLo = (low12 >> 7) & 0x1F;
+    uint64_t pml4Phys   = val & 0x000FFFFFFFFFF000ULL;
+    uint64_t reservedHi = val >> 52;
+
+    if (memType != 0 && memType != 6) return false;
+    if (walkLen != 3) return false;
+    if (allowWb != 1) return false;
+    if (reservedLo != 0) return false;
+    if (reservedHi != 0) return false;
+    if (pml4Phys == 0) return false;
+    if (pml4Phys & 0xFFF) return false;
+    if (pml4Phys > 0x7FFFFFFFULL) return false;  // 2 GB SHV 限制
+
+    out->value = val;
+    out->pml4Phys = pml4Phys;
+    out->memType = memType;
+    out->walkLength = walkLen + 1;
+    out->allowWb = (allowWb != 0);
+    return true;
+}
+
+// EPT PTE 64-bit 格式:
+//   Bit 0: R, Bit 1: W, Bit 2: X, Bits 6-7: Memory type
+//   Bits 12-51: Physical address, Bit 59: XE (execute user)
+struct EptPte {
+    uint64_t raw;
+    uint64_t physAddr;
+    bool     r, w, x, xe;
+    uint32_t memType;
+};
+
+static void ParseEptPte(uint64_t raw, EptPte* out) {
+    out->raw = raw;
+    out->r = (raw & 0x1) != 0;
+    out->w = (raw & 0x2) != 0;
+    out->x = (raw & 0x4) != 0;
+    out->memType = (raw >> 6) & 0x3;
+    out->physAddr = raw & 0x000FFFFFFFFFF000ULL;
+    out->xe = (raw >> 59) & 0x1;
+}
+
+// PE section info (栈上固定数组, 避免 std::vector)
+struct PESectionInfo {
+    uint32_t rva;
+    uint32_t virtualSize;
+    char     name[9];
+};
+
+static bool ParsePESections(const uint8_t* peHeaderBuf, size_t bufSize,
+                             PESectionInfo* outSections, int maxSections,
+                             int* outCount) {
+    if (bufSize < 0x40) return false;
+    if (peHeaderBuf[0] != 'M' || peHeaderBuf[1] != 'Z') return false;
+    uint32_t e_lfanew = *(uint32_t*)(peHeaderBuf + 0x3C);
+    if (e_lfanew + 24 > bufSize) return false;
+    const uint8_t* pe = peHeaderBuf + e_lfanew;
+    if (*(uint32_t*)pe != 0x00004550) return false;
+    uint16_t numSections = *(uint16_t*)(pe + 6);
+    uint16_t optHdrSize  = *(uint16_t*)(pe + 20);
+    const uint8_t* sectHdr = pe + 24 + optHdrSize;
+    if (sectHdr + (size_t)numSections * 40 > peHeaderBuf + bufSize) return false;
+    int count = (numSections < maxSections) ? numSections : maxSections;
+    for (int i = 0; i < count; i++) {
+        const uint8_t* s = sectHdr + i * 40;
+        memcpy(outSections[i].name, s, 8);
+        outSections[i].name[8] = '\0';
+        outSections[i].rva = *(uint32_t*)(s + 12);
+        outSections[i].virtualSize = *(uint32_t*)(s + 8);
+    }
+    *outCount = count;
+    return true;
+}
+
+// ★ BUILD 547: EPT dump 专用日志 (独立文件 ept_dump.log, 不污染 stealth_diag.log)
+static HANDLE g_eptLogFile = INVALID_HANDLE_VALUE;
+
+static void EptLog(const char* fmt, ...) {
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    int len = vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    if (len < 0) len = 0;
+
+    if (g_eptLogFile != INVALID_HANDLE_VALUE) {
+        DWORD w = 0;
+        WriteFile(g_eptLogFile, buf, (DWORD)len, &w, 0);
+        FlushFileBuffers(g_eptLogFile);
+    }
+    // 同时写入 stealth_diag.log (通过 DiagLog 复用)
+    DiagLog("%s", buf);
+}
+
+// ★ BUILD 547: 主 EPT dump 函数
+//   返回 true 表示 dump 成功完成 (无论是否找到 EPT 表)
+//   返回 false 表示初始化失败 (PAC 未运行 / PE 解析失败 / .data 读取失败)
+static bool RunEptDump() {
+    EptLog("============================================================\n");
+    EptLog("  BUILD 547: PAC SHV EPT Page Table Dumper (integrated)\n");
+    EptLog("============================================================\n\n");
+
+    auto& kma = stealth::KernelMemoryAccessor::Instance();
+    if (!kma.IsActive()) {
+        EptLog("[FAIL] KernelMemoryAccessor not active (BYOVD init failed?)\n");
+        return false;
+    }
+    EptLog("[Phase 1] KernelMemoryAccessor active (reusing BYOVD handle).\n\n");
+
+    // 阶段 2: 获取 MessageTransfer.sys 内核基址
+    EptLog("[Phase 2] Locating MessageTransfer.sys in kernel...\n");
+    uint64_t pacBase = kma.GetKernelModuleBase("MessageTransfer.sys");
+    if (!pacBase) {
+        EptLog("[FAIL] MessageTransfer.sys not found in kernel module list.\n");
+        EptLog("       Possible causes:\n");
+        EptLog("       - PAC not running (launch PerfectWorld Arena + CS2 first)\n");
+        EptLog("       - Service name different from 'MessageTransfer.sys'\n");
+        return false;
+    }
+    EptLog("[OK] MessageTransfer.sys kernel base = 0x%llX\n\n", (unsigned long long)pacBase);
+
+    // 阶段 3: 解析 PE 头, 获取 .data 段范围
+    EptLog("[Phase 3] Parsing PE headers to locate .data section...\n");
+    uint8_t peHdr[4096];
+    if (!kma.ReadKernelVA(pacBase, peHdr, sizeof(peHdr))) {
+        EptLog("[FAIL] Cannot read PE header at 0x%llX\n", (unsigned long long)pacBase);
+        return false;
+    }
+
+    PESectionInfo sections[16];
+    int sectionCount = 0;
+    if (!ParsePESections(peHdr, sizeof(peHdr), sections, 16, &sectionCount)) {
+        EptLog("[FAIL] PE header parsing failed.\n");
+        return false;
+    }
+    EptLog("[OK] Found %d sections:\n", sectionCount);
+    for (int i = 0; i < sectionCount; i++) {
+        EptLog("  [%d] %-8s RVA=0x%08X VSize=0x%08X\n",
+            i, sections[i].name, sections[i].rva, sections[i].virtualSize);
+    }
+
+    uint32_t dataRva = 0;
+    uint32_t dataSize = 0;
+    for (int i = 0; i < sectionCount; i++) {
+        if (strcmp(sections[i].name, ".data") == 0) {
+            dataRva = sections[i].rva;
+            dataSize = sections[i].virtualSize;
+            break;
+        }
+    }
+    if (!dataRva || !dataSize) {
+        EptLog("[FAIL] .data section not found in MessageTransfer.sys\n");
+        return false;
+    }
+    EptLog("[OK] .data section: RVA=0x%08X Size=0x%X (%u bytes)\n",
+        dataRva, dataSize, dataSize);
+
+    // 限制 .data 段读取量 (避免超时)
+    const uint32_t MAX_DATA_SCAN = 0x10000;  // 64 KB
+    uint32_t scanSize = (dataSize < MAX_DATA_SCAN) ? dataSize : MAX_DATA_SCAN;
+    EptLog("       Scanning first %u bytes (limit: %u KB)\n\n", scanSize, MAX_DATA_SCAN / 1024);
+
+    // ★ 使用 VirtualAlloc 替代 malloc — manual-mapped DLL CRT 堆未初始化
+    uint64_t dataVA = pacBase + dataRva;
+    uint8_t* dataBuf = (uint8_t*)VirtualAlloc(nullptr, scanSize,
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!dataBuf) {
+        EptLog("[FAIL] VirtualAlloc failed for dataBuf\n");
+        return false;
+    }
+
+    // 分块读取 .data 段 (每块 4 KB)
+    const uint32_t CHUNK = 0x1000;
+    bool readOk = true;
+    for (uint32_t off = 0; off < scanSize; off += CHUNK) {
+        uint32_t thisChunk = (off + CHUNK <= scanSize) ? CHUNK : (scanSize - off);
+        if (!kma.ReadKernelVA(dataVA + off, dataBuf + off, thisChunk)) {
+            EptLog("[WARN] ReadKernelVA failed at .data+0x%X (off=%u)\n", off, off);
+            readOk = false;
+            break;
+        }
+    }
+    if (!readOk) {
+        EptLog("[FAIL] Cannot fully read .data section.\n");
+        VirtualFree(dataBuf, 0, MEM_RELEASE);
+        return false;
+    }
+    EptLog("[OK] .data section read successfully.\n\n");
+
+    // 阶段 4: 扫描 EPTP 候选
+    EptLog("[Phase 4] Scanning for EPTP (Extended Page Table Pointer) candidates...\n");
+    int eptpCount = 0;
+    for (uint32_t off = 0; off + 8 <= scanSize; off += 8) {
+        uint64_t val = *(uint64_t*)(dataBuf + off);
+        EptpFormat eptp;
+        if (ParseEPTP(val, &eptp)) {
+            EptLog("  [EPTP @ .data+0x%X] val=0x%016llX | PML4Phys=0x%llX memType=%u walk=%u allowWb=%d\n",
+                off, (unsigned long long)val,
+                (unsigned long long)eptp.pml4Phys, eptp.memType, eptp.walkLength, (int)eptp.allowWb);
+            eptpCount++;
+        }
+    }
+    EptLog("[OK] Found %d EPTP candidate(s).\n\n", eptpCount);
+
+    // 阶段 5: 扫描 EPT 页表内核 VA 候选
+    EptLog("[Phase 5] Scanning for EPT page table kernel VA candidates...\n");
+    struct VaCandidate {
+        uint32_t offInData;
+        uint64_t va;
+    };
+    VaCandidate vaCandidates[64];
+    int vaCandidateCount = 0;
+
+    for (uint32_t off = 0; off + 8 <= scanSize; off += 8) {
+        uint64_t val = *(uint64_t*)(dataBuf + off);
+        uint16_t hi16 = (uint16_t)(val >> 48);
+        if (hi16 != 0xFFFF) continue;
+
+        uint64_t hi = val >> 40;
+        if (hi != 0xFFFFF8 && hi != 0xFFFFE0 && hi != 0xFFFFF0 && hi != 0xFFFFFFFE) continue;
+
+        if (val == 0 || val == 0xFFFFFFFFFFFFFFFF) continue;
+        if (val & 0xFFF) continue;  // 必须页对齐
+
+        if (vaCandidateCount < 64) {
+            vaCandidates[vaCandidateCount].offInData = off;
+            vaCandidates[vaCandidateCount].va = val;
+            vaCandidateCount++;
+            if (vaCandidateCount <= 32) {
+                EptLog("  [VA @ .data+0x%X] 0x%016llX\n", off, (unsigned long long)val);
+            }
+        }
+    }
+    if (vaCandidateCount > 32) {
+        EptLog("  ... (%d more candidates omitted)\n", vaCandidateCount - 32);
+    }
+    EptLog("[OK] Found %d VA candidate(s).\n\n", vaCandidateCount);
+
+    // 阶段 6: 验证 VA 候选是否为 EPT PML4 表
+    EptLog("[Phase 6] Validating VA candidates as EPT PML4 tables...\n");
+    struct ValidatedTable {
+        uint64_t va;
+        uint32_t offInData;
+        int      entryCount;
+        int      validEntryCount;
+    };
+    ValidatedTable validatedTables[8];
+    int validatedTableCount = 0;
+
+    int maxValidate = (vaCandidateCount < 8) ? vaCandidateCount : 8;
+    for (int i = 0; i < maxValidate; i++) {
+        uint64_t va = vaCandidates[i].va;
+        uint32_t off = vaCandidates[i].offInData;
+
+        uint8_t page[4096];
+        if (!kma.ReadKernelVA(va, page, sizeof(page))) {
+            EptLog("  [VA @ .data+0x%X 0x%llX] READ FAILED\n", off, (unsigned long long)va);
+            continue;
+        }
+
+        int nonZero = 0;
+        int validEptEntries = 0;
+        int noAccessCount = 0;
+        for (int e = 0; e < 512; e++) {
+            uint64_t entry = *(uint64_t*)(page + e * 8);
+            if (entry == 0) continue;
+            nonZero++;
+
+            EptPte pte;
+            ParseEptPte(entry, &pte);
+
+            if (pte.physAddr == 0) continue;
+            if (pte.physAddr & 0xFFF) continue;
+            if (pte.physAddr > 0x7FFFFFFFULL) continue;
+
+            validEptEntries++;
+
+            if (!pte.r && !pte.w && !pte.x) {
+                noAccessCount++;
+            }
+        }
+
+        if (nonZero == 0) {
+            EptLog("  [VA @ .data+0x%X 0x%llX] empty (all zeros)\n", off, (unsigned long long)va);
+            continue;
+        }
+
+        EptLog("  [VA @ .data+0x%X 0x%llX] nonZero=%d validEpt=%d noAccess=%d\n",
+            off, (unsigned long long)va, nonZero, validEptEntries, noAccessCount);
+
+        if (validEptEntries >= 1 && validatedTableCount < 8) {
+            validatedTables[validatedTableCount].va = va;
+            validatedTables[validatedTableCount].offInData = off;
+            validatedTables[validatedTableCount].entryCount = nonZero;
+            validatedTables[validatedTableCount].validEntryCount = validEptEntries;
+            validatedTableCount++;
+        }
+    }
+    EptLog("[OK] Validated %d EPT page table(s).\n\n", validatedTableCount);
+
+    // 阶段 7: Dump EPT 页表 (限制深度, 避免超时)
+    int totalIoctlCount = 0;
+    if (validatedTableCount > 0) {
+        EptLog("[Phase 7] Dumping EPT page table structure (limited depth)...\n\n");
+
+        const int MAX_IOCTL = 100;
+        for (int t = 0; t < validatedTableCount && totalIoctlCount < MAX_IOCTL; t++) {
+            EptLog("=== Table #%d at VA=0x%llX (.data+0x%X) ===\n",
+                t, (unsigned long long)validatedTables[t].va, validatedTables[t].offInData);
+
+            uint8_t pml4[4096];
+            if (!kma.ReadKernelVA(validatedTables[t].va, pml4, 4096)) {
+                EptLog("  [SKIP] Cannot re-read PML4 table\n");
+                continue;
+            }
+            totalIoctlCount++;
+
+            int pml4eProcessed = 0;
+            for (int p4 = 0; p4 < 512 && pml4eProcessed < 4 && totalIoctlCount < MAX_IOCTL; p4++) {
+                uint64_t pml4e = *(uint64_t*)(pml4 + p4 * 8);
+                if (pml4e == 0) continue;
+
+                EptPte pte;
+                ParseEptPte(pml4e, &pte);
+                char rwx[8];
+                rwx[0] = pte.r ? 'R' : '-';
+                rwx[1] = pte.w ? 'W' : '-';
+                rwx[2] = pte.x ? 'X' : '-';
+                rwx[3] = pte.xe ? 'U' : '-';
+                rwx[4] = '\0';
+                EptLog("  PML4E[%d] = 0x%016llX  %s  phys=0x%llX\n",
+                    p4, (unsigned long long)pml4e, rwx,
+                    (unsigned long long)pte.physAddr);
+                pml4eProcessed++;
+            }
+            EptLog("\n");
+        }
+
+        EptLog("[NOTE] Deep dump (PDPTE/PDE/PTE levels) requires physical-to-VA conversion.\n");
+        EptLog("       Current PDFWKRNL only supports VA memcpy, cannot read physical pages directly.\n");
+    } else {
+        EptLog("[Phase 7] SKIPPED — no validated EPT page tables.\n");
+        EptLog("          Possible reasons:\n");
+        EptLog("          - SHV not active (PAC not running, or SHV init failed)\n");
+        EptLog("          - EPT page table VA not in .data section (in heap/pool)\n");
+        EptLog("          - .data section larger than 64 KB scan limit\n\n");
+    }
+
+    EptLog("\n============================================================\n");
+    EptLog("  EPT Dump Complete\n");
+    EptLog("  Total IOCTL reads performed: %d (limit was 100)\n", totalIoctlCount);
+    EptLog("============================================================\n");
+
+    VirtualFree(dataBuf, 0, MEM_RELEASE);
+    return true;
+}
 
 static bool LaunchBasicESP() {
     DiagLog("BUILD 546: LaunchBasicESP from embedded data (%zu bytes)\n", g_basicExeSize);
@@ -1275,7 +1670,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.202 DIAG START (BUILD 544: basic.exe protection — DKOM multi-PID + EkkoSleep exempt fix + L1885 bug fix + exit path coverage) ===\n");
+    DiagLog("=== v3.204 DIAG START (BUILD 547: EPT dump integrated — RunEptDump + ept_dump.flag trigger + safe exit) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // ★ BUILD 529: PAC PROBE 模式已废弃 — 改为 E+G 测试模式
@@ -1679,6 +2074,69 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         }
         DiagLog("BYOVD: freed %d guard regions\n",
             guardRegionCount);
+    }
+
+    // ============================================================
+    // ★ BUILD 547: EPT dump 触发点 — BYOVD 初始化完成后检测 flag
+    //   设计:
+    //   1. 检测 %TEMP%\ept_dump.flag 文件存在
+    //   2. 打开 %TEMP%\ept_dump.log 日志文件
+    //   3. 调用 RunEptDump() (复用 KernelMemoryAccessor, 避免句柄竞争)
+    //   4. 关闭日志文件
+    //   5. 删除 flag 文件 (防止下次运行重复触发)
+    //   6. 调用 KernelDefense::DisableAll() 安全退出 (含 UnhideProcess 防 0x139 BSOD)
+    //   7. return 0 — 不进入主循环, 直接安全退出
+    //
+    //   关键: 必须调用 DisableAll() 防止 DKOM 断链状态导致 0x139 蓝屏
+    //         (绝对不能用任务管理器强制终止 loader2.exe)
+    // ============================================================
+    {
+        wchar_t eptFlagPath[MAX_PATH];
+        GetTempPathW(MAX_PATH, eptFlagPath);
+        wcscat_s(eptFlagPath, L"ept_dump.flag");
+        if (GetFileAttributesW(eptFlagPath) != INVALID_FILE_ATTRIBUTES) {
+            DiagLog("=== BUILD 547: EPT DUMP MODE (flag detected) ===\n");
+
+            // 打开 EPT dump 专用日志文件
+            wchar_t eptLogPath[MAX_PATH];
+            GetTempPathW(MAX_PATH, eptLogPath);
+            wcscat_s(eptLogPath, L"ept_dump.log");
+            g_eptLogFile = CreateFileW(eptLogPath, FILE_WRITE_DATA, FILE_SHARE_READ,
+                0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+            if (g_eptLogFile == INVALID_HANDLE_VALUE) {
+                DiagLog("BUILD 547: WARN — Cannot create ept_dump.log (err=%u), logging to stealth_diag.log only\n",
+                    GetLastError());
+            } else {
+                DiagLog("BUILD 547: ept_dump.log opened at %ls\n", eptLogPath);
+            }
+
+            // 执行 EPT dump
+            bool dumpOk = RunEptDump();
+            DiagLog("BUILD 547: RunEptDump %s\n", dumpOk ? "COMPLETED" : "FAILED");
+
+            // 关闭日志文件
+            if (g_eptLogFile != INVALID_HANDLE_VALUE) {
+                CloseHandle(g_eptLogFile);
+                g_eptLogFile = INVALID_HANDLE_VALUE;
+            }
+
+            // 删除 flag 文件 (防止下次运行重复触发)
+            if (!DeleteFileW(eptFlagPath)) {
+                DiagLog("BUILD 547: WARN — Cannot delete ept_dump.flag (err=%u)\n", GetLastError());
+            } else {
+                DiagLog("BUILD 547: ept_dump.flag deleted\n");
+            }
+
+            // ★ 安全退出: 必须调用 DisableAll (含 UnhideProcess) 防 0x139 BSOD
+            //   绝对不能用任务管理器强制终止 loader2.exe — 会触发 0x139 蓝屏
+            DiagLog("BUILD 547: calling KernelDefense::DisableAll() for safe exit...\n");
+            stealth::KernelDefense::DisableAll();
+            StealthEngine::Instance().Shutdown();
+            DiagLog("BUILD 547: EPT dump mode exit (return 0). Check ept_dump.log for results.\n");
+            return 0;
+        } else {
+            DiagLog("BUILD 547: no ept_dump.flag — normal mode (continue to main loop)\n");
+        }
     }
 
     // ★ BUILD 529: 测试模式跳过所有 CS2 操作 (PEB/模块诊断/内存初始化/Overlay/EntityChain)
