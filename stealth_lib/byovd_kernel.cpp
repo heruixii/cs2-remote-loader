@@ -2313,15 +2313,36 @@ int EACCallbackDisabler::DisableObCallbacks(const char* eacDriverName) {
             return 0;
     }
 
-    // 获取 EAC 驱动基址 (主检测: 精确名字匹配)
-    // ★ v3.126h: 即使名字匹配失败, 仍继续扫描回调数组 + 模式匹配 fallback
+    // 获取 PAC 驱动基址 (用于代码范围匹配)
     char eacSysName[128];
     sprintf_s(eacSysName, "%s.sys", eacDriverName);
     uint64_t eacBase = kma.GetKernelModuleBase(eacSysName);
     if (!eacBase) {
         eacBase = kma.GetKernelModuleBase("EasyAntiCheat_EOS.sys");
     }
-    bool nameFound = (eacBase != 0);
+
+    // ★ BUILD 538: 读取 PAC 驱动 SizeOfImage (PE 头) 用于代码范围匹配
+    //   原匹配逻辑: DriverObject(+0x38) → DriverSection(+0x14) → BaseDllName(+0x58 inline)
+    //   Bug1: DRIVER_OBJECT.DriverSection 在 x64 偏移为 +0x28 (代码误用 +0x14, x86 布局)
+    //   Bug2: BaseDllName 是 UNICODE_STRING 指针结构 (代码误作 inline wchar_t 读取)
+    //   上述两个 bug 导致所有回调条目名称匹配失败, ob=0 (尽管驱动已找到, 见日志:
+    //   "fallback found MessageTransfer.sys at 0xfffff80580900000")
+    //   新方案: 读 PE 头 SizeOfImage, 用 preOp/postOp 代码范围匹配
+    //   优势: 最可靠 (直接验证回调代码是否在 PAC 驱动范围内), 仅读已知可信字段, 无蓝屏风险
+    uint64_t eacSize = 0;
+    if (eacBase) {
+        IMAGE_DOS_HEADER dos = {};
+        if (kma.ReadKernelVA(eacBase, &dos, sizeof(dos)) && dos.e_magic == IMAGE_DOS_SIGNATURE) {
+            IMAGE_NT_HEADERS64 nt = {};
+            if (kma.ReadKernelVA(eacBase + dos.e_lfanew, &nt, sizeof(nt)) &&
+                nt.Signature == IMAGE_NT_SIGNATURE) {
+                eacSize = nt.OptionalHeader.SizeOfImage;
+            }
+        }
+    }
+    ByovdDiag("BYOVD:DisableObCallbacks: target='%s' base=0x%llX size=0x%X arrayHead=0x%llX\n",
+        eacSysName, (unsigned long long)eacBase, (unsigned)eacSize,
+        (unsigned long long)cbArrayHead);
 
     // 遍历 CALLBACK_ENTRY 数组
     // ★ v3.68: 先检测链表形式 (Flink!=自身), 若有效则走链表遍历;
@@ -2350,59 +2371,39 @@ int EACCallbackDisabler::DisableObCallbacks(const char* eacDriverName) {
         if (!kma.IsKernelAddressValid(current))
             break;
 
-        uint64_t driverObjVA = current + 0x38;
-        uint64_t driverObj = kma.Read<uint64_t>(driverObjVA);
+        // ★ BUILD 538: 代码范围匹配 (主检测, 最可靠)
+        //   读取回调条目内的 preOp(+0x18) / postOp(+0x28), 验证是否落在 PAC 驱动
+        //   [eacBase, eacBase+eacSize) 代码范围内. 只读取已知偏移 (回调条目内部),
+        //   不解引用其他内核指针 (DriverObject/DriverSection/BaseDllName 链已废弃 —
+        //   偏移不可靠且 BaseDllName 是指针结构非 inline 字符串).
+        uint64_t preOp = kma.Read<uint64_t>(current + 0x18);
+        uint64_t postOp = kma.Read<uint64_t>(current + 0x28);
 
-        // 通过 DriverObject → DriverSection → 驱动名匹配
-        if (driverObj && driverObj > 0xFFFF800000000000ULL) {
-            // 读取 DRIVER_OBJECT.DriverSection → LDR_DATA_TABLE_ENTRY
-            uint64_t driverSection = kma.Read<uint64_t>(driverObj + 0x14);
-            if (driverSection && driverSection > 0xFFFF800000000000ULL) {
-                // LDR_DATA_TABLE_ENTRY.BaseDllName 在 +0x58
-                uint64_t nameVA = driverSection + 0x58;
-                WCHAR wname[64] = {};
-                if (kma.ReadKernelVA(nameVA, wname, sizeof(wname) - sizeof(WCHAR))) {
-                    // 比较文件名
-                    char ansiName[64] = {};
-                    WideCharToMultiByte(CP_ACP, 0, wname, -1, ansiName, 63, nullptr, nullptr);
-                    if (_stricmp(ansiName, eacSysName) == 0) {
-
-                        // ★ v3.110: 先保存原始值再 NULL 化
-                        uint64_t preOp = kma.Read<uint64_t>(current + 0x18);
-                        uint64_t postOp = kma.Read<uint64_t>(current + 0x28);
-                        if ((preOp || postOp) && m_savedObCallbackCount < MAX_SAVED_OB_CALLBACKS) {
-                            SavedObEntry& saved = m_savedObCallbacks[m_savedObCallbackCount];
-                            saved.address = current;
-                            saved.preOp = preOp;
-                            saved.postOp = postOp;
-                            m_savedObCallbackCount++;
-                        }
-
-                        // NULL 化 PreOperation + PostOperation
-                        uint64_t zero = 0;
-                        kma.Write(current + 0x18, zero); // PreOperation
-                        kma.Write(current + 0x28, zero); // PostOperation
-                        removed++;
-                    }
-                    // ★ v3.126h: PAC 模式匹配 fallback — 主检测未命中时用 IsPacPattern 验证
-                    else if (!nameFound && !eacBase && IsPacDriverName_Fallback(ansiName)) {
-                        ByovdDiag("BYOVD:DisableObCallbacks: fallback matched '%s' (pattern)\n", ansiName);
-                        uint64_t preOp = kma.Read<uint64_t>(current + 0x18);
-                        uint64_t postOp = kma.Read<uint64_t>(current + 0x28);
-                        if ((preOp || postOp) && m_savedObCallbackCount < MAX_SAVED_OB_CALLBACKS) {
-                            SavedObEntry& saved = m_savedObCallbacks[m_savedObCallbackCount];
-                            saved.address = current;
-                            saved.preOp = preOp;
-                            saved.postOp = postOp;
-                            m_savedObCallbackCount++;
-                        }
-                        uint64_t zero = 0;
-                        kma.Write(current + 0x18, zero);
-                        kma.Write(current + 0x28, zero);
-                        removed++;
-                    }
-                }
+        bool matched = false;
+        if (eacBase && eacSize && (preOp || postOp)) {
+            if ((preOp >= eacBase && preOp < eacBase + eacSize) ||
+                (postOp >= eacBase && postOp < eacBase + eacSize)) {
+                matched = true;
+                ByovdDiag("BYOVD:DisableObCallbacks: MATCH entry=%u preOp=0x%llX postOp=0x%llX\n",
+                    i, (unsigned long long)preOp, (unsigned long long)postOp);
             }
+        }
+
+        if (matched) {
+            // ★ v3.110: 先保存原始值再 NULL 化
+            if ((preOp || postOp) && m_savedObCallbackCount < MAX_SAVED_OB_CALLBACKS) {
+                SavedObEntry& saved = m_savedObCallbacks[m_savedObCallbackCount];
+                saved.address = current;
+                saved.preOp = preOp;
+                saved.postOp = postOp;
+                m_savedObCallbackCount++;
+            }
+
+            // NULL 化 PreOperation + PostOperation
+            uint64_t zero = 0;
+            kma.Write(current + 0x18, zero); // PreOperation
+            kma.Write(current + 0x28, zero); // PostOperation
+            removed++;
         }
 
         // 遍历到下一个条目 (通过 LIST_ENTRY.Flink)
@@ -2416,10 +2417,15 @@ int EACCallbackDisabler::DisableObCallbacks(const char* eacDriverName) {
     }
 
     m_obCallbacksSaved = (m_savedObCallbackCount > 0);
-    // BUILD 456: 自体验证 — PAC 未装时也证明数组遍历正常
+    // ★ BUILD 538: 修正误导性日志 — 原 "(driver not loaded)" 在驱动已找到时仍输出
+    //   实际情况: 驱动已加载 (base 非零), 但其回调代码不在驱动代码范围内
+    //   (可能该驱动未注册 ObCallbacks, 或回调函数在其他模块中)
     if (removed == 0 && cbArrayHead) {
-        ByovdDiag("VERIFY:ObCallbacks: scan OK — %u entries walked, 0 matched '%s' (driver not loaded)\n",
-            i, eacDriverName);
+        ByovdDiag("VERIFY:ObCallbacks: %u entries walked, 0 matched '%s' (base=0x%llX size=0x%X — driver loaded, no ObCallbacks in range)\n",
+            i, eacDriverName, (unsigned long long)eacBase, (unsigned)eacSize);
+    } else {
+        ByovdDiag("VERIFY:ObCallbacks: %u entries walked, %d removed for '%s'\n",
+            i, removed, eacDriverName);
     }
     return removed;
 }

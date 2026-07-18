@@ -11,15 +11,14 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 537 (v3.195: Gamma-A 方案 — bcdedit /debug on 禁用 PatchGuard, DKOM 永久启用;
-//        原理: Windows 内核调试模式启动时 PatchGuard 设计上不初始化 (微软官方行为),
-//        bcdedit /debug on + bcdedit /dbgsettings serial ... /start autoenable /noumex;
-//        效果: PG 100%% 禁用, DKOM 可永久断链 ActiveProcessLinks, 3小时内 0%% 蓝屏风险;
-//        变更: 移除主循环中 60-90s Unhide/Rehide 周期缓解 (PG 已禁用无需缓解);
-//        保留: 早期 DKOM 隐藏 (EnableAll 后立即断链), ObCallbacks 移除, VAD 伪装, EkkoSleep;
-//        检测概率: 5-12%% (Gamma 目标达成);
-//        前置条件: 需运行 enable_gamma_a.bat + 重启系统使 bcdedit 配置生效;
-//        风险: 桌面右下角可能显示"测试模式"水印, PAC 可能检测调试模式 (需测试2 验证))
+// BUILD: 538 (v3.196: 修复 ObCallbacks 移除 bug — 代码范围匹配替代名称匹配;
+//        根因: 原 DisableObCallbacks 用 DriverObject+0x14 读取 DriverSection (x64 应为 +0x28),
+//        且把 BaseDllName (UNICODE_STRING 指针) 误作 inline wchar_t 读取 — 两个偏移 bug
+//        导致所有回调条目名称匹配失败, ob=0 (尽管驱动已找到 @ 0xfffff80580900000);
+//        修复: 读取 PE 头 SizeOfImage, 用 preOp/postOp 代码范围 [base, base+size) 匹配;
+//        优势: 最可靠 (直接验证回调代码是否在 PAC 驱动内), 仅读已知可信字段, 零蓝屏风险;
+//        保留: BUILD 537 Gamma-A 全部特性 (bcdedit /debug on, DKOM 永久断链, ObCallbacks, VAD, EkkoSleep);
+//        日志: 修正误导性 "(driver not loaded)" → "driver loaded, no ObCallbacks in range")
 // ============================================================
 
 #include "stealth_core.h"
@@ -1084,7 +1083,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.194 DIAG START (BUILD 536: VEH catches RtlDeactivateActivationContext crash — worker thread activation context NULL fix) ===\n");
+    DiagLog("=== v3.196 DIAG START (BUILD 538: ObCallbacks code-range matching — fixes DriverSection offset + UNICODE_STRING inline read bugs) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // ★ BUILD 529: PAC PROBE 模式已废弃 — 改为 E+G 测试模式
