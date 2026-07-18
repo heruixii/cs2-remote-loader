@@ -2741,89 +2741,105 @@ DKOMProcessHider& DKOMProcessHider::Instance() {
     return inst;
 }
 
+// ============================================================
+// ★ BUILD 544: 向后兼容 API — 转发到多 PID 实现
+// ============================================================
 bool DKOMProcessHider::HideProcess() {
-    auto& kma = KernelMemoryAccessor::Instance();
-    if (!kma.IsActive()) {
-        ByovdDiag("DKOM.HideProcess: FAIL kma not active\n");
-        return false;
-    }
+    return HideProcessByPid(GetCurrentProcessId());
+}
 
-    uint64_t ntBase = kma.GetNtoskrnlBase();
-    if (!ntBase) {
-        ByovdDiag("DKOM.HideProcess: FAIL ntBase=0\n");
-        return false;
-    }
+bool DKOMProcessHider::UnhideProcess() {
+    return UnhideProcessByPid(GetCurrentProcessId());
+}
 
-    // EPROCESS 偏移 (Windows 10/11):
-    //   +0x440 UniqueProcessId
-    //   +0x448 ActiveProcessLinks (LIST_ENTRY)
-    //   +0x5A8 ImageFileName
-    // ★ BUILD 537: Win11 24H2 (Build 26100) 偏移可能不同 — 添加诊断日志确认
-
+uint64_t DKOMProcessHider::GetCurrentEPROCESS() const {
+    // 查找 loader2 (当前进程) 在 m_hiddenList 中的 EPROCESS
     DWORD currentPid = GetCurrentProcessId();
+    for (size_t i = 0; i < MAX_HIDDEN; i++) {
+        if (m_hiddenList[i].hidden && m_hiddenList[i].pid == currentPid) {
+            return m_hiddenList[i].eprocess;
+        }
+    }
+    return 0;
+}
 
-    // 获取 PsInitialSystemProcess → 找到 System EPROCESS
+// ============================================================
+// ★ BUILD 544: EnsureOffsetsResolved — 动态扫描 EPROCESS 偏移
+//   原理: System EPROCESS (PID=4) 的 UniqueProcessId 字段值为 4
+//   扫描 0x100-0x800 范围, 找到值为 4 的字段, 验证其后 8 字节为内核地址 (ActiveProcessLinks.Flink)
+//   二次验证: 通过 Flink 遍历到下一个 EPROCESS, 读取其 PID (应 > 0 且 < 100000)
+//   适配所有 Windows 版本 (Win10/11/24H2/25H2), 不依赖硬编码偏移
+// ============================================================
+bool DKOMProcessHider::EnsureOffsetsResolved(KernelMemoryAccessor& kma, uint64_t ntBase) {
+    if (m_pidOffset != 0 && m_linksOffset != 0) {
+        ByovdDiag("DKOM: using cached offsets pidOffset=0x%X linksOffset=0x%X\n",
+            m_pidOffset, m_linksOffset);
+        return true;
+    }
+
     uint64_t psInitProcVA = kma.ResolveExport(ntBase, "PsInitialSystemProcess");
     if (!psInitProcVA) {
-        ByovdDiag("DKOM.HideProcess: FAIL PsInitialSystemProcess not resolved (ntBase=0x%llX)\n",
+        ByovdDiag("DKOM.EnsureOffsets: FAIL PsInitialSystemProcess not resolved (ntBase=0x%llX)\n",
             (unsigned long long)ntBase);
         return false;
     }
 
     uint64_t systemEPROCESS = kma.Read<uint64_t>(psInitProcVA);
     if (!systemEPROCESS) {
-        ByovdDiag("DKOM.HideProcess: FAIL systemEPROCESS=0 (psInitProcVA=0x%llX)\n",
+        ByovdDiag("DKOM.EnsureOffsets: FAIL systemEPROCESS=0 (psInitProcVA=0x%llX)\n",
             (unsigned long long)psInitProcVA);
         return false;
     }
 
-    ByovdDiag("DKOM.HideProcess: start pid=%u ntBase=0x%llX sysEPROCESS=0x%llX\n",
-        currentPid, (unsigned long long)ntBase, (unsigned long long)systemEPROCESS);
+    ByovdDiag("DKOM.EnsureOffsets: scanning EPROCESS offsets (0x100-0x800) sysEPROC=0x%llX...\n",
+        (unsigned long long)systemEPROCESS);
 
-    // ★ BUILD 537: 动态查找 UniqueProcessId / ActiveProcessLinks 偏移
-    //   原理: System EPROCESS (PID=4) 的 UniqueProcessId 字段值为 4
-    //   扫描 0x100-0x800 范围, 找到值为 4 的字段, 验证其后 8 字节为内核地址 (ActiveProcessLinks.Flink)
-    //   二次验证: 通过 Flink 遍历到下一个 EPROCESS, 读取其 PID (应 > 0 且 < 100000)
-    //   适配所有 Windows 版本 (Win10/11/24H2/25H2), 不依赖硬编码偏移
-    if (m_pidOffset == 0 || m_linksOffset == 0) {
-        ByovdDiag("DKOM.HideProcess: scanning EPROCESS offsets (0x100-0x800)...\n");
-        for (uint32_t off = 0x100; off < 0x800; off += 8) {
-            uint64_t val = kma.Read<uint64_t>(systemEPROCESS + off);
-            if (val != 4) continue;
+    for (uint32_t off = 0x100; off < 0x800; off += 8) {
+        uint64_t val = kma.Read<uint64_t>(systemEPROCESS + off);
+        if (val != 4) continue;
 
-            // 候选 UniqueProcessId 偏移 = off
-            // 验证 off+8 (Flink) 和 off+16 (Blink) 是否为内核地址
-            uint64_t flink = kma.Read<uint64_t>(systemEPROCESS + off + 8);
-            uint64_t blink = kma.Read<uint64_t>(systemEPROCESS + off + 16);
-            if (flink < 0xFFFF800000000000ULL || blink < 0xFFFF800000000000ULL) continue;
+        // 候选 UniqueProcessId 偏移 = off
+        // 验证 off+8 (Flink) 和 off+16 (Blink) 是否为内核地址
+        uint64_t flink = kma.Read<uint64_t>(systemEPROCESS + off + 8);
+        uint64_t blink = kma.Read<uint64_t>(systemEPROCESS + off + 16);
+        if (flink < 0xFFFF800000000000ULL || blink < 0xFFFF800000000000ULL) continue;
 
-            // 二次验证: 通过 Flink 遍历到下一个 EPROCESS, 读取其 PID
-            uint64_t nextEPROC = flink - (off + 8);
-            uint64_t nextPid = kma.Read<uint64_t>(nextEPROC + off);
-            if (nextPid == 0 || nextPid >= 100000) continue;
+        // 二次验证: 通过 Flink 遍历到下一个 EPROCESS, 读取其 PID
+        uint64_t nextEPROC = flink - (off + 8);
+        uint64_t nextPid = kma.Read<uint64_t>(nextEPROC + off);
+        if (nextPid == 0 || nextPid >= 100000) continue;
 
-            // 验证通过
-            m_pidOffset = off;
-            m_linksOffset = off + 8;
-            ByovdDiag("DKOM.HideProcess: offsets found — pidOffset=0x%X linksOffset=0x%X "
-                      "(flink=0x%llX blink=0x%llX nextEPROC=0x%llX nextPid=%llu)\n",
-                m_pidOffset, m_linksOffset,
-                (unsigned long long)flink, (unsigned long long)blink,
-                (unsigned long long)nextEPROC, (unsigned long long)nextPid);
-            break;
-        }
-
-        if (m_pidOffset == 0 || m_linksOffset == 0) {
-            ByovdDiag("DKOM.HideProcess: FAIL cannot find UniqueProcessId offset (scanned 0x100-0x800, "
-                      "no field with value 4 followed by kernel-range LIST_ENTRY)\n");
-            return false;
-        }
-    } else {
-        ByovdDiag("DKOM.HideProcess: using cached offsets pidOffset=0x%X linksOffset=0x%X\n",
-            m_pidOffset, m_linksOffset);
+        // 验证通过
+        m_pidOffset = off;
+        m_linksOffset = off + 8;
+        ByovdDiag("DKOM.EnsureOffsets: offsets found — pidOffset=0x%X linksOffset=0x%X "
+                  "(flink=0x%llX blink=0x%llX nextEPROC=0x%llX nextPid=%llu)\n",
+            m_pidOffset, m_linksOffset,
+            (unsigned long long)flink, (unsigned long long)blink,
+            (unsigned long long)nextEPROC, (unsigned long long)nextPid);
+        return true;
     }
 
-    // 遍历 ActiveProcessLinks 链表 → 找到我们的 EPROCESS
+    ByovdDiag("DKOM.EnsureOffsets: FAIL cannot find UniqueProcessId offset (scanned 0x100-0x800, "
+              "no field with value 4 followed by kernel-range LIST_ENTRY)\n");
+    return false;
+}
+
+// ============================================================
+// ★ BUILD 544: FindEPROCESSByPid — 通过 PID 查找 EPROCESS
+//   从 PsInitialSystemProcess (System, PID=4) 开始遍历 ActiveProcessLinks
+//   ★ System PID==4 断言 (iter==1 时检测偏移错误)
+// ============================================================
+uint64_t DKOMProcessHider::FindEPROCESSByPid(KernelMemoryAccessor& kma, DWORD pid) {
+    uint64_t ntBase = kma.GetNtoskrnlBase();
+    if (!ntBase) return 0;
+
+    uint64_t psInitProcVA = kma.ResolveExport(ntBase, "PsInitialSystemProcess");
+    if (!psInitProcVA) return 0;
+
+    uint64_t systemEPROCESS = kma.Read<uint64_t>(psInitProcVA);
+    if (!systemEPROCESS) return 0;
+
     uint64_t current = systemEPROCESS;
     uint64_t start   = current;
     DWORD iter = 0;
@@ -2832,155 +2848,335 @@ bool DKOMProcessHider::HideProcess() {
     do {
         iter++;
         if (iter > maxIter) {
-            ByovdDiag("DKOM.HideProcess: FAIL exceeded maxIter=%u (possible cycle)\n", maxIter);
-            return false;
+            ByovdDiag("DKOM.FindByPid: FAIL exceeded maxIter=%u (possible cycle) pid=%u\n",
+                maxIter, pid);
+            return 0;
         }
 
-        uint64_t pid = kma.Read<uint64_t>(current + m_pidOffset);
+        uint64_t currentPid = kma.Read<uint64_t>(current + m_pidOffset);
 
-        // 前 20 次迭代记录日志 (诊断偏移问题, 不会撑爆日志)
-        if (iter <= 20) {
-            ByovdDiag("DKOM.HideProcess: iter=%u EPROC=0x%llX pid@+0x%X=%llu (0x%llX)\n",
-                iter, (unsigned long long)current, m_pidOffset,
-                (unsigned long long)pid, (unsigned long long)pid);
+        // ★ System PID==4 断言 — iter==1 时 current==systemEPROCESS, PID 必须为 4
+        if (iter == 1 && currentPid != 4) {
+            ByovdDiag("DKOM.FindByPid: FAIL System PID assertion failed (iter=1 pid@+0x%X=%llu, "
+                      "expected 4 — offset wrong)\n", m_pidOffset, (unsigned long long)currentPid);
+            return 0;
         }
 
-        if ((DWORD)pid == currentPid) {
-            m_eprocess = current;
-
-            // 读取 Flink / Blink (ActiveProcessLinks 在 m_linksOffset)
-            // ★ BUILD 537: 紧凑读-改-写, 中间不插入任何阻塞 I/O (避免 TOCTOU 竞态)
-            uint64_t flink = kma.Read<uint64_t>(current + m_linksOffset);
-            uint64_t blink = kma.Read<uint64_t>(current + m_linksOffset + 8);
-
-            m_flinkBackup = flink;
-            m_blinkBackup = blink;
-
-            if (!flink || !blink) {
-                ByovdDiag("DKOM.HideProcess: FAIL flink/blink is NULL (EPROC=0x%llX flink=0x%llX blink=0x%llX)\n",
-                    (unsigned long long)current, (unsigned long long)flink, (unsigned long long)blink);
-                return false;
-            }
-            if (flink < 0xFFFF800000000000ULL || blink < 0xFFFF800000000000ULL) {
-                ByovdDiag("DKOM.HideProcess: FAIL flink/blink not in kernel range (flink=0x%llX blink=0x%llX)\n",
-                    (unsigned long long)flink, (unsigned long long)blink);
-                return false;
-            }
-
-            // ★ BUILD 497: 修复 DKOM 断链 — 写入邻居节点的 LIST_ENTRY, 而非自己的
-            //   blink 是前一个节点 ActiveProcessLinks 的地址 → blink 处即 prev.Flink
-            //   flink 是后一个节点 ActiveProcessLinks 的地址 → flink+8 处即 next.Blink
-            //   跳过当前节点: prev.Flink = next, next.Blink = prev
-            //
-            // ★ BUILD 537: 失败安全写入顺序 — 先 next.Blink, 后 prev.Flink
-            //   若 w2 失败: 链表未变, current 仍在链表, 无 BSOD
-            //   若 w2 成功 w1 失败: next.Blink→prev, 但 prev.Flink→current 仍可达,
-            //                       current 未被跳过, 内核遍历正常, 无 BSOD
-            //   两写均成功: current 被完全跳过, DKOM 成功
-            //   (反向顺序 w1 先写会留下 next.Blink→current 的悬挂指针, 内核遍历必 BSOD)
-            bool w2 = kma.Write(flink + 8, blink);  // next.Blink = prev (先写, 失败安全)
-            bool w1 = kma.Write(blink, flink);      // prev.Flink = next (后写, 成功后 current 被跳过)
-
-            if (!w1 || !w2) {
-                // 链表可能部分破坏, 但写入顺序保证不 BSOD;
-                // 不置 m_hidden=true, 避免 UnhideProcess 错误触发
-                ByovdDiag("DKOM.HideProcess: FAIL Write1(prev.Flink)=%d Write2(next.Blink)=%d "
-                          "(blink=0x%llX flink=0x%llX) — abort, m_hidden NOT set\n",
-                    w1?1:0, w2?1:0, (unsigned long long)blink, (unsigned long long)flink);
-                return false;
-            }
-
-            m_hidden = true;
-            ByovdDiag("DKOM.HideProcess: FOUND pid=%u at EPROC=0x%llX flink=0x%llX blink=0x%llX — SUCCESS (iter=%u)\n",
-                currentPid, (unsigned long long)current,
-                (unsigned long long)flink, (unsigned long long)blink, iter);
-            return true;
+        if ((DWORD)currentPid == pid) {
+            return current;
         }
 
         // 移动到下一个 EPROCESS
         uint64_t flink = kma.Read<uint64_t>(current + m_linksOffset);
         if (!flink || flink < 0xFFFF800000000000ULL) {
-            ByovdDiag("DKOM.HideProcess: FAIL chain broken at iter=%u EPROC=0x%llX flink=0x%llX\n",
-                iter, (unsigned long long)current, (unsigned long long)flink);
-            return false;  // 直接返回, 不 break 到循环外避免误导性 "not found" 日志
+            ByovdDiag("DKOM.FindByPid: chain broken at iter=%u EPROC=0x%llX flink=0x%llX (pid=%u not found)\n",
+                iter, (unsigned long long)current, (unsigned long long)flink, pid);
+            return 0;  // 直接返回, 不 break 避免误导性 "not found" 日志
         }
 
         current = flink - m_linksOffset; // Flink 指向 ActiveProcessLinks, 需要减去偏移回 EPROCESS
     } while (current != start);
 
-    ByovdDiag("DKOM.HideProcess: FAIL pid=%u not found after %u iterations (cycle back to start)\n",
-        currentPid, iter);
-    return false;
+    ByovdDiag("DKOM.FindByPid: pid=%u not found after %u iterations (cycle back to start)\n",
+        pid, iter);
+    return 0;
 }
 
-bool DKOMProcessHider::UnhideProcess() {
-    auto& kma = KernelMemoryAccessor::Instance();
-    if (!kma.IsActive() || !m_hidden || !m_eprocess) return false;
+// ============================================================
+// ★ BUILD 544: FindOrAllocSlot — 在 m_hiddenList 中查找或分配槽位
+// ============================================================
+DKOMProcessHider::HiddenEntry* DKOMProcessHider::FindOrAllocSlot(DWORD pid) {
+    // 先查找已存在的条目 (重复隐藏同一 PID 时复用)
+    for (size_t i = 0; i < MAX_HIDDEN; i++) {
+        if (m_hiddenList[i].hidden && m_hiddenList[i].pid == pid) {
+            return &m_hiddenList[i];
+        }
+    }
+    // 分配空槽 (eprocess==0 或 hidden==false)
+    for (size_t i = 0; i < MAX_HIDDEN; i++) {
+        if (!m_hiddenList[i].hidden) {
+            // 清空字段
+            m_hiddenList[i].eprocess    = 0;
+            m_hiddenList[i].flinkBackup = 0;
+            m_hiddenList[i].blinkBackup = 0;
+            m_hiddenList[i].pid         = pid;
+            m_hiddenList[i].hidden      = false;
+            return &m_hiddenList[i];
+        }
+    }
+    return nullptr;  // 槽位已满
+}
 
-    // ★ BUILD 537: 使用动态偏移 m_linksOffset (适配 Win10/11/24H2)
-    if (m_linksOffset == 0) {
-        ByovdDiag("DKOM.UnhideProcess: FAIL m_linksOffset=0 (HideProcess never succeeded)\n");
+// ============================================================
+// ★ BUILD 544: PerformUnlink — 执行 DKOM 断链
+//   写 next.Blink=prev (先写, 失败安全) → prev.Flink=next (后写, 成功后 current 被跳过)
+//   备份 flink/blink 到 entry (供 UnhideProcessByPid 检查链表完整性)
+// ============================================================
+bool DKOMProcessHider::PerformUnlink(KernelMemoryAccessor& kma, HiddenEntry* entry,
+                                      DWORD pid, uint64_t eproc) {
+    // 读取 Flink / Blink (ActiveProcessLinks 在 m_linksOffset)
+    // ★ BUILD 537: 紧凑读-改-写, 中间不插入任何阻塞 I/O (避免 TOCTOU 竞态)
+    uint64_t flink = kma.Read<uint64_t>(eproc + m_linksOffset);
+    uint64_t blink = kma.Read<uint64_t>(eproc + m_linksOffset + 8);
+
+    if (!flink || !blink) {
+        ByovdDiag("DKOM.PerformUnlink: FAIL flink/blink is NULL (pid=%u EPROC=0x%llX flink=0x%llX blink=0x%llX)\n",
+            pid, (unsigned long long)eproc, (unsigned long long)flink, (unsigned long long)blink);
+        return false;
+    }
+    if (flink < 0xFFFF800000000000ULL || blink < 0xFFFF800000000000ULL) {
+        ByovdDiag("DKOM.PerformUnlink: FAIL flink/blink not in kernel range (pid=%u flink=0x%llX blink=0x%llX)\n",
+            pid, (unsigned long long)flink, (unsigned long long)blink);
         return false;
     }
 
-    // ★ BUILD 541: 修复 DKOM 断链期间新进程插入导致的 0x139 蓝屏
-    //   根因: HideProcess 后 prev→next (current 被断链). 运行期间若有新进程 C 创建,
-    //         内核将 C 插入到 prev 和 next 之间 → prev→C→next.
-    //         原 UnhideProcess 写 prev->Flink=&current, next->Blink=&current,
-    //         覆盖了 C 的链表项 → C 变成"悬空"节点 → C 退出时 RemoveEntryList
-    //         检查 prev->Flink==&C 失败 → BugCheck 0x139 参数 3.
-    //   三次蓝屏确认: 21:16:37, 21:42:37, 22:40:50, 均为 0x139 (3, addr1, addr2, 0),
-    //   参数地址与 loader2 EPROC 完全不同 → 证实是其他进程 (新插入的 C) 退出触发.
+    // 备份到 entry (供 UnhideProcessByPid 链表一致性检查)
+    entry->eprocess    = eproc;
+    entry->flinkBackup = flink;
+    entry->blinkBackup = blink;
+
+    // ★ BUILD 497/537: 修复 DKOM 断链 — 写入邻居节点的 LIST_ENTRY, 而非自己的
+    //   blink 是前一个节点 ActiveProcessLinks 的地址 → blink 处即 prev.Flink
+    //   flink 是后一个节点 ActiveProcessLinks 的地址 → flink+8 处即 next.Blink
+    //   跳过当前节点: prev.Flink = next, next.Blink = prev
     //
-    //   修复: UnhideProcess 时先检查链表是否被修改:
-    //     1. 读取 prev->Flink 和 next->Blink 当前值
-    //     2. 若 prev->Flink==m_flinkBackup(原next) 且 next->Blink==m_blinkBackup(原prev),
-    //        链表未被修改 → 使用原逻辑恢复 (写 prev->Flink=&current, next->Blink=&current)
-    //     3. 若链表被修改 (有新进程 C 插入) → 使用"自循环"回退:
-    //        写 current->Flink=&current, current->Blink=&current (不修改 prev/next)
-    //        自循环安全性: RemoveEntryList(&current) 检查
-    //          current->Blink->Flink == current->Flink == &current ✓
-    //          current->Flink->Blink == current->Blink == &current ✓
-    //        检查通过, 不会 0x139. 且不破坏 C 的链表项.
-    uint64_t currentLinksVA = m_eprocess + m_linksOffset;
+    // ★ BUILD 537: 失败安全写入顺序 — 先 next.Blink, 后 prev.Flink
+    //   若 w2 失败: 链表未变, current 仍在链表, 无 BSOD
+    //   若 w2 成功 w1 失败: next.Blink→prev, 但 prev.Flink→current 仍可达,
+    //                       current 未被跳过, 内核遍历正常, 无 BSOD
+    //   两写均成功: current 被完全跳过, DKOM 成功
+    //   (反向顺序 w1 先写会留下 next.Blink→current 的悬挂指针, 内核遍历必 BSOD)
+    bool w2 = kma.Write(flink + 8, blink);  // next.Blink = prev (先写, 失败安全)
+    bool w1 = kma.Write(blink, flink);      // prev.Flink = next (后写, 成功后 current 被跳过)
+
+    if (!w1 || !w2) {
+        // 链表可能部分破坏, 但写入顺序保证不 BSOD;
+        // 不置 entry->hidden=true, 避免 UnhideProcessByPid 错误触发
+        ByovdDiag("DKOM.PerformUnlink: FAIL w1(prev.Flink)=%d w2(next.Blink)=%d (pid=%u "
+                  "blink=0x%llX flink=0x%llX) — abort, hidden NOT set\n",
+            w1?1:0, w2?1:0, pid, (unsigned long long)blink, (unsigned long long)flink);
+        // 清空 entry, 释放槽位
+        entry->eprocess    = 0;
+        entry->flinkBackup = 0;
+        entry->blinkBackup = 0;
+        return false;
+    }
+
+    // ★ BUILD 537: FOUND 日志在 Write 之后 (防 TOCTOU 竞态)
+    ByovdDiag("DKOM.PerformUnlink: SUCCESS pid=%u EPROC=0x%llX flink=0x%llX blink=0x%llX\n",
+        pid, (unsigned long long)eproc, (unsigned long long)flink, (unsigned long long)blink);
+    return true;
+}
+
+// ============================================================
+// ★ BUILD 544: SelfLoopHarden — 自循环加固
+//   写 current.Flink=&current, current.Blink=&current
+//   防止非当前进程 (basic.exe) 被外部 TerminateProcess 时:
+//     PspExitProcess → RemoveEntryList(&current->ActiveProcessLinks)
+//     检查 current->Blink->Flink == &current ✓ (self-loop)
+//     检查 current->Flink->Blink == &current ✓ (self-loop)
+//   不触发 0x139 蓝屏
+//
+//   注意: current 已经被 PerformUnlink 从链表中跳过 (prev->Flink=next, next->Blink=prev)
+//   所以修改 current 自身的 Flink/Blink 不影响链表其他节点
+// ============================================================
+bool DKOMProcessHider::SelfLoopHarden(KernelMemoryAccessor& kma, HiddenEntry* entry) {
+    uint64_t currentLinksVA = entry->eprocess + m_linksOffset;
+
+    bool w1 = kma.Write(currentLinksVA,     currentLinksVA);  // current.Flink = &current (self-loop)
+    bool w2 = kma.Write(currentLinksVA + 8, currentLinksVA);  // current.Blink = &current (self-loop)
+
+    if (!w1 || !w2) {
+        ByovdDiag("DKOM.SelfLoopHarden: FAIL w1(Flink)=%d w2(Blink)=%d (pid=%u currentLinks=0x%llX) "
+                  "— non-current process may BSOD on external TerminateProcess\n",
+            w1?1:0, w2?1:0, entry->pid, (unsigned long long)currentLinksVA);
+        return false;
+    }
+
+    ByovdDiag("DKOM.SelfLoopHarden: OK pid=%u currentLinks=0x%llX (self-loop written)\n",
+        entry->pid, (unsigned long long)currentLinksVA);
+    return true;
+}
+
+// ============================================================
+// ★ BUILD 544: HideProcessByPid — 隐藏指定 PID 的进程
+// ============================================================
+bool DKOMProcessHider::HideProcessByPid(DWORD pid) {
+    auto& kma = KernelMemoryAccessor::Instance();
+    if (!kma.IsActive()) {
+        ByovdDiag("DKOM.HideByPid: FAIL kma not active (pid=%u)\n", pid);
+        return false;
+    }
+
+    uint64_t ntBase = kma.GetNtoskrnlBase();
+    if (!ntBase) {
+        ByovdDiag("DKOM.HideByPid: FAIL ntBase=0 (pid=%u)\n", pid);
+        return false;
+    }
+
+    // 1. 解析偏移 (复用缓存)
+    if (!EnsureOffsetsResolved(kma, ntBase)) {
+        ByovdDiag("DKOM.HideByPid: FAIL offsets not resolved (pid=%u)\n", pid);
+        return false;
+    }
+
+    ByovdDiag("DKOM.HideByPid: start pid=%u ntBase=0x%llX pidOffset=0x%X linksOffset=0x%X\n",
+        pid, (unsigned long long)ntBase, m_pidOffset, m_linksOffset);
+
+    // 2. 查找 EPROCESS
+    uint64_t eproc = FindEPROCESSByPid(kma, pid);
+    if (!eproc) {
+        ByovdDiag("DKOM.HideByPid: FAIL pid=%u not found (may be already hidden)\n", pid);
+        return false;
+    }
+
+    // 3. 分配槽位
+    HiddenEntry* entry = FindOrAllocSlot(pid);
+    if (!entry) {
+        ByovdDiag("DKOM.HideByPid: FAIL no free slot (max %d hidden, pid=%u)\n",
+            (int)MAX_HIDDEN, pid);
+        return false;
+    }
+
+    // 已隐藏则直接返回 (避免重复断链)
+    if (entry->hidden) {
+        ByovdDiag("DKOM.HideByPid: pid=%u already hidden (EPROC=0x%llX)\n",
+            pid, (unsigned long long)entry->eprocess);
+        return true;
+    }
+
+    // 4. 执行断链
+    if (!PerformUnlink(kma, entry, pid, eproc)) {
+        return false;
+    }
+
+    // 5. 自循环加固 (仅非当前进程)
+    //   当前进程走 DisableAll→UnhideAll 正常路径, 无需自循环
+    //   非当前进程 (basic.exe) 可能被外部 TerminateProcess, 需自循环防止 0x139
+    if (pid != GetCurrentProcessId()) {
+        SelfLoopHarden(kma, entry);
+        // SelfLoopHarden 失败不致命 — basic.exe 仍可正常工作,
+        // 只是不能被外部 TerminateProcess (会被 DisableAll→UnhideAll 先挂回)
+    }
+
+    entry->hidden = true;
+    ByovdDiag("DKOM.HideByPid: SUCCESS pid=%u EPROC=0x%llX hidden=%d\n",
+        pid, (unsigned long long)eproc, entry->hidden ? 1 : 0);
+    return true;
+}
+
+// ============================================================
+// ★ BUILD 544: UnhideProcessByPid — 取消隐藏指定 PID
+//   复用 BUILD 541 链表一致性检查 + 自循环回退逻辑
+//
+//   根因 (BUILD 541): HideProcess 后 prev→next (current 被断链). 运行期间若有新进程 C 创建,
+//     内核将 C 插入到 prev 和 next 之间 → prev→C→next.
+//     原逻辑写 prev->Flink=&current, next->Blink=&current,
+//     覆盖了 C 的链表项 → C 变成"悬空"节点 → C 退出时 RemoveEntryList 检查失败 → 0x139.
+//
+//   修复: UnhideProcessByPid 时先检查链表是否被修改:
+//     1. 读取 prev->Flink 和 next->Blink 当前值
+//     2. 若 prev->Flink==m_flinkBackup(原next) 且 next->Blink==m_blinkBackup(原prev),
+//        链表未被修改 → 使用原逻辑恢复 (写 prev->Flink=&current, next->Blink=&current)
+//     3. 若链表被修改 (有新进程 C 插入) → 使用"自循环"回退:
+//        写 current->Flink=&current, current->Blink=&current (不修改 prev/next)
+//        自循环安全性: RemoveEntryList(&current) 检查
+//          current->Blink->Flink == current->Flink == &current ✓
+//          current->Flink->Blink == current->Blink == &current ✓
+//        检查通过, 不会 0x139. 且不破坏 C 的链表项.
+// ============================================================
+bool DKOMProcessHider::UnhideProcessByPid(DWORD pid) {
+    auto& kma = KernelMemoryAccessor::Instance();
+    if (!kma.IsActive()) return false;
+
+    // 查找条目
+    HiddenEntry* entry = nullptr;
+    for (size_t i = 0; i < MAX_HIDDEN; i++) {
+        if (m_hiddenList[i].hidden && m_hiddenList[i].pid == pid) {
+            entry = &m_hiddenList[i];
+            break;
+        }
+    }
+    if (!entry) {
+        // 未隐藏, 无需 Unhide (no-op)
+        return false;
+    }
+
+    if (m_linksOffset == 0) {
+        ByovdDiag("DKOM.UnhideByPid: FAIL m_linksOffset=0 (pid=%u, HideProcess never succeeded)\n", pid);
+        return false;
+    }
+
+    uint64_t currentLinksVA = entry->eprocess + m_linksOffset;
 
     // 读取 prev->Flink 和 next->Blink 的当前值, 检查链表是否被修改
-    uint64_t prevFlinkNow = kma.Read<uint64_t>(m_blinkBackup);     // prev->Flink 当前值
-    uint64_t nextBlinkNow = kma.Read<uint64_t>(m_flinkBackup + 8); // next->Blink 当前值
+    uint64_t prevFlinkNow = kma.Read<uint64_t>(entry->blinkBackup);     // prev->Flink 当前值
+    uint64_t nextBlinkNow = kma.Read<uint64_t>(entry->flinkBackup + 8); // next->Blink 当前值
 
-    bool listIntact = (prevFlinkNow == m_flinkBackup && nextBlinkNow == m_blinkBackup);
+    bool listIntact = (prevFlinkNow == entry->flinkBackup && nextBlinkNow == entry->blinkBackup);
 
     if (listIntact) {
         // 链表未被修改 — 使用原逻辑恢复 (正确将 current 重新链入)
-        bool w1 = kma.Write(m_blinkBackup, currentLinksVA);       // prev.Flink = &current.ActiveProcessLinks
-        bool w2 = kma.Write(m_flinkBackup + 8, currentLinksVA);   // next.Blink = &current.ActiveProcessLinks
+        bool w1 = kma.Write(entry->blinkBackup, currentLinksVA);       // prev.Flink = &current.ActiveProcessLinks
+        bool w2 = kma.Write(entry->flinkBackup + 8, currentLinksVA);   // next.Blink = &current.ActiveProcessLinks
 
-        ByovdDiag("DKOM.UnhideProcess: list intact — w1(prev.Flink)=%d w2(next.Blink)=%d "
-                  "(EPROC=0x%llX linksOffset=0x%X currentLinks=0x%llX)\n",
-            w1?1:0, w2?1:0, (unsigned long long)m_eprocess, m_linksOffset,
+        ByovdDiag("DKOM.UnhideByPid: list intact — w1(prev.Flink)=%d w2(next.Blink)=%d "
+                  "(pid=%u EPROC=0x%llX linksOffset=0x%X currentLinks=0x%llX)\n",
+            w1?1:0, w2?1:0, pid, (unsigned long long)entry->eprocess, m_linksOffset,
             (unsigned long long)currentLinksVA);
 
-        m_hidden = false;
+        entry->hidden = false;
+        entry->eprocess = 0;
+        entry->flinkBackup = 0;
+        entry->blinkBackup = 0;
         return (w1 && w2);
     } else {
         // 链表被修改 — 有新进程 C 插入到 prev 和 next 之间
         // 使用"自循环"回退: current->Flink=&current, current->Blink=&current
         // 不修改 prev/next, 避免破坏新插入进程 C 的链表项
-        ByovdDiag("DKOM.UnhideProcess: LIST MODIFIED (new process inserted) — using self-loop "
-                  "(prevFlink=0x%llX expect=0x%llX, nextBlink=0x%llX expect=0x%llX, EPROC=0x%llX)\n",
-            (unsigned long long)prevFlinkNow, (unsigned long long)m_flinkBackup,
-            (unsigned long long)nextBlinkNow, (unsigned long long)m_blinkBackup,
-            (unsigned long long)m_eprocess);
+        // 注意: 若 PerformUnlink 后调用了 SelfLoopHarden, current 已经是自循环状态,
+        //       此处再次写入幂等 (无副作用)
+        ByovdDiag("DKOM.UnhideByPid: LIST MODIFIED (new process inserted) — using self-loop "
+                  "(pid=%u prevFlink=0x%llX expect=0x%llX, nextBlink=0x%llX expect=0x%llX, EPROC=0x%llX)\n",
+            pid,
+            (unsigned long long)prevFlinkNow, (unsigned long long)entry->flinkBackup,
+            (unsigned long long)nextBlinkNow, (unsigned long long)entry->blinkBackup,
+            (unsigned long long)entry->eprocess);
 
-        bool w1 = kma.Write(currentLinksVA, currentLinksVA);       // current->Flink = &current (self-loop)
-        bool w2 = kma.Write(currentLinksVA + 8, currentLinksVA);   // current->Blink = &current (self-loop)
+        bool w1 = kma.Write(currentLinksVA,     currentLinksVA);  // current->Flink = &current (self-loop)
+        bool w2 = kma.Write(currentLinksVA + 8, currentLinksVA);  // current->Blink = &current (self-loop)
 
-        ByovdDiag("DKOM.UnhideProcess: self-loop w1(Flink)=%d w2(Blink)=%d (currentLinks=0x%llX)\n",
-            w1?1:0, w2?1:0, (unsigned long long)currentLinksVA);
+        ByovdDiag("DKOM.UnhideByPid: self-loop w1(Flink)=%d w2(Blink)=%d (pid=%u currentLinks=0x%llX)\n",
+            w1?1:0, w2?1:0, pid, (unsigned long long)currentLinksVA);
 
-        m_hidden = false;
+        entry->hidden = false;
+        entry->eprocess = 0;
+        entry->flinkBackup = 0;
+        entry->blinkBackup = 0;
         return (w1 && w2);
     }
+}
+
+// ============================================================
+// ★ BUILD 544: UnhideAll — 取消隐藏所有已隐藏进程
+//   进程退出前必须调用 — 任一隐藏进程未挂回都会在退出时触发 0x139 蓝屏
+// ============================================================
+void DKOMProcessHider::UnhideAll() {
+    ByovdDiag("DKOM.UnhideAll: starting (scanning %d slots)\n", (int)MAX_HIDDEN);
+    int unhiddenCount = 0;
+    for (size_t i = 0; i < MAX_HIDDEN; i++) {
+        if (m_hiddenList[i].hidden) {
+            DWORD pid = m_hiddenList[i].pid;
+            ByovdDiag("DKOM.UnhideAll: unhiding pid=%u (slot %zu, EPROC=0x%llX)\n",
+                pid, i, (unsigned long long)m_hiddenList[i].eprocess);
+            if (UnhideProcessByPid(pid)) {
+                unhiddenCount++;
+            } else {
+                ByovdDiag("DKOM.UnhideAll: FAIL unhiding pid=%u\n", pid);
+            }
+        }
+    }
+    ByovdDiag("DKOM.UnhideAll: done (%d processes unhidden)\n", unhiddenCount);
 }
 
 // ============================================================
@@ -6030,7 +6226,8 @@ KernelDefense::Result KernelDefense::EnableAll() {
 }
 
 void KernelDefense::DisableAll() {
-    DKOMProcessHider::Instance().UnhideProcess();
+    // ★ BUILD 544: 取消隐藏所有进程 (loader2 + basic) — 防止 basic.exe 退出时 0x139 蓝屏
+    DKOMProcessHider::Instance().UnhideAll();
     auto& kma = KernelMemoryAccessor::Instance();
 
     // ★ v3.110: 在卸载驱动前先恢复所有回调, 防止反作弊检测到回调被移除

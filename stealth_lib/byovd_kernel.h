@@ -280,31 +280,69 @@ private:
 // 将我们的进程从 EPROCESS.ActiveProcessLinks 双向链表中摘除
 // 效果: 反作弊通过 NtQuerySystemInformation 枚举无法找到我们
 //       进程继续正常执行 (调度器不依赖 ActiveProcessLinks)
+//
+// ★ BUILD 544: 多 PID 支持 — 同时隐藏 loader2.exe (当前进程) + basic.exe (子进程)
+//   固定数组 m_hiddenList[4] 替代单一状态字段, 避免 std::vector CRT 堆依赖
 // ============================================================
 class DKOMProcessHider {
 public:
     static DKOMProcessHider& Instance();
 
-    // 隐藏当前进程
+    // === 向后兼容 API (转发到多 PID 实现) ===
+    // 隐藏当前进程 — 转发到 HideProcessByPid(GetCurrentProcessId())
     // 副作用: Task Manager / Process Explorer 看不到我们
     bool HideProcess();
 
-    // 取消隐藏 (重新插入 ActiveProcessLinks)
+    // 取消隐藏当前进程 — 转发到 UnhideProcessByPid(GetCurrentProcessId())
     bool UnhideProcess();
 
-    // 获取当前 EPROCESS 地址 (调试用)
-    uint64_t GetCurrentEPROCESS() const { return m_eprocess; }
+    // === BUILD 544: 多 PID API ===
+    // 隐藏指定 PID 的进程 (用于 basic.exe)
+    // ★ 对非当前进程启用自循环加固 (basic.exe 被 TerminateProcess 时
+    //   PspExitProcess → RemoveEntryList 检查 current->Blink->Flink==&current 通过)
+    bool HideProcessByPid(DWORD pid);
+
+    // 取消隐藏指定 PID 的进程
+    bool UnhideProcessByPid(DWORD pid);
+
+    // 取消隐藏所有已隐藏进程 — 进程退出前必须调用 (防 0x139 蓝屏)
+    void UnhideAll();
+
+    // 获取当前进程 (loader2.exe) 的 EPROCESS — 向后兼容
+    uint64_t GetCurrentEPROCESS() const;
 
 private:
     DKOMProcessHider() = default;
 
-    uint64_t m_eprocess     = 0;
-    uint64_t m_flinkBackup  = 0;
-    uint64_t m_blinkBackup  = 0;
-    bool     m_hidden       = false;
-    // ★ BUILD 537: 动态 EPROCESS 偏移 (运行时扫描确定, 适配 Win10/11/24H2)
-    uint32_t m_pidOffset    = 0;   // UniqueProcessId 偏移 (Win10/11 23H2 = 0x440, Win11 24H2 不同)
-    uint32_t m_linksOffset  = 0;   // ActiveProcessLinks 偏移 (Win10/11 23H2 = 0x448, Win11 24H2 不同)
+    // 隐藏条目 (固定数组, 不使用 std::vector — manual-mapped DLL CRT 堆未初始化)
+    struct HiddenEntry {
+        uint64_t eprocess;      // 0 = 空槽
+        uint64_t flinkBackup;   // 原 next (用于 Unhide 时检查链表完整性)
+        uint64_t blinkBackup;   // 原 prev
+        DWORD    pid;
+        bool     hidden;
+    };
+
+    static constexpr size_t MAX_HIDDEN = 4;  // loader2 + basic + 2 余量
+    HiddenEntry m_hiddenList[MAX_HIDDEN] = {};
+
+    // 动态 EPROCESS 偏移 (运行时扫描缓存, 全部 PID 共享)
+    // ★ BUILD 537: Win11 24H2 (Build 26100) 偏移与 23H2 完全不同 — 必须运行时扫描
+    uint32_t m_pidOffset   = 0;   // UniqueProcessId 偏移 (Win10/11 23H2 = 0x440, Win11 24H2 = 0x1D0)
+    uint32_t m_linksOffset = 0;   // ActiveProcessLinks 偏移 (Win10/11 23H2 = 0x448, Win11 24H2 = 0x1D8)
+
+    // === 辅助方法 (private) ===
+    // 解析 EPROCESS 偏移 (扫描 System EPROCESS PID=4, 0x100-0x800 范围)
+    bool EnsureOffsetsResolved(KernelMemoryAccessor& kma, uint64_t ntBase);
+    // 通过 PID 查找 EPROCESS (从 PsInitialSystemProcess 遍历 ActiveProcessLinks)
+    uint64_t FindEPROCESSByPid(KernelMemoryAccessor& kma, DWORD pid);
+    // 在 m_hiddenList 中查找已存在的条目, 没有则分配空槽
+    HiddenEntry* FindOrAllocSlot(DWORD pid);
+    // 执行 DKOM 断链 (先 next.Blink 后 prev.Flink — 失败安全)
+    bool PerformUnlink(KernelMemoryAccessor& kma, HiddenEntry* entry, DWORD pid, uint64_t eproc);
+    // 自循环加固 (写 current.Flink=&current, current.Blink=&current)
+    // 防止非当前进程被外部 TerminateProcess 时 RemoveEntryList 检查失败 → 0x139
+    bool SelfLoopHarden(KernelMemoryAccessor& kma, HiddenEntry* entry);
 };
 
 // ============================================================

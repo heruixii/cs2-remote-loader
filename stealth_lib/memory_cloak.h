@@ -56,6 +56,13 @@ public:
     // 返回自身代码所在页面的基地址 (用于 EkkoSleep 自身页豁免)
     static uintptr_t GetSelfPage();
 
+    // ★ BUILD 544: 返回 EncryptAll/DecryptAll/XorCrypt 所在页面基地址
+    //   EkkoSleep 调用这些函数期间, 这些函数自身代码页必须保持明文
+    //   否则 EncryptAll 加密自身代码页 → 返回时执行已加密代码 → 无日志崩溃
+    static uintptr_t GetEncryptAllPage();
+    static uintptr_t GetDecryptAllPage();
+    static uintptr_t GetXorCryptPage();
+
 private:
     SleepObfuscator() = default;
 

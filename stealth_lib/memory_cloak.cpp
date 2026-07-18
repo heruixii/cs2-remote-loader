@@ -57,6 +57,13 @@ static void EkkoSleepPageMarker() {
     __asm__("nop"); // 占位, 永不执行
 }
 
+// ★ BUILD 544: 前向声明 — page marker 函数定义在各自目标函数前 (L94/L143/L175)
+//   GetEncryptAllPage/GetDecryptAllPage/GetXorCryptPage 在 L115 引用这些 marker,
+//   必须前向声明避免编译错误 (C3861: identifier not found)
+static void EncryptAllPageMarker();
+static void DecryptAllPageMarker();
+static void XorCryptPageMarker();
+
 // ============================================================
 // SleepObfuscator
 // ============================================================
@@ -89,6 +96,12 @@ void SleepObfuscator::RC4Crypt(void* data, SIZE_T size, const BYTE* key, SIZE_T 
     }
 }
 
+// ★ BUILD 544: XorCrypt 页面标记 — 紧邻 XorCrypt 定义确保同 4KB 页
+//   EkkoSleep 期间 XorCrypt 被 EncryptAll/DecryptAll 调用, 其代码页必须保持明文
+static void XorCryptPageMarker() {
+    __asm__("nop"); // 占位, 永不执行
+}
+
 void SleepObfuscator::XorCrypt(void* data, SIZE_T size, BYTE key) {
     auto* buf = static_cast<BYTE*>(data);
     for (SIZE_T i = 0; i < size; i++) {
@@ -101,6 +114,19 @@ void SleepObfuscator::XorCrypt(void* data, SIZE_T size, BYTE key) {
 //   之前的 GetSelfPage 返回自身地址, 可能与 EkkoSleep 不在同一页
 uintptr_t SleepObfuscator::GetSelfPage() {
     return reinterpret_cast<uintptr_t>(&EkkoSleepPageMarker) & ~0xFFFULL;
+}
+
+// ★ BUILD 544: 返回 EncryptAll/DecryptAll/XorCrypt 所在页面基地址
+//   page marker 紧邻目标函数定义, 编译器将它们排到同一 4KB 页
+//   EkkoSleep 调用这些函数期间必须豁免其代码页, 否则加密自身 → 崩溃
+uintptr_t SleepObfuscator::GetEncryptAllPage() {
+    return reinterpret_cast<uintptr_t>(&EncryptAllPageMarker) & ~0xFFFULL;
+}
+uintptr_t SleepObfuscator::GetDecryptAllPage() {
+    return reinterpret_cast<uintptr_t>(&DecryptAllPageMarker) & ~0xFFFULL;
+}
+uintptr_t SleepObfuscator::GetXorCryptPage() {
+    return reinterpret_cast<uintptr_t>(&XorCryptPageMarker) & ~0xFFFULL;
 }
 
 void SleepObfuscator::RegisterProtectedRegion(void* addr, SIZE_T size) {
@@ -131,6 +157,13 @@ void SleepObfuscator::RegisterProtectedCode(void* addr, SIZE_T size) {
     region.xorKey = static_cast<BYTE>(rng.Next());
 }
 
+// ★ BUILD 544: EncryptAll 页面标记 — 紧邻 EncryptAll 定义确保同 4KB 页
+//   EkkoSleep 调用 EncryptAll 期间, EncryptAll 自身代码页必须保持明文
+//   否则 EncryptAll 加密自身代码页 → 返回时执行已加密代码 → 无日志崩溃
+static void EncryptAllPageMarker() {
+    __asm__("nop"); // 占位, 永不执行
+}
+
 void SleepObfuscator::EncryptAll() {
     // ★ v3.125: 固定数组 — 只遍历 m_regionCount 个有效条目
     for (int ri = 0; ri < m_regionCount; ri++) {
@@ -155,6 +188,12 @@ void SleepObfuscator::EncryptAll() {
             VirtualProtect(region.addr, region.size, oldProtect, &oldProtect);
         }
     }
+}
+
+// ★ BUILD 544: DecryptAll 页面标记 — 紧邻 DecryptAll 定义确保同 4KB 页
+//   EkkoSleep 调用 DecryptAll 期间, DecryptAll 自身代码页必须保持明文
+static void DecryptAllPageMarker() {
+    __asm__("nop"); // 占位, 永不执行
 }
 
 void SleepObfuscator::DecryptAll() {

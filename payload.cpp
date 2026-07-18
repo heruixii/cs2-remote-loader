@@ -11,29 +11,17 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 543 (v3.201: 回退到 BUILD 541 安全状态 — BUILD 542 触发 0x109 蓝屏 (CRITICAL_STRUCTURE_CORRUPTION);
-//        蓝屏根因: BUILD 542 在 DisableObCallbacks 中改用链表遍历 (current=flink) + 真实偏移
-//        (+0x28 PreOp / +0x30 PostOp) + OBDEBUG 诊断日志读取额外字段:
-//          (1) 链表遍历走了 256 个条目 (BUILD 541 线性扫描只走 10 个就 break);
-//          (2) 每个条目读取 7 个字段 (flink/blink/+0x18/+0x20/+0x28/+0x30/+0x38) = 1792 次 IOCTL 读取
-//              (BUILD 541 是 20 次, 90 倍增长);
-//          (3) OBDEBUG[0] 的 +0x20=0xFFFFF800C450E740 是 ntoskrnl 地址 (可能 PatchGuard 保护结构);
-//          大量读取 + 读取敏感字段触发 PatchGuard 0x109 (CRITICAL_STRUCTURE_CORRUPTION).
-//        BugCheck 参数: 0x109 (0xa3a025e6db898508, 0xb3b7326cf0598f93, 0xffffe68e4af08080, 0x1a)
-//        关键发现: MessageTransfer.sys 是 minifilter (FltRegisterFilter), 不注册 ObCallbacks,
-//        ob=0 是正常的 — E+G 方案不需要 ObCallbacks 移除, DKOM+EkkoSleep+句柄重随机化已足够.
-//        回退内容:
-//          (1) DisableObCallbacks: 链表遍历 → 线性扫描 (current += CB_ENTRY_SIZE);
-//          (2) 偏移: +0x28/+0x30 → +0x18/+0x28 (与 BUILD 541 一致, 虽然偏移不对但安全);
-//          (3) NULL 化偏移: +0x28/+0x30 → +0x18/+0x28;
-//          (4) RestoreAll 偏移: +0x28/+0x30 → +0x18/+0x28;
-//          (5) 删除 OBDEBUG 诊断日志 (不再读取额外字段避免 PatchGuard);
-//          (6) 接受 ob=0 (PAC 不注册 ObCallbacks).
-//        教训: 不要读取额外内核字段用于诊断 — 可能触发 PatchGuard; ob=0 是正常的, 不应
-//        为了"修复" ob=0 而引入大量诊断读取; 真实偏移 (para0x0dise 逆向确认) 在 manual-mapped
-//        DLL 上下文中读取大量条目仍会触发 PatchGuard, 即使 bcdedit /debug on 已禁用部分 PG 检查.
-//        保留: BUILD 541 UnhideProcess 链表一致性检查 + 自循环回退;
-//        保留: BUILD 539 VEH fatal + DllMain DETACH + BUILD 540 CS2 退出检测)
+// BUILD: 544 (v3.202: basic.exe 完整保护 — DKOM 多 PID 支持 + EkkoSleep 豁免修复
+//        1. DKOM 多 PID: HideProcessByPid/UnhideProcessByPid/UnhideAll, 固定数组 m_hiddenList[4];
+//           非当前进程自循环加固 (basic.exe 被 TerminateProcess 时 RemoveEntryList 通过检查);
+//           保留 BUILD 541 链表一致性检查 + 自循环回退.
+//        2. EkkoSleep 豁免: 添加 EncryptAll/DecryptAll/XorCrypt page marker (紧邻各自目标函数定义),
+//           exemptPages[2] → exemptPages[8], 修复 EkkoSleep 加密自身代码页崩溃.
+//        3. 修复 BUG L1885: HideProcess() → HideProcessByPid(basicPid) — 原代码隐藏 loader2 (已隐藏).
+//        4. basic.exe 启动后立即 DKOM 隐藏 (L1441); TerminateBasicESP 先 Unhide 再 Terminate.
+//        5. 退出路径全覆盖: TerminateBasicESP/VEH fatal/DllMain DETACH/DisableAll 全部改用 UnhideAll.
+//        6. 解除半测试模式 EkkoSleep 跳过 — 阶段 A 验证修复.
+//        保留: BUILD 539 VEH fatal + BUILD 540 CS2 退出检测 + BUILD 541 自循环回退 + BUILD 543 ObCallbacks 线性扫描)
 // ============================================================
 
 #include "stealth_core.h"
@@ -260,8 +248,10 @@ veh_fatal:
     //   安全性: 原子标志 g_vehUnhideDone 防止重入 (VEH 中 IOCTL 可能二次崩溃);
     //           UnhideProcess 内部检查 m_hidden (未隐藏时 no-op); IOCTL 有 2s 超时保护
     if (!InterlockedExchange(&g_vehUnhideDone, 1)) {
-        DiagLog("VEH-FATAL: calling UnhideProcess before exit (prevent 0x139 BSOD on PspExitProcess)\n");
-        stealth::DKOMProcessHider::Instance().UnhideProcess();
+        DiagLog("VEH-FATAL: calling UnhideAll before exit (prevent 0x139 BSOD on PspExitProcess)\n");
+        // ★ BUILD 544: 必须同时挂回 loader2 + basic — 否则任一退出都触发 0x139
+        //   basic.exe 被 DKOM 隐藏后, 若未挂回链表就退出, PspExitProcess → RemoveEntryList 检查失败 → 0x139
+        stealth::DKOMProcessHider::Instance().UnhideAll();
     }
 
     // ★ v3.126f: Hollowing crash — 用 longjmp 跳回 setjmp 点, 回退到 CreateProcess
@@ -750,7 +740,13 @@ static void BringBasicToTop() {
 // v3.32: 清理基础.exe 进程
 static void TerminateBasicESP() {
     if (g_hBasicProcess) {
-        DiagLog("--- Terminating basic.exe ---\n");
+        // ★ BUILD 544: TerminateProcess 前必须 Unhide — 否则 basic.exe 退出时
+        //   PspExitProcess → RemoveEntryList 检查 prev->Flink==&basic 失败 → 0x139 蓝屏
+        //   (basic.exe 被 DKOM 隐藏后, prev->Flink=next 跳过 basic,
+        //    RemoveEntryList 检查 basic->Blink->Flink==&basic 失败)
+        DWORD basicPid = GetProcessId(g_hBasicProcess);
+        DiagLog("--- Terminating basic.exe (pid=%u) ---\n", basicPid);
+        stealth::DKOMProcessHider::Instance().UnhideProcessByPid(basicPid);
         TerminateProcess(g_hBasicProcess, 0);
         CloseHandle(g_hBasicProcess);
         g_hBasicProcess = nullptr;
@@ -1114,7 +1110,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.201 DIAG START (BUILD 543: revert to BUILD 541 safe state — BUILD 542 triggered 0x109 BSOD from 1792 IOCTL reads via Flink traversal + OBDEBUG field reads; ob=0 is normal since MessageTransfer.sys is minifilter, not ObCallbacks) ===\n");
+    DiagLog("=== v3.202 DIAG START (BUILD 544: basic.exe protection — DKOM multi-PID + EkkoSleep exempt fix + L1885 bug fix + exit path coverage) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // ★ BUILD 529: PAC PROBE 模式已废弃 — 改为 E+G 测试模式
@@ -1202,15 +1198,39 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
 
         uintptr_t ekkoPage = SleepObfuscator::GetSelfPage();
         uintptr_t vehPage  = reinterpret_cast<uintptr_t>(DiagVehHandler) & ~0xFFFULL;
+        // ★ BUILD 544: 豁免 EncryptAll/DecryptAll/XorCrypt 所在页 — 防止 EkkoSleep 加密自身代码崩溃
+        //   EkkoSleep 调用 EncryptAll → XorCrypt 加密代码页, 若这些函数自身所在页被加密,
+        //   则 EncryptAll 返回时执行已加密代码 → 无日志崩溃
+        uintptr_t encryptAllPage = SleepObfuscator::GetEncryptAllPage();
+        uintptr_t decryptAllPage = SleepObfuscator::GetDecryptAllPage();
+        uintptr_t xorCryptPage   = SleepObfuscator::GetXorCryptPage();
 
-        // 收集所有需要豁免的页面 (去重排序)
-        // ★ v3.120: 固定数组, 避免 std::vector CRT 堆依赖
-        uintptr_t exemptPages[2] = { ekkoPage, vehPage };
-        int exemptPageCount = (vehPage != ekkoPage) ? 2 : 1;
-        if (exemptPageCount == 2 && exemptPages[0] > exemptPages[1]) {
-            uintptr_t tmp = exemptPages[0];
-            exemptPages[0] = exemptPages[1];
-            exemptPages[1] = tmp;
+        // 收集所有需要豁免的页面 (去重 + 排序)
+        // ★ BUILD 544: 数组从 [2] 扩展到 [8] 以容纳 5 个豁免页 (去重后可能更少)
+        uintptr_t exemptPages[8] = {
+            ekkoPage, vehPage, encryptAllPage, decryptAllPage, xorCryptPage
+        };
+        int exemptPageCount = 5;
+        // 去重 (数组小, 简单 O(n^2))
+        for (int i = 0; i < exemptPageCount; i++) {
+            for (int j = i + 1; j < exemptPageCount; ) {
+                if (exemptPages[j] == exemptPages[i]) {
+                    exemptPages[j] = exemptPages[exemptPageCount - 1];
+                    exemptPageCount--;
+                } else {
+                    j++;
+                }
+            }
+        }
+        // 排序 (插入排序, 数组小)
+        for (int i = 1; i < exemptPageCount; i++) {
+            uintptr_t v = exemptPages[i];
+            int j = i - 1;
+            while (j >= 0 && exemptPages[j] > v) {
+                exemptPages[j + 1] = exemptPages[j];
+                j--;
+            }
+            exemptPages[j + 1] = v;
         }
 
         SIZE_T totalProtected = 0;
@@ -1232,8 +1252,11 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             totalProtected += segSz;
         }
 
-        DiagLog("OK: EkkoSleep protected %llu bytes (exempt: ekko@0x%llX veh@0x%llX)\n",
-            (unsigned long long)totalProtected, (unsigned long long)ekkoPage, (unsigned long long)vehPage);
+        DiagLog("OK: EkkoSleep protected %llu bytes (exempt: ekko@0x%llX veh@0x%llX encryptAll@0x%llX decryptAll@0x%llX xorCrypt@0x%llX, count=%d)\n",
+            (unsigned long long)totalProtected,
+            (unsigned long long)ekkoPage, (unsigned long long)vehPage,
+            (unsigned long long)encryptAllPage, (unsigned long long)decryptAllPage,
+            (unsigned long long)xorCryptPage, exemptPageCount);
     }
 
     // --- 阶段1: 初始化规避引擎 (9层) ---
@@ -1442,6 +1465,13 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             DiagLog("LaunchBasicESP: %s\n", basicOk ? "SUCCESS" : "FAILED");
             // v3.32-plus: 基础.exe 注入后清理痕迹 (PEB Ldr unlinking)
             if (basicOk) {
+                // ★ BUILD 544: 立即 DKOM 隐藏 basic.exe — 缩短 ActiveProcessLinks 可见窗口
+                //   basic.exe 持有 CS2 句柄, 若被 PAC 通过 NtQuerySystemInformation 枚举发现
+                //   会立即触发封号. DKOM 隐藏使 basic.exe 的 PID 在枚举中"消失", PAC 无法反查句柄.
+                DWORD basicPid = GetProcessId(g_hBasicProcess);
+                bool basicHideOk = stealth::DKOMProcessHider::Instance().HideProcessByPid(basicPid);
+                DiagLog("BUILD 544: basic.exe DKOM hide (pid=%u): %s\n",
+                    basicPid, basicHideOk ? "OK" : "FAILED");
                 CleanupInjectionTraces();
                 // ★ v3.126: 将基础.exe 窗口置顶
                 BringBasicToTop();
@@ -1881,8 +1911,12 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     BringBasicToTop();
                     g_basicRestartBackoffMs = RandomJitter(800, 400);
 
-                    // v3.34 Scheme 4: DKOM 隐藏 basic.exe 进程
-                    stealth::DKOMProcessHider::Instance().HideProcess();
+                    // ★ BUILD 544: 修复 BUG — 原 HideProcess() 隐藏当前进程 (loader2, 已隐藏)
+                    //   改为 HideProcessByPid(basic.exe 的 PID)
+                    DWORD basicPid = GetProcessId(g_hBasicProcess);
+                    bool basicHideOk = stealth::DKOMProcessHider::Instance().HideProcessByPid(basicPid);
+                    DiagLog("BUILD 544: basic.exe retry DKOM hide (pid=%u): %s\n",
+                        basicPid, basicHideOk ? "OK" : "FAILED");
                 } else {
                     if (g_basicRestartBackoffMs < 30000)
                         g_basicRestartBackoffMs *= 2;
@@ -1995,7 +2029,9 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         // ★ BUILD 537: 半测试模式也跳过 EkkoSleep — 半测试3 目标是验证 ObCallbacks 移除 +
         //   DKOM 隐藏 + 不被踢, EkkoSleep 有已知崩溃风险 (加密自身代码页), 跳过避免崩溃
         //   确保主循环持续运行. EkkoSleep 验证留待测试3 (完整模式) 修复豁免逻辑后进行.
-        if (!g_egTestMode && !g_halfTestMode) {
+        // ★ BUILD 544: 解除半测试跳过 — EkkoSleep 豁免已修复 (EncryptAll/DecryptAll/XorCrypt 页加入豁免)
+        //   保留 g_egTestMode (无 CS2) 跳过 — 测试2 不需要内存加密
+        if (!g_egTestMode) {
             StealthEngine::Instance().StealthSleep(sleepMs);
         } else {
             Sleep(sleepMs);
@@ -2020,8 +2056,10 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
     //   正常退出路径 (CheatMainLoop return) 已调用 DisableAll→UnhideProcess.
     //   这里作为双保险: 如果 DETACH 被触发, 确保链表挂回.
     if (fdwReason == DLL_PROCESS_DETACH) {
-        DiagLog("DllMain: DETACH — calling UnhideProcess (prevent 0x139 BSOD)\n");
-        stealth::DKOMProcessHider::Instance().UnhideProcess();
+        DiagLog("DllMain: DETACH — calling UnhideAll (prevent 0x139 BSOD)\n");
+        // ★ BUILD 544: 必须挂回所有隐藏进程 (loader2 + basic)
+        //   basic.exe 被 DKOM 隐藏后, 若未挂回链表就退出, PspExitProcess → RemoveEntryList 检查失败 → 0x139
+        stealth::DKOMProcessHider::Instance().UnhideAll();
         return TRUE;
     }
 
