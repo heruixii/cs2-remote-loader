@@ -78,17 +78,18 @@ namespace detail {
 //   或直接使用 STEALTH_STR_STACK("敏感字符串") 返回解密后的栈缓冲区
 //
 //   注意: 返回的指针指向调用者栈上的局部缓冲区, 必须在同一作用域内使用
+//   ★ BUILD 549: 使用 stealth::detail:: 完整路径, 确保在任何命名空间下都能编译
 #define STEALTH_STR_DECRYPT_TO(str, outBuf, bufSize) do { \
-    constexpr auto enc = detail::EncryptedString<sizeof(str)>(str); \
+    constexpr auto enc = stealth::detail::EncryptedString<sizeof(str)>(str); \
     size_t paddedSize = ((sizeof(str) + 7) / 4) * 4; \
     for (size_t i = 0; i < paddedSize; i += 8) { \
         uint32_t v0 = enc.data[i / 4]; \
         uint32_t v1 = enc.data[i / 4 + 1]; \
         uint32_t sum = 0xC6EF3720; \
         for (int r = 0; r < 32; r++) { \
-            v1 -= (((v0 << 4) ^ (v0 >> 5)) + v0) ^ (sum + detail::XTEA_KEY[(sum >> 11) & 3]); \
-            sum -= detail::XTEA_DELTA; \
-            v0 -= (((v1 << 4) ^ (v1 >> 5)) + v1) ^ (sum + detail::XTEA_KEY[sum & 3]); \
+            v1 -= (((v0 << 4) ^ (v0 >> 5)) + v0) ^ (sum + stealth::detail::XTEA_KEY[(sum >> 11) & 3]); \
+            sum -= stealth::detail::XTEA_DELTA; \
+            v0 -= (((v1 << 4) ^ (v1 >> 5)) + v1) ^ (sum + stealth::detail::XTEA_KEY[sum & 3]); \
         } \
         if (i < sizeof(str) - 1 && i < bufSize - 1) outBuf[i] = static_cast<char>(v0 & 0xFF); \
         if (i + 1 < sizeof(str) - 1 && i + 1 < bufSize - 1) outBuf[i + 1] = static_cast<char>((v0 >> 8) & 0xFF); \

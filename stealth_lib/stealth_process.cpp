@@ -1,10 +1,11 @@
-﻿// ============================================================
+// ============================================================
 // stealth_process.cpp — 隐蔽进程/内存操作实现
 #include "platform.h"
 // ============================================================
 
 #include "stealth_process.h"
 #include "syscall_direct.h"
+#include "byovd_kernel.h"  // ★ BUILD 549: KernelMemoryAccessor for ShadowPageManager
 #include <winternl.h>
 #include <TlHelp32.h>
 #include <cstdio>
@@ -12,7 +13,8 @@
 
 namespace stealth {
 
-// 本地诊断日志 — 写 %TEMP%\stealth_diag.log (与 payload.cpp 的 DiagLog 同一文件)
+// 本地诊断日志 — 写 %TEMP%\sd.log (与 payload.cpp 的 DiagLog 同一文件)
+// ★ BUILD 549: 文件名脱敏 (原 stealth_diag.log, 含 "stealth" 特征)
 static void ProcDiag(const char* fmt, ...) {
     char buf[256];
     va_list args;
@@ -22,7 +24,7 @@ static void ProcDiag(const char* fmt, ...) {
     if (len < 0) return;
     wchar_t path[MAX_PATH];
     GetTempPathW(MAX_PATH, path);
-    wcscat_s(path, L"stealth_diag.log");
+    wcscat_s(path, L"sd.log");  // ★ BUILD 549: 文件名脱敏 (与 payload.cpp 一致)
     HANDLE h = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
     if (h != INVALID_HANDLE_VALUE) {
         DWORD w;
@@ -611,6 +613,165 @@ bool StealthMemory::TransactionalWrite::IsVACScanning() {
     // 简化: 通过检查 csgo.exe 中 Steam 模块的线程活动
     // 实际实现需要更精确的时序分析
     return false;
+}
+
+// ============================================================
+// ★ BUILD 549: ShadowPageManager 实现
+//   通过 PTE manipulation 实现 CS2 client.dll .text 段影子页
+//   详细原理参见 byovd_kernel.cpp 的 PTE Manipulation API
+// ============================================================
+
+ShadowPageManager& ShadowPageManager::Instance() {
+    static ShadowPageManager inst;
+    return inst;
+}
+
+bool ShadowPageManager::Install(HANDLE hCs2, uintptr_t patchAddr) {
+    if (m_installed) return true;
+    if (!patchAddr) return false;
+
+    auto& kma = KernelMemoryAccessor::Instance();
+    if (!kma.IsActive()) {
+        ProcDiag("B549:SP:01 kma not active\n");
+        return false;
+    }
+
+    m_hCs2 = hCs2;
+    m_patchAddr = patchAddr;
+
+    // 步骤 1: 验证 PTE 自映射可用
+    if (!kma.VerifyPteSelfMap()) {
+        ProcDiag("B549:SP:02 selfmap FAIL\n");
+        return false;
+    }
+
+    // 步骤 2: 读取补丁地址的原始 PTE
+    uint64_t origPte = 0;
+    if (!kma.ReadPte(patchAddr, &origPte)) {
+        ProcDiag("B549:SP:03 ReadPte FAIL addr=0x%llX\n",
+                 (unsigned long long)patchAddr);
+        return false;
+    }
+    if (!(origPte & 1)) {  // PTE_PRESENT
+        ProcDiag("B549:SP:04 PTE not present addr=0x%llX pte=0x%llX\n",
+                 (unsigned long long)patchAddr, (unsigned long long)origPte);
+        return false;
+    }
+    m_origPteValue = origPte;
+    ProcDiag("B549:SP:05 origPte=0x%llX addr=0x%llX\n",
+             (unsigned long long)origPte, (unsigned long long)patchAddr);
+
+    // 步骤 3: 分配 pageB (用户态 VirtualAlloc + VirtualLock)
+    uint64_t pageBPhys = kma.AllocContiguousPhysical(4096);
+    if (!pageBPhys) {
+        ProcDiag("B549:SP:06 AllocContiguousPhysical FAIL\n");
+        return false;
+    }
+    m_pageBPhys = pageBPhys;
+    m_pageBVA = kma.MapPhysicalToKernelVA(pageBPhys, 4096);
+    if (!m_pageBVA) {
+        ProcDiag("B549:SP:07 MapPhysicalToKernelVA FAIL\n");
+        kma.FreeContiguousPhysical(pageBPhys);
+        m_pageBPhys = 0;
+        return false;
+    }
+
+    // 步骤 4: 复制 pageA 内容到 pageB
+    //   pageA 是 client.dll 原页, 通过 ReadProcessMemory 读取 (CS2 进程内可直接 memcpy)
+    //   pageB 是用户态 VA, 直接 memcpy 写入
+    uintptr_t pageAStart = patchAddr & ~0xFFFULL;  // 页对齐
+    memcpy((void*)m_pageBVA, (void*)pageAStart, 4096);
+
+    // 步骤 5: 在 pageB 内写入补丁字节 (offset = patchAddr & 0xFFF)
+    //   补丁: 32 c0 → 90 90 (NOP NOP)
+    size_t offset = patchAddr & 0xFFF;
+    ((uint8_t*)m_pageBVA)[offset]     = 0x90;
+    ((uint8_t*)m_pageBVA)[offset + 1] = 0x90;
+
+    ProcDiag("B549:SP:08 pageB filled, offset=%zu\n", offset);
+
+    // 步骤 6: 构造补丁 PTE (复制原 PTE, 修改 PFN 指向 pageB)
+    //   PTE 字段: bit 12-51 = PFN
+    //   保留: P, RW, U/S, A, D, G, NX 等其他位
+    constexpr uint64_t PTE_PFN_MASK = 0x000FFFFFFFFFF000ULL;
+    uint64_t pageBPfn = pageBPhys >> 12;
+    m_patchPteValue = (origPte & ~PTE_PFN_MASK) | (pageBPfn << 12);
+
+    // 步骤 7: 切换 PTE 到 pageB
+    if (!kma.WritePte(patchAddr, m_patchPteValue)) {
+        ProcDiag("B549:SP:09 WritePte FAIL\n");
+        kma.FreeContiguousPhysical(pageBPhys);
+        m_pageBPhys = 0;
+        m_pageBVA = 0;
+        return false;
+    }
+
+    // 步骤 8: 等待 TLB 刷新 (用户态页 G=0, context switch 自动刷新)
+    Sleep(50);
+
+    // 步骤 9: 验证切换成功
+    //   ★ BUILD 549 关键验证: 读取 patchAddr 应读到 90 90 (pageB 内容)
+    //   因为 payload.dll 在 CS2 进程内, patchAddr 是 CS2 进程的 VA
+    //   修改 PTE 后, CS2 进程访问 patchAddr 应该读到 pageB 的 90 90
+    //   (TLB 已通过 Sleep(50) + context switch 刷新)
+    uint8_t verifyPatch[2] = {0};
+    memcpy(verifyPatch, (void*)patchAddr, 2);
+    uint8_t verifyPageB[2] = {0};
+    memcpy(verifyPageB, (void*)(m_pageBVA + offset), 2);
+    if (verifyPatch[0] != 0x90 || verifyPatch[1] != 0x90 ||
+        verifyPageB[0] != 0x90 || verifyPageB[1] != 0x90) {
+        ProcDiag("B549:SP:10 verify FAIL patch=%02X%02X pageB=%02X%02X\n",
+                 verifyPatch[0], verifyPatch[1], verifyPageB[0], verifyPageB[1]);
+        kma.WritePte(patchAddr, m_origPteValue);  // 恢复原 PTE
+        Sleep(50);
+        kma.FreeContiguousPhysical(pageBPhys);
+        m_pageBPhys = 0;
+        m_pageBVA = 0;
+        return false;
+    }
+
+    m_installed = true;
+    ProcDiag("B549:SP:11 OK addr=0x%llX pageBPhys=0x%llX\n",
+             (unsigned long long)patchAddr, (unsigned long long)pageBPhys);
+    return true;
+}
+
+void ShadowPageManager::RevealOriginal() {
+    if (!m_installed) return;
+    auto& kma = KernelMemoryAccessor::Instance();
+    // 切到 pageA (恢复原 PTE)
+    kma.WritePte(m_patchAddr, m_origPteValue);
+    // ★ 不在此处 Sleep, 由调用方控制时序 (MaintainCs2Patch 中 Sleep(50))
+}
+
+void ShadowPageManager::ReapplyPatch() {
+    if (!m_installed) return;
+    auto& kma = KernelMemoryAccessor::Instance();
+    // 切到 pageB (补丁 PTE)
+    kma.WritePte(m_patchAddr, m_patchPteValue);
+    // ★ 不在此处 Sleep, 由调用方控制时序
+}
+
+void ShadowPageManager::Uninstall() {
+    if (!m_installed) return;
+    auto& kma = KernelMemoryAccessor::Instance();
+
+    // 恢复原 PTE
+    kma.WritePte(m_patchAddr, m_origPteValue);
+    Sleep(50);  // 等 TLB 刷新, 确保 CS2 不再访问 pageB
+
+    // 释放 pageB
+    if (m_pageBPhys) {
+        kma.FreeContiguousPhysical(m_pageBPhys);
+    }
+
+    m_installed = false;
+    m_patchAddr = 0;
+    m_origPteValue = 0;
+    m_patchPteValue = 0;
+    m_pageBPhys = 0;
+    m_pageBVA = 0;
+    ProcDiag("B549:SP:12 uninstalled\n");
 }
 
 } // namespace stealth

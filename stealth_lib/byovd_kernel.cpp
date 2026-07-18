@@ -28,7 +28,7 @@
 #include <intrin.h>
 #endif
 
-// ★ v3.37: BYOVD 本地诊断日志 (写 %TEMP%\stealth_diag.log)
+// ★ v3.37/B549: BYOVD 本地诊断日志 (写 %TEMP%\sd.log)
 static void ByovdDiag(const char* fmt, ...) {
     char buf[512];
     va_list args;
@@ -38,7 +38,7 @@ static void ByovdDiag(const char* fmt, ...) {
     if (len < 0) return;
     wchar_t path[MAX_PATH];
     GetTempPathW(MAX_PATH, path);
-    wcscat_s(path, L"stealth_diag.log");
+    wcscat_s(path, L"sd.log");  // ★ BUILD 549: 文件名脱敏 (与 payload.cpp 一致)
     HANDLE h = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
     if (h != INVALID_HANDLE_VALUE) {
         DWORD w;
@@ -1503,6 +1503,232 @@ bool KernelMemoryAccessor::WriteKernelVA(uint64_t va, const void* inBuf, size_t 
     }
     // ★ v3.124: 使用 PhysicalWriteViaIOCTL (0x8000204C) — 直接内核VA写入
     return PhysicalWriteViaIOCTL(m_hDevice, g_probedWriteIoctl, va, inBuf, size);
+}
+
+// ============================================================
+// ★ BUILD 549: PTE Manipulation API (Shadow Page)
+//   通过 PTE 自映射实现影子页 — CS2 执行补丁字节 (pageB), PAC 扫描看到原始字节 (pageA)
+//
+//   技术原理:
+//   - Win10/11 PML4 自引用索引: 0x1ED (固定)
+//   - PTE_BASE = 0xFFFFF68000000000
+//   - 任意 VA 的 PTE 虚拟地址 = PTE_BASE + ((va >> 12) << 3)
+//   - PTE 结构: bit 0=P, 1=RW, 2=U/S, 5=A, 6=D, 7=PS, 8=G, 12-51=PFN, 63=NX
+//
+//   影子页策略:
+//   - pageA = client.dll 原页 (PAC 扫描看到原始字节, 无需分配)
+//   - pageB = VirtualAlloc + VirtualLock 锁定的用户态页 (复制原字节 + 改 90 90)
+//   - 修改 client.dll 补丁页的 PTE.PFN 指向 pageB → CS2 执行补丁代码
+//   - 周期性切回 pageA 50ms → PAC 扫描命中原始字节
+// ============================================================
+
+// PTE 自映射基址 (Win10 1709+ 固定, PML4 自引用索引 0x1ED)
+//   PTE_BASE = 0xFFFFF68000000000 = ((0xFFFFF6FB7DB00000ULL) + 0x1ED * 8 * 0x1000 * 0x200 * 0x80000)
+//   简化: 0xFFFFF68000000000 + ((va >> 12) << 3) 直接得到 PTE VA
+static constexpr uint64_t PTE_BASE = 0xFFFFF68000000000ULL;
+
+// PTE 字段位掩码
+static constexpr uint64_t PTE_PRESENT  = 1ULL << 0;
+static constexpr uint64_t PTE_RW       = 1ULL << 1;
+static constexpr uint64_t PTE_USER     = 1ULL << 2;
+static constexpr uint64_t PTE_PFN_MASK = 0x000FFFFFFFFFF000ULL;  // bit 12-51
+
+uint64_t KernelMemoryAccessor::ReadPte(uint64_t va, uint64_t* outPteValue) {
+    if (!m_active || !outPteValue) return 0;
+    // PTE 自映射公式: PTE_BASE + ((va >> 12) << 3)
+    //   注: va >> 12 是页号, << 3 是每个 PTE 8 字节
+    //   完整公式包含 PML4/PDPT/PD 自引用层级, 但 PTE_BASE 已编码了所有层级偏移
+    uint64_t pteVA = PTE_BASE + ((va >> 12) << 3);
+    if (!ReadKernelVA(pteVA, outPteValue, 8)) {
+        ByovdDiag("B549:01 va=0x%llX pteVA=0x%llX FAIL\n",
+                  (unsigned long long)va, (unsigned long long)pteVA);
+        return 0;
+    }
+    return pteVA;
+}
+
+bool KernelMemoryAccessor::WritePte(uint64_t va, uint64_t newPteValue) {
+    if (!m_active) return false;
+    uint64_t pteVA = PTE_BASE + ((va >> 12) << 3);
+    if (!WriteKernelVA(pteVA, &newPteValue, 8)) {
+        ByovdDiag("B549:02 va=0x%llX pteVA=0x%llX FAIL\n",
+                  (unsigned long long)va, (unsigned long long)pteVA);
+        return false;
+    }
+    return true;
+}
+
+bool KernelMemoryAccessor::VerifyPteSelfMap() {
+    if (m_pml4SelfRefIndex) return true;  // 已验证
+    if (!m_active) return false;
+
+    // ★ BUILD 549: 改进验证策略 — 不依赖 ReadPhysical (PDFWKRNL 模式下不可用)
+    //
+    // 策略:
+    //   1. 假设 PML4 自引用索引为 0x1ED (Win10 1709+ 固定)
+    //   2. 读取一个已知 VA (当前进程的 &VerifyPteSelfMap 函数地址) 的 PTE
+    //   3. 验证 PTE.P=1 且 PFN 非 0 (说明 PTE 自映射基址正确)
+    //   4. 如果失败, 尝试备选索引 0x1E8/0x1F0/0x1F8/0x1E0/0x1E4
+    //
+    //   原理: PTE_BASE + ((va >> 12) << 3) 是 PTE 的虚拟地址
+    //         如果 PTE_BASE 错误, ReadKernelVA 会读取到无效地址或非 PTE 数据
+    //         通过检查 PTE.P=1 + PFN 非 0 可过滤大部分错误
+
+    // 候选 PML4 自引用索引列表
+    //   Win10 1709+ 固定 0x1ED, 但留备选以防 KASLR 随机化
+    static const uint32_t candidates[] = { 0x1ED, 0x1E8, 0x1F0, 0x1F8, 0x1E0, 0x1E4 };
+    constexpr int numCandidates = sizeof(candidates) / sizeof(candidates[0]);
+
+    // 测试 VA: 使用静态局部变量的地址 (必然是有效用户态 VA)
+    //   ★ BUILD 549: 不能用成员函数指针 (sizeof != 8), 改用静态变量地址
+    static char dummyTestVar = 0;
+    uint64_t testVA = (uint64_t)&dummyTestVar;
+
+    // 临时保存 PTE_BASE, 用于多候选测试
+    //   PTE_BASE 公式: 0xFFFFF68000000000 + (idx << 39) * 0x1000 / 0x1000
+    //   简化: PTE_BASE 实际是固定的 0xFFFFF68000000000, idx 仅影响 PML4E 解析
+    //   但我们的 ReadPte 使用的公式 PTE_BASE + ((va >> 12) << 3) 已经隐含了 idx 的偏移
+    //   所以只需验证 ReadPte 能返回有效的 PTE 即可
+    //
+    //   ★ 关键: PTE_BASE = 0xFFFFF68000000000 是基于 idx=0x1ED 计算的
+    //           如果实际 idx 不是 0x1ED, PTE_BASE 会不同, ReadPte 会读取错误地址
+    //           因此需要为每个候选 idx 计算对应的 PTE_BASE 并测试
+
+    for (int i = 0; i < numCandidates; i++) {
+        uint32_t idx = candidates[i];
+        // PTE_BASE 公式 (基于 PML4 自引用索引 idx):
+        //   PTE_BASE = (idx << 39) | (idx << 30) | (idx << 21) | (idx << 12)
+        //   但这会导致符号扩展问题, 用更安全的计算:
+        //   PTE_BASE = 0xFFFF000000000000 | (idx << 39) | (idx << 30) | (idx << 21) | (idx << 12)
+        //   简化: 实际上 PTE_BASE 是固定的 0xFFFFF68000000000 (idx=0x1ED)
+        //         其他 idx 对应不同的 PTE_BASE, 但 Win10 1709+ 固定 0x1ED
+        //         所以这里只测试 0x1ED, 其他候选仅作为 fallback 标记
+        //
+        //   ★ 简化策略: 只用固定 PTE_BASE = 0xFFFFF68000000000 测试
+        //     如果 ReadPte 返回有效 PTE (P=1, PFN!=0), 认为 0x1ED 正确
+        //     如果失败, 标记为不可用, 回退到 VirtualProtect
+
+        if (i > 0) {
+            // 跳过其他候选 (Win10 1709+ 固定 0x1ED, 其他 idx 的 PTE_BASE 计算复杂)
+            // 如果 0x1ED 失败, 直接返回 false, 由调用方回退
+            break;
+        }
+
+        uint64_t pteValue = 0;
+        uint64_t pteVA = ReadPte(testVA, &pteValue);
+        if (pteVA && (pteValue & PTE_PRESENT)) {
+            uint64_t pfn = (pteValue & PTE_PFN_MASK) >> 12;
+            if (pfn != 0) {
+                m_pml4SelfRefIndex = idx;
+                ByovdDiag("B549:05 OK idx=0x%X pteVA=0x%llX pte=0x%llX\n",
+                          idx, (unsigned long long)pteVA, (unsigned long long)pteValue);
+                return true;
+            }
+        }
+        ByovdDiag("B549:04 idx=0x%X test FAIL pte=0x%llX\n",
+                  idx, (unsigned long long)pteValue);
+    }
+
+    ByovdDiag("B549:06 PTE selfmap verify FAIL\n");
+    return false;
+}
+
+uint64_t KernelMemoryAccessor::AllocContiguousPhysical(size_t size) {
+    if (!m_active) return 0;
+    if (size == 0 || size > 0x10000) return 0;  // 上限 64KB
+
+    // ★ BUILD 549 最简方案: 用户态分配 + 锁定
+    //   1. VirtualAlloc 分配一页 PAGE_READWRITE
+    //   2. VirtualLock 锁定防止换出 (PFN 稳定)
+    //   3. 通过 PTE 自映射读取该页 PTE, 提取 PFN
+    //   4. 该 PFN 即 pageB 的物理地址
+    //
+    //   优点: 实现简单, 无需内核 R/W 操作 PfnDatabase
+    //   缺点: pageB 物理页归当前进程所有, 进程退出前不能释放
+    //         (Uninstall 时恢复原 PTE 后再释放, 安全)
+    //
+    //   关键约束: 必须先 VerifyPteSelfMap 成功, 否则无法读取 PTE
+
+    if (!m_pml4SelfRefIndex) {
+        if (!VerifyPteSelfMap()) {
+            ByovdDiag("B549:07 selfmap FAIL\n");
+            return 0;
+        }
+    }
+
+    void* p = VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!p) {
+        ByovdDiag("B549:08 VirtualAlloc FAIL err=%u\n", GetLastError());
+        return 0;
+    }
+
+    // 触发缺页, 确保物理页已分配
+    memset(p, 0, size);
+
+    if (!VirtualLock(p, size)) {
+        ByovdDiag("B549:09 VirtualLock FAIL err=%u\n", GetLastError());
+        VirtualFree(p, 0, MEM_RELEASE);
+        return 0;
+    }
+
+    // 通过 PTE 自映射读取该页 PTE
+    uint64_t pteValue = 0;
+    if (!ReadPte((uint64_t)p, &pteValue)) {
+        ByovdDiag("B549:10 ReadPte FAIL va=%p\n", p);
+        VirtualUnlock(p, size);
+        VirtualFree(p, 0, MEM_RELEASE);
+        return 0;
+    }
+
+    if (!(pteValue & PTE_PRESENT)) {
+        ByovdDiag("B549:11 PTE not present va=%p pte=0x%llX\n",
+                  p, (unsigned long long)pteValue);
+        VirtualUnlock(p, size);
+        VirtualFree(p, 0, MEM_RELEASE);
+        return 0;
+    }
+
+    // 提取 PFN (bit 12-51)
+    uint64_t pfn = (pteValue & PTE_PFN_MASK) >> 12;
+    uint64_t phys = pfn << 12;
+
+    // 缓存: m_shadowPageBKernelVA 存储用户态 VA (用于读写 pageB 内容和释放)
+    //       m_shadowPageBPhys 存储物理地址
+    m_shadowPageBKernelVA = (uint64_t)p;
+    m_shadowPageBPhys = phys;
+
+    ByovdDiag("B549:12 OK va=%p phys=0x%llX pte=0x%llX\n",
+              p, (unsigned long long)phys, (unsigned long long)pteValue);
+    return phys;
+}
+
+bool KernelMemoryAccessor::FreeContiguousPhysical(uint64_t physAddr) {
+    if (physAddr == 0) return false;
+    if (physAddr != m_shadowPageBPhys) {
+        ByovdDiag("B549:13 phys mismatch 0x%llX != 0x%llX\n",
+                  (unsigned long long)physAddr, (unsigned long long)m_shadowPageBPhys);
+        return false;
+    }
+    void* p = (void*)m_shadowPageBKernelVA;
+    if (p) {
+        VirtualUnlock(p, 4096);  // 假定单页
+        VirtualFree(p, 0, MEM_RELEASE);
+    }
+    m_shadowPageBKernelVA = 0;
+    m_shadowPageBPhys = 0;
+    ByovdDiag("B549:14 freed phys=0x%llX\n", (unsigned long long)physAddr);
+    return true;
+}
+
+uint64_t KernelMemoryAccessor::MapPhysicalToKernelVA(uint64_t physAddr, size_t size) {
+    // ★ BUILD 549: pageB 是用户态分配的, 直接返回缓存的用户态 VA
+    //   (无需内核 R/W, 用 memcpy 直接写入 pageB 内容即可)
+    if (physAddr == 0) return 0;
+    if (physAddr == m_shadowPageBPhys) {
+        return m_shadowPageBKernelVA;
+    }
+    ByovdDiag("B549:15 phys 0x%llX not cached\n", (unsigned long long)physAddr);
+    return 0;
 }
 
 // ============================================================

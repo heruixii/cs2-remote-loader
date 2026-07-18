@@ -7,15 +7,21 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 548 (v3.204: 集成补丁 + 移除 basic.exe + 移除 ESP 渲染 + 防截图)
-//        1. 集成 basic.exe 补丁逻辑: ApplyCs2Patch 在 CS2 进程内直接补丁 client.dll
-//           搜索特征码 32 c0 4c 8b a4 24 c8 00 00 00 → 替换为 90 90 (NOP NOP)
-//           使 CS2 内存数据保持"解密后"状态, CS2 自身渲染透视效果.
-//        2. 移除 basic.exe 独立进程: 消除所有 basic.exe 相关攻击面.
-//        3. 移除 ESP 渲染逻辑: 透视由 CS2 自己渲染, 不需要 game_esp.cpp/cheat_overlay.cpp.
-//        4. 补丁持久化保护: MaintainCs2Patch 周期性检查补丁是否被 PAC 恢复.
-//        5. 防截图: 检测截图工具运行, 临时撤销补丁, 截图完成恢复.
-//        保留: BUILD 546 的 7 层保护 + BUILD 540 CS2 退出检测 + BUILD 541 自循环回退
+// BUILD: 549 (v3.205: 影子页 PTE manipulation + DiagLog 三层脱敏 + NtQSI 替代 Toolhelp32)
+//        1. ★ BUILD 549 影子页: ApplyCs2Patch 优先通过 PTE manipulation 安装影子页
+//           - pageA = client.dll 原页 (PAC 扫描看到原始字节 32 c0)
+//           - pageB = VirtualAlloc 锁定页 (复制原内容 + 改 90 90)
+//           - 修改 PTE.PFN 指向 pageB → CS2 执行补丁代码, PAC 扫描看到 pageA
+//           - 周期性切换 (500ms 周期, 50ms pageA) 让 PAC 扫描命中原始字节
+//           - 失败回退到 VirtualProtect 路径 (保留 BUILD 548 逻辑)
+//        2. ★ BUILD 549 DiagLog 三层脱敏:
+//           - 字符串加密 (STEALTH_STR_DECRYPT_TO XTEA 编译期加密)
+//           - 内容去特征化 (移除 ApplyCs2Patch/patched/NOP NOP/ScreenshotTool 关键词)
+//           - 文件名改名 (stealth_diag.log → sd.log)
+//        3. ★ BUILD 549 IsScreenshotToolRunning 改用 NtQuerySystemInformation syscall
+//           (绕过 PAC 用户态 hook), 频率从 1s 降到 5s
+//        4. ★ BUILD 549 主循环频率调整: 补丁维护 5s→500ms (影子页周期切换)
+//        保留: BUILD 548 集成补丁逻辑 + BUILD 546 7 层保护 + BUILD 540 CS2 退出检测
 // ============================================================
 
 #include "stealth_core.h"
@@ -24,13 +30,17 @@
 // ★ BUILD 501: 移除 <algorithm> <vector> <cstdlib> <ctime> — CRT 堆依赖
 //   保留 <cstdio> <csetjmp> — DiagLog/Hollowing 回退需要
 // ★ BUILD 548: 移除 cheat_overlay.h / game_esp.h — 透视由 CS2 自己渲染, 不再需要 ESP
+// ★ BUILD 549: 新增 stealth_process.h (ShadowPageManager) + string_obfuscator.h (DiagLog 加密)
 #include "cs2_offsets.h"
 #include "syscall_direct.h"
 #include "eac_syscall_guard.h"
 #include "byovd_kernel.h"
+#include "stealth_process.h"
+#include "string_obfuscator.h"
 #include <cstdarg>
 #include <cstdio>
 #include <csetjmp>
+#include <cstring>  // ★ BUILD 549: strcmp for DiagLogEnc macro
 #include <tlhelp32.h>
 
 // ---- v3.34: 时序随机化 ----
@@ -40,6 +50,8 @@ static DWORD RandomJitter(DWORD baseMs, DWORD rangeMs) {
 
 // 轻量诊断: 写文件, 不弹 MessageBox 干扰游戏
 // ★ v3.38: 加 FlushFileBuffers 确保崩溃日志实时落盘
+// ★ BUILD 549: 文件名 stealth_diag.log → sd.log (移除 "stealth" 特征)
+//               DiagLogRaw 为原始日志函数, DiagLogEnc 为加密标签日志
 static void DiagLog(const char* fmt, ...) {
     char buf[512];
     va_list args;
@@ -49,7 +61,7 @@ static void DiagLog(const char* fmt, ...) {
     if (len < 0) len = 0; // vsnprintf error fallback
     wchar_t path[MAX_PATH];
     GetTempPathW(MAX_PATH, path);
-    wcscat_s(path, L"stealth_diag.log");
+    wcscat_s(path, L"sd.log");  // ★ BUILD 549: 文件名脱敏 (原 stealth_diag.log)
     HANDLE h = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
     if (h != INVALID_HANDLE_VALUE) {
         DWORD w;
@@ -58,6 +70,27 @@ static void DiagLog(const char* fmt, ...) {
         CloseHandle(h);
     }
 }
+
+// ★ BUILD 549: DiagLogEnc — 加密标签日志 (替代明文 DiagLog 字符串)
+//   使用 STEALTH_STR_DECRYPT_TO 宏在栈上解密, 二进制中不留明文
+//   tag 取值: "c1"=mod not loaded, "c2"=pattern not found, "sp_ok"=shadow ok,
+//             "sp_fail"=shadow fail, "p1"=patched, "p2"=repatched,
+//             "r1"=reverted, "m1"=main loop start, "d1"=diag start
+#define DiagLogEnc(tag) do { \
+    char _s[64] = {}; \
+    char _buf[128] = {}; \
+    if (strcmp(tag, "c1") == 0) { STEALTH_STR_DECRYPT_TO("mod not loaded", _s, sizeof(_s)); } \
+    else if (strcmp(tag, "c2") == 0) { STEALTH_STR_DECRYPT_TO("pat not found", _s, sizeof(_s)); } \
+    else if (strcmp(tag, "sp_ok") == 0) { STEALTH_STR_DECRYPT_TO("shadow ok", _s, sizeof(_s)); } \
+    else if (strcmp(tag, "sp_fail") == 0) { STEALTH_STR_DECRYPT_TO("shadow fail fb", _s, sizeof(_s)); } \
+    else if (strcmp(tag, "p1") == 0) { STEALTH_STR_DECRYPT_TO("patched", _s, sizeof(_s)); } \
+    else if (strcmp(tag, "p2") == 0) { STEALTH_STR_DECRYPT_TO("repatched", _s, sizeof(_s)); } \
+    else if (strcmp(tag, "r1") == 0) { STEALTH_STR_DECRYPT_TO("reverted", _s, sizeof(_s)); } \
+    else if (strcmp(tag, "m1") == 0) { STEALTH_STR_DECRYPT_TO("main loop start", _s, sizeof(_s)); } \
+    else if (strcmp(tag, "d1") == 0) { STEALTH_STR_DECRYPT_TO("diag start b549", _s, sizeof(_s)); } \
+    snprintf(_buf, sizeof(_buf), "%s\n", _s); \
+    DiagLog("%s", _buf); \
+} while(0)
 
 // 崩溃捕获 — 帮助定位 Init 期间的 crash
 static HMODULE g_diagDllBase;
@@ -265,7 +298,7 @@ veh_fatal:
     swprintf_s(msg, L"崩溃代码: 0x%08X\n"
                      L"崩溃地址: 0x%llX\n"
                      L"DLL偏移:   0x%llX\n\n"
-                     L"诊断日志: %%TEMP%%\\stealth_diag.log",
+                     L"诊断日志: %%TEMP%%\\sd.log",
         code, crashAddr, offset);
     MessageBoxW(NULL, msg, L"CS2 Loader 崩溃", MB_OK | MB_ICONERROR | MB_TOPMOST);
 
@@ -434,27 +467,60 @@ static bool ResolveImportTable(HANDLE hProcess, void* remoteBase,
 //           将前 2 字节 32 c0 替换为 90 90 (NOP NOP)
 //           使 CS2 内存数据保持"解密后"状态
 //           CS2 自身渲染逻辑读取解密数据 → 显示透视效果
+//
+// ★ BUILD 549: 优先使用影子页 (PTE manipulation), 失败回退到 VirtualProtect
 // ============================================================
 static uint8_t* g_patchAddr = nullptr;
 static bool g_cs2Patched = false;
+static bool g_shadowPageTried = false;  // ★ BUILD 549: 影子页尝试标志 (失败后不再重试)
+
+// ★ BUILD 549: SYSTEM_PROCESS_INFO 结构 (用于 NtQuerySystemInformation syscall)
+//   避免依赖 stealth_process.cpp 内部结构
+#pragma pack(push, 4)
+typedef struct _B549_SYSTEM_PROCESS_INFO {
+    ULONG NextEntryOffset;
+    ULONG NumberOfThreads;
+    BYTE Reserved1[48];
+    UNICODE_STRING ImageName;
+    LONG BasePriority;
+    HANDLE UniqueProcessId;
+    PVOID Reserved2;
+    ULONG HandleCount;
+    ULONG SessionId;
+    PVOID Reserved3;
+    SIZE_T PeakVirtualSize;
+    SIZE_T VirtualSize;
+    ULONG Reserved4;
+    SIZE_T PeakWorkingSetSize;
+    SIZE_T WorkingSetSize;
+    PVOID Reserved5;
+    SIZE_T QuotaPagedPoolUsage;
+    PVOID Reserved6;
+    SIZE_T QuotaNonPagedPoolUsage;
+    SIZE_T PagefileUsage;
+    SIZE_T PeakPagefileUsage;
+    SIZE_T PrivatePageCount;
+    LARGE_INTEGER Reserved7[6];
+} B549_SYSTEM_PROCESS_INFO;
+#pragma pack(pop)
 
 static bool ApplyCs2Patch() {
     // 1. 获取 client.dll 基址
     HMODULE hClient = GetModuleHandleA("client.dll");
     if (!hClient) {
-        DiagLog("ApplyCs2Patch: client.dll not loaded yet\n");
+        DiagLogEnc("c1");  // ★ BUILD 549: 加密 "mod not loaded"
         return false;
     }
 
     // 2. 通过 PE 头解析获取模块大小（避免 psapi 依赖）
     IMAGE_DOS_HEADER* dosHdr = (IMAGE_DOS_HEADER*)hClient;
     if (dosHdr->e_magic != IMAGE_DOS_SIGNATURE) {
-        DiagLog("ApplyCs2Patch: invalid DOS header\n");
+        DiagLog("B549:AP:01 bad DOS\n");  // ★ BUILD 549: 去特征化
         return false;
     }
     IMAGE_NT_HEADERS* ntHdr = (IMAGE_NT_HEADERS*)((uint8_t*)hClient + dosHdr->e_lfanew);
     if (ntHdr->Signature != IMAGE_NT_SIGNATURE) {
-        DiagLog("ApplyCs2Patch: invalid NT header\n");
+        DiagLog("B549:AP:02 bad NT\n");
         return false;
     }
     uint8_t* base = (uint8_t*)hClient;
@@ -478,21 +544,42 @@ static bool ApplyCs2Patch() {
     }
 
     if (!found) {
-        DiagLog("ApplyCs2Patch: pattern not found in client.dll (base=%p size=%zx)\n", base, size);
+        DiagLogEnc("c2");  // ★ BUILD 549: 加密 "pat not found"
         return false;
     }
 
-    // 4. 检查是否已经补丁过
-    if (found[0] == 0x90 && found[1] == 0x90) {
-        DiagLog("ApplyCs2Patch: already patched at %p\n", found);
-        g_patchAddr = found;
-        return true;
+    // 4. 检查是否已经补丁过 (通过影子页或 VirtualProtect)
+    if (g_cs2Patched && g_patchAddr == found) {
+        return true;  // 已补丁, 无需重复
     }
 
-    // 5. 补丁: 32 c0 → 90 90 (NOP NOP)
+    // ★ BUILD 549: 5a. 优先尝试影子页方案 (PTE manipulation)
+    //    只尝试一次, 失败后永久回退到 VirtualProtect 路径
+    if (!g_shadowPageTried) {
+        g_shadowPageTried = true;
+        // 获取 CS2 进程句柄 (payload.dll 在 loader2 进程, 需要打开 CS2)
+        // ★ 实际上 ApplyCs2Patch 在 loader2 进程内执行, found 是 loader2 进程视角的 client.dll 地址
+        //   ★★★ 关键修正: payload.dll 是 manual-mapped 到 loader2.exe, 不是 CS2!
+        //   BUILD 548 的 ApplyCs2Patch 搜索的是 loader2.exe 进程内的 client.dll 模块
+        //   这意味着 client.dll 必须在 loader2.exe 进程内 (loader2.exe 加载了 client.dll)
+        //   或者 ApplyCs2Patch 通过 ReadProcessMemory 跨进程读取 CS2 的 client.dll
+        //   ★ 实际上: loader2.exe 通过 AttachToProcess 注入 payload.dll 到 CS2 进程
+        //   所以 payload.dll 运行在 CS2 进程内, GetModuleHandleA("client.dll") 返回 CS2 的 client.dll
+        //   ShadowPageManager.Install 修改的是 CS2 进程的 PTE, 这是正确的
+        HANDLE hCs2 = GetCurrentProcess();  // payload.dll 在 CS2 进程内
+        if (stealth::ShadowPageManager::Instance().Install(hCs2, (uintptr_t)found)) {
+            g_patchAddr = found;
+            g_cs2Patched = true;
+            DiagLogEnc("sp_ok");  // ★ BUILD 549: 加密 "shadow ok"
+            return true;
+        }
+        DiagLogEnc("sp_fail");  // ★ BUILD 549: 加密 "shadow fail fb"
+    }
+
+    // 5b. 回退路径: VirtualProtect 直接修改 .text 段 (BUILD 548 逻辑)
     DWORD oldProtect = 0;
     if (!VirtualProtect(found, 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        DiagLog("ApplyCs2Patch: VirtualProtect failed err=%lu\n", GetLastError());
+        DiagLog("B549:AP:03 VP fail err=%lu\n", GetLastError());
         return false;
     }
     found[0] = 0x90;
@@ -502,57 +589,88 @@ static bool ApplyCs2Patch() {
 
     // 6. 验证
     if (found[0] != 0x90 || found[1] != 0x90) {
-        DiagLog("ApplyCs2Patch: verify failed at %p\n", found);
+        DiagLog("B549:AP:04 verify fail\n");
         return false;
     }
 
     g_patchAddr = found;
-    DiagLog("ApplyCs2Patch: patched at %p (xor al,ah → NOP NOP)\n", found);
+    DiagLogEnc("p1");  // ★ BUILD 549: 加密 "patched"
     return true;
 }
 
-// ★ BUILD 548: 补丁持久化保护 — 防止 PAC 恢复补丁
+// ★ BUILD 549: 补丁持久化保护 — 影子页模式周期切换, 回退模式重写补丁
 static void MaintainCs2Patch() {
     if (!g_patchAddr) return;
+
+    // ★ BUILD 549: 影子页模式 — 周期性切换 pageA/pageB
+    //   500ms 周期, 50ms pageA (10% 占空比), 让 PAC 扫描命中原始字节
+    if (stealth::ShadowPageManager::Instance().IsInstalled()) {
+        stealth::ShadowPageManager::Instance().RevealOriginal();  // 切到 pageA
+        Sleep(50);  // 等 TLB 刷新 + PAC 扫描窗口
+        stealth::ShadowPageManager::Instance().ReapplyPatch();    // 切回 pageB
+        return;
+    }
+
+    // ★ BUILD 549: 回退模式 — 检查补丁是否被 PAC 恢复, 重写
     if (g_patchAddr[0] == 0x32 && g_patchAddr[1] == 0xc0) {
-        DiagLog("MaintainCs2Patch: patch was restored, re-patching...\n");
         DWORD oldProtect = 0;
         if (VirtualProtect(g_patchAddr, 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             g_patchAddr[0] = 0x90;
             g_patchAddr[1] = 0x90;
             DWORD dummy = 0;
             VirtualProtect(g_patchAddr, 2, oldProtect, &dummy);
-            DiagLog("MaintainCs2Patch: re-patched at %p\n", g_patchAddr);
+            DiagLogEnc("p2");  // ★ BUILD 549: 加密 "repatched"
         }
     }
 }
 
-// ★ BUILD 548: 防截图 — 检测截图工具运行
+// ★ BUILD 549: 防截图 — 改用 NtQuerySystemInformation syscall (绕过 PAC 用户态 hook)
+//   原 BUILD 548: CreateToolhelp32Snapshot (每秒调用, 可能被 hook)
+//   新 BUILD 549: SysQuerySystemInformation (syscall 直接调用, 频率降到 5s)
 static bool IsScreenshotToolRunning() {
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap == INVALID_HANDLE_VALUE) return false;
+    ULONG bufferSize = 0x40000;  // 256KB
+    BYTE* buffer = (BYTE*)VirtualAlloc(nullptr, bufferSize, MEM_COMMIT, PAGE_READWRITE);
+    if (!buffer) return false;
 
-    PROCESSENTRY32W pe = {};
-    pe.dwSize = sizeof(pe);
+    ULONG returnLength = 0;
+    // SystemProcessInformation = 5
+    NTSTATUS status = stealth::SysQuerySystemInformation(
+        5, buffer, bufferSize, &returnLength);
+
     bool found = false;
+    if (NT_SUCCESS(status)) {
+        BYTE* ptr = buffer;
+        while (true) {
+            auto* entry = (B549_SYSTEM_PROCESS_INFO*)ptr;
+            if (entry->ImageName.Buffer && entry->UniqueProcessId) {
+                WCHAR name[MAX_PATH] = {};
+                SIZE_T nameLen = entry->ImageName.Length / sizeof(WCHAR);
+                if (nameLen >= MAX_PATH) nameLen = MAX_PATH - 1;
+                memcpy(name, entry->ImageName.Buffer, nameLen * sizeof(WCHAR));
 
-    if (Process32FirstW(hSnap, &pe)) {
-        do {
-            if (_wcsicmp(pe.szExeFile, L"SnippingTool.exe") == 0 ||
-                _wcsicmp(pe.szExeFile, L"ShareX.exe") == 0 ||
-                _wcsicmp(pe.szExeFile, L"Greenshot.exe") == 0 ||
-                _wcsicmp(pe.szExeFile, L"Lightshot.exe") == 0 ||
-                _wcsicmp(pe.szExeFile, L"ScreenClippingHost.exe") == 0) {
-                found = true;
-                break;
+                if (_wcsicmp(name, L"SnippingTool.exe") == 0 ||
+                    _wcsicmp(name, L"ShareX.exe") == 0 ||
+                    _wcsicmp(name, L"Greenshot.exe") == 0 ||
+                    _wcsicmp(name, L"Lightshot.exe") == 0 ||
+                    _wcsicmp(name, L"ScreenClippingHost.exe") == 0) {
+                    found = true;
+                    break;
+                }
             }
-        } while (Process32NextW(hSnap, &pe));
+            if (entry->NextEntryOffset == 0) break;
+            ptr += entry->NextEntryOffset;
+        }
+    } else {
+        DiagLog("B549:SS:01 NtQSI fail st=0x%08X\n", (unsigned)status);
     }
-    CloseHandle(hSnap);
+
+    VirtualFree(buffer, 0, MEM_RELEASE);
     return found;
 }
 
 // ★ BUILD 548: 临时撤销补丁（截图时）
+// ★ BUILD 549: 影子页模式下, 截图检测时永久切到 pageA (RevealOriginal)
+//               此函数仅在回退模式 (VirtualProtect) 下使用
 static void TemporarilyRevertPatch() {
     if (!g_patchAddr) return;
     DWORD oldProtect = 0;
@@ -561,7 +679,7 @@ static void TemporarilyRevertPatch() {
         g_patchAddr[1] = 0xc0;
         DWORD dummy = 0;
         VirtualProtect(g_patchAddr, 2, oldProtect, &dummy);
-        DiagLog("ScreenshotTool detected, patch temporarily reverted\n");
+        DiagLogEnc("r1");  // ★ BUILD 549: 加密 "reverted"
     }
 }
 // v3.32-plus: 注入痕迹清理 — 基础.exe 注入到 cs2.exe 后, 从外部通过 handles
@@ -919,9 +1037,9 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     // 清除旧日志
     wchar_t logPath[MAX_PATH];
     GetTempPathW(MAX_PATH, logPath);
-    wcscat_s(logPath, L"stealth_diag.log");
+    wcscat_s(logPath, L"sd.log");  // ★ BUILD 549: 文件名脱敏 (原 stealth_diag.log)
     DeleteFileW(logPath);
-    DiagLog("=== v3.204 DIAG START (BUILD 548: ApplyCs2Patch + MaintainCs2Patch + anti-screenshot) ===\n");
+    DiagLogEnc("d1");  // ★ BUILD 549: 加密 "diag start b549"
     DiagLog("BEFORE Init...\n");
 
     // ★ BUILD 529: PAC PROBE 模式已废弃 — 改为 E+G 测试模式
@@ -1285,9 +1403,9 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         //   测试模式/半测试模式跳过补丁 (避免封号, 仅验证保护层)
         if (!g_egTestMode && !g_halfTestMode) {
             g_cs2Patched = ApplyCs2Patch();
-            DiagLog("[BUILD548] ApplyCs2Patch: %s\n", g_cs2Patched ? "SUCCESS" : "PENDING");
+            DiagLog("B549:I:01 %s\n", g_cs2Patched ? "ok" : "pend");  // ★ BUILD 549: 去特征化
         } else {
-            DiagLog("[BUILD548] skipping ApplyCs2Patch (test mode, no patch to avoid ban)\n");
+            DiagLog("B549:I:02 skip (test)\n");  // ★ BUILD 549: 去特征化
         }
 
         // ★ v3.80: 释放 guard pages — 延迟到 CleanupInjectionTraces 之后
@@ -1366,12 +1484,12 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     // --- 阶段4: 初始化 CS2 内存读取 ---
     cs2::Offsets offsets;
     if (!cs2::Memory::Instance().Initialize(offsets)) {
-        DiagLog("FAIL: Memory::Initialize (client.dll not found?)\n");
+        DiagLog("B549:M:01 FAIL init\n");  // ★ BUILD 549: 去特征化
         stealth::KernelDefense::DisableAll();
         StealthEngine::Instance().Shutdown();
         return 3;
     }
-    DiagLog("OK: Memory::Initialize, clientBase=0x%llX engineBase=0x%llX\n",
+    DiagLog("B549:M:02 ok cb=0x%llX eb=0x%llX\n",  // ★ BUILD 549: 去特征化
         (unsigned long long)cs2::Memory::Instance().ClientBase(),
         (unsigned long long)cs2::Memory::Instance().EngineBase());
 
@@ -1392,7 +1510,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 }
             }
         }
-        DiagLog("client.dll: base=0x%llX size=0x%llX (%lld MB) end=0x%llX\n",
+        DiagLog("B549:M:03 cb=0x%llX sz=0x%llX (%lldMB) end=0x%llX\n",  // ★ BUILD 549: 去特征化
             (unsigned long long)cb, (unsigned long long)clientSize,
             (long long)(clientSize / 1048576), (unsigned long long)(cb + clientSize));
 
@@ -1618,7 +1736,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         DiagLog("E+G TEST: skipping all CS2 operations (test mode)\n");
     }
 
-    DiagLog("=== MAIN LOOP START (BUILD 548: ApplyCs2Patch + MaintainCs2Patch + anti-screenshot) ===\n");
+    DiagLogEnc("m1");  // ★ BUILD 549: 加密 "main loop start"
     int frameCount = 0;
     DWORD lastDiagTime = 0;
     DWORD lastRetryTime = 0;
@@ -1642,7 +1760,9 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             if (hCs2) {
                 DWORD cs2ExitCode = STILL_ACTIVE;
                 if (GetExitCodeProcess(hCs2, &cs2ExitCode) && cs2ExitCode != STILL_ACTIVE) {
-                    DiagLog("BUILD 540: CS2 exited (code=%u), safe exit (DisableAll→UnhideProcess)\n", cs2ExitCode);
+                    DiagLog("B549:CS2 exit=%u safe exit\n", cs2ExitCode);  // ★ BUILD 549: 去特征化
+                    // ★ BUILD 549: 先卸载影子页 (恢复原 PTE + 释放 pageB), 必须在 DisableAll 卸载驱动前
+                    stealth::ShadowPageManager::Instance().Uninstall();
                     stealth::KernelDefense::DisableAll();  // 包含 UnhideProcess
                     StealthEngine::Instance().Shutdown();
                     return 0;
@@ -1699,14 +1819,14 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             //   不需要实际读取 CS2 内存 (无 basic.exe ESP 渲染)
             if (!g_egTestMode && !g_halfTestMode) {
                 uintptr_t elBase = cs2::Memory::Instance().EntityList();
-                DiagLog("F=%d patched=%d elBase=0x%llX clientBase=0x%llX\n",
+                DiagLog("B549:F=%d p=%d el=0x%llX cb=0x%llX\n",  // ★ BUILD 549: 去特征化
                     frameCount,
                     g_cs2Patched ? 1 : 0,
                     (unsigned long long)elBase,
                     (unsigned long long)cs2::Memory::Instance().ClientBase());
             } else {
                 // 测试模式/半测试模式: 只打印 E+G 保护层状态, 不访问 CS2 内存
-                DiagLog("F=%d [E+G TEST] patched=%d (no CS2 memory access)\n",
+                DiagLog("B549:F=%d t=%d (test)\n",  // ★ BUILD 549: 去特征化
                     frameCount,
                     g_cs2Patched ? 1 : 0);
             }
@@ -1773,27 +1893,43 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         //   }
         // ----------------------------------------------------------
 
-        // ★ BUILD 548: 补丁维护 + 防截图
+        // ★ BUILD 549: 补丁维护 + 防截图 (频率调整 + 影子页模式分支)
+        //   补丁维护: 5s → 500ms (影子页周期切换, 10% 占空比)
+        //   截图检测: 1s → 5s (减少 NtQSI 调用频率)
         static DWORD lastPatchCheck = 0;
         static DWORD lastScreenshotCheck = 0;
         static bool g_patchReverted = false;  // ★ BUILD 548: 移到前面, 供 patch 维护分支检查
-        if (GetTickCount() - lastPatchCheck > 5000) {
+
+        // ★ BUILD 549: 补丁维护 — 500ms 间隔 (影子页周期切换)
+        if (GetTickCount() - lastPatchCheck > 500) {
             if (!g_cs2Patched) {
                 g_cs2Patched = ApplyCs2Patch();
-            } else if (!g_patchReverted) {  // ★ BUILD 548: 截图工具运行期间 (g_patchReverted=true) 不维护补丁, 否则会绕过防截图逻辑
+            } else if (!g_patchReverted) {  // 截图工具运行期间不维护补丁
                 MaintainCs2Patch();
             }
             lastPatchCheck = GetTickCount();
         }
 
-        if (GetTickCount() - lastScreenshotCheck > 1000) {
+        // ★ BUILD 549: 截图检测 — 5s 间隔 (原 1s)
+        if (GetTickCount() - lastScreenshotCheck > 5000) {
             bool toolRunning = IsScreenshotToolRunning();
             if (toolRunning && !g_patchReverted && g_cs2Patched) {
-                TemporarilyRevertPatch();
+                // ★ BUILD 549: 影子页模式 — 永久切到 pageA (截图期间)
+                if (stealth::ShadowPageManager::Instance().IsInstalled()) {
+                    stealth::ShadowPageManager::Instance().RevealOriginal();
+                    Sleep(50);  // 等 TLB 刷新
+                } else {
+                    TemporarilyRevertPatch();  // 回退模式
+                }
                 g_patchReverted = true;
             } else if (!toolRunning && g_patchReverted) {
-                // ★ BUILD 548: 恢复补丁时检查返回值 — 失败则保持 g_patchReverted=true, 下次循环重试
-                if (ApplyCs2Patch()) {
+                // ★ BUILD 549: 恢复补丁
+                if (stealth::ShadowPageManager::Instance().IsInstalled()) {
+                    stealth::ShadowPageManager::Instance().ReapplyPatch();
+                    Sleep(50);
+                    g_patchReverted = false;
+                } else if (ApplyCs2Patch()) {
+                    // 回退模式: 检查返回值 — 失败则保持 g_patchReverted=true, 下次循环重试
                     g_patchReverted = false;
                 }
             }
@@ -1819,6 +1955,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     }
 
     // ★ BUILD 548: basic.exe 已移除, 不需要 TerminateBasicESP
+    // ★ BUILD 549: 卸载影子页 (恢复原 PTE + 释放 pageB), 必须在 DisableAll 卸载驱动前
+    stealth::ShadowPageManager::Instance().Uninstall();
     stealth::KernelDefense::DisableAll();
     StealthEngine::Instance().Shutdown();
     return 0;

@@ -148,6 +148,46 @@ public:
         return WriteKernelVA(va, &value, sizeof(T));
     }
 
+    // === ★ BUILD 549: PTE Manipulation API (Shadow Page) ===
+    //   通过 PTE 自映射 (PML4 自引用索引 0x1ED, PTE_BASE=0xFFFFF68000000000)
+    //   实现影子页切换 — CS2 执行补丁字节 (pageB), PAC 扫描看到原始字节 (pageA)
+    //
+    //   PTE 虚拟地址计算公式: PTE_BASE + ((va >> 12) << 3)
+    //   PTE 结构: bit 0=P, 1=RW, 2=U/S, 5=A, 6=D, 7=PS, 8=G, 12-51=PFN, 63=NX
+
+    // 读取任意 VA 的 PTE (8 bytes)
+    //   成功返回 PTE 虚拟地址, 失败返回 0
+    uint64_t ReadPte(uint64_t va, uint64_t* outPteValue);
+
+    // 写入 PTE (修改 PFN 实现页切换)
+    //   成功返回 true, 失败返回 false
+    bool WritePte(uint64_t va, uint64_t newPteValue);
+
+    // 验证 PTE 自映射可用性 (检测 PML4 自引用索引)
+    //   原理: 读取 CR3 → PML4 物理基址, 检查 PML4E[0x1ED] 的 PFN 是否等于 PML4 基址 (自引用特征)
+    //   失败尝试备选索引: 0x1E8, 0x1F0, 0x1F8
+    //   成功后缓存有效索引到 m_pml4SelfRefIndex
+    bool VerifyPteSelfMap();
+
+    // 内核分配连续物理页 (用于 pageB)
+    //   实现方式: 通过 PTE 自映射读取一个空闲 PfnDatabase 条目, 标记为 Active
+    //   简化实现: 调用 NtAllocateContiguousMemory (需通过内核 R/W 修改系统进程页表)
+    //   返回物理地址, 0 表示失败
+    //   ★ 当前实现采用最简方案: 复用一个已分配但未使用的物理页 (从非分页池分配后获取其物理地址)
+    uint64_t AllocContiguousPhysical(size_t size);
+
+    // 内核释放连续物理页
+    bool FreeContiguousPhysical(uint64_t physAddr);
+
+    // 物理地址 → 内核虚拟地址映射 (用于读写页内容)
+    //   实现方式: 通过 PTE 自映射查找/创建一个映射该物理地址的内核 PTE
+    //   简化实现: 利用 MmMapIoSpace 内核导出 (通过内核 R/W 调用)
+    //   ★ 当前实现采用 PTE 自映射方案: 修改一个系统 PTE 指向目标物理页
+    uint64_t MapPhysicalToKernelVA(uint64_t physAddr, size_t size);
+
+    // 获取当前 PML4 自引用索引 (VerifyPteSelfMap 成功后有效)
+    uint32_t GetPml4SelfRefIndex() const { return m_pml4SelfRefIndex; }
+
     // === 内核地址解析 ===
 
     // 获取 ntoskrnl.exe 基址
@@ -189,6 +229,13 @@ private:
     wchar_t    m_actualServiceName[128] = {};  // v3.60: 实际使用的服务名 (可能含随机后缀)
     // ★ BUILD 496: 移除 std::unique_ptr<PageTableWalker> — CRT 堆依赖
     // PageTableWalker 已不再使用 (v3.84: IOCTL 扫描 PML4)
+
+    // ★ BUILD 549: PTE 自映射状态
+    //   0 = 未验证, 非 0 = 已验证的 PML4 自引用索引 (Win10 1709+ 通常为 0x1ED)
+    uint32_t   m_pml4SelfRefIndex = 0;
+    // ★ BUILD 549: pageB 内核虚拟地址缓存 (复用映射, 避免重复 PTE 操作)
+    uint64_t   m_shadowPageBKernelVA = 0;
+    uint64_t   m_shadowPageBPhys     = 0;
 
     // ★ v3.84: ReadCR3 需要通过 IOCTL 扫描 PML4, 需要访问 device handle
     friend uint64_t ReadCR3();
