@@ -11,8 +11,9 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 533 (v3.191: IOCTL 频率优化 — 缓存 GetKernelModuleBase 模块基址 + FindObpCallbackArrayHead 地址,
-//        降低 ReDisablePacCallbacks 频率 5s→20-30s; 避免 PDFWKRNL.sys 5分钟内 7000+ IOCTL 资源耗尽卡死)
+// BUILD: 534 (v3.192: 修复 ReapplyAllCallbacks 高频调用 — 从 500-1500ms 降至 60-90s,
+//        解决 BUILD 533 仍卡死的根因: L1675 ReapplyAllCallbacks 绕过了 ReDisablePacCallbacks 的 20-30s 优化;
+//        5分钟 IOCTL 从 7000+ 降至 ~120, 降低 58 倍)
 // ============================================================
 
 #include "stealth_core.h"
@@ -1660,17 +1661,23 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             syscallCheckInterval = (int)RandomJitter(25, 10); // 每次重随机
         }
 
-        // ★ v3.126g: PAC 周期性监控 — 每500-1500ms 检查反作弊驱动是否加载,
+        // ★ v3.126g: PAC 周期性监控 — 检查反作弊驱动是否加载,
         //   如果加载则自动摘除内核回调, 解决反作弊在 BYOVD 之后启动的问题
-        //   短随机间隔确保反作弊初始化未完成时就被摘除, 不给反作弊可乘之机
         //   注意: 使用 GetTickCount 而非 frameCount, 避免 Sleep 波动影响
+        // ★ BUILD 534: 频率从 500-1500ms → 60-90s
+        //   原 500-1500ms 调用 ReapplyAllCallbacks (每次 15+ IOCTL), 5分钟 7000+ IOCTL
+        //   导致 PDFWKRNL.sys 资源耗尽卡死 (BUILD 532 在 300s 卡死, BUILD 533 在 160s 卡死).
+        //   ReapplyAllCallbacks 调用 DisableAll (ObCallbacks+ProcessNotify+ImageNotify),
+        //   ProcessNotify/ImageNotify 不需要频繁重新摘除 (PAC 不会频繁重注册).
+        //   ObCallbacks 的频繁重新摘除由 L1773 ReDisablePacCallbacks (20-30s) 负责.
+        //   5分钟内: ReapplyAllCallbacks 4次×15 IOCTL + ReDisablePacCallbacks 12次×5 IOCTL = ~120 IOCTL
         {
             static DWORD lastPacCheck = 0;
             DWORD nowTick = GetTickCount();
-            static DWORD pacCheckInterval = RandomJitter(500, 1000);
+            static DWORD pacCheckInterval = RandomJitter(60000, 30000);  // ★ BUILD 534: 60-90s
             if (nowTick - lastPacCheck >= pacCheckInterval) {
                 lastPacCheck = nowTick;
-                pacCheckInterval = RandomJitter(500, 1000);
+                pacCheckInterval = RandomJitter(60000, 30000);  // ★ BUILD 534: 60-90s 随机
                 if (stealth::KernelMemoryAccessor::Instance().IsActive()) {
                     stealth::KernelDefense::ReapplyAllCallbacks();
                 }
