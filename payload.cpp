@@ -11,7 +11,8 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 532 (v3.190: PDFWKRNL IOCTL 超时保护 — overlapped I/O + 2s 超时 + 10s 冷却, 防止驱动卡死导致主循环永久阻塞)
+// BUILD: 533 (v3.191: IOCTL 频率优化 — 缓存 GetKernelModuleBase 模块基址 + FindObpCallbackArrayHead 地址,
+//        降低 ReDisablePacCallbacks 频率 5s→20-30s; 避免 PDFWKRNL.sys 5分钟内 7000+ IOCTL 资源耗尽卡死)
 // ============================================================
 
 #include "stealth_core.h"
@@ -1757,9 +1758,16 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         //     不检查 PAC 是否重新注册了新回调。必须始终尝试重新移除。
         //     (memory 约束: "EAC callback removal must run in a periodic loop,
         //      with HasRemovedCallbacks() check removed to allow repeated attempts")
+        // ★ BUILD 533: 降低频率从 diagInterval(4-6s) → 20-30s
+        //   原每 5 秒调用一次 (60次/5分钟), 每次 20+ IOCTL, 总 7000+ IOCTL/5分钟
+        //   导致 PDFWKRNL.sys 资源耗尽卡死. 降至 20-30s → 10次/5分钟, 降低 6 倍.
+        //   BUILD 533 同时缓存 GetKernelModuleBase + ObpCallbackArrayHead, 进一步
+        //   减少 IOCTL (首次 20+ IOCTL, 后续 10+ IOCTL)
         static DWORD lastObCheckTime = 0;
-        if (now - lastObCheckTime >= diagInterval) {
+        static DWORD obCheckInterval = 20000;  // ★ BUILD 533: 20 秒起步
+        if (now - lastObCheckTime >= obCheckInterval) {
             lastObCheckTime = now;
+            obCheckInterval = RandomJitter(20000, 10000);  // 20-30 秒随机
             // 始终尝试重新移除 — ReDisablePacCallbacks 内部会扫描 ObpCallbackArray
             // 找到 PAC 注册的新回调并 NULL 化, 已移除的不会重复处理
             int reRemoved = stealth::EACCallbackDisabler::Instance().ReDisablePacCallbacks();

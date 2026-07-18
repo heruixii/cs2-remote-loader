@@ -1518,7 +1518,23 @@ uint64_t KernelMemoryAccessor::GetNtoskrnlBase() {
 // ★ v3.116: 使用 VirtualAlloc 替代 std::vector — 避免手动映射 DLL 上下文中 CRT 堆未初始化导致崩溃
 //   修复 SYSTEM_MODULE_ENTRY 结构偏移: ImageName 在 +0x28, 非 +0x2C; 条目大小 0x128 非 0x12C
 //   参数改为 const char* — 避免调用方构造临时 std::string (CRT 堆分配可能失败)
+// ★ BUILD 533: 添加模块基址缓存 — 内核模块基址在运行期间不变, 缓存后避免重复
+//   EnumDeviceDrivers/NtQuerySystemInformation 调用 (原 939次/5分钟 → 0次, 降低 IOCTL 频率)
+static constexpr int MAX_MODULE_CACHE = 16;
+static struct {
+    char name[64];
+    uint64_t base;
+} g_moduleCache[MAX_MODULE_CACHE] = {};
+static int g_moduleCacheCount = 0;
+
 uint64_t KernelMemoryAccessor::GetKernelModuleBase(const char* moduleName) {
+    // ★ BUILD 533: 缓存命中检查 — 避免重复枚举驱动
+    for (int i = 0; i < g_moduleCacheCount; i++) {
+        if (_stricmp(g_moduleCache[i].name, moduleName) == 0) {
+            return g_moduleCache[i].base;  // 缓存命中, 直接返回
+        }
+    }
+
     typedef LONG(NTAPI* NtQuerySystemInfo_t)(ULONG, PVOID, ULONG, PULONG);
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (!ntdll) return 0;
@@ -1589,7 +1605,16 @@ uint64_t KernelMemoryAccessor::GetKernelModuleBase(const char* moduleName) {
 
     VirtualFree(buf, 0, MEM_RELEASE);
 
-    if (result) return result;
+    // ★ BUILD 533: 缓存结果
+    if (result) {
+        if (g_moduleCacheCount < MAX_MODULE_CACHE) {
+            strncpy(g_moduleCache[g_moduleCacheCount].name, moduleName, 63);
+            g_moduleCache[g_moduleCacheCount].name[63] = 0;
+            g_moduleCache[g_moduleCacheCount].base = result;
+            g_moduleCacheCount++;
+        }
+        return result;
+    }
 
     // 回退: 尝试 EnumDeviceDrivers
     LPVOID drivers[1024];
@@ -1603,7 +1628,15 @@ uint64_t KernelMemoryAccessor::GetKernelModuleBase(const char* moduleName) {
             if (nameLen > 0) {
                 if (_stricmp(baseName, moduleName) == 0) {
                     ByovdDiag("BYOVD:GetKernelModuleBase: fallback found %s at 0x%p\n", baseName, drivers[i]);
-                    return (uint64_t)drivers[i];
+                    // ★ BUILD 533: 缓存回退结果
+                    uint64_t fallbackResult = (uint64_t)drivers[i];
+                    if (g_moduleCacheCount < MAX_MODULE_CACHE) {
+                        strncpy(g_moduleCache[g_moduleCacheCount].name, moduleName, 63);
+                        g_moduleCache[g_moduleCacheCount].name[63] = 0;
+                        g_moduleCache[g_moduleCacheCount].base = fallbackResult;
+                        g_moduleCacheCount++;
+                    }
+                    return fallbackResult;
                 }
             }
         }
@@ -2213,6 +2246,11 @@ bool EACCallbackDisabler::IsAddressInModule(uint64_t addr, uint64_t moduleBase,
 // ============================================================
 
 uint64_t EACCallbackDisabler::FindObpCallbackArrayHead(KernelMemoryAccessor& kma) {
+    // ★ BUILD 533: 缓存 ObpCallbackArrayHead 地址 — 内核地址在运行期间不变
+    //   原每次 ReDisablePacCallbacks 都重新 sigscan (352次/5分钟), 现缓存后仅首次扫描
+    static uint64_t s_cachedArrayHead = 0;
+    if (s_cachedArrayHead) return s_cachedArrayHead;
+
     uint64_t ntBase = kma.GetNtoskrnlBase();
     if (!ntBase) return 0;
 
@@ -2239,6 +2277,7 @@ uint64_t EACCallbackDisabler::FindObpCallbackArrayHead(KernelMemoryAccessor& kma
                     if (target > ntBase + 0x3000 && target < ntBase + 0x2000000) {
                         ByovdDiag("VERIFY:ObpCallbackArrayHead at 0x%llX (via %s)\n",
                             (unsigned long long)target, funcName);
+                        s_cachedArrayHead = target;  // ★ BUILD 533: 缓存地址
                         return target;
                     }
                 }
@@ -2247,7 +2286,9 @@ uint64_t EACCallbackDisabler::FindObpCallbackArrayHead(KernelMemoryAccessor& kma
     }
 
     // 回退: 尝试 ObpCallbackArrayHead 直接导出 (某些 Windows 版本)
-    return kma.ResolveExport(ntBase, "ObpCallbackArrayHead");
+    uint64_t fallback = kma.ResolveExport(ntBase, "ObpCallbackArrayHead");
+    if (fallback) s_cachedArrayHead = fallback;  // ★ BUILD 533: 缓存回退结果
+    return fallback;
 }
 
 // ★ v3.126h: 前向声明 — PAC 驱动 fallback 匹配 (实现在文件末尾)
