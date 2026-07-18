@@ -1,0 +1,22 @@
+BUILD 537: DKOM dynamic offset scan - adapt Win11 24H2 (pidOffset=0x1D0 linksOffset=0x1D8)
+
+Win11 24H2 Build 26100 EPROCESS offsets differ from 23H2:
+- UniqueProcessId: 0x440 (23H2) -> 0x1D0 (24H2)
+- ActiveProcessLinks: 0x448 (23H2) -> 0x1D8 (24H2)
+
+Changes:
+- byovd_kernel.h: add m_pidOffset/m_linksOffset member variables for caching
+- HideProcess(): dynamic scan 0x100-0x800, find field with value 4 (System PID),
+  triple-validate (kernel-range Flink/Blink + nextPid in 0-100000), cache offsets
+- UnhideProcess(): fix write target (prev.Flink/next.Blink instead of self NO-OP),
+  use m_linksOffset instead of hardcoded 0x448
+- Failure-safe Write order: next.Blink first (w2), prev.Flink second (w1) -
+  if w1 fails after w2 success, current still reachable via prev.Flink, no BSOD
+- Add 11 diagnostic log paths covering all return false/true cases
+
+Verified on Win11 24H2 Build 26100:
+- DKOM.HideProcess: offsets found - pidOffset=0x1D0 linksOffset=0x1D8
+- DKOM.HideProcess: FOUND pid=10160 SUCCESS (iter=451)
+- E+G: early DKOM hide (permanent, PG disabled): OK
+- Process hidden from tasklist/NtQuerySystemInformation
+- Main loop running (F=300+ frames)

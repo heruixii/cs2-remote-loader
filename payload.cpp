@@ -11,15 +11,16 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 540 (v3.198: 主循环 CS2 退出检测安全网 — 防止 TerminateProcess 路径 0x139 蓝屏;
-//        根因: DKOM 永久断链后, 进程被 TerminateProcess(任务管理器) 终止时 PspExitProcess
-//        的 RemoveEntryList 调试检查失败 → BugCheck 0x139 参数 3;
-//        21:42:37 第二次蓝屏即此路径 — 进程卡死后用户强制终止, VEH 不触发, DllMain DETACH 不触发;
-//        修复: 主循环每次迭代用 GetExitCodeProcess 检测 CS2 是否退出, 若退出则主动调用
-//        DisableAll(含 UnhideProcess) → return 0 安全退出, 避免 TerminateProcess 路径;
-//        保留: BUILD 539 VEH fatal + DllMain DETACH 调用 UnhideProcess;
-//        安全性: g_egTestMode(pac_probe) 无 CS2 句柄跳过检测; GetExitCodeProcess 无 syscall 痕迹;
-//                句柄暂时无效(ReopenProcessHandle 窗口期)时返回 FALSE 不误退出)
+// BUILD: 541 (v3.199: 修复 DKOM 断链期间新进程插入导致 0x139 蓝屏 — UnhideProcess 链表一致性检查 + 自循环回退;
+//        根因: HideProcess 后 prev→next (current 断链), 运行期间新进程 C 创建被内核插入到
+//        prev 和 next 之间 → prev→C→next; 原 UnhideProcess 写 prev->Flink=&current,
+//        next->Blink=&current 覆盖了 C 的链表项 → C 退出时 RemoveEntryList 检查失败 → 0x139;
+//        三次蓝屏确认: 21:16:37, 21:42:37, 22:40:50, 参数地址与 loader2 EPROC 完全不同 → 证实是其他进程退出触发;
+//        修复: UnhideProcess 读取 prev->Flink 和 next->Blink 当前值, 若链表未被修改
+//        (prev->Flink==原next 且 next->Blink==原prev) 则原逻辑恢复; 若链表被修改
+//        (有新进程 C 插入) 则使用自循环 (current->Flink=&current, current->Blink=&current),
+//        不修改 prev/next 避免破坏 C 的链表项; 自循环通过 RemoveEntryList 调试检查;
+//        保留: BUILD 539 VEH fatal + DllMain DETACH + BUILD 540 CS2 退出检测)
 // ============================================================
 
 #include "stealth_core.h"
@@ -1100,7 +1101,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.198 DIAG START (BUILD 540: Main-loop CS2 exit watchdog — prevents TerminateProcess path 0x139 BSOD) ===\n");
+    DiagLog("=== v3.199 DIAG START (BUILD 541: UnhideProcess list-integrity check + self-loop fallback — fixes 0x139 BSOD when new process inserted during DKOM hide) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // ★ BUILD 529: PAC PROBE 模式已废弃 — 改为 E+G 测试模式

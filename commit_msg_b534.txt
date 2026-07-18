@@ -1,0 +1,27 @@
+BUILD 534: fix ReapplyAllCallbacks high-frequency call causing PDFWKRNL.sys hang
+
+Root cause of BUILD 533 still hanging at 160s:
+- payload.cpp L1675 ReapplyAllCallbacks was called every 500-1500ms
+- This completely bypassed BUILD 533's ReDisablePacCallbacks 20-30s optimization
+- ReapplyAllCallbacks calls DisableAll (ObCallbacks+ProcessNotify+ImageNotify),
+  each call ~15 IOCTLs
+- 5min: 500-1500ms interval = ~300 calls × 15 IOCTLs = 4500+ IOCTLs
+- BUILD 533 cache reduced per-call IOCTLs but frequency unchanged → still hangs
+
+Fix (BUILD 534):
+- Lower ReapplyAllCallbacks frequency from 500-1500ms to 60-90s
+- ObCallbacks still covered by ReDisablePacCallbacks (20-30s) at L1773
+- ProcessNotify/ImageNotify don't need frequent re-removal (PAC doesn't re-register often)
+
+Expected 5min IOCTL budget:
+- ReapplyAllCallbacks: 4 calls × 15 IOCTLs = 60 IOCTLs
+- ReDisablePacCallbacks: 12 calls × 5 IOCTLs = 60 IOCTLs
+- Total: ~120 IOCTLs (vs BUILD 532's 7000+, 58x reduction)
+
+Test results leading to this fix:
+- BUILD 532: hung at 300s (7000+ IOCTLs, no cache)
+- BUILD 533: hung at 160s (cache reduced per-call IOCTLs but frequency unchanged)
+- BUILD 534: expected 10min+ stable (~120 IOCTLs/5min)
+
+Note: loader.exe (PID 21916) from BUILD 533 test is stuck on synchronous IOCTL,
+cannot be terminated (kernel IRP blocked). System restart required to test BUILD 534.

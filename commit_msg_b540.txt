@@ -1,0 +1,16 @@
+BUILD 540: main-loop CS2 exit watchdog - prevents TerminateProcess path 0x139 BSOD
+
+Root cause: DKOM permanent unlink + TerminateProcess(task manager kill)
+triggers PspExitProcess RemoveEntryList debug check failure -> BugCheck 0x139 arg3
+
+2nd BSOD at 21:42:37 was this path: process hung at F=5605, user force-killed
+loader2.exe, VEH did not fire, DllMain DETACH did not fire for manual-mapped DLL
+
+Fix: main loop checks CS2 exit via GetExitCodeProcess every iteration; when CS2
+exits, calls DisableAll(includes UnhideProcess) then return 0 for safe exit
+
+Retained: BUILD 539 VEH-fatal + DllMain DETACH UnhideProcess; BUILD 538
+ObCallbacks code-range matching; BUILD 537 Gamma-A DKOM permanent unlink
+
+Safety: g_egTestMode(pac_probe) skips check (no CS2 handle); GetExitCodeProcess
+returns FALSE on transient invalid handle (ReopenProcessHandle window) - no false exit

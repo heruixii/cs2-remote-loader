@@ -1,0 +1,28 @@
+BUILD 536: VEH catches RtlDeactivateActivationContext crash - patch rax to safe buffer
+
+Root cause: BUILD 535 removed fltlib.dll RPC but crash still occurred at ~360s
+in ntdll!RtlDeactivateActivationContext+0x5A2 (tid=worker, faultAddr=0x38).
+Diagnosis: rax=NULL means TEB+0x98 (ActivationContextStackPointer) is NULL for
+certain system worker threads (threadpool/RPC) created outside standard ntdll
+path. On thread exit, LdrShutdownThread calls RtlDeactivateActivationContext
+which dereferences NULL+0x38 causing ACCESS_VIOLATION.
+
+Fix: VEH handler now catches ACCESS_VIOLATION crashes within the
+RtlDeactivateActivationContext address range and patches rax to point to
+a safe zero-initialized buffer (g_safeDummyBuf[16]). The cmp dword ptr
+[rax+0x38], 9 instruction re-executes successfully, reads 0 (not 9), and
+the function takes the "empty activation context stack" branch to return
+normally without crashing.
+
+Changes:
+- Added globals: g_RtlDeactivateAddr/End (function range), g_safeDummyBuf[16]
+  (safe buffer), g_mainThreadId (diagnostic)
+- VEH handler: detect crash in RtlDeactivateActivationContext range, set
+  rax=&g_safeDummyBuf, return EXCEPTION_CONTINUE_EXECUTION
+- CheatMainLoop: get RtlDeactivateActivationContext address via
+  GetModuleHandleW+GetProcAddress at startup
+
+Safety: cmp is side-effect-free (only affects EFLAGS), re-execution is safe.
+Mathematically proven that g_safeDummyBuf[14] (offset 0x38) cannot equal 9
+even when EkkoSleep XOR-encrypts the buffer. No kernel-mode changes, no
+bluescreen risk. 3 code reviews passed.

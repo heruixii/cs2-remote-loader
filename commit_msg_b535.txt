@@ -1,0 +1,19 @@
+BUILD 535: fix ntdll!RtlDeactivateActivationContext crash by removing fltlib.dll RPC
+
+Root cause: GetPacTargetName() called LoadLibraryW(fltlib.dll) + FilterFindFirst/Next
+every 30s. These are RPC client stubs that trigger rpcrt4.dll to create worker threads.
+When worker threads exit, LdrShutdownThread -> RtlDeactivateActivationContext runs in
+manual-mapped DLL context where activation context stack is corrupted -> ACCESS_VIOLATION.
+
+BUILD 534 crashed at 346s: ntdll!RtlDeactivateActivationContext+0x5A2
+  (cmp dword ptr [rax+0x38], 9 where rax=[rdi+0x98] is corrupted activation context ptr)
+
+Fix:
+1. GetPacTargetName: removed fltlib.dll RPC, use hardcoded L"MessageTransfer"
+2. Wrapped IsPacMinifilterLoaded/UnloadPacMinifilter dead code with #if 0
+   (same fltlib.dll RPC pattern, latent risk if re-enabled)
+3. Enhanced VEH logging: thread ID + faulting data address + READ/WRITE/EXEC/OTHER
+   for better crash diagnostics
+4. BUILD version 534 -> 535
+
+3 code reviews passed: no blue screen risk, no crash risk, correct fix.

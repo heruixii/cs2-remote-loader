@@ -2916,24 +2916,64 @@ bool DKOMProcessHider::UnhideProcess() {
         return false;
     }
 
-    // ★ BUILD 537: 修复 UnhideProcess — 写入邻居节点的 Flink/Blink, 而非自身的
-    //   HideProcess 写: prev.Flink = next, next.Blink = prev (跳过 current)
-    //     prev.Flink 位于 m_blinkBackup 处 (m_blinkBackup = &prev.ActiveProcessLinks)
-    //     next.Blink 位于 m_flinkBackup + 8 处 (m_flinkBackup = &next.ActiveProcessLinks)
-    //   UnhideProcess 应写: prev.Flink = &current.ActiveProcessLinks, next.Blink = &current.ActiveProcessLinks
-    //     即重新把 current 链入 ActiveProcessLinks
-    //   注意: 写自身 current.Flink/Blink 是 NO-OP (HideProcess 未修改自身, 仅修改邻居)
+    // ★ BUILD 541: 修复 DKOM 断链期间新进程插入导致的 0x139 蓝屏
+    //   根因: HideProcess 后 prev→next (current 被断链). 运行期间若有新进程 C 创建,
+    //         内核将 C 插入到 prev 和 next 之间 → prev→C→next.
+    //         原 UnhideProcess 写 prev->Flink=&current, next->Blink=&current,
+    //         覆盖了 C 的链表项 → C 变成"悬空"节点 → C 退出时 RemoveEntryList
+    //         检查 prev->Flink==&C 失败 → BugCheck 0x139 参数 3.
+    //   三次蓝屏确认: 21:16:37, 21:42:37, 22:40:50, 均为 0x139 (3, addr1, addr2, 0),
+    //   参数地址与 loader2 EPROC 完全不同 → 证实是其他进程 (新插入的 C) 退出触发.
+    //
+    //   修复: UnhideProcess 时先检查链表是否被修改:
+    //     1. 读取 prev->Flink 和 next->Blink 当前值
+    //     2. 若 prev->Flink==m_flinkBackup(原next) 且 next->Blink==m_blinkBackup(原prev),
+    //        链表未被修改 → 使用原逻辑恢复 (写 prev->Flink=&current, next->Blink=&current)
+    //     3. 若链表被修改 (有新进程 C 插入) → 使用"自循环"回退:
+    //        写 current->Flink=&current, current->Blink=&current (不修改 prev/next)
+    //        自循环安全性: RemoveEntryList(&current) 检查
+    //          current->Blink->Flink == current->Flink == &current ✓
+    //          current->Flink->Blink == current->Blink == &current ✓
+    //        检查通过, 不会 0x139. 且不破坏 C 的链表项.
     uint64_t currentLinksVA = m_eprocess + m_linksOffset;
-    bool w1 = kma.Write(m_blinkBackup, currentLinksVA);       // prev.Flink = &current.ActiveProcessLinks
-    bool w2 = kma.Write(m_flinkBackup + 8, currentLinksVA);   // next.Blink = &current.ActiveProcessLinks
 
-    ByovdDiag("DKOM.UnhideProcess: w1(prev.Flink)=%d w2(next.Blink)=%d "
-              "(EPROC=0x%llX linksOffset=0x%X currentLinks=0x%llX)\n",
-        w1?1:0, w2?1:0, (unsigned long long)m_eprocess, m_linksOffset,
-        (unsigned long long)currentLinksVA);
+    // 读取 prev->Flink 和 next->Blink 的当前值, 检查链表是否被修改
+    uint64_t prevFlinkNow = kma.Read<uint64_t>(m_blinkBackup);     // prev->Flink 当前值
+    uint64_t nextBlinkNow = kma.Read<uint64_t>(m_flinkBackup + 8); // next->Blink 当前值
 
-    m_hidden = false;
-    return (w1 && w2);
+    bool listIntact = (prevFlinkNow == m_flinkBackup && nextBlinkNow == m_blinkBackup);
+
+    if (listIntact) {
+        // 链表未被修改 — 使用原逻辑恢复 (正确将 current 重新链入)
+        bool w1 = kma.Write(m_blinkBackup, currentLinksVA);       // prev.Flink = &current.ActiveProcessLinks
+        bool w2 = kma.Write(m_flinkBackup + 8, currentLinksVA);   // next.Blink = &current.ActiveProcessLinks
+
+        ByovdDiag("DKOM.UnhideProcess: list intact — w1(prev.Flink)=%d w2(next.Blink)=%d "
+                  "(EPROC=0x%llX linksOffset=0x%X currentLinks=0x%llX)\n",
+            w1?1:0, w2?1:0, (unsigned long long)m_eprocess, m_linksOffset,
+            (unsigned long long)currentLinksVA);
+
+        m_hidden = false;
+        return (w1 && w2);
+    } else {
+        // 链表被修改 — 有新进程 C 插入到 prev 和 next 之间
+        // 使用"自循环"回退: current->Flink=&current, current->Blink=&current
+        // 不修改 prev/next, 避免破坏新插入进程 C 的链表项
+        ByovdDiag("DKOM.UnhideProcess: LIST MODIFIED (new process inserted) — using self-loop "
+                  "(prevFlink=0x%llX expect=0x%llX, nextBlink=0x%llX expect=0x%llX, EPROC=0x%llX)\n",
+            (unsigned long long)prevFlinkNow, (unsigned long long)m_flinkBackup,
+            (unsigned long long)nextBlinkNow, (unsigned long long)m_blinkBackup,
+            (unsigned long long)m_eprocess);
+
+        bool w1 = kma.Write(currentLinksVA, currentLinksVA);       // current->Flink = &current (self-loop)
+        bool w2 = kma.Write(currentLinksVA + 8, currentLinksVA);   // current->Blink = &current (self-loop)
+
+        ByovdDiag("DKOM.UnhideProcess: self-loop w1(Flink)=%d w2(Blink)=%d (currentLinks=0x%llX)\n",
+            w1?1:0, w2?1:0, (unsigned long long)currentLinksVA);
+
+        m_hidden = false;
+        return (w1 && w2);
+    }
 }
 
 // ============================================================

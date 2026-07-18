@@ -1,0 +1,8 @@
+BUILD 532 fix: close-and-reopen overlapped handle for PDFWKRNL IOCTL timeout
+
+PDFWKRNL driver only allows one handle (second CreateFileW returns err=5).
+Replaced separate overlapped handle (g_hPdfwOverlapped) with close-and-reopen
+strategy (TrySwitchToOverlapped): close sync handle, reopen with
+FILE_FLAG_OVERLAPPED. On failure, restore sync handle (degraded but functional).
+
+Updated 4 Init success paths and Shutdown to use new approach.

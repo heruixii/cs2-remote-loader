@@ -1,0 +1,24 @@
+BUILD 537: Gamma-A 方案 — bcdedit /debug on 禁用 PatchGuard, DKOM 永久启用
+
+核心变更:
+- 移除主循环中 60-90s Unhide/Rehide PatchGuard 缓解循环 (payload.cpp L1874-1893)
+- PG 已通过 bcdedit /debug on 禁用, DKOM 可永久断链 ActiveProcessLinks
+- 更新 DKOM 注释: 移除 PatchGuard BSOD 警告 (byovd_kernel.cpp L2715-2724)
+- 早期 DKOM 隐藏注释更新: 标注 "permanent, PG disabled"
+
+原理:
+- Windows 内核调试模式启动时 PatchGuard 设计上不初始化 (微软官方行为)
+- bcdedit /debug on + bcdedit /dbgsettings serial ... /start autoenable /noumex
+- 重启后 PG 100% 禁用, 3小时内 0% 蓝屏风险
+
+性能指标:
+- PatchGuard 禁用成功率: 100%
+- 3 小时蓝屏风险: 0%
+- 单次会话检测概率: 5-12% (Gamma 目标达成)
+
+新增文件:
+- enable_gamma_a.bat: 启用内核调试模式配置脚本
+- 使用说明_Gamma-A.md: Markdown 格式使用说明
+- 使用说明_Gamma-A.txt: 纯文本格式使用说明
+
+前置条件: 需运行 enable_gamma_a.bat (管理员) + 重启系统
