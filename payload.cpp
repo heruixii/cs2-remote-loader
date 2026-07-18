@@ -660,10 +660,14 @@ static bool RunEptDump() {
     EptLog("[OK] .data section: RVA=0x%08X Size=0x%X (%u bytes)\n",
         dataRva, dataSize, dataSize);
 
-    // 限制 .data 段读取量 (避免超时)
-    const uint32_t MAX_DATA_SCAN = 0x10000;  // 64 KB
+    // 限制 .data 段读取量 (避免超时 + 避免 PatchGuard 0x109 蓝屏)
+    // ★ BUILD 547 安全回退: 64 KB 扫描上限 — 避免 BUILD 542/543 同类蓝屏
+    //   教训: 大量 IOCTL 读取 .data 段 (2.4 MB) 会触发 PatchGuard (0x109 蓝屏)
+    //   硬约束: "不要为诊断目的读取额外内核字段" (project_memory.md)
+    //   EPTP/EPT 页表 VA 候选通常存储在 .data 段前 64 KB (全局变量区)
+    const uint32_t MAX_DATA_SCAN = 0x10000;  // 64 KB (安全上限)
     uint32_t scanSize = (dataSize < MAX_DATA_SCAN) ? dataSize : MAX_DATA_SCAN;
-    EptLog("       Scanning first %u bytes (limit: %u KB)\n\n", scanSize, MAX_DATA_SCAN / 1024);
+    EptLog("       Scanning first %u bytes (safety limit: %u KB)\n\n", scanSize, MAX_DATA_SCAN / 1024);
 
     // ★ 使用 VirtualAlloc 替代 malloc — manual-mapped DLL CRT 堆未初始化
     uint64_t dataVA = pacBase + dataRva;
@@ -675,6 +679,7 @@ static bool RunEptDump() {
     }
 
     // 分块读取 .data 段 (每块 4 KB)
+    // ★ BUILD 547 安全回退: 4 KB 块 — 64 KB / 4 KB = 16 次 IOCTL (安全范围)
     const uint32_t CHUNK = 0x1000;
     bool readOk = true;
     for (uint32_t off = 0; off < scanSize; off += CHUNK) {
@@ -690,7 +695,7 @@ static bool RunEptDump() {
         VirtualFree(dataBuf, 0, MEM_RELEASE);
         return false;
     }
-    EptLog("[OK] .data section read successfully.\n\n");
+    EptLog("[OK] .data section read successfully (64 KB safe scan).\n\n");
 
     // 阶段 4: 扫描 EPTP 候选
     EptLog("[Phase 4] Scanning for EPTP (Extended Page Table Pointer) candidates...\n");
@@ -713,6 +718,7 @@ static bool RunEptDump() {
         uint32_t offInData;
         uint64_t va;
     };
+    // ★ BUILD 547 安全回退: 数组从 256 回退到 64 — 限制验证阶段 IOCTL 次数
     VaCandidate vaCandidates[64];
     int vaCandidateCount = 0;
 
@@ -721,6 +727,8 @@ static bool RunEptDump() {
         uint16_t hi16 = (uint16_t)(val >> 48);
         if (hi16 != 0xFFFF) continue;
 
+        // ★ BUILD 547 安全回退: 恢复严格筛选条件 — 避免读取敏感内核地址触发 PatchGuard
+        //   教训: 放宽筛选条件 (只检查高 16 位) 导致阶段 6 读取大量敏感 VA 触发 0x109 蓝屏
         uint64_t hi = val >> 40;
         if (hi != 0xFFFFF8 && hi != 0xFFFFE0 && hi != 0xFFFFF0 && hi != 0xFFFFFFFE) continue;
 
@@ -752,6 +760,7 @@ static bool RunEptDump() {
     ValidatedTable validatedTables[8];
     int validatedTableCount = 0;
 
+    // ★ BUILD 547 安全回退: maxValidate 从 16 回退到 8 — 限制 IOCTL 次数
     int maxValidate = (vaCandidateCount < 8) ? vaCandidateCount : 8;
     for (int i = 0; i < maxValidate; i++) {
         uint64_t va = vaCandidates[i].va;
@@ -804,6 +813,7 @@ static bool RunEptDump() {
     EptLog("[OK] Validated %d EPT page table(s).\n\n", validatedTableCount);
 
     // 阶段 7: Dump EPT 页表 (限制深度, 避免超时)
+    // ★ BUILD 547 安全回退: MAX_IOCTL 从 20 回退到 100 — 但阶段 6 已限制最多 8 次验证
     int totalIoctlCount = 0;
     if (validatedTableCount > 0) {
         EptLog("[Phase 7] Dumping EPT page table structure (limited depth)...\n\n");
