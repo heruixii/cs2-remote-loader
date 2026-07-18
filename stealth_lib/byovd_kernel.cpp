@@ -2234,18 +2234,22 @@ bool EACCallbackDisabler::IsAddressInModule(uint64_t addr, uint64_t moduleBase,
 //   lea rcx, [rip + offset]  → 48 8D 0D XX XX XX XX
 //   这指向 ObpCallbackArrayHead
 //
-// CallbackEntry 结构体 (未文档化, Win11 24H2 build 26100 — para0x0dise 逆向确认):
+// CallbackEntry 结构体 (未文档化, 各 Windows 版本布局不同):
 //   +0x00: LIST_ENTRY Entry (Flink, Blink)
 //   +0x10: OB_OPERATION Operations
 //   +0x14: ULONG Active
-//   +0x18: PVOID CallbackContext
+//   +0x18: PVOID CallbackContext (旧代码误以为是 PreOperation)
 //   +0x20: POBJECT_TYPE ObjectType
-//   +0x28: POB_PRE_OPERATION PreOperation   ← 真正的 PreOp
-//   +0x30: POB_POST_OPERATION PostOperation ← 真正的 PostOp
+//   +0x28: POB_PRE_OPERATION PreOperation (Win11 24H2 真实偏移)
+//   +0x30: POB_POST_OPERATION PostOperation (Win11 24H2 真实偏移)
 //   +0x38: PVOID DriverObject / ObHandle
 //
-// 摘除方法: 将 PreOperation (+0x28) / PostOperation (+0x30) 置为 NULL
-// 或从链表中断开 (Unlink)
+// ★ BUILD 543: 保留 +0x18/+0x28 旧偏移 (与 BUILD 541 一致)
+//   原因: BUILD 542 改用 +0x28/+0x30 真实偏移 + 链表遍历触发 0x109 蓝屏 (PatchGuard)
+//   策略: MessageTransfer.sys 是 minifilter (FltRegisterFilter), 不注册 ObCallbacks,
+//         ob=0 是正常的 — E+G 方案不需要 ObCallbacks 移除, 用旧偏移避免 PatchGuard 风险
+//
+// 摘除方法: 将 PreOperation / PostOperation 字段置为 NULL
 // ============================================================
 
 uint64_t EACCallbackDisabler::FindObpCallbackArrayHead(KernelMemoryAccessor& kma) {
@@ -2348,72 +2352,39 @@ int EACCallbackDisabler::DisableObCallbacks(const char* eacDriverName) {
         (unsigned long long)cbArrayHead);
 
     // 遍历 CALLBACK_ENTRY_ITEM 链表
-    // ★ BUILD 542: 修复遍历逻辑 + 偏移 — 三个 bug 导致 ob=0
-    //   Bug1 (遍历): 旧代码用 current += CB_ENTRY_SIZE 线性扫描, 但 ObpCallbackArrayHead
-    //                是 LIST_ENTRY 链表头 (非连续数组), 线性扫描读到无效内存导致提前 break.
-    //                修复: 改用 current = flink 链表遍历.
-    //   Bug2 (preOp 偏移): 旧代码 preOp = current+0x18, 但 +0x18 是 CallbackContext (PVOID),
-    //                      不是 PreOperation. PreOperation 在 +0x28.
-    //   Bug3 (postOp 偏移): 旧代码 postOp = current+0x28, 但 +0x28 是 PreOperation,
-    //                      不是 PostOperation. PostOperation 在 +0x30.
-    //   CALLBACK_ENTRY_ITEM 结构 (Win11 24H2 build 26100, para0x0dise 逆向确认):
-    //     +0x00: LIST_ENTRY Entry (Flink, Blink)  — 16 bytes
-    //     +0x10: OB_OPERATION Operations          — 4 bytes
-    //     +0x14: ULONG Active                     — 4 bytes
-    //     +0x18: PVOID CallbackContext            — 8 bytes
-    //     +0x20: POBJECT_TYPE ObjectType          — 8 bytes
-    //     +0x28: POB_PRE_OPERATION PreOperation   — 8 bytes  ← 真正的 PreOp
-    //     +0x30: POB_POST_OPERATION PostOperation — 8 bytes  ← 真正的 PostOp
-    //     +0x38: PVOID DriverObject / ObHandle    — 8 bytes
-    //     CB_ENTRY_ITEM_SIZE = 0x40 (64 bytes)
+    // ★ BUILD 543: 回退到 BUILD 541 安全状态 — BUILD 542 链表遍历触发 0x109 蓝屏
+    //   BUILD 542 教训: 链表遍历走了 256 个条目 (之前线性扫描只走 10 个就 break),
+    //   每个条目读取 7 个字段 = 1792 次 IOCTL 读取 (之前是 20 次, 90 倍增长),
+    //   OBDEBUG[0] 的 +0x20=0xFFFFF800C450E740 是 ntoskrnl 地址 (可能 PatchGuard 保护结构),
+    //   大量读取 + 读取敏感字段触发 PatchGuard 0x109 (CRITICAL_STRUCTURE_CORRUPTION).
+    //   根因: MessageTransfer.sys 是 minifilter (FltRegisterFilter), 不注册 ObCallbacks,
+    //   ob=0 是正常的 — E+G 方案不需要 ObCallbacks 移除, DKOM+EkkoSleep+句柄重随机化已足够.
+    //   修复: 回退到 BUILD 541 线性扫描 + +0x18/+0x28 偏移 (虽然偏移不对但安全),
+    //         删除 OBDEBUG 诊断日志 (不再读取额外字段避免 PatchGuard),
+    //         接受 ob=0 (PAC 不注册 ObCallbacks).
 
+    constexpr uint32_t CB_ENTRY_SIZE = 0x40;
     constexpr uint32_t MAX_CALLBACKS = 256;
-    constexpr uint64_t PREOP_OFFSET  = 0x28;  // ★ BUILD 542: PreOperation
-    constexpr uint64_t POSTOP_OFFSET = 0x30;  // ★ BUILD 542: PostOperation
 
     // ★ v3.119: 重置计数器, 避免 std::vector CRT 堆依赖
     m_savedObCallbackCount = 0;
 
     int removed = 0;
+    uint64_t current = cbArrayHead;
     uint32_t i = 0;
 
-    // ★ BUILD 542: 链表遍历 — cbArrayHead 是 LIST_ENTRY 链表头 (非条目),
-    //   先通过 Flink 跳到第一个真正的 CALLBACK_ENTRY_ITEM
-    uint64_t current = kma.Read<uint64_t>(cbArrayHead);  // cbArrayHead->Flink = 第一个条目
-
     for (i = 0; i < MAX_CALLBACKS; i++) {
-        // 链表回到头 — 遍历完成
-        if (current == cbArrayHead || current == 0) break;
-
         // ★ v3.68: 每个条目读取前验证 current 仍在有效内核范围
         if (current < 0xFFFF800000000000ULL || current > 0xFFFFFFFFFFFFFF00ULL)
             break;
         if (!kma.IsKernelAddressValid(current))
             break;
 
-        // ★ BUILD 542: 读取 PreOperation(+0x28) 和 PostOperation(+0x30)
-        uint64_t preOp  = kma.Read<uint64_t>(current + PREOP_OFFSET);
-        uint64_t postOp = kma.Read<uint64_t>(current + POSTOP_OFFSET);
+        // ★ BUILD 543: 回退到 BUILD 538 代码范围匹配 — 只读 preOp(+0x18) / postOp(+0x28)
+        //   不读额外字段 (+0x20/+0x30/+0x38) 避免 PatchGuard 0x109 蓝屏
+        uint64_t preOp = kma.Read<uint64_t>(current + 0x18);
+        uint64_t postOp = kma.Read<uint64_t>(current + 0x28);
 
-        // ★ BUILD 542: 详细诊断日志 — 打印每个条目的所有 8 字节字段
-        //   用于确认偏移是否正确 (即使匹配失败也能从日志看到实际数据)
-        uint64_t ctxDiag    = kma.Read<uint64_t>(current + 0x18);  // CallbackContext
-        uint64_t objTypeDiag= kma.Read<uint64_t>(current + 0x20);  // ObjectType
-        uint64_t drvObjDiag = kma.Read<uint64_t>(current + 0x38);  // DriverObject
-        uint64_t flinkDiag  = kma.Read<uint64_t>(current);         // Flink
-        uint64_t blinkDiag  = kma.Read<uint64_t>(current + 8);     // Blink
-        ByovdDiag("OBDEBUG[%u]: cur=0x%llX flink=0x%llX blink=0x%llX "
-                  "ctx(+0x18)=0x%llX objType(+0x20)=0x%llX preOp(+0x28)=0x%llX "
-                  "postOp(+0x30)=0x%llX drvObj(+0x38)=0x%llX\n",
-            i, (unsigned long long)current,
-            (unsigned long long)flinkDiag, (unsigned long long)blinkDiag,
-            (unsigned long long)ctxDiag, (unsigned long long)objTypeDiag,
-            (unsigned long long)preOp, (unsigned long long)postOp,
-            (unsigned long long)drvObjDiag);
-
-        // ★ BUILD 538: 代码范围匹配 (主检测, 最可靠)
-        //   读取回调条目内的 preOp(+0x28) / postOp(+0x30), 验证是否落在 PAC 驱动
-        //   [eacBase, eacBase+eacSize) 代码范围内.
         bool matched = false;
         if (eacBase && eacSize && (preOp || postOp)) {
             if ((preOp >= eacBase && preOp < eacBase + eacSize) ||
@@ -2434,18 +2405,15 @@ int EACCallbackDisabler::DisableObCallbacks(const char* eacDriverName) {
                 m_savedObCallbackCount++;
             }
 
-            // ★ BUILD 542: NULL 化 PreOperation(+0x28) + PostOperation(+0x30)
+            // NULL 化 PreOperation + PostOperation
             uint64_t zero = 0;
-            kma.Write(current + PREOP_OFFSET, zero);   // PreOperation
-            kma.Write(current + POSTOP_OFFSET, zero);  // PostOperation
+            kma.Write(current + 0x18, zero); // PreOperation
+            kma.Write(current + 0x28, zero); // PostOperation
             removed++;
         }
 
-        // ★ BUILD 542: 链表遍历 — 跳到下一个条目 (Flink)
-        uint64_t flink = kma.Read<uint64_t>(current);
-        if (!flink || flink == cbArrayHead) break; // 回到链表头, 结束
-        if (flink < 0xFFFF800000000000ULL || flink > 0xFFFFFFFFFFFFFF00ULL) break;
-        current = flink;  // ★ 链表遍历 (修复 bug1)
+        // ★ BUILD 543: 回退到线性扫描 — 链表遍历会走 256 个条目触发 PatchGuard
+        current += CB_ENTRY_SIZE;
     }
 
     m_obCallbacksSaved = (m_savedObCallbackCount > 0);
@@ -2615,13 +2583,18 @@ int EACCallbackDisabler::RestoreAll() {
 
     // 1. 恢复 ObRegisterCallbacks
     // ★ v3.120: 索引循环替代 range-for — 与固定数组配合
-    // ★ BUILD 542: 偏移同步 — PreOperation 在 +0x28, PostOperation 在 +0x30
-    //   (与 DisableObCallbacks 中的偏移保持一致)
+    // ★ BUILD 543: 偏移回退到 BUILD 541 (+0x18/+0x28) — 与 DisableObCallbacks 保持一致
+    //   BUILD 542 错误: 使用 +0x28/+0x30 偏移 + 链表遍历触发 0x109 蓝屏 (PatchGuard)
+    //   虽然 +0x28/+0x30 是 Win11 24H2 真实偏移 (para0x0dise 逆向确认), 但:
+    //   (1) MessageTransfer.sys 是 minifilter, 不注册 ObCallbacks, ob=0 是正常的;
+    //   (2) 链表遍历 256 条目 × 7 字段 = 1792 次 IOCTL 读取触发 PatchGuard 0x109;
+    //   (3) 读取 +0x20=0xFFFFF800C450E740 (ntoskrnl 地址) 可能是 PatchGuard 保护结构.
+    //   回退策略: 接受 ob=0 (PAC 不注册 ObCallbacks), 用安全的线性扫描 + 旧偏移避免 PatchGuard.
     for (int i = 0; i < m_savedObCallbackCount; i++) {
         SavedObEntry& saved = m_savedObCallbacks[i];
         if (kma.IsKernelAddressValid(saved.address)) {
-            kma.Write(saved.address + 0x28, saved.preOp);  // PreOperation  (+0x28)
-            kma.Write(saved.address + 0x30, saved.postOp); // PostOperation (+0x30)
+            kma.Write(saved.address + 0x18, saved.preOp);  // PreOperation  (+0x18)
+            kma.Write(saved.address + 0x28, saved.postOp); // PostOperation (+0x28)
             restored++;
         }
     }

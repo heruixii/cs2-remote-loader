@@ -11,25 +11,27 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 542 (v3.200: 修复 ObCallbacks ob=0 — DisableObCallbacks 三个 bug 导致未匹配到 PAC 回调;
-//        根因1 (遍历 bug): 旧代码用 current += CB_ENTRY_SIZE 线性扫描, 但 ObpCallbackArrayHead
-//        是 LIST_ENTRY 链表头 (非连续数组), 线性扫描读到无效内存导致 IsKernelAddressValid 失败
-//        提前 break, 实际只走 10 个条目 (日志: "10 entries walked, 0 matched");
-//        根因2 (preOp 偏移 bug): 旧代码 preOp = current+0x18, 但 +0x18 是 CallbackContext (PVOID),
-//        不是 PreOperation. PreOperation 在 +0x28;
-//        根因3 (postOp 偏移 bug): 旧代码 postOp = current+0x28, 但 +0x28 是 PreOperation,
-//        不是 PostOperation. PostOperation 在 +0x30;
-//        CALLBACK_ENTRY_ITEM 结构 (Win11 24H2 build 26100, para0x0dise 逆向确认):
-//          +0x00 LIST_ENTRY Entry / +0x10 OB_OPERATION Operations / +0x14 ULONG Active
-//          +0x18 CallbackContext / +0x20 ObjectType
-//          +0x28 PreOperation ← 真正的 PreOp
-//          +0x30 PostOperation ← 真正的 PostOp
-//          +0x38 DriverObject / ObHandle; CB_ENTRY_ITEM_SIZE = 0x40
-//        修复: (1) 遍历改用 current = flink 链表遍历, 先 flink 跳过链表头到第一个条目;
-//        (2) preOp 偏移 +0x18 → +0x28; (3) postOp 偏移 +0x28 → +0x30;
-//        (4) NULL 化偏移 +0x18/+0x28 → +0x28/+0x30; (5) RestoreAll 同步修改偏移;
-//        (6) 添加 OBDEBUG 诊断日志打印每个条目的所有字段 (cur/flink/blink/ctx/objType/preOp/postOp/drvObj)
-//        便于后续验证偏移正确性;
+// BUILD: 543 (v3.201: 回退到 BUILD 541 安全状态 — BUILD 542 触发 0x109 蓝屏 (CRITICAL_STRUCTURE_CORRUPTION);
+//        蓝屏根因: BUILD 542 在 DisableObCallbacks 中改用链表遍历 (current=flink) + 真实偏移
+//        (+0x28 PreOp / +0x30 PostOp) + OBDEBUG 诊断日志读取额外字段:
+//          (1) 链表遍历走了 256 个条目 (BUILD 541 线性扫描只走 10 个就 break);
+//          (2) 每个条目读取 7 个字段 (flink/blink/+0x18/+0x20/+0x28/+0x30/+0x38) = 1792 次 IOCTL 读取
+//              (BUILD 541 是 20 次, 90 倍增长);
+//          (3) OBDEBUG[0] 的 +0x20=0xFFFFF800C450E740 是 ntoskrnl 地址 (可能 PatchGuard 保护结构);
+//          大量读取 + 读取敏感字段触发 PatchGuard 0x109 (CRITICAL_STRUCTURE_CORRUPTION).
+//        BugCheck 参数: 0x109 (0xa3a025e6db898508, 0xb3b7326cf0598f93, 0xffffe68e4af08080, 0x1a)
+//        关键发现: MessageTransfer.sys 是 minifilter (FltRegisterFilter), 不注册 ObCallbacks,
+//        ob=0 是正常的 — E+G 方案不需要 ObCallbacks 移除, DKOM+EkkoSleep+句柄重随机化已足够.
+//        回退内容:
+//          (1) DisableObCallbacks: 链表遍历 → 线性扫描 (current += CB_ENTRY_SIZE);
+//          (2) 偏移: +0x28/+0x30 → +0x18/+0x28 (与 BUILD 541 一致, 虽然偏移不对但安全);
+//          (3) NULL 化偏移: +0x28/+0x30 → +0x18/+0x28;
+//          (4) RestoreAll 偏移: +0x28/+0x30 → +0x18/+0x28;
+//          (5) 删除 OBDEBUG 诊断日志 (不再读取额外字段避免 PatchGuard);
+//          (6) 接受 ob=0 (PAC 不注册 ObCallbacks).
+//        教训: 不要读取额外内核字段用于诊断 — 可能触发 PatchGuard; ob=0 是正常的, 不应
+//        为了"修复" ob=0 而引入大量诊断读取; 真实偏移 (para0x0dise 逆向确认) 在 manual-mapped
+//        DLL 上下文中读取大量条目仍会触发 PatchGuard, 即使 bcdedit /debug on 已禁用部分 PG 检查.
 //        保留: BUILD 541 UnhideProcess 链表一致性检查 + 自循环回退;
 //        保留: BUILD 539 VEH fatal + DllMain DETACH + BUILD 540 CS2 退出检测)
 // ============================================================
@@ -1112,7 +1114,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.200 DIAG START (BUILD 542: fix ob=0 — DisableObCallbacks use Flink traversal + correct PreOp(+0x28)/PostOp(+0x30) offsets, was linear scan + wrong offsets) ===\n");
+    DiagLog("=== v3.201 DIAG START (BUILD 543: revert to BUILD 541 safe state — BUILD 542 triggered 0x109 BSOD from 1792 IOCTL reads via Flink traversal + OBDEBUG field reads; ob=0 is normal since MessageTransfer.sys is minifilter, not ObCallbacks) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // ★ BUILD 529: PAC PROBE 模式已废弃 — 改为 E+G 测试模式
