@@ -11,9 +11,11 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 534 (v3.192: 修复 ReapplyAllCallbacks 高频调用 — 从 500-1500ms 降至 60-90s,
-//        解决 BUILD 533 仍卡死的根因: L1675 ReapplyAllCallbacks 绕过了 ReDisablePacCallbacks 的 20-30s 优化;
-//        5分钟 IOCTL 从 7000+ 降至 ~120, 降低 58 倍)
+// BUILD: 535 (v3.193: 修复 ntdll!RtlDeactivateActivationContext 崩溃 — 移除 GetPacTargetName 中
+//        fltlib.dll RPC 调用 (LoadLibraryW+FilterFindFirst/Next), 改用硬编码 L"MessageTransfer";
+//        根因: fltlib.dll RPC 创建 worker 线程, 退出时激活上下文栈损坏 → ACCESS_VIOLATION;
+//        BUILD 534 在 346s 崩溃于 ntdll+0x72152 (RtlDeactivateActivationContext+0x5A2);
+//        同时增强 VEH 日志: 记录线程 ID + 故障数据地址, 便于后续诊断)
 // ============================================================
 
 #include "stealth_core.h"
@@ -85,9 +87,24 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     uint64_t dllBase   = (uint64_t)g_diagDllBase;
     uint64_t offset    = (dllBase && crashAddr >= dllBase) ? (crashAddr - dllBase) : 0;
     DWORD code = ep->ExceptionRecord->ExceptionCode;
+    DWORD tid  = GetCurrentThreadId();  // ★ BUILD 535: 记录崩溃线程 ID
 
-    DiagLog("CRASH: code=0x%08X addr=0x%llX off=%llX\n",
-        code, crashAddr, offset);
+    // ★ BUILD 535: 增强 VEH 日志 — 记录线程 ID + 故障数据地址 (ACCESS_VIOLATION)
+    //   对于 0xC0000005: ExceptionInformation[0]=0(read)/1(write)/8(exec), [1]=故障数据地址
+    //   用于诊断 RtlDeactivateActivationContext 类崩溃 (区分主线程 vs worker 线程)
+    if (code == 0xC0000005 && ep->ExceptionRecord->NumberParameters >= 2) {
+        ULONG_PTR readWrite = ep->ExceptionRecord->ExceptionInformation[0];
+        ULONG_PTR faultAddr = ep->ExceptionRecord->ExceptionInformation[1];
+        const char* accessType = (readWrite == 0) ? "READ"
+                               : (readWrite == 1) ? "WRITE"
+                               : (readWrite == 8) ? "EXEC" : "OTHER";
+        DiagLog("CRASH: code=0x%08X addr=0x%llX off=%llX tid=%u AV:%s faultAddr=0x%llX\n",
+            code, crashAddr, offset, tid,
+            accessType, (unsigned long long)faultAddr);
+    } else {
+        DiagLog("CRASH: code=0x%08X addr=0x%llX off=%llX tid=%u\n",
+            code, crashAddr, offset, tid);
+    }
 
     // ★ v3.78: VEH 自愈 — 捕获 BYOVD IOCTL 导致的代码/数据污染
     //   STATUS_PRIVILEGED_INSTRUCTION (0xC0000096): 执行了被物理映射覆盖的代码页
@@ -100,8 +117,9 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
         uintptr_t backupEnd   = backupStart + g_backupLen;
         if (crashAddr < backupStart || crashAddr >= backupEnd) {
             // 崩溃不在 payload 代码区域, 不自愈 (可能是系统 DLL 或栈)
-            DiagLog("VEH: crash outside backup range [0x%llX-0x%llX), skipping self-heal\n",
-                (unsigned long long)backupStart, (unsigned long long)backupEnd);
+            // ★ BUILD 535: 记录线程 ID 帮助诊断 worker 线程崩溃
+            DiagLog("VEH: crash outside backup range [0x%llX-0x%llX), skipping self-heal tid=%u\n",
+                (unsigned long long)backupStart, (unsigned long long)backupEnd, tid);
             goto veh_fatal;
         }
 

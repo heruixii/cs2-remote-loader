@@ -5250,6 +5250,12 @@ static bool IsPacPattern(const wchar_t* name) {
 
 // ★ v3.126p: 统一 PAC 目标名获取 — 支持改名容错
 // ★ BUILD 497: 固定数组替代 std::wstring — 避免 CRT 堆依赖
+// ★ BUILD 535: 移除 LoadLibraryW(fltlib.dll) + FilterFindFirst/Next RPC 调用
+//   根因: fltlib.dll 的 FilterFindFirst/Next 是 RPC 客户端 stub, 会触发 rpcrt4.dll
+//   创建 RPC worker 线程。worker 线程退出时 LdrShutdownThread → RtlDeactivateActivationContext,
+//   在 manual-mapped DLL 上下文中激活上下文栈损坏 → ACCESS_VIOLATION 崩溃
+//   (BUILD 534 在 346s 崩溃于 ntdll!RtlDeactivateActivationContext+0x5A2, cmp [rax+0x38],9)
+//   修复: 直接使用硬编码 L"MessageTransfer" (项目唯一 PAC 目标, 不改名)
 static wchar_t g_cachedPacName[256] = {};
 static DWORD   g_lastPacNameCheck = 0;
 
@@ -5259,27 +5265,11 @@ static const wchar_t* GetPacTargetName() {
         return g_cachedPacName;
     g_lastPacNameCheck = now;
 
-    // 枚举所有 minifilter, 找 PAC 匹配
-    wchar_t found[256] = {};
-    HMODULE hFltLib = LoadLibraryW(L"fltlib.dll");
-    if (hFltLib) {
-        auto pFF = (HRESULT(WINAPI*)(DWORD,LPVOID,DWORD,LPDWORD,LPVOID))GetProcAddress(hFltLib,"FilterFindFirst");
-        auto pFN = (HRESULT(WINAPI*)(HANDLE,LPVOID,DWORD,LPDWORD))GetProcAddress(hFltLib,"FilterFindNext");
-        auto pFC = (HRESULT(WINAPI*)(HANDLE))GetProcAddress(hFltLib,"FilterFindClose");
-        if (pFF && pFN && pFC) {
-            BYTE buf[1024]={}; HANDLE hF=nullptr; DWORD br=0;
-            HRESULT hr = pFF(0,buf,sizeof(buf),&br,&hF);
-            while (SUCCEEDED(hr)) {
-                wchar_t* fn = (wchar_t*)(buf+8);
-                if (IsPacPattern(fn)) { wcscpy_s(found, fn); break; }
-                hr = pFN(hF,buf,sizeof(buf),&br);
-            }
-            if (hF) pFC(hF);
-        }
-        FreeLibrary(hFltLib);
-    }
-    if (!found[0]) wcscpy_s(found, L"MessageTransfer"); // 回退默认
-    wcscpy_s(g_cachedPacName, found);
+    // ★ BUILD 535: 直接使用硬编码 PAC 名 — 不再调用 fltlib.dll RPC
+    //   项目唯一 PAC 目标是 MessageTransfer.sys (完美世界 CS2 反作弊 minifilter)
+    //   历史改名容错已不需要 (MessageTransfer 不会被改名)
+    //   fltlib.dll RPC 枚举路径已移除 (参见函数头注释)
+    wcscpy_s(g_cachedPacName, L"MessageTransfer");
     return g_cachedPacName;
 }
 
@@ -5444,6 +5434,11 @@ static uint64_t FindPacFilterInKernel(uint64_t fltmgrBase, uint64_t fltGlobals, 
     return 0;
 }
 
+// ★ BUILD 535: fltlib.dll RPC 函数全部废弃 — 与 GetPacTargetName 同根因
+//   (rpcrt4 worker 线程退出 → RtlDeactivateActivationContext → 激活上下文栈损坏 → 崩溃)
+//   IsPacMinifilterLoaded / UnloadPacMinifilter 当前无调用者 (GuardPac 已 #if 0, DisablePac 已注释)
+//   保留定义以备未来参考, 但必须先解决 manual-mapped DLL 激活上下文问题才能启用
+#if 0
 // 动态加载 fltlib.dll 的 FilterUnload 函数 (无需 WDK)
 typedef HRESULT (WINAPI* _FilterUnload)(LPCWSTR lpFilterName);
 // ★ v3.126l: FilterFindFirst/FilterFindNext — 枚举已加载 minifilter
@@ -5497,6 +5492,7 @@ static bool IsPacMinifilterLoaded() {
     FreeLibrary(hFltLib);
     return found;
 }
+#endif // BUILD 535: IsPacMinifilterLoaded 废弃
 
 static bool DisablePacService() {
     ByovdDiag("PAC:DisablePacService: opening SCM...\n");
@@ -5555,6 +5551,7 @@ static bool DisablePacService() {
     return true;
 }
 
+#if 0 // BUILD 535: UnloadPacMinifilter 废弃 (fltlib.dll RPC, 与 GetPacTargetName 同根因)
 static bool UnloadPacMinifilter() {
     // 动态加载 fltlib.dll → FilterUnload
     HMODULE hFltLib = LoadLibraryW(L"fltlib.dll");
@@ -5584,6 +5581,7 @@ static bool UnloadPacMinifilter() {
         return (hr == 0x801F0010 || hr == 0x801F000F); // 不算失败
     }
 }
+#endif // BUILD 535: UnloadPacMinifilter 废弃
 
 static void DeletePacDriverFiles() {
     // 1. 完美平台 plugin 目录中的 MessageTransfer.sys
