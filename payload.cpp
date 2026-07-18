@@ -11,11 +11,14 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 535 (v3.193: 修复 ntdll!RtlDeactivateActivationContext 崩溃 — 移除 GetPacTargetName 中
-//        fltlib.dll RPC 调用 (LoadLibraryW+FilterFindFirst/Next), 改用硬编码 L"MessageTransfer";
-//        根因: fltlib.dll RPC 创建 worker 线程, 退出时激活上下文栈损坏 → ACCESS_VIOLATION;
-//        BUILD 534 在 346s 崩溃于 ntdll+0x72152 (RtlDeactivateActivationContext+0x5A2);
-//        同时增强 VEH 日志: 记录线程 ID + 故障数据地址, 便于后续诊断)
+// BUILD: 536 (v3.194: VEH 捕获 ntdll!RtlDeactivateActivationContext 崩溃 — worker 线程激活上下文栈 NULL 修复;
+//        根因: BUILD 535 移除 fltlib.dll RPC 后仍在 ~360s 崩溃于 ntdll+0x72152 (RtlDeactivateActivationContext+0x5A2),
+//        诊断显示 tid=非主线程, faultAddr=0x38 表示 rax=NULL (TEB ActivationContextStackPointer 未初始化);
+//        崩溃指令 cmp dword ptr [rax+0x38], 9 解引用 NULL+0x38 导致 ACCESS_VIOLATION;
+//        某些系统 worker 线程 (线程池/RPC) 创建时未通过标准 ntdll 路径, TEB+0x98 为 NULL, 退出时崩溃;
+//        修复: VEH 检测崩溃地址在 RtlDeactivateActivationContext 范围内时, 设置 rax 指向安全缓冲区,
+//        让 cmp 指令正常执行, 函数走"无激活上下文"分支正常返回, 避免崩溃;
+//        同时记录主线程 ID 用于诊断对比)
 // ============================================================
 
 #include "stealth_core.h"
@@ -82,6 +85,15 @@ static bool g_hollowJmpSet = false;
 // ★ v3.126g: BYOVD 驱动加载状态 — 当驱动成功加载时跳过 Process Hollowing
 static bool g_byovdDriverLoaded = false;
 
+// ★ BUILD 536: ntdll!RtlDeactivateActivationContext 地址范围 — 用于 VEH 捕获 worker 线程激活上下文栈 NULL 崩溃
+//   根因: 某些系统 worker 线程 (线程池/RPC) TEB+0x98 (ActivationContextStackPointer) 为 NULL,
+//   线程退出时 LdrShutdownThread → RtlDeactivateActivationContext 解引用 NULL+0x38 崩溃.
+//   修复: VEH 检测崩溃地址在该范围内时, 设置 rax 指向 g_safeDummyBuf, 让 cmp [rax+0x38],9 正常执行.
+static uint64_t g_RtlDeactivateAddr = 0;       // RtlDeactivateActivationContext 函数起始地址
+static uint64_t g_RtlDeactivateEnd  = 0;       // 函数结束地址 (起始 + 0x800, 保守范围)
+static uint32_t g_safeDummyBuf[16]  = {};      // 安全缓冲区 — VEH 设置 rax 指向此缓冲区 (64 字节, 满足 +0x38 偏移读取)
+static DWORD    g_mainThreadId      = 0;       // 主线程 ID — 用于诊断对比崩溃线程
+
 static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     uint64_t crashAddr = (uint64_t)ep->ExceptionRecord->ExceptionAddress;
     uint64_t dllBase   = (uint64_t)g_diagDllBase;
@@ -104,6 +116,29 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     } else {
         DiagLog("CRASH: code=0x%08X addr=0x%llX off=%llX tid=%u\n",
             code, crashAddr, offset, tid);
+    }
+
+    // ★ BUILD 536: 捕获 ntdll!RtlDeactivateActivationContext 内的 ACCESS_VIOLATION 崩溃
+    //   根因: 某些系统 worker 线程 (线程池/RPC) 的 TEB+0x98 (ActivationContextStackPointer) 为 NULL,
+    //   线程退出时 LdrShutdownThread → RtlDeactivateActivationContext 读取 [TEB+0x98] 得到 NULL,
+    //   随后 cmp dword ptr [rax+0x38], 9 解引用 NULL+0x38=0x38 导致 ACCESS_VIOLATION.
+    //   修复: 检测到该崩溃时, 设置 rax 指向安全缓冲区 g_safeDummyBuf, 让 cmp 指令正常执行,
+    //         函数走"无激活上下文"分支正常返回, 避免 worker 线程崩溃拖垮整个进程.
+    //   安全性: cmp 是无副作用的比较指令, 重新执行不会改变任何寄存器 (除 EFLAGS);
+    //           g_safeDummyBuf[0]=0 != 9, 函数走"栈为空"分支, 直接返回, 不影响逻辑.
+    if (code == 0xC0000005 && g_RtlDeactivateAddr &&
+        crashAddr >= g_RtlDeactivateAddr && crashAddr < g_RtlDeactivateEnd) {
+        ULONG_PTR faultAddr = (ep->ExceptionRecord->NumberParameters >= 2)
+                            ? ep->ExceptionRecord->ExceptionInformation[1] : 0;
+        const char* threadType = (tid == g_mainThreadId) ? "MAIN" : "WORKER";
+        DiagLog("VEH-B536: RtlDeactivateActivationContext crash caught! tid=%u (%s) "
+                "faultAddr=0x%llX, patching rax → g_safeDummyBuf\n",
+                tid, threadType, (unsigned long long)faultAddr);
+        // 设置 rax 指向安全缓冲区 (g_safeDummyBuf 有 64 字节, 满足 +0x38 偏移读取)
+        // cmp dword ptr [rax+0x38], 9 将读取 g_safeDummyBuf[14] (偏移 0x38 = 56 字节 = 14*4)
+        // g_safeDummyBuf[14] = 0 (零初始化), 0 != 9, 函数走"栈为空"分支正常返回
+        ep->ContextRecord->Rax = (DWORD64)&g_safeDummyBuf[0];
+        return EXCEPTION_CONTINUE_EXECUTION;
     }
 
     // ★ v3.78: VEH 自愈 — 捕获 BYOVD IOCTL 导致的代码/数据污染
@@ -1042,7 +1077,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"stealth_diag.log");
     DeleteFileW(logPath);
-    DiagLog("=== v3.187 DIAG START (BUILD 529: E+G test mode — flag triggers no-CS2 no-basic.exe endurance run) ===\n");
+    DiagLog("=== v3.194 DIAG START (BUILD 536: VEH catches RtlDeactivateActivationContext crash — worker thread activation context NULL fix) ===\n");
     DiagLog("BEFORE Init...\n");
 
     // ★ BUILD 529: PAC PROBE 模式已废弃 — 改为 E+G 测试模式
@@ -1077,6 +1112,28 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     PVOID vehHandle = AddVectoredExceptionHandler(1, DiagVehHandler);
     DiagLog("VEH registered, dllBase=0x%llX dllSize=%llu\n",
         (unsigned long long)dllBase, (unsigned long long)dllSize);
+
+    // ★ BUILD 536: 记录主线程 ID + 获取 ntdll!RtlDeactivateActivationContext 地址范围
+    //   用于 VEH 捕获 worker 线程激活上下文栈 NULL 崩溃 (cmp [rax+0x38],9 解引用 NULL)
+    g_mainThreadId = GetCurrentThreadId();
+    {
+        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+        if (hNtdll) {
+            FARPROC pfn = GetProcAddress(hNtdll, "RtlDeactivateActivationContext");
+            if (pfn) {
+                g_RtlDeactivateAddr = (uint64_t)pfn;
+                g_RtlDeactivateEnd  = (uint64_t)pfn + 0x800;  // 保守范围 2KB (函数通常 < 1KB)
+                DiagLog("BUILD 536: RtlDeactivateActivationContext range [0x%llX-0x%llX) mainTid=%u\n",
+                    (unsigned long long)g_RtlDeactivateAddr,
+                    (unsigned long long)g_RtlDeactivateEnd,
+                    g_mainThreadId);
+            } else {
+                DiagLog("BUILD 536: GetProcAddress(RtlDeactivateActivationContext) FAILED\n");
+            }
+        } else {
+            DiagLog("BUILD 536: GetModuleHandleW(ntdll.dll) FAILED\n");
+        }
+    }
 
     // ============================================================
     // 注册 EkkoSleep 内存加密保护区
