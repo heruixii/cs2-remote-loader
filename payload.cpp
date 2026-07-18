@@ -269,6 +269,12 @@ static DWORD g_basicRestartBackoffMs = 1000;  // 退避时间, 防止快速重�
 //   注入功能仅在测试3 (无 flag) 时启用
 static bool g_egTestMode = false;
 
+// ★ BUILD 537: 半测试模式标志 — 由 %TEMP%\half_test.flag 触发
+//   半测试模式: 附加 CS2 (验证 ObCallbacks 移除 + DKOM 隐藏 + 句柄重随机化),
+//   但跳过 basic.exe 启动 (避免注入导致封号)
+//   用于阶段 A 测试: 验证 loader2 附加 CS2 不被踢 + ObCallbacks 移除有效
+static bool g_halfTestMode = false;
+
 // v3.34: NtUnmapViewOfSection 函数指针 (用于 Process Hollowing)
 typedef LONG(NTAPI* _NtUnmapViewOfSection)(HANDLE, PVOID);
 static _NtUnmapViewOfSection g_pNtUnmapViewOfSection = nullptr;
@@ -1102,6 +1108,20 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         } else {
             DiagLog("E+G TEST: no flag — normal mode (CS2 attach + basic.exe injection)\n");
         }
+
+        // ★ BUILD 537: 半测试模式检查 — half_test.flag 存在时附加 CS2 但跳过 basic.exe
+        //   阶段 A 测试: 验证 loader2 附加 CS2 不被踢 + ObCallbacks 移除有效
+        if (!g_egTestMode) {
+            wchar_t halfPath[MAX_PATH];
+            GetTempPathW(MAX_PATH, halfPath);
+            wcscat_s(halfPath, L"half_test.flag");
+            g_halfTestMode = (GetFileAttributesW(halfPath) != INVALID_FILE_ATTRIBUTES);
+            if (g_halfTestMode) {
+                DiagLog("=== HALF TEST MODE (BUILD 537): CS2 attach YES, basic.exe NO ===\n");
+                DiagLog("HALF TEST: flag found at %ls\n", halfPath);
+                DiagLog("HALF TEST: will attach CS2 + run E+G protection, but skip basic.exe injection\n");
+            }
+        }
     }
 
     // v3.34: 随机种子 (基于 PID+TID+TickCount, 规避可预测性)
@@ -1385,7 +1405,9 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         //   DKOM/VAD 操作受 guard pages 保护
         // ★ BUILD 529: 测试模式跳过 basic.exe 启动 — 避免测试失败时 basic.exe 注入
         //   CS2 导致封号. basic.exe 仅在测试3 (无 flag) 时启动.
-        if (!g_egTestMode) {
+        // ★ BUILD 537: 半测试模式 (half_test.flag) 也跳过 basic.exe 启动
+        //   阶段 A: 附加 CS2 验证 ObCallbacks 移除, 但不启动 basic.exe (避免注入封号)
+        if (!g_egTestMode && !g_halfTestMode) {
             bool basicOk = LaunchBasicESP();
             DiagLog("LaunchBasicESP: %s\n", basicOk ? "SUCCESS" : "FAILED");
             // v3.32-plus: 基础.exe 注入后清理痕迹 (PEB Ldr unlinking)
@@ -1394,6 +1416,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 // ★ v3.126: 将基础.exe 窗口置顶
                 BringBasicToTop();
             }
+        } else if (g_halfTestMode) {
+            DiagLog("HALF TEST: skipping LaunchBasicESP (half test mode, no injection to avoid ban)\n");
         } else {
             DiagLog("E+G TEST: skipping LaunchBasicESP (test mode, no injection to avoid ban)\n");
         }
@@ -1409,7 +1433,10 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
 
     // ★ BUILD 529: 测试模式跳过所有 CS2 操作 (PEB/模块诊断/内存初始化/Overlay/EntityChain)
     //   CS2 内存初始化失败会 return 3 退出, 测试模式下必须跳过避免退出
-    if (!g_egTestMode) {
+    // ★ BUILD 537: 半测试模式也跳过 — Memory::Initialize 失败会 return 3 退出,
+    //   导致主循环不运行, 无法验证 ObCallbacks 持续移除 + DKOM 隐藏 + 不被踢.
+    //   半测试模式主循环已跳过 CS2 内存访问 (L1847), 无需 Memory::Initialize.
+    if (!g_egTestMode && !g_halfTestMode) {
     {
         HANDLE hProc = StealthEngine::Instance().GetProcessHandle();
 
@@ -1714,6 +1741,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         }
         DiagLog("--- End Entity Chain Trace ---\n");
     }
+    } else if (g_halfTestMode) {
+        DiagLog("HALF TEST: skipping all CS2 operations (half test mode — no Memory::Initialize to avoid return 3 exit)\n");
     } else {
         DiagLog("E+G TEST: skipping all CS2 operations (test mode)\n");
     }
@@ -1783,7 +1812,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
 
         // 重试启动 (仅非正常退出时)
         // ★ BUILD 529: 测试模式跳过 basic.exe 重启 (不启动 basic.exe, 防封号)
-        if (!g_egTestMode && !g_hBasicProcess && !g_basicDone) {
+        // ★ BUILD 537: 半测试模式也跳过 basic.exe 重启
+        if (!g_egTestMode && !g_halfTestMode && !g_hBasicProcess && !g_basicDone) {
             DWORD nowTick = GetTickCount();
             if (nowTick - lastRetryTime >= g_basicRestartBackoffMs) {
                 lastRetryTime = nowTick;
@@ -1816,7 +1846,10 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             //   EntityList() 会调用 Read<uintptr_t>(0 + dwEntityList) 通过 syscall
             //   读取地址 0, 导致 ntdll 崩溃 (CRASH: code=0xC0000005 in ntdll).
             //   ClientBase() 本身安全 (只返回成员变量), 但为统一性一并跳过.
-            if (!g_egTestMode) {
+            // ★ BUILD 537: 半测试模式也跳过 CS2 内存访问 — 避免初始化不完整导致崩溃
+            //   半测试模式目标: 验证 ObCallbacks 移除 + DKOM 隐藏 + loader2 附加 CS2 不被踢
+            //   不需要实际读取 CS2 内存 (无 basic.exe ESP 渲染)
+            if (!g_egTestMode && !g_halfTestMode) {
                 uintptr_t elBase = cs2::Memory::Instance().EntityList();
                 DiagLog("F=%d basicAlive=%d elBase=0x%llX clientBase=0x%llX\n",
                     frameCount,
@@ -1824,7 +1857,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     (unsigned long long)elBase,
                     (unsigned long long)cs2::Memory::Instance().ClientBase());
             } else {
-                // 测试模式: 只打印 E+G 保护层状态, 不访问 CS2 内存
+                // 测试模式/半测试模式: 只打印 E+G 保护层状态, 不访问 CS2 内存
                 DiagLog("F=%d [E+G TEST] basicAlive=%d (no CS2 memory access)\n",
                     frameCount,
                     (g_hBasicProcess != nullptr) ? 1 : 0);
@@ -1904,7 +1937,10 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         //   所在页也被加密).
         //   测试模式无 CS2 无反作弊扫描, 不需要内存加密; 用普通 Sleep 代替.
         //   正常模式 (测试3) 仍需 EkkoSleep, 后续需修复豁免逻辑 (豁免 memory_cloak.cpp 所有代码页).
-        if (!g_egTestMode) {
+        // ★ BUILD 537: 半测试模式也跳过 EkkoSleep — 半测试3 目标是验证 ObCallbacks 移除 +
+        //   DKOM 隐藏 + 不被踢, EkkoSleep 有已知崩溃风险 (加密自身代码页), 跳过避免崩溃
+        //   确保主循环持续运行. EkkoSleep 验证留待测试3 (完整模式) 修复豁免逻辑后进行.
+        if (!g_egTestMode && !g_halfTestMode) {
             StealthEngine::Instance().StealthSleep(sleepMs);
         } else {
             Sleep(sleepMs);
