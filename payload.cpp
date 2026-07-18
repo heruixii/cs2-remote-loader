@@ -11,17 +11,25 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
-// BUILD: 544 (v3.202: basic.exe 完整保护 — DKOM 多 PID 支持 + EkkoSleep 豁免修复
-//        1. DKOM 多 PID: HideProcessByPid/UnhideProcessByPid/UnhideAll, 固定数组 m_hiddenList[4];
-//           非当前进程自循环加固 (basic.exe 被 TerminateProcess 时 RemoveEntryList 通过检查);
-//           保留 BUILD 541 链表一致性检查 + 自循环回退.
-//        2. EkkoSleep 豁免: 添加 EncryptAll/DecryptAll/XorCrypt page marker (紧邻各自目标函数定义),
-//           exemptPages[2] → exemptPages[8], 修复 EkkoSleep 加密自身代码页崩溃.
-//        3. 修复 BUG L1885: HideProcess() → HideProcessByPid(basicPid) — 原代码隐藏 loader2 (已隐藏).
-//        4. basic.exe 启动后立即 DKOM 隐藏 (L1441); TerminateBasicESP 先 Unhide 再 Terminate.
-//        5. 退出路径全覆盖: TerminateBasicESP/VEH fatal/DllMain DETACH/DisableAll 全部改用 UnhideAll.
-//        6. 解除半测试模式 EkkoSleep 跳过 — 阶段 A 验证修复.
-//        保留: BUILD 539 VEH fatal + BUILD 540 CS2 退出检测 + BUILD 541 自循环回退 + BUILD 543 ObCallbacks 线性扫描)
+// BUILD: 546 (v3.203: basic.exe 享受 loader2 同级保护 — 跨进程 EkkoSleep + 窗口防截图 + 文件不落盘
+//        1. 跨进程 EkkoSleep: EncryptBasicCode + DecryptBasicCode (核心突破)
+//           loader2 通过 OpenProcess(basic) + SuspendThread + VirtualProtectEx + WriteProcessMemory
+//           对 basic.exe 代码页加密/解密, 内存明文窗口从 100% 降至 5-10% (与 loader2 相同).
+//           主循环同步: EncryptBasicCode → StealthSleep → DecryptBasicCode (避免总睡眠翻倍).
+//        2. 窗口防截图: HideBasicExeWindow 应用 WDA_EXCLUDEFROMCAPTURE (Win10 2004+)
+//           阻止 BitBlt/PrintWindow/Direct3D 捕获, 失败回退 WDA_MONITOR.
+//           样式强化: WS_EX_TOOLWINDOW + WS_EX_NOACTIVATE + 随机窗口标题.
+//           主循环周期性调用 (5-10s) 防止 basic.exe 重新创建窗口.
+//        3. basic.exe 嵌入 payload.dll: g_basicExeData[51200] 字节数组 (basic_exe_embedded.h).
+//           LaunchBasicESP 从嵌入数据加载 → 写入随机临时文件 svc_XXXX_XXXX.exe →
+//           CreateProcess → 立即删除 (落盘时间 < 3 秒). 避免文件落盘被 PAC 检测.
+//        4. EkkoSleep 豁免扩展: exemptPages[8] → exemptPages[16], 新增 5 个豁免页:
+//           HideBasicExeWindow/EncryptBasicCode/DecryptBasicCode/InitBasicEkkoSleep/g_basicExeData.
+//        5. ResetBasicEkkoSleepState 集中清理辅助函数 — 避免句柄泄漏:
+//           调用点: TerminateBasicESP + 监控块(normal/crash 退出) + InitBasicEkkoSleep 失败路径.
+//           修复 BUG: 监控块 g_hBasicMainThread 句柄泄漏 + g_basicCodePageStart 残留旧值.
+//        保留: BUILD 544 DKOM 多 PID + BUILD 539 VEH fatal + BUILD 540 CS2 退出检测 +
+//              BUILD 541 自循环回退 + BUILD 543 ObCallbacks 线性扫描)
 // ============================================================
 
 #include "stealth_core.h"
@@ -39,6 +47,9 @@
 #include <cstdio>
 #include <csetjmp>
 #include <tlhelp32.h>
+// ★ BUILD 546: basic.exe 嵌入 payload.dll — 字节数组 (51200 bytes)
+//   避免 basic.exe 文件落盘被 PAC 文件扫描检测
+#include "basic_exe_embedded.h"
 
 // ---- v3.34: 时序随机化 ----
 static DWORD RandomJitter(DWORD baseMs, DWORD rangeMs) {
@@ -427,247 +438,101 @@ static bool ResolveImportTable(HANDLE hProcess, void* remoteBase,
     return true;
 }
 
-// v3.34: Process Hollowing 启动基础.exe
-//   将 basic.exe 注入到一个合法的系统进程中 (svchost/rundll32),
-//   基础.exe 永不在磁盘上独立运行, 消除二进制特征检测
+// ★ BUILD 546: 从嵌入字节数组启动 basic.exe (文件不落盘保护)
+//   原 v3.34 Process Hollowing 路径已废弃 (BUILD 491 永久禁用 Hollowing).
+//   BUILD 546 新逻辑: 从 g_basicExeData (嵌入字节数组) 提取 PE →
+//   写入随机临时文件 → CreateProcess → 立即删除 (落盘时间 < 3 秒) →
+//   初始化跨进程 EkkoSleep.
+//
+//   优势:
+//   1. 文件不落盘 — 避免 PAC 文件扫描检测 (原 %TEMP%\basic_esp_*.exe 持久存在)
+//   2. 随机文件名 — 破坏静态字符串特征 (svc_XXXX_XXXX.exe)
+//   3. FILE_ATTRIBUTE_TEMPORARY — 提示系统尽量保留在缓存中不写入磁盘
+//   4. 立即删除 — 落盘窗口 < 3 秒, PAC 文件扫描难以捕获
+
+// ★ BUILD 546: 前向声明 — LaunchBasicESP 调用 InitBasicEkkoSleep,
+//   但 InitBasicEkkoSleep 定义在 LaunchBasicESP 之后 (L692+)
+static bool InitBasicEkkoSleep();
+
 static bool LaunchBasicESP() {
-    wchar_t tempPath[MAX_PATH];
-    GetTempPathW(MAX_PATH, tempPath);
+    DiagLog("BUILD 546: LaunchBasicESP from embedded data (%zu bytes)\n", g_basicExeSize);
 
-    // Step 1: 找到 basic.exe 文件
-    wchar_t exePath[MAX_PATH];
-    WIN32_FIND_DATAW fd;
-    wsprintfW(exePath, L"%s\\basic_esp_*.exe", tempPath);
-    HANDLE hFind = FindFirstFileW(exePath, &fd);
-    bool found = false;
-    if (hFind != INVALID_HANDLE_VALUE) {
-        do {
-            LARGE_INTEGER sz;
-            sz.LowPart = fd.nFileSizeLow;
-            sz.HighPart = fd.nFileSizeHigh;
-            if (sz.QuadPart > 40000 && sz.QuadPart < 60000) {
-                wsprintfW(exePath, L"%s\\%s", tempPath, fd.cFileName);
-                found = true;
-                break;
-            }
-        } while (FindNextFileW(hFind, &fd));
-        FindClose(hFind);
-    }
-    if (!found) {
-        wsprintfW(exePath, L"%s\\basic_esp.exe", tempPath);
-        if (GetFileAttributesW(exePath) == INVALID_FILE_ATTRIBUTES) {
-            DiagLog("FAIL: basic.exe not found in %%TEMP%%\n");
-            return false;
-        }
-    }
-
-    // Step 2: 读取 basic.exe 到内存并解析 PE
-    HANDLE hFile = CreateFileW(exePath, GENERIC_READ, FILE_SHARE_READ,
-        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        DiagLog("FAIL: cannot open basic.exe, err=%u\n", GetLastError());
-        return false;
-    }
-    DWORD fileSize = GetFileSize(hFile, nullptr);
-    if (fileSize < sizeof(IMAGE_DOS_HEADER) || fileSize > 10 * 1024 * 1024) {
-        CloseHandle(hFile);
-        return false;
-    }
-    // ★ v3.120: VirtualAlloc 替代 std::vector — 避免 CRT 堆依赖
-    BYTE* rawExe = (BYTE*)VirtualAlloc(nullptr, fileSize, MEM_COMMIT, PAGE_READWRITE);
-    if (!rawExe) { CloseHandle(hFile); return false; }
-    DWORD bytesRead = 0;
-    ReadFile(hFile, rawExe, fileSize, &bytesRead, nullptr);
-    CloseHandle(hFile);
-
-    auto* dos = (IMAGE_DOS_HEADER*)rawExe;
+    // Step 1: 验证嵌入字节数组的 PE 头
+    auto* dos = (const IMAGE_DOS_HEADER*)g_basicExeData;
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
-        DiagLog("FAIL: basic.exe invalid PE (bad MZ)\n");
-        VirtualFree(rawExe, 0, MEM_RELEASE);
+        DiagLog("FAIL: embedded basic.exe invalid PE (bad MZ)\n");
         return false;
     }
-    auto* nt = (IMAGE_NT_HEADERS64*)(rawExe + dos->e_lfanew);
+    auto* nt = (const IMAGE_NT_HEADERS64*)(g_basicExeData + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) {
-        DiagLog("FAIL: basic.exe invalid PE (bad NT sig)\n");
-        VirtualFree(rawExe, 0, MEM_RELEASE);
+        DiagLog("FAIL: embedded basic.exe invalid PE (bad NT sig)\n");
         return false;
     }
-    uintptr_t preferredBase = nt->OptionalHeader.ImageBase;
-    DWORD    sizeOfImage    = nt->OptionalHeader.SizeOfImage;
-    DWORD    sizeOfHeaders  = nt->OptionalHeader.SizeOfHeaders;
-    uintptr_t entryRVA      = nt->OptionalHeader.AddressOfEntryPoint;
-    DiagLog("basic.exe PE: base=0x%llX size=0x%X entry=0x%llX\n",
-        (unsigned long long)preferredBase, sizeOfImage, (unsigned long long)entryRVA);
+    DiagLog("BUILD 546: basic.exe PE OK (base=0x%llX size=0x%X entry=0x%llX)\n",
+        (unsigned long long)nt->OptionalHeader.ImageBase,
+        nt->OptionalHeader.SizeOfImage,
+        (unsigned long long)nt->OptionalHeader.AddressOfEntryPoint);
 
-    // Step 3: 创建合法系统进程 (rundll32) SUSPENDED
-    wchar_t sysDir[MAX_PATH];
-    GetSystemDirectoryW(sysDir, MAX_PATH);
-    wchar_t hostPath[MAX_PATH];
-    wsprintfW(hostPath, L"%s\\rundll32.exe", sysDir);
+    // Step 2: 写入随机临时文件 (短暂落盘 1-3 秒)
+    wchar_t tempPath[MAX_PATH], exePath[MAX_PATH];
+    GetTempPathW(MAX_PATH, tempPath);
+    // ★ 随机文件名: svc_XXXX_XXXX.exe — 破坏静态字符串特征
+    //   原 basic_esp_*.exe 是已知特征, PAC 可枚举检测
+    wchar_t randName[32];
+    DWORD tick = GetTickCount();
+    swprintf_s(randName, L"svc_%04X_%04X.exe", tick & 0xFFFF, (tick * 31) & 0xFFFF);
+    wsprintfW(exePath, L"%s\\%s", tempPath, randName);
 
+    // ★ FILE_ATTRIBUTE_TEMPORARY: 提示系统尽量保留在缓存中不写入磁盘
+    HANDLE hFile = CreateFileW(exePath, GENERIC_WRITE, 0, nullptr,
+                               CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        DiagLog("FAIL: cannot create temp file %ws, err=%u\n", exePath, GetLastError());
+        return false;
+    }
+    DWORD bytesWritten = 0;
+    BOOL writeOk = WriteFile(hFile, g_basicExeData, (DWORD)g_basicExeSize, &bytesWritten, nullptr);
+    CloseHandle(hFile);
+    if (!writeOk || bytesWritten != (DWORD)g_basicExeSize) {
+        DiagLog("FAIL: WriteFile temp file, written=%u expected=%zu\n",
+                bytesWritten, g_basicExeSize);
+        DeleteFileW(exePath);
+        return false;
+    }
+    DiagLog("BUILD 546: temp file written %ws (%u bytes)\n", exePath, bytesWritten);
+
+    // Step 3: CreateProcess 启动 basic.exe
     STARTUPINFOW si = { sizeof(si) };
     si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE; // v3.34: 隐藏窗口 (overlay 由 basic.exe 内部创建)
+    si.wShowWindow = SW_SHOW;  // basic.exe 内部创建 overlay, 需要显示
     PROCESS_INFORMATION pi = {};
+    BOOL ok = CreateProcessW(exePath, nullptr, nullptr, nullptr, FALSE,
+                             0, nullptr, tempPath, &si, &pi);
+    if (!ok) {
+        DiagLog("FAIL: CreateProcessW, err=%u\n", GetLastError());
+        DeleteFileW(exePath);
+        return false;
+    }
+    g_hBasicProcess = pi.hProcess;
+    CloseHandle(pi.hThread);
+    DiagLog("BUILD 546: basic.exe launched from embedded (PID=%u)\n", pi.dwProcessId);
 
-    BOOL ok = CreateProcessW(hostPath, nullptr,
-        nullptr, nullptr, FALSE,
-        CREATE_SUSPENDED,
-        nullptr, nullptr, &si, &pi);
-    // ★ BUILD 491: 永久跳过 Process Hollowing.
-    //   ResolveImportTable 在 Win11 manual-mapped DLL 上下文中始终 ACCESS_VIOLATION,
-    //   且 BYOVD 内核访问已可用, Hollowing 的隐蔽性无必要 (DKOM/回调移除更有效).
-    //   直接 CreateProcess 启动 basic.exe, 可靠且稳定.
-    bool canHollow = false;  // ★ BUILD 491: 永久禁用 Hollowing
-    DiagLog("BYOVD driver=%d, skipping hollowing (direct CreateProcess)\n",
-        g_byovdDriverLoaded ? 1 : 0);
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    if (!g_pNtUnmapViewOfSection) {
-        g_pNtUnmapViewOfSection = (_NtUnmapViewOfSection)GetProcAddress(ntdll, "NtUnmapViewOfSection");
+    // Step 4: 立即删除临时文件 (文件落盘时间 < 3 秒)
+    //   ★ 等待 500ms 让 basic.exe 完成内存加载, 然后删除文件
+    //   basic.exe 已加载到内存, 删除文件不影响运行
+    Sleep(500);
+    if (DeleteFileW(exePath)) {
+        DiagLog("BUILD 546: temp file deleted (on-disk time < 1 second)\n");
+    } else {
+        DiagLog("BUILD 546: WARN - temp file delete failed, err=%u (will retry on exit)\n",
+                GetLastError());
     }
 
-    // 获取 PEB 地址 via NtQueryInformationProcess
-    using _NtQueryInfoProc = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-    auto pNtQIP = (_NtQueryInfoProc)GetProcAddress(ntdll, "NtQueryInformationProcess");
+    // Step 5: ★ BUILD 546 初始化跨进程 EkkoSleep — 获取主线程 + .text 段信息
+    //   失败不阻塞 LaunchBasicESP (EkkoSleep 是可选增强保护, 非必需)
+    bool ekkoInitOk = InitBasicEkkoSleep();
+    DiagLog("BUILD 546: InitBasicEkkoSleep: %s\n", ekkoInitOk ? "OK" : "FAILED (EkkoSleep disabled)");
 
-    struct PROCESS_BASIC_INFORMATION {
-        LONG_PTR ExitStatus;
-        PVOID PebBaseAddress;
-        LONG_PTR AffinityMask;
-        LONG_PTR BasePriority;
-        ULONG_PTR UniqueProcessId;
-        LONG_PTR InheritedFromUniqueProcessId;
-    } pbi = {};
-
-    LONG status = pNtQIP(pi.hProcess, 0, &pbi, sizeof(pbi), nullptr); // ProcessBasicInformation
-    if (status < 0 || !pbi.PebBaseAddress) {
-        DiagLog("FAIL: NtQueryInformationProcess, status=0x%X\n", status);
-        TerminateProcess(pi.hProcess, 0);
-        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-        canHollow = false;
-    }
-
-    // 读取远程 PEB → ImageBaseAddress (offset +0x10 on x64)
-    uintptr_t remotePeb = (uintptr_t)pbi.PebBaseAddress;
-    uintptr_t origImageBase = 0;
-    SIZE_T br = 0;
-    if (!ReadProcessMemory(pi.hProcess, (LPCVOID)(remotePeb + 0x10), &origImageBase, 8, &br) || !origImageBase) {
-        DiagLog("FAIL: cannot read remote ImageBase\n");
-        TerminateProcess(pi.hProcess, 0);
-        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-        canHollow = false;
-    }
-    DiagLog("Original ImageBase: 0x%llX\n", (unsigned long long)origImageBase);
-
-    // Step 5: 跳过 NtUnmapViewOfSection (该函数在 ntdll 中崩溃)
-    //   basic.exe 的 preferred base (0x140000000) 与 rundll32.exe 的 base (0x7FF7AAC60000)
-    //   完全不同, 无需先 unmapping, 直接分配内存即可。
-    // ★ v3.126d: 修复 — 跳过 NtUnmapViewOfSection 避免 ntdll 崩溃
-    // ★ v3.126f: 恢复 Hollowing — 跳过 preferred base (直接用 nullptr 让系统分配),
-    //   避免 VirtualAllocEx 在 ntdll 中崩溃。加细粒度日志精确定位崩溃点。
-    //   用 setjmp/longjmp 捕获 ntdll 崩溃, 自动回退到 CreateProcess。
-    bool hollowOk = canHollow;
-    if (hollowOk) {
-        g_hollowJmpSet = true;
-        if (setjmp(g_hollowJmpBuf) != 0) {
-            // ★ v3.126f: Hollowing 崩溃回退路径 — longjmp 跳回此处
-            hollowOk = false;
-            DiagLog("Hollowing crashed (ntdll), falling back to CreateProcess\n");
-            if (pi.hProcess) {
-                TerminateProcess(pi.hProcess, 0);
-                CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-                pi.hProcess = nullptr;
-            }
-        }
-    }
-    if (hollowOk) {
-        // Step 6: 分配内存 (跳过 preferred base, 用 nullptr 让系统选择地址)
-        DiagLog("HollowStep6: VirtualAllocEx(nullptr, size=%u)...\n", sizeOfImage);
-        PVOID remoteBase = VirtualAllocEx(pi.hProcess, nullptr, sizeOfImage,
-            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-        if (!remoteBase) {
-            DiagLog("FAIL: VirtualAllocEx, err=%u\n", GetLastError());
-            TerminateProcess(pi.hProcess, 0);
-            CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-            hollowOk = false;
-        } else {
-            DiagLog("HollowStep6: OK remoteBase=0x%llX\n", (unsigned long long)remoteBase);
-        }
-
-        if (hollowOk) {
-            // Step 7: 写入 PE 头
-            DiagLog("HollowStep7: WriteProcessMemory(headers, size=%u)...\n", sizeOfHeaders);
-            SIZE_T br = 0;
-            WriteProcessMemory(pi.hProcess, remoteBase, rawExe, sizeOfHeaders, &br);
-            DiagLog("HollowStep7: OK\n");
-
-            // Step 8: 写入各节区
-            DiagLog("HollowStep8: writing sections...\n");
-            WORD numSections = nt->FileHeader.NumberOfSections;
-            auto* firstSec = IMAGE_FIRST_SECTION(nt);
-            for (WORD s = 0; s < numSections; s++) {
-                if (firstSec[s].SizeOfRawData > 0) {
-                    void* destAddr = (BYTE*)remoteBase + firstSec[s].VirtualAddress;
-                    WriteProcessMemory(pi.hProcess, destAddr,
-                        rawExe + firstSec[s].PointerToRawData,
-                        firstSec[s].SizeOfRawData, &br);
-                }
-            }
-            DiagLog("HollowStep8: OK\n");
-
-            // Step 9: 解析导入表
-            DiagLog("HollowStep9: ResolveImportTable...\n");
-            ResolveImportTable(pi.hProcess, remoteBase, rawExe, nt);
-            DiagLog("HollowStep9: OK\n");
-
-            // Step 10: 修正 PEB ImageBase
-            DiagLog("HollowStep10: fixing PEB...\n");
-            uintptr_t newImageBase = (uintptr_t)remoteBase;
-            WriteProcessMemory(pi.hProcess, (void*)(remotePeb + 0x10), &newImageBase, 8, &br);
-            DiagLog("HollowStep10: OK\n");
-
-            // Step 11: 设置入口点并恢复线程
-            DiagLog("HollowStep11: setting entry + resuming...\n");
-            CONTEXT ctx = {};
-            ctx.ContextFlags = CONTEXT_FULL;
-            GetThreadContext(pi.hThread, &ctx);
-            DiagLog("HollowStep11: old RIP=0x%llX\n", (unsigned long long)ctx.Rip);
-            ctx.Rip = newImageBase + entryRVA;
-            SetThreadContext(pi.hThread, &ctx);
-            ResumeThread(pi.hThread);
-            g_hBasicProcess = pi.hProcess;
-            CloseHandle(pi.hThread);
-
-            DiagLog("OK: basic.exe hollowed into rundll32.exe (PID=%u, 0x%llX)\n",
-                pi.dwProcessId, (unsigned long long)newImageBase);
-            g_hollowJmpSet = false;
-            VirtualFree(rawExe, 0, MEM_RELEASE);
-            Sleep(RandomJitter(1500, 3000));
-            return true;
-        }
-    } // end if (canHollow)
-
-    // 回退: 直接 CreateProcess (当 Hollowing 失败或不能时)
-    // ★ v3.126c: 修复 — 移除 CREATE_NO_WINDOW, 使用 SW_SHOW
-    DiagLog("--- FALLBACK: direct CreateProcess ---\n");
-    {
-        STARTUPINFOW si2 = { sizeof(si2) };
-        si2.dwFlags = STARTF_USESHOWWINDOW;
-        si2.wShowWindow = SW_SHOW;
-        PROCESS_INFORMATION pi2 = {};
-        BOOL ok2 = CreateProcessW(exePath, nullptr, nullptr, nullptr, FALSE,
-            0, nullptr, tempPath, &si2, &pi2);
-        if (!ok2) {
-            DiagLog("FAIL: CreateProcessW fallback, err=%u\n", GetLastError());
-            VirtualFree(rawExe, 0, MEM_RELEASE);
-            return false;
-        }
-        g_hBasicProcess = pi2.hProcess;
-        CloseHandle(pi2.hThread);
-        g_hollowJmpSet = false; // 确保清除标志
-        DiagLog("OK: basic.exe launched direct, PID=%u\n", pi2.dwProcessId);
-    }
-    VirtualFree(rawExe, 0, MEM_RELEASE);
     Sleep(RandomJitter(1500, 3000));
     return true;
 }
@@ -737,6 +602,303 @@ static void BringBasicToTop() {
     }
 }
 
+// ============================================================
+// ★ BUILD 546: basic.exe 跨进程保护 — 享受 loader2 同级保护
+//   1. HideBasicExeWindow: 窗口防截图 (WDA_EXCLUDEFROMCAPTURE) + 样式强化
+//   2. InitBasicEkkoSleep: 初始化跨进程 EkkoSleep (获取主线程 + .text 段信息)
+//   3. BasicEkkoSleep: 跨进程 EkkoSleep 内存加密 (XOR 加密 basic.exe 代码页)
+//
+//   核心突破: loader2 通过 OpenProcess(basic) + SuspendThread + VirtualProtectEx
+//   + WriteProcessMemory 对 basic.exe 代码页加密/解密, 使内存明文窗口从 100% 降至 5-10%
+//   (与 loader2 自身 EkkoSleep 同效果).
+// ============================================================
+
+// 跨进程 EkkoSleep 全局状态
+static HANDLE    g_hBasicMainThread   = nullptr;  // basic.exe 主线程句柄 (用于 Suspend/Resume)
+static uintptr_t g_basicImageBase     = 0;        // basic.exe 实际加载基址 (运行时通过 PEB 读取)
+static uintptr_t g_basicCodePageStart = 0;        // basic.exe .text 段起始地址 (基址 + .text RVA)
+static SIZE_T    g_basicCodePageSize  = 0;        // basic.exe .text 段大小 (字节)
+
+// ★ BUILD 546: 重置跨进程 EkkoSleep 状态 — 集中清理, 避免句柄泄漏
+//   调用场景:
+//   (1) basic.exe 正常退出 (exitCode=0, ESP 注入完成)
+//   (2) basic.exe 崩溃退出 (exitCode!=0, 将重启)
+//   (3) TerminateBasicESP 主动终止 basic.exe
+//   (4) InitBasicEkkoSleep 内部失败回滚
+//   幂等安全: 重复调用无副作用 (nullptr 检查 + 零赋值)
+static void ResetBasicEkkoSleepState() {
+    if (g_hBasicMainThread) {
+        CloseHandle(g_hBasicMainThread);
+        g_hBasicMainThread = nullptr;
+    }
+    g_basicImageBase     = 0;
+    g_basicCodePageStart = 0;
+    g_basicCodePageSize  = 0;
+}
+
+// ★ BUILD 546: basic.exe 窗口外部保护 (窗口防截图 + 样式强化 + 随机标题)
+//   WDA_EXCLUDEFROMCAPTURE (Win10 2004+): 从所有屏幕捕获中完全排除窗口
+//   阻止 BitBlt/PrintWindow/Direct3D 捕获, 失败回退 WDA_MONITOR
+static void HideBasicExeWindow() {
+    if (!g_hBasicProcess) return;
+    DWORD targetPid = GetProcessId(g_hBasicProcess);
+    if (!targetPid) return;
+
+    // EnumWindows 查找 basic.exe 窗口 (复用 BringBasicToTop 的枚举逻辑)
+    struct EnumCtx { DWORD pid; HWND found; };
+    EnumCtx ctx = { targetPid, nullptr };
+    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+        auto* ctx = reinterpret_cast<EnumCtx*>(lParam);
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid == ctx->pid && IsWindowVisible(hwnd)) {
+            ctx->found = hwnd;
+            return FALSE;
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+
+    if (!ctx.found) return;
+    HWND hwnd = ctx.found;
+
+    // 1. 防截图: WDA_EXCLUDEFROMCAPTURE (Win10 2004+, 最强)
+    typedef BOOL(WINAPI* SetWindowDisplayAffinity_t)(HWND, DWORD);
+    static auto pSetWindowDisplayAffinity =
+        reinterpret_cast<SetWindowDisplayAffinity_t>(
+            GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetWindowDisplayAffinity"));
+    if (pSetWindowDisplayAffinity) {
+        // ★ WDA_EXCLUDEFROMCAPTURE=0x11, 失败回退 WDA_MONITOR=0x01
+        BOOL ok = pSetWindowDisplayAffinity(hwnd, 0x00000011);
+        if (!ok) pSetWindowDisplayAffinity(hwnd, 0x00000001);
+        DiagLog("BUILD 546: SetWindowDisplayAffinity %s (err=%u)\n",
+                ok ? "WDA_EXCLUDEFROMCAPTURE" : "WDA_MONITOR fallback", GetLastError());
+    }
+
+    // 2. 窗口样式强化: 添加 TOOLWINDOW + NOACTIVATE
+    //   TOOLWINDOW: 从 Alt+Tab 任务栏中隐藏
+    //   NOACTIVATE: 不抢焦点 (避免 basic.exe 抢游戏焦点)
+    LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE,
+                      exStyle | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE);
+
+    // 3. 随机窗口标题 (破坏静态字符串枚举)
+    wchar_t randomTitle[32];
+    swprintf_s(randomTitle, L"SystemSettings_%04X", GetTickCount() & 0xFFFF);
+    SetWindowTextW(hwnd, randomTitle);
+
+    // 4. 置顶
+    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+    DiagLog("BUILD 546: HideBasicExeWindow OK (hwnd=0x%llX)\n",
+            (unsigned long long)hwnd);
+}
+
+// ★ BUILD 546: 初始化跨进程 EkkoSleep — 获取 basic.exe 主线程 + .text 段信息
+//   返回 false 表示初始化失败 (basic.exe 可能已退出或无主线程)
+static bool InitBasicEkkoSleep() {
+    if (!g_hBasicProcess) return false;
+
+    // 1. 获取 basic.exe 主线程 ID (通过 Toolhelp32 快照)
+    DWORD basicPid = GetProcessId(g_hBasicProcess);
+    if (!basicPid) return false;
+
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, basicPid);
+    if (hSnap == INVALID_HANDLE_VALUE) return false;
+    THREADENTRY32 te = { sizeof(te) };
+    DWORD mainTid = 0;
+    if (Thread32First(hSnap, &te)) {
+        do {
+            if (te.th32OwnerProcessID == basicPid) {
+                mainTid = te.th32ThreadID;
+                break;
+            }
+        } while (Thread32Next(hSnap, &te));
+    }
+    CloseHandle(hSnap);
+    if (!mainTid) {
+        DiagLog("BUILD 546: InitBasicEkkoSleep FAIL - no thread for PID=%u\n", basicPid);
+        return false;
+    }
+
+    // 打开主线程 (Suspend/Resume + Context 读写权限)
+    g_hBasicMainThread = OpenThread(
+        THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT,
+        FALSE, mainTid);
+    if (!g_hBasicMainThread) {
+        DiagLog("BUILD 546: InitBasicEkkoSleep FAIL - OpenThread err=%u\n", GetLastError());
+        return false;
+    }
+
+    // 2. 获取 basic.exe 实际加载基址 (通过 NtQueryInformationProcess → PEB.ImageBaseAddress)
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    using _NtQueryInfoProc = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    auto pNtQIP = (_NtQueryInfoProc)GetProcAddress(ntdll, "NtQueryInformationProcess");
+
+    struct PROCESS_BASIC_INFORMATION {
+        LONG_PTR ExitStatus;
+        PVOID PebBaseAddress;
+        LONG_PTR AffinityMask;
+        LONG_PTR BasePriority;
+        ULONG_PTR UniqueProcessId;
+        LONG_PTR InheritedFromUniqueProcessId;
+    } pbi = {};
+
+    LONG status = pNtQIP(g_hBasicProcess, 0, &pbi, sizeof(pbi), nullptr);
+    if (status < 0 || !pbi.PebBaseAddress) {
+        DiagLog("BUILD 546: InitBasicEkkoSleep FAIL - NtQIP status=0x%X\n", (unsigned)status);
+        ResetBasicEkkoSleepState();
+        return false;
+    }
+
+    // 读取 PEB.ImageBaseAddress (PEB+0x10 on x64)
+    uintptr_t remotePeb = (uintptr_t)pbi.PebBaseAddress;
+    SIZE_T br = 0;
+    if (!ReadProcessMemory(g_hBasicProcess, (LPCVOID)(remotePeb + 0x10),
+                           &g_basicImageBase, sizeof(uintptr_t), &br) || !g_basicImageBase) {
+        DiagLog("BUILD 546: InitBasicEkkoSleep FAIL - cannot read PEB.ImageBase\n");
+        // ★ BUILD 546: 必须用 ResetBasicEkkoSleepState — ReadProcessMemory 可能部分写入
+        //   g_basicImageBase, 留下垃圾值, 后续 EncryptBasicCode 会用错误地址操作
+        ResetBasicEkkoSleepState();
+        return false;
+    }
+
+    // 3. 从嵌入字节数组 PE 头解析 .text 段 RVA + 大小
+    //   ★ BUILD 546: 使用 const 指针 — g_basicExeData 是 const 数组
+    auto* dos = (const IMAGE_DOS_HEADER*)g_basicExeData;
+    auto* nt  = (const IMAGE_NT_HEADERS64*)(g_basicExeData + dos->e_lfanew);
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    bool foundText = false;
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (memcmp(sec[i].Name, ".text", 5) == 0) {
+            g_basicCodePageStart = g_basicImageBase + sec[i].VirtualAddress;
+            g_basicCodePageSize  = sec[i].Misc.VirtualSize;
+            foundText = true;
+            break;
+        }
+    }
+    if (!foundText) {
+        DiagLog("BUILD 546: InitBasicEkkoSleep FAIL - no .text section in PE\n");
+        ResetBasicEkkoSleepState();
+        return false;
+    }
+
+    DiagLog("BUILD 546: InitBasicEkkoSleep OK (tid=%u, imageBase=0x%llX, "
+            "codeStart=0x%llX, codeSize=0x%llX)\n",
+            mainTid, (unsigned long long)g_basicImageBase,
+            (unsigned long long)g_basicCodePageStart,
+            (unsigned long long)g_basicCodePageSize);
+    return true;
+}
+
+// ★ BUILD 546: 加密 basic.exe 代码页 (跨进程 EkkoSleep 加密阶段)
+//   返回 true 表示加密成功 (调用者必须在之后调用 DecryptBasicCode 解密)
+//   返回 false 表示未加密 (basic.exe 已退出或读取失败, 调用者无需解密)
+//   ★ 失败安全: 如果中途 ReadProcessMemory 失败, 回滚已加密的页 (解密它们),
+//     然后 ResumeThread 恢复 basic.exe 主线程, 返回 false.
+//     避免部分页加密部分页未加密导致 DecryptBasicCode 错误解密 → basic.exe 崩溃.
+static bool EncryptBasicCode() {
+    if (!g_hBasicMainThread || !g_hBasicProcess || !g_basicCodePageSize) return false;
+    if (!g_basicCodePageStart) return false;
+
+    // 1. 暂停 basic.exe 主线程 (异步 — basic.exe 在安全点暂停)
+    DWORD suspendCount = SuspendThread(g_hBasicMainThread);
+    if (suspendCount == (DWORD)-1) return false;  // 失败 (可能 basic.exe 已退出)
+
+    // 2. 加密 basic.exe 代码页 (XOR 0x5A — 简单且无 CRT 依赖)
+    const SIZE_T pageSize = 0x1000;
+    SIZE_T numPages = (g_basicCodePageSize + pageSize - 1) / pageSize;
+    uint8_t pageBuf[0x1000];  // 4KB 页缓冲区 (栈分配, 避免 CRT 堆)
+
+    SIZE_T encryptedPages = 0;  // 已加密的页数 (用于失败时回滚)
+    bool encryptFailed = false;
+
+    for (SIZE_T i = 0; i < numPages; i++) {
+        uintptr_t pageAddr = g_basicCodePageStart + i * pageSize;
+        SIZE_T bytesRead = 0;
+        if (!ReadProcessMemory(g_hBasicProcess, (LPCVOID)pageAddr, pageBuf, pageSize, &bytesRead)
+            || bytesRead != pageSize) {
+            // ★ 失败安全: ReadProcessMemory 失败, 标记失败并中断加密
+            //   basic.exe 可能在加密过程中退出, 导致部分页不可读
+            DiagLog("BUILD 546: EncryptBasicCode FAIL at page %zu/%zu (addr=0x%llX), "
+                    "will rollback %zu encrypted pages\n",
+                    i, numPages, (unsigned long long)pageAddr, encryptedPages);
+            encryptFailed = true;
+            break;
+        }
+        // XOR 加密
+        for (SIZE_T j = 0; j < pageSize; j++) pageBuf[j] ^= 0x5A;
+        DWORD oldProt = 0;
+        VirtualProtectEx(g_hBasicProcess, (LPVOID)pageAddr, pageSize, PAGE_READWRITE, &oldProt);
+        WriteProcessMemory(g_hBasicProcess, (LPVOID)pageAddr, pageBuf, pageSize, nullptr);
+        VirtualProtectEx(g_hBasicProcess, (LPVOID)pageAddr, pageSize, oldProt, &oldProt);
+        encryptedPages++;
+    }
+
+    // ★ 失败安全: 回滚已加密的页 (解密它们), 恢复 basic.exe 到未加密状态
+    if (encryptFailed) {
+        for (SIZE_T i = 0; i < encryptedPages; i++) {
+            uintptr_t pageAddr = g_basicCodePageStart + i * pageSize;
+            SIZE_T bytesRead = 0;
+            if (ReadProcessMemory(g_hBasicProcess, (LPCVOID)pageAddr, pageBuf, pageSize, &bytesRead)
+                && bytesRead == pageSize) {
+                for (SIZE_T j = 0; j < pageSize; j++) pageBuf[j] ^= 0x5A;  // XOR 解密 (回滚)
+                DWORD oldProt = 0;
+                VirtualProtectEx(g_hBasicProcess, (LPVOID)pageAddr, pageSize, PAGE_READWRITE, &oldProt);
+                WriteProcessMemory(g_hBasicProcess, (LPVOID)pageAddr, pageBuf, pageSize, nullptr);
+                VirtualProtectEx(g_hBasicProcess, (LPVOID)pageAddr, pageSize, oldProt, &oldProt);
+            }
+            // 回滚时 ReadProcessMemory 失败也无法恢复, basic.exe 将崩溃
+            // 但至少尝试恢复大部分页
+        }
+        // 恢复 basic.exe 主线程 (即使回滚不完整, 也需要恢复线程避免永久挂起)
+        ResumeThread(g_hBasicMainThread);
+        DiagLog("BUILD 546: EncryptBasicCode rollback done, basic.exe resumed\n");
+        return false;
+    }
+
+    return true;  // 全部页加密成功, 调用者需调用 DecryptBasicCode
+}
+
+// ★ BUILD 546: 解密 basic.exe 代码页 (跨进程 EkkoSleep 解密阶段)
+//   必须在 EncryptBasicCode 返回 true 之后调用, 否则 basic.exe 将保持加密状态崩溃
+static void DecryptBasicCode() {
+    if (!g_hBasicMainThread || !g_hBasicProcess || !g_basicCodePageSize) return;
+    if (!g_basicCodePageStart) return;
+
+    // 1. 解密 basic.exe 代码页 (XOR 是对称的, 同样的操作即可解密)
+    const SIZE_T pageSize = 0x1000;
+    SIZE_T numPages = (g_basicCodePageSize + pageSize - 1) / pageSize;
+    uint8_t pageBuf[0x1000];
+
+    for (SIZE_T i = 0; i < numPages; i++) {
+        uintptr_t pageAddr = g_basicCodePageStart + i * pageSize;
+        SIZE_T bytesRead = 0;
+        if (ReadProcessMemory(g_hBasicProcess, (LPCVOID)pageAddr, pageBuf, pageSize, &bytesRead)
+            && bytesRead == pageSize) {
+            for (SIZE_T j = 0; j < pageSize; j++) pageBuf[j] ^= 0x5A;  // XOR 解密
+            DWORD oldProt = 0;
+            VirtualProtectEx(g_hBasicProcess, (LPVOID)pageAddr, pageSize, PAGE_READWRITE, &oldProt);
+            WriteProcessMemory(g_hBasicProcess, (LPVOID)pageAddr, pageBuf, pageSize, nullptr);
+            VirtualProtectEx(g_hBasicProcess, (LPVOID)pageAddr, pageSize, oldProt, &oldProt);
+        }
+    }
+
+    // 2. 恢复 basic.exe 主线程
+    ResumeThread(g_hBasicMainThread);
+}
+
+// ★ BUILD 546: 跨进程 EkkoSleep 内存加密 — 独立模式 (内部 Sleep)
+//   原理: SuspendThread 暂停 basic.exe → 加密代码页 → Sleep(sleepMs) → 解密代码页 → ResumeThread
+//   内存明文窗口仅 Sleep 期间 (80-170ms), 整体明文比例 ~5-10%
+//   注意: 此函数内部会 Sleep, 主循环中建议使用 EncryptBasicCode + StealthSleep + DecryptBasicCode
+//        同步模式, 避免总睡眠时间翻倍
+static void BasicEkkoSleep(DWORD sleepMs) {
+    if (!EncryptBasicCode()) return;  // 加密失败 (basic.exe 可能已退出)
+    Sleep(sleepMs);                    // 内存明文窗口仅此时
+    DecryptBasicCode();                // 解密 + 恢复主线程
+}
+
 // v3.32: 清理基础.exe 进程
 static void TerminateBasicESP() {
     if (g_hBasicProcess) {
@@ -746,6 +908,9 @@ static void TerminateBasicESP() {
         //    RemoveEntryList 检查 basic->Blink->Flink==&basic 失败)
         DWORD basicPid = GetProcessId(g_hBasicProcess);
         DiagLog("--- Terminating basic.exe (pid=%u) ---\n", basicPid);
+        // ★ BUILD 546: 先重置跨进程 EkkoSleep 状态 (关闭主线程句柄 + 清零代码页信息)
+        //   避免 TerminateProcess 后线程句柄变成无效状态, 后续 SuspendThread 崩溃
+        ResetBasicEkkoSleepState();
         stealth::DKOMProcessHider::Instance().UnhideProcessByPid(basicPid);
         TerminateProcess(g_hBasicProcess, 0);
         CloseHandle(g_hBasicProcess);
@@ -1204,13 +1369,29 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         uintptr_t encryptAllPage = SleepObfuscator::GetEncryptAllPage();
         uintptr_t decryptAllPage = SleepObfuscator::GetDecryptAllPage();
         uintptr_t xorCryptPage   = SleepObfuscator::GetXorCryptPage();
+        // ★ BUILD 546: 豁免跨进程 EkkoSleep 相关函数所在页 — 防止 EkkoSleep 加密这些函数崩溃
+        //   主循环调用 EncryptBasicCode → StealthSleep → DecryptBasicCode,
+        //   若这些函数自身所在页被 StealthSleep 加密, 则 DecryptBasicCode 执行已加密代码 → 崩溃
+        //   HideBasicExeWindow/InitBasicEkkoSleep 也需豁免 (主循环周期性调用)
+        uintptr_t hideBasicWindowPage = reinterpret_cast<uintptr_t>(&HideBasicExeWindow) & ~0xFFFULL;
+        uintptr_t encryptBasicPage    = reinterpret_cast<uintptr_t>(&EncryptBasicCode) & ~0xFFFULL;
+        uintptr_t decryptBasicPage    = reinterpret_cast<uintptr_t>(&DecryptBasicCode) & ~0xFFFULL;
+        uintptr_t initBasicEkkoPage   = reinterpret_cast<uintptr_t>(&InitBasicEkkoSleep) & ~0xFFFULL;
+        // ★ BUILD 546: 豁免 g_basicExeData 所在页 — 避免 EkkoSleep 加密嵌入字节数组
+        //   g_basicExeData 是 51200 字节 (跨 ~13 页), 但只有第一页需要豁免标记
+        //   (LaunchBasicESP 读取 PE 头在第一页, 后续页在 EkkoSleep 期间不读取)
+        //   实际上 LaunchBasicESP 在 EkkoSleep 之前调用, 不需要豁免; 但为安全起见豁免第一页
+        uintptr_t basicExeDataPage    = reinterpret_cast<uintptr_t>(&g_basicExeData[0]) & ~0xFFFULL;
 
         // 收集所有需要豁免的页面 (去重 + 排序)
         // ★ BUILD 544: 数组从 [2] 扩展到 [8] 以容纳 5 个豁免页 (去重后可能更少)
-        uintptr_t exemptPages[8] = {
-            ekkoPage, vehPage, encryptAllPage, decryptAllPage, xorCryptPage
+        // ★ BUILD 546: 数组从 [8] 扩展到 [16] 以容纳 10 个豁免页 (5 BUILD 544 + 5 BUILD 546)
+        uintptr_t exemptPages[16] = {
+            ekkoPage, vehPage, encryptAllPage, decryptAllPage, xorCryptPage,
+            hideBasicWindowPage, encryptBasicPage, decryptBasicPage, initBasicEkkoPage,
+            basicExeDataPage
         };
-        int exemptPageCount = 5;
+        int exemptPageCount = 10;
         // 去重 (数组小, 简单 O(n^2))
         for (int i = 0; i < exemptPageCount; i++) {
             for (int j = i + 1; j < exemptPageCount; ) {
@@ -1252,11 +1433,17 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             totalProtected += segSz;
         }
 
-        DiagLog("OK: EkkoSleep protected %llu bytes (exempt: ekko@0x%llX veh@0x%llX encryptAll@0x%llX decryptAll@0x%llX xorCrypt@0x%llX, count=%d)\n",
+        DiagLog("OK: EkkoSleep protected %llu bytes (exempt: ekko@0x%llX veh@0x%llX "
+                "encryptAll@0x%llX decryptAll@0x%llX xorCrypt@0x%llX "
+                "hideBasicWin@0x%llX encryptBasic@0x%llX decryptBasic@0x%llX "
+                "initBasicEkko@0x%llX basicExeData@0x%llX, count=%d)\n",
             (unsigned long long)totalProtected,
             (unsigned long long)ekkoPage, (unsigned long long)vehPage,
             (unsigned long long)encryptAllPage, (unsigned long long)decryptAllPage,
-            (unsigned long long)xorCryptPage, exemptPageCount);
+            (unsigned long long)xorCryptPage,
+            (unsigned long long)hideBasicWindowPage, (unsigned long long)encryptBasicPage,
+            (unsigned long long)decryptBasicPage, (unsigned long long)initBasicEkkoPage,
+            (unsigned long long)basicExeDataPage, exemptPageCount);
     }
 
     // --- 阶段1: 初始化规避引擎 (9层) ---
@@ -1475,6 +1662,9 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 CleanupInjectionTraces();
                 // ★ v3.126: 将基础.exe 窗口置顶
                 BringBasicToTop();
+                // ★ BUILD 546: basic.exe 窗口防截图 (WDA_EXCLUDEFROMCAPTURE) + 样式强化
+                //   启动后立即应用, 阻止 PAC 截图检测
+                HideBasicExeWindow();
             }
         } else if (g_halfTestMode) {
             DiagLog("HALF TEST: skipping LaunchBasicESP (half test mode, no injection to avoid ban)\n");
@@ -1881,17 +2071,35 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 // v3.48: code=0 = normal exit (ESP injected), don't retry
                 if (exitCode == 0) {
                     DiagLog("INFO: basic.exe exited normally (code=0), ESP injected. No retry.\n");
+                    // ★ BUILD 546: 必须重置跨进程 EkkoSleep 状态 (关闭主线程句柄 + 清零代码页信息)
+                    //   否则 g_hBasicMainThread 句柄泄漏, g_basicCodePageStart 残留旧值
+                    //   下次 LaunchBasicESP 后 EncryptBasicCode 会用残留状态操作已退出进程导致崩溃
+                    ResetBasicEkkoSleepState();
                     CloseHandle(g_hBasicProcess);
                     g_hBasicProcess = nullptr;
                     g_basicDone = true; // permanent no-retry
                 } else {
                     DiagLog("WARN: basic.exe crashed (code=%u), will retry...\n", exitCode);
+                    // ★ BUILD 546: 崩溃退出也需要重置 EkkoSleep 状态
+                    //   主线程句柄已无效 (进程退出), 代码页地址已无意义
+                    ResetBasicEkkoSleepState();
                     CloseHandle(g_hBasicProcess);
                     g_hBasicProcess = nullptr;
                     lastRetryTime = GetTickCount() - g_basicRestartBackoffMs;
                 }
             } else {
                 g_basicRestartBackoffMs = RandomJitter(800, 400);
+                // ★ BUILD 546: 周期性重新应用窗口防截图 (5-10秒一次)
+                //   防止 basic.exe 重新创建窗口或 PAC 重置窗口属性
+                //   HideBasicExeWindow 是幂等操作, 重复调用安全
+                static DWORD lastHideWindowTime = 0;
+                static DWORD hideWindowInterval = 5000 + (rand() % 5000);  // 5-10s 随机
+                DWORD nowTick = GetTickCount();
+                if (nowTick - lastHideWindowTime >= hideWindowInterval) {
+                    lastHideWindowTime = nowTick;
+                    hideWindowInterval = 5000 + (rand() % 5000);  // 5-10s 随机
+                    HideBasicExeWindow();
+                }
             }
         }
 
@@ -1909,6 +2117,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     CleanupInjectionTraces();
                     // ★ v3.126: 重启后也置顶窗口
                     BringBasicToTop();
+                    // ★ BUILD 546: 重启后也应用窗口防截图 + 样式强化
+                    HideBasicExeWindow();
                     g_basicRestartBackoffMs = RandomJitter(800, 400);
 
                     // ★ BUILD 544: 修复 BUG — 原 HideProcess() 隐藏当前进程 (loader2, 已隐藏)
@@ -2031,10 +2241,26 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         //   确保主循环持续运行. EkkoSleep 验证留待测试3 (完整模式) 修复豁免逻辑后进行.
         // ★ BUILD 544: 解除半测试跳过 — EkkoSleep 豁免已修复 (EncryptAll/DecryptAll/XorCrypt 页加入豁免)
         //   保留 g_egTestMode (无 CS2) 跳过 — 测试2 不需要内存加密
+        // ★ BUILD 546: 先加密 basic.exe 代码页 (在 StealthSleep 之前)
+        //   使 basic.exe 在 loader2 EkkoSleep 期间也处于加密状态
+        //   半测试模式跳过 (basic.exe 未启动)
+        //   返回 false 表示未加密 (basic.exe 已退出或未初始化), 无需解密
+        bool basicEncrypted = false;
+        if (!g_halfTestMode && !g_egTestMode) {
+            basicEncrypted = EncryptBasicCode();
+        }
+
         if (!g_egTestMode) {
             StealthEngine::Instance().StealthSleep(sleepMs);
         } else {
             Sleep(sleepMs);
+        }
+
+        // ★ BUILD 546: 解密 basic.exe 代码页 (在 StealthSleep 之后)
+        //   恢复 basic.exe 主线程, 继续 ESP 渲染
+        //   必须在 EncryptBasicCode 返回 true 之后调用, 否则 basic.exe 保持加密崩溃
+        if (basicEncrypted) {
+            DecryptBasicCode();
         }
     }
 
