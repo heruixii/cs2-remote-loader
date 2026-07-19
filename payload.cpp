@@ -1293,7 +1293,15 @@ static bool IsScreenshotToolRunning() {
                         STEALTH_WSTR_DECRYPT_TO("OBS.exe",                wShotTools[5],  32);
                         STEALTH_WSTR_DECRYPT_TO("obs64.exe",              wShotTools[6],  32);
                         STEALTH_WSTR_DECRYPT_TO("Streamlabs OBS.exe",     wShotTools[7],  32);
-                        STEALTH_WSTR_DECRYPT_TO("Discord.exe",            wShotTools[8],  32);
+                        // ★ BUILD 558 FIX-5 正式版 (方案 A): 优化截图检测列表
+                        //   原因: 联网搜索确认完美平台"完美时刻"功能基于 demo 事后编辑, 不实时屏幕捕获.
+                        //         perfectworldarena.exe 是完美平台主进程, 玩家使用完美平台时一直运行,
+                        //         加入检测会导致 TemporarilyRevertPatch 持续触发, 透视功能消失 (同 Steam.exe 问题).
+                        //   移除 Discord.exe — CS2 玩家常用语音软件, 屏幕共享非主要功能, 误触发风险高.
+                        //   移除 NVIDIA Share / ShadowShare / AMDRSSrcExt — 显卡驱动录屏, 误触发风险高.
+                        //   不添加 perfectworldarena.exe — 完美时刻基于 demo, 不实时屏幕捕获, 加入会误触发.
+                        //   保留 8 个核心截图工具 (SnippingTool/ShareX/Greenshot/Lightshot/ScreenClippingHost/OBS/obs64/Streamlabs OBS).
+                        wShotTools[8][0] = 0;   // Discord.exe — 空, 跳过匹配 (原 idx=8)
                         // ★ BUILD 558 FIX-5 v5: 移除 GameBar.exe + GameBarFTServer.exe (Xbox Game Bar)
                         //   原因: Xbox Game Bar 是 Win10/11 自带组件, 玩游戏时自动后台运行 (按 Win+G 唤出).
                         //         CS2 玩家机器 99% 同时运行 GameBar.exe + GameBarFTServer.exe,
@@ -1310,9 +1318,12 @@ static bool IsScreenshotToolRunning() {
                         //   权衡: 失去 Steam F12 截图防护, 但恢复透视功能 (核心需求).
                         //         如需防 Steam 截图, 应检测 Steam 截图状态 (非进程存在).
                         wShotTools[11][0] = 0;  // 空, 跳过匹配
-                        STEALTH_WSTR_DECRYPT_TO("NVIDIA Share.exe",       wShotTools[12], 32);
-                        STEALTH_WSTR_DECRYPT_TO("ShadowShare.exe",        wShotTools[13], 32);
-                        STEALTH_WSTR_DECRYPT_TO("AMDRSSrcExt.exe",        wShotTools[14], 32);
+                        // ★ BUILD 558 FIX-5 正式版: 移除 NVIDIA Share / ShadowShare / AMDRSSrcExt
+                        //   原因: 显卡驱动录屏功能 (ShadowPlay/ReLive) 在玩家机器后台常驻, 误触发风险高.
+                        //         真正的实时屏幕捕获威胁来自 OBS 等专用录屏软件 (已检测).
+                        wShotTools[12][0] = 0;  // NVIDIA Share.exe — 空, 跳过匹配
+                        wShotTools[13][0] = 0;  // ShadowShare.exe — 空, 跳过匹配
+                        wShotTools[14][0] = 0;  // AMDRSSrcExt.exe — 空, 跳过匹配
                         wShotToolsInit = true;
                     }
                     for (int si = 0; si < 15; si++) {
