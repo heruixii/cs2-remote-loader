@@ -1,4 +1,4 @@
-﻿// ============================================================
+// ============================================================
 // payload.cpp — 远程加载 DLL Payload
 //
 // 编译为 DLL, 经 XTEA 加密后托管在 HTTP 服务器上,
@@ -18,6 +18,25 @@
 //           - g_driverCandidates[] 仅含 PDFWKRNL (BUILD 490), RTCore64 分支永不执行
 //           - 消除 .rdata 中 \Device\RTCore64 / \DosDevices\RTCore64 / ntoskrnl.exe 明文
 //        保留: BUILD 549 影子页 PTE + DiagLog 加密 + BUILD 548 集成补丁 + BUILD 546 7 层保护
+// BUILD: 553 (v3.210: 防护深度分析改进 — 基于 BUILD 552 三维度分析)
+//        1. ★ BUILD 553 P0-1: ShadowPageManager 降频 (500ms → 5s)
+//           - IOCTL 频率: 240/min → 24/min, 远低于 PDFWKRNL.sys 卡死基线 (1400/min)
+//           - 占空比: 10% → 1% (50ms pageA / 5000ms 周期)
+//           - 修复 B1 缺陷: 违反 10s cooldown 约束
+//        2. ★ BUILD 553 P0-2: MinifilterNeutralizer 周期性重新中和 (GuardPac 恢复)
+//           - 60-90s 周期检查 IsMessageTransferNeutralized, 失败则重新中和
+//           - 修复 A1 缺陷: BUILD 552 只在启动时中和一次
+//        3. ★ BUILD 553 P1-1: FindShvInstallEntry 三级边界查找 (0xCC/0x90/0x00)
+//           - Pass 1: 0xCC int3 (最可靠)
+//           - Pass 2: 连续 ≥2 字节 0x90 nop (MSVC 对齐)
+//           - Pass 3: 连续 ≥4 字节 0x00 零填充 (Clang 对齐)
+//           - 修复 B2 缺陷: 现代编译器不用 0xCC 边界导致 patch 失败
+//        4. ★ BUILD 553 P1-2: VEH 自愈计数重置 (MAX_VEH_RETRIES 3→10 + 60s 重置)
+//           - 修复 B4 缺陷: 长期运行后 VEH 自愈能力耗尽
+//        5. ★ BUILD 553 P1-3: ShvInstallPatcher SIG1 特征码 XOR 加密
+//           - g_sig1Key=0xA7, SIG1_ENC 运行时解密
+//           - 修复 A3 缺陷: 消除 .rdata 中 48 B9 00 00 00 80 明文特征码
+//        保留: BUILD 552 SHV patch + BUILD 549 影子页 + BUILD 548 集成补丁 + BUILD 546 7 层保护
 // BUILD: 549 (v3.205: 影子页 PTE manipulation + DiagLog 三层脱敏 + NtQSI 替代 Toolhelp32)
 //        1. ★ BUILD 549 影子页: ApplyCs2Patch 优先通过 PTE manipulation 安装影子页
 //           - pageA = client.dll 原页 (PAC 扫描看到原始字节 32 c0)
@@ -129,7 +148,13 @@ void* g_vehHandlerPageVA = nullptr; // ★ v3.78: VEH handler 所在页 VA (exte
 static volatile LONG g_vehRestoring = 0;
 // ★ v3.126d: 崩溃计数 — 防止自愈后同一指令再次崩溃导致的无限循环
 static volatile LONG g_vehCrashCount = 0;
-static constexpr LONG MAX_VEH_RETRIES = 3;
+// ★ BUILD 553: MAX_VEH_RETRIES 3 → 10 + 60s 无崩溃重置 (修复 B4 缺陷)
+//   原因: 3 次太严格, PAC 周期性破坏代码页时 VEH 快速耗尽 → 进程崩溃
+//   新策略: 10 次容忍 + 60s 无新崩溃则重置计数, 避免长期累积误放弃
+//   安全性: 10 次仍能防止无限循环 (PAC 破坏频率 << 10 次/60s)
+static constexpr LONG MAX_VEH_RETRIES = 10;
+static volatile DWORD g_vehLastCrashTick = 0;  // ★ BUILD 553: 上次崩溃时间 (用于 60s 重置)
+static constexpr DWORD VEH_RESET_INTERVAL_MS = 60000;  // 60s 无崩溃则重置计数
 
 // ★ BUILD 539: VEH fatal 路径 UnhideProcess 重入防护
 //   防止 VEH 中调用 UnhideProcess → IOCTL 二次崩溃 → 再次进入 VEH 的无限循环
@@ -226,6 +251,18 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
         }
 
         // ★ v3.126d: 自愈计数 — 同一指令连续崩溃超过 MAX_VEH_RETRIES 次即放弃
+        // ★ BUILD 553: 60s 无崩溃重置计数 (避免长期累积误放弃)
+        //   原实现: 计数只增不减, 3 次后永久放弃 → 长期运行后失去自愈能力
+        //   新实现: 距上次崩溃 >60s 则重置为 0, 允许新一轮自愈
+        {
+            DWORD nowTick = GetTickCount();
+            DWORD lastTick = (DWORD)g_vehLastCrashTick;
+            if (lastTick != 0 && (nowTick - lastTick) > VEH_RESET_INTERVAL_MS) {
+                // 60s 无崩溃, 重置计数 (InterlockedExchange 保证原子性)
+                InterlockedExchange(&g_vehCrashCount, 0);
+            }
+            g_vehLastCrashTick = (volatile DWORD)nowTick;
+        }
         if (InterlockedIncrement(&g_vehCrashCount) > MAX_VEH_RETRIES) {
             DiagLog("VEH-SELFHEAL: EXCEEDED MAX_RETRIES (%d), aborting\n", MAX_VEH_RETRIES);
             g_vehRestoring = 0;
@@ -403,8 +440,13 @@ static bool ResolveImportTable(HANDLE hProcess, void* remoteBase,
         wideDllName[wlen] = L'\0';
         HMODULE hMod = stealth::GetModuleBaseFromPEB(stealth::ModNameHashRT(wideDllName));
         if (!hMod) {
-            hMod = LoadLibraryA(dllName);  // 回退 (LoadLibraryA 仍可能被 hook, 但 dllName 不在二进制中)
-            if (!hMod) continue;
+            // ★ BUILD 554 P0-3: 移除 LoadLibraryA 回退 (修复 A4 缺陷)
+            //   原因: LoadLibraryA 是 PAC 用户态 hook 的高优先级 API (PvpAlive.dll 必然 hook),
+            //         一次调用触发 LdrLoadDll 完整模块加载流程, PAC 通过 LdrRegisterDllNotification
+            //         或 LoadLibrary hook 可枚举所有新加载模块.
+            //   策略: payload.dll 只依赖系统 DLL (KERNEL32/ntdll/USER32/ADVAPI32),
+            //         这些在 CS2 进程中必然已加载. PEB Ldr 遍历失败 → 跳过该 IAT 条目.
+            continue;
         }
 
         uintptr_t iatRVA = desc->FirstThunk;
@@ -684,7 +726,10 @@ static void MaintainCs2Patch() {
     if (!g_patchAddr) return;
 
     // ★ BUILD 549: 影子页模式 — 周期性切换 pageA/pageB
-    //   500ms 周期, 50ms pageA (10% 占空比), 让 PAC 扫描命中原始字节
+    //   ★ BUILD 553: 周期从 500ms → 5s (降频 10 倍), 占空比从 10% → 1%
+    //     原因: BUILD 552 分析发现 500ms 周期导致 240 IOCTL/min, 违反 PDFWKRNL.sys
+    //           10s cooldown 约束, 可能触发驱动卡死 (参考 BUILD 532/533 卡死基线)
+    //   5s 周期, 50ms pageA (1% 占空比), 让 PAC 扫描命中原始字节
     if (stealth::ShadowPageManager::Instance().IsInstalled()) {
         stealth::ShadowPageManager::Instance().RevealOriginal();  // 切到 pageA
         Sleep(50);  // 等 TLB 刷新 + PAC 扫描窗口
@@ -726,20 +771,45 @@ static bool IsScreenshotToolRunning() {
         while (true) {
             auto* entry = (B549_SYSTEM_PROCESS_INFO*)ptr;
             if (entry->ImageName.Buffer && entry->UniqueProcessId) {
-                WCHAR name[MAX_PATH] = {};
-                SIZE_T nameLen = entry->ImageName.Length / sizeof(WCHAR);
-                if (nameLen >= MAX_PATH) nameLen = MAX_PATH - 1;
-                memcpy(name, entry->ImageName.Buffer, nameLen * sizeof(WCHAR));
+                    WCHAR name[MAX_PATH] = {};
+                    SIZE_T nameLen = entry->ImageName.Length / sizeof(WCHAR);
+                    if (nameLen >= MAX_PATH) nameLen = MAX_PATH - 1;
+                    memcpy(name, entry->ImageName.Buffer, nameLen * sizeof(WCHAR));
 
-                if (_wcsicmp(name, L"SnippingTool.exe") == 0 ||
-                    _wcsicmp(name, L"ShareX.exe") == 0 ||
-                    _wcsicmp(name, L"Greenshot.exe") == 0 ||
-                    _wcsicmp(name, L"Lightshot.exe") == 0 ||
-                    _wcsicmp(name, L"ScreenClippingHost.exe") == 0) {
-                    found = true;
-                    break;
+                    // ★ BUILD 554 P1-1: 截图工具检测扩展 (5 → 15+) + 全部加密 (修复 A5 缺陷)
+                    //   原因: 原 5 个工具为明文 L"..." 在 .rdata 中, 暴露反截图意图;
+                    //         且未覆盖 OBS/Discord/GameBar/Steam/NVIDIA/AMD 等主流工具.
+                    //   策略: 全部改用 STEALTH_WSTR_DECRYPT_TO 编译期加密, 运行时解密到栈缓冲,
+                    //         首次调用一次性解密并缓存到 static 数组 (单线程, 无并发问题).
+                    //         检测列表覆盖主流直播/录屏/截图/屏幕共享工具 (15+ 项).
+                    static wchar_t wShotTools[15][32] = {};
+                    static bool wShotToolsInit = false;
+                    if (!wShotToolsInit) {
+                        STEALTH_WSTR_DECRYPT_TO("SnippingTool.exe",       wShotTools[0],  32);
+                        STEALTH_WSTR_DECRYPT_TO("ShareX.exe",             wShotTools[1],  32);
+                        STEALTH_WSTR_DECRYPT_TO("Greenshot.exe",          wShotTools[2],  32);
+                        STEALTH_WSTR_DECRYPT_TO("Lightshot.exe",          wShotTools[3],  32);
+                        STEALTH_WSTR_DECRYPT_TO("ScreenClippingHost.exe", wShotTools[4],  32);
+                        STEALTH_WSTR_DECRYPT_TO("OBS.exe",                wShotTools[5],  32);
+                        STEALTH_WSTR_DECRYPT_TO("obs64.exe",              wShotTools[6],  32);
+                        STEALTH_WSTR_DECRYPT_TO("Streamlabs OBS.exe",     wShotTools[7],  32);
+                        STEALTH_WSTR_DECRYPT_TO("Discord.exe",            wShotTools[8],  32);
+                        STEALTH_WSTR_DECRYPT_TO("GameBar.exe",            wShotTools[9],  32);
+                        STEALTH_WSTR_DECRYPT_TO("GameBarFTServer.exe",    wShotTools[10], 32);
+                        STEALTH_WSTR_DECRYPT_TO("Steam.exe",              wShotTools[11], 32);
+                        STEALTH_WSTR_DECRYPT_TO("NVIDIA Share.exe",       wShotTools[12], 32);
+                        STEALTH_WSTR_DECRYPT_TO("ShadowShare.exe",        wShotTools[13], 32);
+                        STEALTH_WSTR_DECRYPT_TO("AMDRSSrcExt.exe",        wShotTools[14], 32);
+                        wShotToolsInit = true;
+                    }
+                    for (int si = 0; si < 15; si++) {
+                        if (wShotTools[si][0] && _wcsicmp(name, wShotTools[si]) == 0) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (found) break;
                 }
-            }
             if (entry->NextEntryOffset == 0) break;
             ptr += entry->NextEntryOffset;
         }
@@ -1507,6 +1577,37 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 (unsigned long long)((uintptr_t)dllBase + dllSize));
         }
 
+        // ★ BUILD 554 P1-3: 验证 .data/.bss 段已被 EkkoSleep 覆盖 (修复 B1 假设)
+        //   分析发现: L1326-1404 的 EkkoSleep 注册代码已覆盖整个 DLL 镜像
+        //             [dllBase+0x1000, dllBase+dllSize), 包含 .text/.rdata/.data/.bss 全部段.
+        //   本段为显式验证 + 诊断输出, 确认 .data/.bss 段确实在已注册范围内,
+        //   并通过 DiagLogEnc 输出段范围供 sd.log 排查 (PAC 扫描 .data 段时加密生效).
+        //   注: 若未来 EkkoSleep 注册范围改为仅 .text 段, 此处需补充 RegisterProtectedRegion 调用.
+        if (dllBase && dllSize > 0x1000) {
+            auto* dosHdr = (IMAGE_DOS_HEADER*)dllBase;
+            if (dosHdr->e_magic == IMAGE_DOS_SIGNATURE) {
+                auto* ntHdr = (IMAGE_NT_HEADERS64*)((uint8_t*)dllBase + dosHdr->e_lfanew);
+                if (ntHdr->Signature == IMAGE_NT_SIGNATURE) {
+                    auto* secHdr = IMAGE_FIRST_SECTION(ntHdr);
+                    uintptr_t ekBase = (uintptr_t)dllBase + 0x1000;
+                    uintptr_t ekEnd  = (uintptr_t)dllBase + dllSize;
+                    for (int i = 0; i < ntHdr->FileHeader.NumberOfSections; i++) {
+                        char secName[9] = {};
+                        memcpy(secName, secHdr[i].Name, 8);
+                        uintptr_t secStart = (uintptr_t)dllBase + secHdr[i].VirtualAddress;
+                        uintptr_t secEnd   = secStart + secHdr[i].Misc.VirtualSize;
+                        // 验证段在 EkkoSleep 已注册范围内
+                        bool inRange = (secStart >= ekBase && secEnd <= ekEnd);
+                        DiagLog("B554:SEC:%s [%llX-%llX] inEkkoRange=%d\n",
+                            secName,
+                            (unsigned long long)secStart,
+                            (unsigned long long)secEnd,
+                            (int)inRange);
+                    }
+                }
+            }
+        }
+
         auto kernelResult = stealth::KernelDefense::EnableAll();
 
         // ★ v3.75: 后校验 — 仅诊断，不自动恢复
@@ -1578,6 +1679,22 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         }
         DiagLog("BYOVD: freed %d guard regions\n",
             guardRegionCount);
+
+        // ★ BUILD 554 P0-1: 启用 VADConcealer (修复 A1 死代码缺陷)
+        //   原因: CleanupInjectionTraces 在 #if 0 中从未执行 (BUILD 549+),
+        //         导致 payload.dll 的 MEM_PRIVATE | PAGE_EXECUTE_READWRITE 区域
+        //         完全暴露给 PAC VAD 树扫描.
+        //   策略: 在 EnableAll + SHV patch + ApplyCs2Patch + guard pages 释放后
+        //         立即调用 VADConcealer 隐藏 payload.dll 内存区域.
+        //   实现: 通过 BYOVD 内核 R/W 修改 VAD 树, 将 MEM_PRIVATE 改为 MEM_MAPPED.
+        //   周期: 60-90s 主循环重新调用 (PAC 可能恢复 VAD 标志).
+        {
+            DWORD cs2Pid = GetCurrentProcessId();  // payload.dll 在 CS2 进程内
+            uintptr_t bases[1] = { (uintptr_t)g_diagDllBase };
+            int vadOk = stealth::VADConcealer::ConcealAllRegions(cs2Pid, bases, 1);
+            DiagLog("B554:VAD:%d/1 base=0x%llX\n", vadOk,
+                (unsigned long long)g_diagDllBase);
+        }
     }
 
         // ★ BUILD 548: EPT dump 触发逻辑已移除 (不再需要 EPT dump 诊断)
@@ -1969,6 +2086,16 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     if (!stealth::ShvInstallPatcher::IsPatched()) {
                         stealth::ShvInstallPatcher::PatchShvInstallEntry();
                     }
+
+                    // ★ BUILD 554 P0-1: 周期性重新调用 VADConcealer
+                    //   原因: PAC 可能通过周期性内核修复恢复 VAD 标志 (MEM_MAPPED → MEM_PRIVATE),
+                    //         使 payload.dll 注入区域重新暴露给 VAD 扫描.
+                    //   策略: 每 60-90s 与 ReapplyAllCallbacks 同周期重新隐藏, 保持深度防御.
+                    {
+                        DWORD cs2Pid = GetCurrentProcessId();
+                        uintptr_t bases[1] = { (uintptr_t)g_diagDllBase };
+                        stealth::VADConcealer::ConcealAllRegions(cs2Pid, bases, 1);
+                    }
                 }
             }
         }
@@ -2065,13 +2192,15 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
 
         // ★ BUILD 549: 补丁维护 + 防截图 (频率调整 + 影子页模式分支)
         //   补丁维护: 5s → 500ms (影子页周期切换, 10% 占空比)
+        //   ★ BUILD 553: 500ms → 5s (降频 10 倍, 减少 IOCTL 频率)
+        //     IOCTL/min: 240 → 24, 远低于 PDFWKRNL.sys 卡死基线 (1400/min)
         //   截图检测: 1s → 5s (减少 NtQSI 调用频率)
         static DWORD lastPatchCheck = 0;
         static DWORD lastScreenshotCheck = 0;
         static bool g_patchReverted = false;  // ★ BUILD 548: 移到前面, 供 patch 维护分支检查
 
-        // ★ BUILD 549: 补丁维护 — 500ms 间隔 (影子页周期切换)
-        if (GetTickCount() - lastPatchCheck > 500) {
+        // ★ BUILD 553: 补丁维护 — 5s 间隔 (从 BUILD 549 的 500ms 降频, 1% 占空比)
+        if (GetTickCount() - lastPatchCheck > 5000) {
             if (!g_cs2Patched) {
                 g_cs2Patched = ApplyCs2Patch();
             } else if (!g_patchReverted) {  // 截图工具运行期间不维护补丁
