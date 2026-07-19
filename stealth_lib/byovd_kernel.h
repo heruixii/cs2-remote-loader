@@ -248,7 +248,11 @@ private:
 //   1. ObRegisterCallbacks — 句柄访问监控 (最关键)
 //   2. PsSetCreateProcessNotifyRoutine — 进程创建通知
 //   3. PsSetLoadImageNotifyRoutine — 模块加载通知
-//   4. PsSetCreateThreadNotifyRoutine — 线程创建通知 (可选)
+//   4. PsSetCreateThreadNotifyRoutine — 线程创建通知
+//
+// ★ BUILD 551: 第 4 类 (PsSetCreateThreadNotifyRoutine) 已确认 PAC 注册
+//   (基于 PAC_SHV_逆向分析报告 §6),原 BUILD 528 误判为 "EAC 一般不注册"
+//   实际 PAC IAT 确认注册此回调,必须摘除
 //
 // 本类使用 KernelMemoryAccessor 的内核R/W能力:
 //   - 遍历各回调数组
@@ -277,8 +281,13 @@ public:
     // 单独摘除模块加载通知回调
     int DisableImageNotifyCallbacks(const char* eacDriverName = "EasyAntiCheat");
 
+    // ★ BUILD 551: 单独摘除线程创建通知回调
+    //   基于逆向确认 PAC 注册了 PsSetCreateThreadNotifyRoutine
+    //   (PAC_SHV_逆向分析报告 §6 表格确认)
+    int DisableThreadNotifyCallbacks(const char* eacDriverName = "EasyAntiCheat");
+
     // ★ v3.110: 检查是否已摘除回调 (用于判断是否需要恢复)
-    bool HasRemovedCallbacks() const { return m_obCallbacksSaved || m_processCallbacksSaved || m_imageCallbacksSaved; }
+    bool HasRemovedCallbacks() const { return m_obCallbacksSaved || m_processCallbacksSaved || m_imageCallbacksSaved || m_threadCallbacksSaved; }
 
     // ★ BUILD 528: E+G — 重新移除 PAC ObCallbacks (内部处理名称解析)
     //   供 payload.cpp 主循环周期性调用, 对抗 PAC 重新注册回调.
@@ -315,10 +324,15 @@ private:
     int m_savedProcessCallbackCount = 0;
     SavedArrayEntry m_savedImageCallbacks[MAX_SAVED_ARRAY_CALLBACKS];
     int m_savedImageCallbackCount = 0;
+    // ★ BUILD 551: 线程通知回调保存数组 (新增)
+    SavedArrayEntry m_savedThreadCallbacks[MAX_SAVED_ARRAY_CALLBACKS];
+    int m_savedThreadCallbackCount = 0;
 
     bool m_obCallbacksSaved = false;
     bool m_processCallbacksSaved = false;
     bool m_imageCallbacksSaved = false;
+    // ★ BUILD 551: 线程回调状态 (新增)
+    bool m_threadCallbacksSaved = false;
 };
 
 // ============================================================
@@ -517,6 +531,68 @@ private:
     static uint64_t FindFilterByName(uint64_t fltmgrBase, uint64_t fltGlobals, const wchar_t* name);
     // 替换 FLT_FILTER.Operations 数组中所有回调为无害 stub
     static bool NeutralizeCallbacks(uint64_t filterAddr);
+};
+
+// ============================================================
+// ★ BUILD 552: ShvInstallPatcher — PAC SHV 主动防御 (方案 D)
+//
+// 目标: 在 PAC SHV 启动前 patch SHV_Install 入口为 `mov eax, -4; ret`,
+//       让 SHV 永远返回 STATUS_TOO_MANY_OPEN_FILES, 阻止 VMX/EPT 启动.
+//
+// 原理:
+//   1. 通过 KernelMemoryAccessor::GetKernelModuleBase("MessageTransfer.sys")
+//      定位 PAC 驱动内核基址
+//   2. 通过特征码扫描 (MOV RCX, 0x80000000 = 48 B9 00 00 00 80 00 00 00 00)
+//      在 PAC 驱动 .text 段定位 SHV_Install 入口
+//   3. 通过 KernelMemoryAccessor::WriteKernelVA 写入 6 字节 patch:
+//        B8 FC FF FF FF  → mov eax, 0FFFFFFFCh (STATUS_TOO_MANY_OPEN_FILES)
+//        C3              → ret
+//   4. patch 后 PAC 调用 SHV_Install 时立即返回失败, VMXON 永不执行,
+//      EPT 永不构造, 硬件级内存监控失效
+//
+// 安全性:
+//   - 修改的是 PAC 驱动 (第三方驱动) 的 .text, PatchGuard 通常不扫描
+//   - patch 后 PAC 不进入 SHV 初始化流程, 不会触发 SHV 内部自检
+//   - 失败不影响主流程 (仅记录 ByovdDiag 日志)
+//
+// 参考: PAC_SHV_逆向分析报告.md §13.4 方案 D 评估
+// ============================================================
+class ShvInstallPatcher {
+public:
+    // Patch PAC SHV_Install 入口为 mov eax, -4; ret
+    // 返回 true = patch 成功 (或已被 patch), false = 失败
+    //   失败原因: PAC 未加载 / BYOVD 未就绪 / 特征码未匹配 / 写入失败
+    static bool PatchShvInstallEntry();
+
+    // 检查 SHV_Install 是否已被 patch (用于周期性验证)
+    // 返回 true = 已 patch (前 6 字节为 B8 FC FF FF FF C3)
+    static bool IsPatched();
+
+    // 还原 SHV_Install 原始字节 (仅用于调试/测试, 不应在生产环境调用)
+    // 返回 true = 还原成功
+    static bool RestoreShvInstallEntry();
+
+private:
+    // 通过特征码在 PAC 驱动 .text 段定位 SHV_Install 入口
+    // 特征 1: MOV RCX, 0x80000000 (48 B9 00 00 00 80 00 00 00 00) — 2GB 物理内存限制
+    // 特征 2: 紧跟 CALL rel32 (E8 xx xx xx xx) — 调用 CheckPhysicalMemoryLimit
+    // 返回 SHV_Install 入口绝对 VA, 0 = 未找到
+    // ★ SHV_Install 入口在特征 1 之前若干字节 (函数序言: push rbp / sub rsp 等)
+    //   扫描时向前回溯查找函数边界 (0xCC int3 填充 或 0x90 nop 填充)
+    static uint64_t FindShvInstallEntry(uint64_t pacDriverBase, uint32_t textSize);
+
+    // ★ BUILD 552: PAC 驱动名通过 STEALTH_STR_DECRYPT_TO 运行时解密 (避免明文进入 .rdata)
+    //   原 `static constexpr const char* PAC_DRIVER_NAME = "MessageTransfer.sys";` 已移除
+
+    // patch 字节序列: mov eax, 0FFFFFFFCh; ret
+    //   B8 FC FF FF FF  = mov eax, -4 (STATUS_TOO_MANY_OPEN_FILES)
+    //   C3              = ret
+    static constexpr uint8_t PATCH_BYTES[6] = { 0xB8, 0xFC, 0xFF, 0xFF, 0xFF, 0xC3 };
+
+    // 原始字节缓存 (用于 RestoreShvInstallEntry)
+    static uint8_t m_originalBytes[6];
+    static bool m_hasOriginalBytes;
+    static uint64_t m_patchedAddress;
 };
 
 } // namespace stealth

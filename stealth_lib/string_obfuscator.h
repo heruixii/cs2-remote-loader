@@ -114,6 +114,34 @@ namespace detail {
     SecureZeroMemory(_aBuf, sizeof(_aBuf)); \
 } while(0)
 
+// ★ BUILD 551: STEALTH_GET_PROC_ADDRESS — 加密版 GetProcAddress
+//   用法: FARPROC p = STEALTH_GET_PROC_ADDRESS(hMod, "NtQuerySystemInformation");
+//   原理: 编译期加密 API 名,运行时解密到栈缓冲,调用 GetProcAddress,用后清零
+//   规避: .rdata 中不再残留 "NtQuerySystemInformation" 等明文 API 名
+//   注意: 使用 lambda 表达式,API 名在栈上短暂存在 (仅 lambda 执行期间)
+#define STEALTH_GET_PROC_ADDRESS(hMod, apiNameStr) \
+    [&]() -> FARPROC { \
+        char _apiBuf[128] = {}; \
+        STEALTH_STR_DECRYPT_TO(apiNameStr, _apiBuf, sizeof(_apiBuf)); \
+        FARPROC _p = GetProcAddress((hMod), _apiBuf); \
+        SecureZeroMemory(_apiBuf, sizeof(_apiBuf)); \
+        return _p; \
+    }()
+
+// ★ BUILD 551: STEALTH_GET_PROC_ADDRESS_NOREF — 不使用 lambda 捕获的版本
+//   用法: static auto fn = reinterpret_cast<Foo>(STEALTH_GET_PROC_ADDRESS_NOREF(hMod, "NtFoo"));
+//   修复: 原版 []() 无捕获 lambda 无法访问外围 hMod → 编译报错 "not captured"
+//         改为将 hMod 作为 lambda 参数显式传入, 真正做到零捕获 (适用于 static 初始化场景)
+//   等价: GetProcAddress(hMod, "apiName") — 但 apiName 经 XTEA 编译期加密, 不进入 .rdata
+#define STEALTH_GET_PROC_ADDRESS_NOREF(hMod, apiNameStr) \
+    ([](HMODULE _h) -> FARPROC { \
+        char _apiBuf[128] = {}; \
+        STEALTH_STR_DECRYPT_TO(apiNameStr, _apiBuf, sizeof(_apiBuf)); \
+        FARPROC _p = GetProcAddress(_h, _apiBuf); \
+        SecureZeroMemory(_apiBuf, sizeof(_apiBuf)); \
+        return _p; \
+    }(hMod))
+
 // 运行时字符串 XOR 混淆工具 (用于动态生成的字符串)
 class StringObfuscator {
 public:

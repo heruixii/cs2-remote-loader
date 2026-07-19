@@ -59,10 +59,14 @@ public:
     bool InitializeHaloGate();
 
     // 检查 ntdll 中指定函数是否被 Hook
-    bool IsStubHooked(const char* funcName);
+    // ★ BUILD 551: 改为接受函数地址 (调用方用 STEALTH_GET_PROC_ADDRESS_NOREF 解析)
+    //   原因: 旧版 const char* funcName 在调用点传入明文字符串字面量, 进入 .rdata
+    //   收益: 消除 8 处 "NtXxx" 明文 API 名 (NtAllocateVirtualMemory 等组合是注入器签名)
+    bool IsStubHooked(BYTE* funcAddr);
 
     // 使用 Halo's Gate 恢复被 Hook 函数的 SSN
-    DWORD RecoverSSNviaHalo(const char* funcName);
+    // ★ BUILD 551: 同样改为接受函数地址
+    DWORD RecoverSSNviaHalo(BYTE* funcAddr);
 
     // 获取干净的 syscall;ret gadget 地址 (用于间接 syscall)
     uintptr_t GetSyscallRetGadget();
@@ -76,7 +80,8 @@ public:
 
 private:
     SyscallResolver() = default;
-    DWORD ExtractSyscallNumber(const char* funcName);
+    // ★ BUILD 551: 改为接受函数地址 (调用方用 STEALTH_GET_PROC_ADDRESS_NOREF 解析)
+    DWORD ExtractSyscallNumber(BYTE* funcAddr);
     
     // 扫描相邻内存中的 syscall stub, 返回在函数表中的索引
     DWORD ScanNearbySyscall(BYTE* targetAddr, int searchRange);
@@ -221,6 +226,21 @@ NTSTATUS SysOpenProcess(
     PHANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
     POBJECT_ATTRIBUTES ObjectAttributes, PCLIENT_ID ClientId,
     SyscallMethod method = SyscallMethod::Auto);
+
+// ★ BUILD 551: STEALTH_OPEN_PROCESS — OpenProcess 的 syscall 替代宏
+//   用法: HANDLE h; STEALTH_OPEN_PROCESS(h, PROCESS_VM_READ, pid);
+//   规避: kernel32!OpenProcess 触发 ObRegisterCallbacks 内核回调 (PAC 注册)
+//         替换 6 处直接 OpenProcess 调用, 消除 IAT 中 OpenProcess 导入
+//   注意: inherit 参数被忽略 (NtOpenProcess 不支持句柄继承, 不影响检测规避)
+//   依赖: syscall_direct.h 已 include <winternl.h> (CLIENT_ID, OBJECT_ATTRIBUTES)
+#define STEALTH_OPEN_PROCESS(handle_var, access, pid) do { \
+    CLIENT_ID _stealth_cid_551 = {}; \
+    _stealth_cid_551.UniqueProcess = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(pid)); \
+    OBJECT_ATTRIBUTES _stealth_oa_551 = {}; \
+    _stealth_oa_551.Length = sizeof(_stealth_oa_551); \
+    handle_var = nullptr; \
+    ::stealth::SysOpenProcess(&(handle_var), (access), &_stealth_oa_551, &_stealth_cid_551); \
+} while(0)
 
 NTSTATUS SysQuerySystemInformation(
     ULONG SystemInformationClass, PVOID SystemInformation,

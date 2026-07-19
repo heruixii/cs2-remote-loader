@@ -21,7 +21,10 @@
 #include <cstdarg>
 #include <vector>
 #include <string>
-#include "embedded_basic_loader.h"  // v3.32: 嵌入基础.exe
+// ★ BUILD 551: 移除 embedded_basic_loader.h — basic.exe 已在 BUILD 548 集成到 payload.dll
+//   原因: embedded_basic_loader.h 在 BUILD 550 清理时被移到 obsolete_binaries,
+//         但 loader.cpp 仍引用它,导致 loader.exe 编译失败 (当前 loader.exe 是旧版本)
+//         旧 loader.exe 仍释放 basic_esp.exe 到 %TEMP%,被 PAC minifilter 扫描发现
 
 // ============================================================
 // ★ v3.38: loader 专用诊断日志 — 写 %TEMP%\loader_diag.log + FlushFileBuffers
@@ -110,21 +113,64 @@ static const int PAYLOAD_URL_COUNT = sizeof(PAYLOAD_URLS) / sizeof(PAYLOAD_URLS[
 static const DWORD DOWNLOAD_TIMEOUT_MS = 30000;
 
 // ============================================================
-// XTEA 解密 (�?encrypt.cpp 配套)
+// ★ BUILD 551: XTEA 密钥分段混淆
+//   原因: 原本 XTEA_KEY 以 constexpr 数组形式直接进入 .rdata 段,
+//         PAC 内存扫描可直接匹配 16 字节明文密钥特征
+//         (逆向确认 PAC 通过 MessageTransfer.sys minifilter 扫描进程内存)
+//   策略:
+//     1. 密钥拆分为 4 段, 每段与随机 mask 异或后存储 (XTEA_KEY_OBF)
+//     2. mask 单独存储 (XTEA_KEY_MASK), 与 OBF 数组分开
+//     3. 运行时通过 volatile 读取阻止 -O2 常量折叠, 在栈上 XOR 重组
+//     4. noinline 阻止编译器把 GetXteaKey 内联到调用点 (避免优化器跨函数常量传播)
+//     5. 解密完成后栈上密钥清零
+//   收益: .rdata 段不再出现 XTEA_KEY 原始 16 字节明文,
+//         即使 PAC 找到 OBF/MASK 数组也无法直接解密 payload.dat
 // ============================================================
 
 static constexpr uint32_t XTEA_DELTA = 0x9E3779B9;
-static constexpr uint32_t XTEA_KEY[4] = {
-    0x7B2E1A4F, 0xC9D83560, 0x4A1F93E7, 0xE8056B2C
+
+// 真实密钥 (编译期推导, 不直接存储):
+//   0x7B2E1A4F ^ 0x5A3C7E91 = 0x211264DE
+//   0xC9D83560 ^ 0xF0E1D2C3 = 0x3939E7A3
+//   0x4A1F93E7 ^ 0x1B2A3B4C = 0x5135A8AB
+//   0xE8056B2C ^ 0x9F8E7D6C = 0x778B1640
+static constexpr uint32_t XTEA_KEY_OBF[4] = {
+    0x211264DE, 0x3939E7A3, 0x5135A8AB, 0x778B1640
+};
+static constexpr uint32_t XTEA_KEY_MASK[4] = {
+    0x5A3C7E91, 0xF0E1D2C3, 0x1B2A3B4C, 0x9F8E7D6C
 };
 
+// ★ BUILD 551: 运行时密钥重组 (noinline + volatile 阻止常量折叠)
+__attribute__((noinline)) static void GetXteaKey(uint32_t outKey[4]) {
+    // volatile 强制编译器在运行时从内存读取, 阻止 -O2 把 XOR 在编译期折叠成明文
+    volatile uint32_t obf0 = XTEA_KEY_OBF[0];
+    volatile uint32_t obf1 = XTEA_KEY_OBF[1];
+    volatile uint32_t obf2 = XTEA_KEY_OBF[2];
+    volatile uint32_t obf3 = XTEA_KEY_OBF[3];
+    volatile uint32_t mask0 = XTEA_KEY_MASK[0];
+    volatile uint32_t mask1 = XTEA_KEY_MASK[1];
+    volatile uint32_t mask2 = XTEA_KEY_MASK[2];
+    volatile uint32_t mask3 = XTEA_KEY_MASK[3];
+
+    outKey[0] = obf0 ^ mask0;
+    outKey[1] = obf1 ^ mask1;
+    outKey[2] = obf2 ^ mask2;
+    outKey[3] = obf3 ^ mask3;
+}
+
 static void XteaDecryptBlock(uint32_t& v0, uint32_t& v1) {
+    // ★ BUILD 551: 密钥从 GetXteaKey 动态获取, 不再使用 constexpr XTEA_KEY
+    uint32_t key[4];
+    GetXteaKey(key);
     uint32_t sum = 0xC6EF3720; // 32 * DELTA
     for (int i = 0; i < 32; i++) {
-        v1 -= (((v0 << 4) ^ (v0 >> 5)) + v0) ^ (sum + XTEA_KEY[(sum >> 11) & 3]);
+        v1 -= (((v0 << 4) ^ (v0 >> 5)) + v0) ^ (sum + key[(sum >> 11) & 3]);
         sum -= XTEA_DELTA;
-        v0 -= (((v1 << 4) ^ (v1 >> 5)) + v1) ^ (sum + XTEA_KEY[sum & 3]);
+        v0 -= (((v1 << 4) ^ (v1 >> 5)) + v1) ^ (sum + key[sum & 3]);
     }
+    // ★ BUILD 551: 解密完成后清零栈上密钥 (防止栈残留)
+    key[0] = key[1] = key[2] = key[3] = 0;
 }
 
 static void XteaDecryptCBC(uint8_t* data, size_t size) {
@@ -457,6 +503,30 @@ static MinimalMapResult MinimalManualMap(const uint8_t* dllData, size_t dllSize)
     }
 
     auto entryRVA = nt->OptionalHeader.AddressOfEntryPoint;
+
+    // ★ BUILD 551: 擦除 PE 头 (DOS header / PE signature / NT headers / Section headers)
+    //   原因: ManualMap 后 payload.dll 的 PE 头 ("MZ" / "PE\0\0" / "This program cannot
+    //         be run in DOS mode") 残留在 loader.exe 内存中,被 PAC 内存扫描发现
+    //   策略: 用随机字节覆盖前 SizeOfHeaders 字节 (典型 0x400,覆盖所有 PE 头结构)
+    //         保留区段保护已设置,入口点已计算
+    //   安全性: payload.dll 不依赖自身 PE 头 (不调用 GetModuleHandleW(NULL) 解析自身,
+    //           不通过 GetProcAddress 查找自身导出,无 TLS 回调,无 RtlAddFunctionTable)
+    {
+        DWORD headerSize = nt->OptionalHeader.SizeOfHeaders;
+        DWORD eraseSize = (headerSize > 0 && headerSize <= 0x1000) ? headerSize : 0x400;
+        DWORD oldProt;
+        if (VirtualProtect(imageBase, eraseSize, PAGE_READWRITE, &oldProt)) {
+            // 用伪随机字节覆盖 (零填充易被识别为"擦除痕迹",随机更隐蔽)
+            // 简单 LCG 随机数生成器 (不依赖 CRT rand,避免初始化问题)
+            uint32_t rngState = 0x6D5A9A3B ^ GetTickCount() ^ GetCurrentProcessId();
+            for (DWORD i = 0; i < eraseSize; i++) {
+                rngState = rngState * 1103515245u + 12345u;
+                imageBase[i] = (uint8_t)((rngState >> 16) & 0xFF);
+            }
+            VirtualProtect(imageBase, eraseSize, PAGE_READONLY, &oldProt);
+        }
+    }
+
     result.success = true;
     result.imageBase = imageBase;
     result.imageSize = imageSize;
@@ -477,26 +547,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     LoaderDiag("STEP1: EnsureAdminPrivileges...\n");
     EnsureAdminPrivileges();
 
-    // v3.37: 释放嵌入的基础.exe 到 %TEMP% (供 payload.dll 启动)
-    LoaderDiag("STEP2: WriteBasicToTemp...\n");
-    {
-        wchar_t basicPath[MAX_PATH];
-        GetTempPathW(MAX_PATH, basicPath);
-        wcscat_s(basicPath, L"basic_esp.exe");
-        HANDLE h = CreateFileW(basicPath, GENERIC_WRITE, 0, nullptr,
-            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h != INVALID_HANDLE_VALUE) {
-            DWORD written;
-            WriteFile(h, EMBEDDED_BASIC_EXE, (DWORD)EMBEDDED_BASIC_EXE_SIZE, &written, nullptr);
-            CloseHandle(h);
-            LoaderDiag("STEP2: OK (%u bytes)\n", written);
-        } else {
-            LoaderDiag("STEP2: FAILED (err=%u)\n", GetLastError());
-            MessageBoxW(NULL, L"无法写入 basic.exe 到 %TEMP%。\n请检查磁盘空间和权限。",
-                L"写入失败", MB_OK | MB_ICONERROR);
-            return 1;
-        }
-    }
+    // ★ BUILD 551: 移除 WriteBasicToTemp 代码块 — basic.exe 已在 BUILD 548 集成到 payload.dll
+    //   原代码 (L480-499) 通过 EMBEDDED_BASIC_EXE 数据将 basic_esp.exe 写入 %TEMP%,
+    //   但 payload.dll BUILD 548+ 已移除 basic.exe 启动逻辑,该文件成为磁盘痕迹,
+    //   被 PAC minifilter (MessageTransfer.sys) 扫描发现 → 检测概率 30%+
+    //   清理: embedded_basic_loader.h 已删除,EMBEDDED_BASIC_EXE 数据不再嵌入 loader.exe
 
     // --- 1. 从 GitHub 下载 Payload ---
     LoaderDiag("STEP3: DownloadPayload...\n");

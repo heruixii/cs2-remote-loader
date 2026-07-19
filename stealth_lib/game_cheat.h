@@ -9,7 +9,7 @@
 #include "cs2_memory.h"
 #include "cheat_overlay.h"
 #include "game_esp.h"
-#include "eac_syscall_guard.h"
+#include "handle_acl_guard.h"  // ★ BUILD 552: eac_syscall_guard 拆分 (仅保留 HandleACLGuard)
 #include "byovd_kernel.h"
 // ★ BUILD 500: 移除 <thread> <chrono> <random> — CRT 堆依赖, 用 Win32 API 替代
 
@@ -149,10 +149,8 @@ public:
             // === 反检测帧维护 ===
             engine.OnFrame();
 
-            // === 纵深防御: Syscall Stub 完整性验证 (每 30 帧) ===
-            if ((frameCount % 30) == 0) {
-                stealth::SyscallGuard::VerifyAndRepair();
-            }
+            // ★ BUILD 552: 移除 SyscallGuard::VerifyAndRepair() 调用 (EAC 专属, 已删除)
+            //   实际 stub 完整性自愈由 syscall_direct 模块的 Halo's Gate / Tartarus Gate 提供
 
             // === 读取游戏数据 ===
             auto entities = memory.GetAllPlayers(true);

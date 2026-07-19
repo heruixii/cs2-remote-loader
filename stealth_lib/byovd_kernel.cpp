@@ -30,7 +30,22 @@
 #include <intrin.h>
 #endif
 
-// ★ v3.37/B549: BYOVD 本地诊断日志 (写 %TEMP%\sd.log)
+// ★ BUILD 551: ByovdDiag 条件编译消除
+//   原因: byovd_kernel.cpp 中 383 处 ByovdDiag 调用包含 "BYOVD:"/"VERIFY:"/"FLT:"/
+//         "DKOM:"/"TRACE:"/"B549:"/"B550:" 等明文格式字符串,这些字符串在 release
+//         编译后会进入 .rdata 段 (约 30+ KB),被 PAC 内存扫描发现
+//         (逆向确认 PAC 通过 MessageTransfer.sys minifilter 扫描进程内存)
+//   策略: release 编译 (NDEBUG) 时, ByovdDiag 宏展开为 ((void)0),
+//         所有 383 处调用被预处理器消除 → 字符串字面量不进入 .rdata 段
+//         debug 编译时保留原 static void ByovdDiag 函数实现
+//   审计: 383 处调用均为纯日志输出, 参数无副作用 (仅读取变量/GetLastError)
+//         经审计无 x++ / 函数调用副作用, 宏消除安全
+//   收益: payload.dll .rdata 段减少约 30 KB 明文特征, 消除 "BYOVD:" 等关键字
+#ifdef NDEBUG
+    // ★ BUILD 551: Release 模式 — ByovdDiag 完全消除 (字符串不进入二进制)
+    #define ByovdDiag(fmt, ...) ((void)0)
+#else
+    // Debug 模式 — 保留日志输出 (写 %TEMP%\sd.log)
 static void ByovdDiag(const char* fmt, ...) {
     char buf[512];
     va_list args;
@@ -49,6 +64,7 @@ static void ByovdDiag(const char* fmt, ...) {
         CloseHandle(h);
     }
 }
+#endif  // NDEBUG
 
 // BYOVD 驱动嵌入支持: 将 RTCore64.sys 编译进 payload
 //   python scripts/embed_driver.py RTCore64.sys → rtcore64_embed.h
@@ -776,7 +792,7 @@ bool KernelMemoryAccessor::IsHVCIEnabled() {
     HMODULE ntdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
     if (ntdll) {
         using NtQuerySystemInfo_t = LONG(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
-        auto pNtQsi = (NtQuerySystemInfo_t)GetProcAddress(ntdll, "NtQuerySystemInformation");
+        auto pNtQsi = (NtQuerySystemInfo_t)STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtQuerySystemInformation");
         if (pNtQsi) {
             struct { ULONG length; ULONG flags; } ci = {};
             ULONG retLen = 0;
@@ -1785,7 +1801,7 @@ uint64_t KernelMemoryAccessor::GetKernelModuleBase(const char* moduleName) {
     typedef LONG(NTAPI* NtQuerySystemInfo_t)(ULONG, PVOID, ULONG, PULONG);
     HMODULE ntdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
     if (!ntdll) return 0;
-    auto pNtQsi = (NtQuerySystemInfo_t)GetProcAddress(ntdll, "NtQuerySystemInformation");
+    auto pNtQsi = (NtQuerySystemInfo_t)STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtQuerySystemInformation");
     if (!pNtQsi) return 0;
 
     // 使用 VirtualAlloc 替代 std::vector — 不依赖 CRT 堆
@@ -1967,11 +1983,12 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     // ★ BUILD 486: 在 Initialize 早期缓存 Nt* SSN — 此时 kernel32→ntdll 调用链仍安全.
     //   后续 LoadDriver 使用这些缓存的 SSN 生成 syscall stubs, 完全绕过 ntdll 包装函数,
     //   避免 Win11 CFG 在 manual-mapped DLL 上下文中阻止 ntdll 间接调用.
+    // ★ BUILD 551: extractSsn 改为接受 funcAddr, 调用方用 STEALTH_GET_PROC_ADDRESS_NOREF 加密解析
+    //   原因: 旧版 const char* name 在调用点传入明文 "NtCreateKey" 等字面量, 进入 .rdata
     if (!g_cachedSsnCreateKey || !g_cachedSsnLoadDriver) {
         HMODULE hNtdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
         if (hNtdll) {
-            auto extractSsn = [](HMODULE mod, const char* name) -> DWORD {
-                auto* addr = reinterpret_cast<BYTE*>(GetProcAddress(mod, name));
+            auto extractSsn = [](BYTE* addr) -> DWORD {
                 if (!addr) return 0;
                 // 标准 x64 Nt* 开头: 4C 8B D1 B8 XX XX XX XX (mov r10,rcx; mov eax,SSN)
                 if (addr[0] == 0x4C && addr[1] == 0x8B && addr[2] == 0xD1 && addr[3] == 0xB8)
@@ -1984,13 +2001,13 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
                 }
                 return 0;
             };
-            g_cachedSsnCreateKey   = extractSsn(hNtdll, "NtCreateKey");
-            g_cachedSsnOpenKey     = extractSsn(hNtdll, "NtOpenKey");
-            g_cachedSsnSetValueKey = extractSsn(hNtdll, "NtSetValueKey");
-            g_cachedSsnLoadDriver  = extractSsn(hNtdll, "NtLoadDriver");
+            g_cachedSsnCreateKey   = extractSsn(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(hNtdll, "NtCreateKey")));
+            g_cachedSsnOpenKey     = extractSsn(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(hNtdll, "NtOpenKey")));
+            g_cachedSsnSetValueKey = extractSsn(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(hNtdll, "NtSetValueKey")));
+            g_cachedSsnLoadDriver  = extractSsn(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(hNtdll, "NtLoadDriver")));
             // ★ BUILD 490: EnablePrivilege 直接 syscall
-            g_cachedSsnOpenProcessToken      = extractSsn(hNtdll, "NtOpenProcessToken");
-            g_cachedSsnAdjustPrivilegesToken = extractSsn(hNtdll, "NtAdjustPrivilegesToken");
+            g_cachedSsnOpenProcessToken      = extractSsn(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(hNtdll, "NtOpenProcessToken")));
+            g_cachedSsnAdjustPrivilegesToken = extractSsn(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(hNtdll, "NtAdjustPrivilegesToken")));
             ByovdDiag("BYOVD:Init: cached Nt* SSN: CK=%u OK=%u SV=%u LD=%u OPT=%u APT=%u\n",
                 g_cachedSsnCreateKey, g_cachedSsnOpenKey,
                 g_cachedSsnSetValueKey, g_cachedSsnLoadDriver,
@@ -2153,7 +2170,7 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
         // 0. NtMakeTemporaryObject — 移除 OBJ_PERMANENT, 关闭句柄后设备对象自动释放
         {
             static auto pNtMakeTemp = (NTSTATUS(NTAPI*)(HANDLE))
-                GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtMakeTemporaryObject");
+                STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtMakeTemporaryObject");
             if (pNtMakeTemp) {
                 NTSTATUS st = pNtMakeTemp(m_hDevice);
                 ByovdDiag("BYOVD:Init: NtMakeTemporaryObject(zombie) → 0x%08X\n", (uint32_t)st);
@@ -2837,12 +2854,83 @@ int EACCallbackDisabler::DisableImageNotifyCallbacks(const char* eacDriverName) 
     return removed;
 }
 
+// ★ BUILD 551: DisableThreadNotifyCallbacks — 摘除 PAC 注册的线程创建通知回调
+//   基于 PAC_SHV_逆向分析报告 §6 确认 PAC IAT 导入 PsSetCreateThreadNotifyRoutine.
+//   实现复用 DisableImageNotifyCallbacks 模式 (PspCreateThreadNotifyRoutine 数组布局相同).
+//   数组最大 64 条目 (与 PspCreateProcessNotifyRoutineEx 相同).
+int EACCallbackDisabler::DisableThreadNotifyCallbacks(const char* eacDriverName) {
+    auto& kma = KernelMemoryAccessor::Instance();
+    if (!kma.IsActive()) return 0;
+
+    uint64_t ntBase = kma.GetNtoskrnlBase();
+    char eacSysName[128];
+    sprintf_s(eacSysName, "%s.sys", eacDriverName);
+    uint64_t eacBase = kma.GetKernelModuleBase(eacSysName);
+    if (!eacBase) {
+        ByovdDiag("VERIFY:ThreadNotify: '%s.sys' not loaded — skip scan\n", eacDriverName);
+        return 0;
+    }
+
+    // PsSetCreateThreadNotifyRoutine → 找到 PspCreateThreadNotifyRoutine 数组
+    uint64_t psSetThread = kma.ResolveExport(ntBase, "PsSetCreateThreadNotifyRoutine");
+    if (!psSetThread) return 0;
+
+    // 搜索 lea rcx, [rip+offset] 或 mov rcx, imm64 定位数组 (与 Image/Process 模式相同)
+    uint8_t funcBody[128] = {};
+    if (!kma.ReadKernelVA(psSetThread, funcBody, sizeof(funcBody))) return 0;
+
+    uint64_t arrayAddr = 0;
+    for (int i = 0; i < (int)sizeof(funcBody) - 7; i++) {
+        if (funcBody[i] == 0x48 && funcBody[i+1] == 0x8D && funcBody[i+2] == 0x0D) {
+            int32_t disp = *(int32_t*)(funcBody + i + 3);
+            arrayAddr = psSetThread + i + 7 + disp;
+            break;
+        }
+        if (funcBody[i] == 0x48 && funcBody[i+1] == 0xB9) {
+            arrayAddr = *(uint64_t*)(funcBody + i + 2);
+            break;
+        }
+    }
+
+    if (!arrayAddr) return 0;
+
+    // 重置计数器 (与 Image/Process 模式一致)
+    m_savedThreadCallbackCount = 0;
+
+    int removed = 0;
+    for (int i = 0; i < 64; i++) {
+        uint64_t entry = kma.Read<uint64_t>(arrayAddr + i * 8);
+        if (!entry) continue;
+        uint64_t callbackPtr = entry & 0xFFFFFFFFFFFFFFFULL;
+        if (IsAddressInModule(callbackPtr, eacBase, 0x100000)) {
+            if (m_savedThreadCallbackCount < MAX_SAVED_ARRAY_CALLBACKS) {
+                SavedArrayEntry& saved = m_savedThreadCallbacks[m_savedThreadCallbackCount];
+                saved.address = arrayAddr + i * 8;
+                saved.originalValue = entry;
+                m_savedThreadCallbackCount++;
+            }
+            uint64_t zero = 0;
+            kma.Write(arrayAddr + i * 8, zero);
+            removed++;
+        }
+    }
+
+    m_threadCallbacksSaved = (m_savedThreadCallbackCount > 0);
+    ByovdDiag("BYOVD:DisableThreadNotify: removed %d thread callbacks (array=0x%llX)\n",
+        removed, (unsigned long long)arrayAddr);
+    return removed;
+}
+
 int EACCallbackDisabler::DisableAll(const char* eacDriverName) {
     int total = 0;
     total += DisableObCallbacks(eacDriverName);
     total += DisableProcessNotifyCallbacks(eacDriverName);
     total += DisableImageNotifyCallbacks(eacDriverName);
-    // PsSetCreateThreadNotifyRoutine 类似模式, 但 EAC 一般不注册此回调
+    // ★ BUILD 551: 摘除线程创建通知回调
+    //   原代码注释 "EAC 一般不注册此回调" 是 BUILD 528 时期的错误判断,
+    //   逆向确认 PAC (MessageTransfer.sys) IAT 导入 PsSetCreateThreadNotifyRoutine,
+    //   必须摘除,否则 loader.exe 注入 payload 时 CreateRemoteThread 会被捕获
+    total += DisableThreadNotifyCallbacks(eacDriverName);
     return total;
 }
 
@@ -2899,6 +2987,17 @@ int EACCallbackDisabler::RestoreAll() {
     // ★ v3.120: 重置计数器, 避免 std::vector CRT 堆依赖
     m_savedImageCallbackCount = 0;
     m_imageCallbacksSaved = false;
+
+    // ★ BUILD 551: 4. 恢复线程创建通知回调
+    for (int i = 0; i < m_savedThreadCallbackCount; i++) {
+        SavedArrayEntry& saved = m_savedThreadCallbacks[i];
+        if (kma.IsKernelAddressValid(saved.address)) {
+            kma.Write(saved.address, saved.originalValue);
+            restored++;
+        }
+    }
+    m_savedThreadCallbackCount = 0;
+    m_threadCallbacksSaved = false;
 
     ByovdDiag("BYOVD:EACCallbackDisabler: restored %d callbacks\n", restored);
     return restored;
@@ -6171,9 +6270,9 @@ static bool IsPacMinifilterLoaded() {
     HMODULE hFltLib = LoadLibraryW(L"fltlib.dll");
     if (!hFltLib) return false;
 
-    _FilterFindFirst pFindFirst = (_FilterFindFirst)GetProcAddress(hFltLib, "FilterFindFirst");
-    _FilterFindNext  pFindNext  = (_FilterFindNext)GetProcAddress(hFltLib, "FilterFindNext");
-    _FilterFindClose pFindClose = (_FilterFindClose)GetProcAddress(hFltLib, "FilterFindClose");
+    _FilterFindFirst pFindFirst = (_FilterFindFirst)STEALTH_GET_PROC_ADDRESS_NOREF(hFltLib, "FilterFindFirst");
+    _FilterFindNext  pFindNext  = (_FilterFindNext)STEALTH_GET_PROC_ADDRESS_NOREF(hFltLib, "FilterFindNext");
+    _FilterFindClose pFindClose = (_FilterFindClose)STEALTH_GET_PROC_ADDRESS_NOREF(hFltLib, "FilterFindClose");
 
     if (!pFindFirst || !pFindNext || !pFindClose) {
         FreeLibrary(hFltLib);
@@ -6275,7 +6374,7 @@ static bool UnloadPacMinifilter() {
         return false;
     }
 
-    _FilterUnload pFilterUnload = (_FilterUnload)GetProcAddress(hFltLib, "FilterUnload");
+    _FilterUnload pFilterUnload = (_FilterUnload)STEALTH_GET_PROC_ADDRESS_NOREF(hFltLib, "FilterUnload");
     if (!pFilterUnload) {
         ByovdDiag("B550:PC: FilterUnload not exported\n");
         FreeLibrary(hFltLib);
@@ -6799,6 +6898,288 @@ int VADConcealer::ConcealAllRegions(DWORD pid, const uintptr_t* bases, int count
         }
     }
     return success;
+}
+
+// ============================================================
+// ★ BUILD 552: ShvInstallPatcher — PAC SHV 主动防御 (方案 D)
+//   详见 byovd_kernel.h 中的类注释和 PAC_SHV_逆向分析报告.md §13.4
+// ============================================================
+
+// 静态成员定义
+uint8_t ShvInstallPatcher::m_originalBytes[6] = {};
+bool ShvInstallPatcher::m_hasOriginalBytes = false;
+uint64_t ShvInstallPatcher::m_patchedAddress = 0;
+
+uint64_t ShvInstallPatcher::FindShvInstallEntry(uint64_t pacDriverBase, uint32_t textSize) {
+    // 通过特征码扫描定位 SHV_Install 入口
+    // 特征 (PAC_SHV_逆向分析报告 §3.2 L101-105):
+    //   MOV RCX, 0x80000000        ; 48 B9 00 00 00 80 00 00 00 00 (10 字节)
+    //   CALL CheckPhysicalMemoryLimit  ; E8 xx xx xx xx (5 字节)
+    //
+    // SHV_Install 入口在特征 1 之前若干字节 (函数序言: sub rsp / push 等)
+    // 向前回溯查找函数边界 (0xCC int3 填充 或 对齐填充 0x90/0x00)
+
+    if (!pacDriverBase || textSize < 0x1000) return 0;
+
+    KernelMemoryAccessor& kma = KernelMemoryAccessor::Instance();
+    if (!kma.IsActive()) return 0;
+
+    // ★ 分块读取 .text 段 (避免一次性分配大缓冲区)
+    //   块大小 64KB, 在块内扫描特征码
+    constexpr uint32_t CHUNK_SIZE = 0x10000;  // 64 KB
+    constexpr uint32_t OVERLAP = 32;          // 块间重叠 (避免跨块特征码漏检)
+
+    // 特征码 1: MOV RCX, 0x80000000 = 48 B9 00 00 00 80 00 00 00 00
+    //   48 = REX.W, B9 = mov ecx, imm32 (REX.W 扩展为 mov rcx, imm64)
+    //   imm64 = 0x0000008000000000? 不对, MOV RCX, imm64 是 48 B9 + 8 字节 imm64
+    //   0x80000000 = 2GB, imm64 = 0x0000000080000000 (8 字节小端)
+    //   字节序列: 48 B9 00 00 00 80 00 00 00 00 (10 字节)
+    static const uint8_t SIG1[10] = { 0x48, 0xB9, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00 };
+
+    uint8_t buf[CHUNK_SIZE + OVERLAP];
+    uint32_t scanned = 0;
+
+    while (scanned < textSize) {
+        uint32_t readSize = CHUNK_SIZE;
+        if (scanned + readSize > textSize) {
+            readSize = textSize - scanned;
+        }
+        if (readSize < sizeof(SIG1) + 5) break;  // 不足以容纳特征码
+
+        uint64_t chunkAddr = pacDriverBase + scanned;
+        if (!kma.ReadKernelVA(chunkAddr, buf, readSize)) {
+            // 读失败, 跳过此块
+            scanned += CHUNK_SIZE;
+            continue;
+        }
+
+        // 在 buf[0..readSize-10] 中查找 SIG1
+        for (uint32_t i = 0; i + 15 <= readSize; i++) {
+            // 比对 SIG1 (10 字节)
+            bool match = true;
+            for (int j = 0; j < 10; j++) {
+                if (buf[i + j] != SIG1[j]) { match = false; break; }
+            }
+            if (!match) continue;
+
+            // 验证紧跟 CALL rel32 (E8 xx xx xx xx)
+            if (i + 15 > readSize) break;  // 不够容纳 CALL
+            if (buf[i + 10] != 0xE8) continue;
+
+            // ★ 找到特征码位置! 绝对 VA = chunkAddr + i
+            uint64_t sigVA = chunkAddr + i;
+
+            // ★ SHV_Install 入口在 sigVA 之前 (函数序言 + 局部变量初始化)
+            //   根据 PAC_SHV_逆向分析报告 §3.2 L99-100:
+            //     SHV_Install:
+            //         (1) 检查物理内存是否超过 EPT 映射限制
+            //         MOV  RCX, 0x80000000        ; ← 这是 sigVA
+            //         CALL CheckPhysicalMemoryLimit
+            //   所以 SHV_Install 入口就在 sigVA 处或紧前
+            //
+            //   向前回溯查找函数边界 (前一个函数末尾的 0xCC int3 填充)
+            //   最多回溯 256 字节 (SHV_Install 序言不会超过 256 字节)
+            constexpr uint32_t MAX_BACKSCAN = 256;
+            uint8_t backscan[MAX_BACKSCAN];
+            uint32_t backscanSize = (i < MAX_BACKSCAN) ? i : MAX_BACKSCAN;
+            uint64_t backscanStart = sigVA - backscanSize;
+
+            if (backscanSize > 0 && kma.ReadKernelVA(backscanStart, backscan, backscanSize)) {
+                // 从后向前查找 0xCC (int3 函数分隔符)
+                // 找到的 0xCC 位置 +1 即为 SHV_Install 入口
+                for (int32_t k = backscanSize - 1; k >= 0; k--) {
+                    if (backscan[k] == 0xCC) {
+                        // 验证后续字节是否为合法函数序言 (sub rsp / push rbp / mov rax 等)
+                        uint32_t entryOffset = k + 1;
+                        uint8_t firstByte = backscan[entryOffset];
+                        // 常见序言: 48 89 (mov), 48 83 (sub rsp), 55 (push rbp), 40-4F (REX prefix)
+                        if (firstByte == 0x48 || firstByte == 0x55 || firstByte == 0x40 ||
+                            firstByte == 0x41 || firstByte == 0x42 || firstByte == 0x43 ||
+                            (firstByte >= 0x40 && firstByte <= 0x4F)) {
+                            return backscanStart + entryOffset;
+                        }
+                    }
+                }
+            }
+
+            // 未找到 0xCC 边界, 假设 SHV_Install 入口就是 sigVA (无序言直接 MOV RCX)
+            //   这是一个保守回退, 实际 SHV_Install 有序言, 但作为 fallback
+            //   ★ 注意: 这种情况下 patch 会覆盖 MOV RCX 指令而非函数入口, 仍然有效
+            //     (PAC 调用 SHV_Install 时仍会执行到 patch 后的 mov eax, -4; ret)
+            //   不过为安全起见, 我们返回 sigVA - 16 (假设序言为 16 字节) 作为候选
+            //   但这可能导致误 patch, 因此实际生产环境应严格依赖 0xCC 边界查找
+            //   此处保守返回 0 (未找到), 避免误 patch
+            ByovdDiag("BYOVD:ShvPatch: SIG1 found @ 0x%llX but no function boundary detected\n",
+                (unsigned long long)sigVA);
+            return 0;
+        }
+
+        scanned += CHUNK_SIZE;
+        // 不需要 overlap, 因为特征码 15 字节 < CHUNK_SIZE
+    }
+
+    ByovdDiag("BYOVD:ShvPatch: SIG1 not found in .text (size=0x%X)\n", textSize);
+    return 0;
+}
+
+bool ShvInstallPatcher::PatchShvInstallEntry() {
+    // 防御性: 若已 patch, 直接返回成功
+    if (IsPatched()) {
+        ByovdDiag("BYOVD:ShvPatch: already patched @ 0x%llX\n",
+            (unsigned long long)m_patchedAddress);
+        return true;
+    }
+
+    KernelMemoryAccessor& kma = KernelMemoryAccessor::Instance();
+    if (!kma.IsActive()) {
+        ByovdDiag("BYOVD:ShvPatch: KMA not active\n");
+        return false;
+    }
+
+    // 1. 定位 PAC 驱动 (MessageTransfer.sys) 内核基址
+    //    ★ BUILD 552: 用 STEALTH_STR_DECRYPT_TO 解密模块名, 避免明文进入 .rdata
+    //      (与 byovd_kernel.cpp L4155/L6496/L6555 保持一致)
+    char pacDriverName[32] = {};
+    STEALTH_STR_DECRYPT_TO("MessageTransfer.sys", pacDriverName, sizeof(pacDriverName));
+    uint64_t pacBase = kma.GetKernelModuleBase(pacDriverName);
+    if (!pacBase) {
+        ByovdDiag("BYOVD:ShvPatch: PAC driver not loaded\n");
+        return false;
+    }
+    ByovdDiag("BYOVD:ShvPatch: PAC driver base = 0x%llX\n", (unsigned long long)pacBase);
+
+    // 2. 读取 PE 头获取 .text 段大小和 RVA
+    //    PE 头位于 pacBase + e_lfanew
+    uint32_t e_lfanew = kma.Read<uint32_t>(pacBase + 0x3C);
+    if (e_lfanew == 0 || e_lfanew > 0x1000) {
+        ByovdDiag("BYOVD:ShvPatch: invalid e_lfanew=0x%X\n", e_lfanew);
+        return false;
+    }
+    uint64_t ntHeaders = pacBase + e_lfanew;
+
+    // IMAGE_NT_HEADERS64: Signature(4) + FileHeader(20) + OptionalHeader(240)
+    //   OptionalHeader.SizeOfImage @ offset 0x38 (from ntHeaders start)
+    //   NumberOfSections @ FileHeader offset 0x6 (from ntHeaders start)
+    uint16_t numSections = kma.Read<uint16_t>(ntHeaders + 0x6);
+    uint16_t sizeOfOptionalHeader = kma.Read<uint16_t>(ntHeaders + 0x14);
+    if (numSections == 0 || numSections > 64) {
+        ByovdDiag("BYOVD:ShvPatch: invalid numSections=%u\n", numSections);
+        return false;
+    }
+
+    // 节表起始: ntHeaders + 0x18 + sizeOfOptionalHeader
+    uint64_t sectionTable = ntHeaders + 0x18 + sizeOfOptionalHeader;
+
+    // 遍历节表查找 .text (VirtualAddress + VirtualSize)
+    uint32_t textRVA = 0;
+    uint32_t textSize = 0;
+    for (uint16_t i = 0; i < numSections; i++) {
+        uint64_t section = sectionTable + i * 40;  // IMAGE_SECTION_HEADER = 40 字节
+        char name[9] = {};
+        for (int j = 0; j < 8; j++) {
+            name[j] = (char)kma.Read<uint8_t>(section + j);
+        }
+        if (name[0] == '.' && name[1] == 't' && name[2] == 'e' && name[3] == 'x' && name[4] == 't') {
+            textRVA = kma.Read<uint32_t>(section + 12);   // VirtualAddress
+            textSize = kma.Read<uint32_t>(section + 8);   // VirtualSize
+            break;
+        }
+    }
+    if (!textRVA || !textSize) {
+        ByovdDiag("BYOVD:ShvPatch: .text section not found\n");
+        return false;
+    }
+    ByovdDiag("BYOVD:ShvPatch: .text RVA=0x%X size=0x%X\n", textRVA, textSize);
+
+    // 3. 特征码扫描定位 SHV_Install 入口
+    uint64_t shvInstallAddr = FindShvInstallEntry(pacBase + textRVA, textSize);
+    if (!shvInstallAddr) {
+        ByovdDiag("BYOVD:ShvPatch: SHV_Install entry not found via signature scan\n");
+        return false;
+    }
+    ByovdDiag("BYOVD:ShvPatch: SHV_Install entry @ 0x%llX\n", (unsigned long long)shvInstallAddr);
+
+    // 4. 读取原始 6 字节 (用于 Restore)
+    if (!kma.ReadKernelVA(shvInstallAddr, m_originalBytes, 6)) {
+        ByovdDiag("BYOVD:ShvPatch: failed to read original bytes @ 0x%llX\n",
+            (unsigned long long)shvInstallAddr);
+        return false;
+    }
+    m_hasOriginalBytes = true;
+    m_patchedAddress = shvInstallAddr;
+
+    // ★ 安全检查: 验证原始字节是合法的函数序言 (不能是 0xCC/0x90 填充或 0)
+    //   合法序言通常以 REX prefix (0x40-0x4F) 或 push/mov 指令开头
+    uint8_t first = m_originalBytes[0];
+    if (first == 0x00 || first == 0xCC || first == 0x90) {
+        ByovdDiag("BYOVD:ShvPatch: suspicious original bytes (first=0x%02X), abort\n", first);
+        m_hasOriginalBytes = false;
+        m_patchedAddress = 0;
+        return false;
+    }
+
+    // 5. 写入 patch: B8 FC FF FF FF C3 (mov eax, -4; ret)
+    if (!kma.WriteKernelVA(shvInstallAddr, PATCH_BYTES, 6)) {
+        ByovdDiag("BYOVD:ShvPatch: WriteKernelVA FAILED @ 0x%llX\n",
+            (unsigned long long)shvInstallAddr);
+        m_hasOriginalBytes = false;
+        m_patchedAddress = 0;
+        return false;
+    }
+
+    // 6. 读回验证
+    uint8_t verify[6] = {};
+    if (!kma.ReadKernelVA(shvInstallAddr, verify, 6)) {
+        ByovdDiag("BYOVD:ShvPatch: verify read FAILED\n");
+        return false;
+    }
+    for (int i = 0; i < 6; i++) {
+        if (verify[i] != PATCH_BYTES[i]) {
+            ByovdDiag("BYOVD:ShvPatch: verify MISMATCH @ byte %d (got 0x%02X, want 0x%02X)\n",
+                i, verify[i], PATCH_BYTES[i]);
+            return false;
+        }
+    }
+
+    ByovdDiag("BYOVD:ShvPatch: SUCCESS — SHV_Install patched @ 0x%llX (mov eax,-4; ret)\n",
+        (unsigned long long)shvInstallAddr);
+    return true;
+}
+
+bool ShvInstallPatcher::IsPatched() {
+    if (!m_patchedAddress) return false;
+
+    KernelMemoryAccessor& kma = KernelMemoryAccessor::Instance();
+    if (!kma.IsActive()) return false;
+
+    uint8_t current[6] = {};
+    if (!kma.ReadKernelVA(m_patchedAddress, current, 6)) return false;
+
+    for (int i = 0; i < 6; i++) {
+        if (current[i] != PATCH_BYTES[i]) return false;
+    }
+    return true;
+}
+
+bool ShvInstallPatcher::RestoreShvInstallEntry() {
+    if (!m_hasOriginalBytes || !m_patchedAddress) {
+        ByovdDiag("BYOVD:ShvPatch: cannot restore — no original bytes cached\n");
+        return false;
+    }
+
+    KernelMemoryAccessor& kma = KernelMemoryAccessor::Instance();
+    if (!kma.IsActive()) return false;
+
+    if (!kma.WriteKernelVA(m_patchedAddress, m_originalBytes, 6)) {
+        ByovdDiag("BYOVD:ShvPatch: restore WriteKernelVA FAILED\n");
+        return false;
+    }
+
+    ByovdDiag("BYOVD:ShvPatch: restored original bytes @ 0x%llX\n",
+        (unsigned long long)m_patchedAddress);
+    m_hasOriginalBytes = false;
+    m_patchedAddress = 0;
+    return true;
 }
 
 } // namespace stealth

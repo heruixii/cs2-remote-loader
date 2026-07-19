@@ -354,17 +354,22 @@ DebugCheckResult AntiDebug::CheckTimingQPC() {
 
 DebugCheckResult AntiDebug::CheckINT3Breakpoints() {
     // 扫描常用函数开头是否有 INT3 (0xCC)
+    // ★ BUILD 552: 重构 funcs[] 数组 — 用 STEALTH_GET_PROC_ADDRESS_NOREF 加密解析
+    //   原实现: const char* funcs[] = {"NtWriteVirtualMemory", ...} 4 个明文 API 名进入 .rdata
+    //   新实现: 运行时 XTEA 编译期加密解析, .rdata 中无明文残留
 
     HMODULE ntdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
     if (!ntdll) return DebugCheckResult::Error;
 
-    const char* funcs[] = {
-        "NtWriteVirtualMemory", "NtReadVirtualMemory",
-        "NtOpenProcess", "NtQuerySystemInformation"
+    // 运行时解析 4 个关键 Nt* 函数地址 (XTEA 编译期加密 API 名)
+    BYTE* stubs[] = {
+        reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtWriteVirtualMemory")),
+        reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtReadVirtualMemory")),
+        reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtOpenProcess")),
+        reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtQuerySystemInformation")),
     };
 
-    for (auto* func : funcs) {
-        auto* addr = reinterpret_cast<BYTE*>(GetProcAddress(ntdll, func));
+    for (auto* addr : stubs) {
         if (addr && addr[0] == 0xCC) {
             return DebugCheckResult::Debugged;
         }
@@ -454,7 +459,9 @@ DebugCheckResult AntiDebug::CheckParentProcess() {
 
     // 获取父进程名
     wchar_t parentName[MAX_PATH] = {};
-    HANDLE hParent = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parentPid);
+    // ★ BUILD 551: OpenProcess → STEALTH_OPEN_PROCESS (syscall 替代, 规避 ObCallbacks)
+    HANDLE hParent = nullptr;
+    STEALTH_OPEN_PROCESS(hParent, PROCESS_QUERY_LIMITED_INFORMATION, parentPid);
     if (hParent) {
         DWORD size = MAX_PATH;
         QueryFullProcessImageNameW(hParent, 0, parentName, &size);
@@ -731,7 +738,7 @@ int AntiDebug::EnumerateAllThreads(DWORD* outBuf, int maxThreads) {
 void AntiDebug::HideAllThreads() {
     using NtSetInformationThread_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG);
     static auto fn = reinterpret_cast<NtSetInformationThread_t>(
-        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtSetInformationThread"));
+        STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtSetInformationThread"));
 
     if (!fn) return;
 
@@ -749,7 +756,7 @@ void AntiDebug::HideAllThreads() {
 void AntiDebug::HideCurrentThread() {
     using NtSetInformationThread_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG);
     static auto fn = reinterpret_cast<NtSetInformationThread_t>(
-        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtSetInformationThread"));
+        STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtSetInformationThread"));
 
     if (!fn) return;
     fn(GetCurrentThread(), 0x11, nullptr, 0);
@@ -765,7 +772,7 @@ bool AntiDebug::TerminateDebugger() {
     using NtQueryInformationProcess_t = NTSTATUS(NTAPI*)(
         HANDLE, ULONG, PVOID, ULONG, PULONG);
     static auto fn = reinterpret_cast<NtQueryInformationProcess_t>(
-        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQueryInformationProcess"));
+        STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQueryInformationProcess"));
 
     if (!fn) return false;
 
@@ -797,7 +804,8 @@ bool AntiDebug::TerminateDebugger() {
         if (apis.procFirst(hSnap, &pe32)) {
             do {
                 if (_wcsicmp(pe32.szExeFile, debugger) == 0) {
-                    hDebuggerProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
+                    // ★ BUILD 551: OpenProcess → STEALTH_OPEN_PROCESS (syscall 替代)
+                    STEALTH_OPEN_PROCESS(hDebuggerProcess, PROCESS_TERMINATE, pe32.th32ProcessID);
                     if (hDebuggerProcess) {
                         TerminateProcess(hDebuggerProcess, 0);
                         CloseHandle(hDebuggerProcess);

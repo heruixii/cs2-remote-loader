@@ -11,6 +11,14 @@
 // ★ v3.37: 本地诊断日志 (写 %TEMP%\sd.log)
 //   ★ BUILD 549: 文件名 stealth_diag.log → sd.log (移除 "stealth" 特征)
 //   ★ BUILD 550: 与 payload.cpp 统一使用 sd.log
+//   ★ BUILD 552: CoreDiag 条件编译消除 (与 ProcDiag/ByovdDiag/DiagLog 同策略)
+//     原因: 13 处 CoreDiag 调用包含 "AttachToProcess:"/"OpenProcessStealth"/
+//           "ReopenProcessHandle:"/"FindWindowW" 等明文格式字符串, 在 .rdata 中暴露
+//           "OpenProcessStealth" 是字符串扫描残留 0x4BF09 的根因
+//     策略: NDEBUG 时宏化为 ((void)0), 字符串不进入 .rdata
+#ifdef NDEBUG
+    #define CoreDiag(fmt, ...) ((void)0)
+#else
 static void CoreDiag(const char* fmt, ...) {
     char buf[256];
     va_list args;
@@ -29,6 +37,7 @@ static void CoreDiag(const char* fmt, ...) {
         CloseHandle(h);
     }
 }
+#endif  // NDEBUG
 
 namespace stealth {
 
@@ -280,11 +289,15 @@ void StealthEngine::OnFrame() {
             lastHookCheck = currentTick;
 
             // 检查 ntdll stub 完整性
+            // ★ BUILD 551: IsStubHooked 改为接受 BYTE* (用 STEALTH_GET_PROC_ADDRESS_NOREF 加密解析)
             auto& resolver = SyscallResolver::Instance();
-            if (resolver.IsStubHooked("NtWriteVirtualMemory") ||
-                resolver.IsStubHooked("NtReadVirtualMemory")) {
-                // 重新用 Halo's Gate 恢复 SSN
-                resolver.InitializeHaloGate();
+            HMODULE ntdllHdl = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
+            if (ntdllHdl) {
+                if (resolver.IsStubHooked(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdllHdl, "NtWriteVirtualMemory"))) ||
+                    resolver.IsStubHooked(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdllHdl, "NtReadVirtualMemory")))) {
+                    // 重新用 Halo's Gate 恢复 SSN
+                    resolver.InitializeHaloGate();
+                }
             }
 
             // ★ 修复 P8: 检查 ETW/AMSI 补丁是否被EAC恢复, 是则自动重新Patch

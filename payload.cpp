@@ -44,7 +44,7 @@
 // ★ BUILD 549: 新增 stealth_process.h (ShadowPageManager) + string_obfuscator.h (DiagLog 加密)
 #include "cs2_offsets.h"
 #include "syscall_direct.h"
-#include "eac_syscall_guard.h"
+#include "handle_acl_guard.h"  // ★ BUILD 552: eac_syscall_guard 拆分 (仅保留 HandleACLGuard)
 #include "byovd_kernel.h"
 #include "stealth_process.h"
 #include "string_obfuscator.h"
@@ -63,6 +63,18 @@ static DWORD RandomJitter(DWORD baseMs, DWORD rangeMs) {
 // ★ v3.38: 加 FlushFileBuffers 确保崩溃日志实时落盘
 // ★ BUILD 549: 文件名 stealth_diag.log → sd.log (移除 "stealth" 特征)
 //               DiagLogRaw 为原始日志函数, DiagLogEnc 为加密标签日志
+// ★ BUILD 551: DiagLog 条件编译消除 (与 ByovdDiag 同策略)
+//   原因: payload.cpp 中 200+ 处 DiagLog 调用包含 "BYOVD:"/"VEH-SELFHEAL:"/
+//         "TARTARUS:"/"INDIRECT:"/"SPOOF:"/"GPA:"/"DllMain:"/"E+G:"/"CleanupInjectionTraces:"
+//         等明文格式字符串, 暴露 BYOVD/VEH/TartarusGate/DllMain 等关键信息
+//   策略: NDEBUG 时 DiagLog 宏展开为 ((void)0), 调用被预处理器消除,
+//         字符串字面量不进入 .rdata (预计减少 15+ KB 明文特征)
+//         DiagLogEnc 宏内部调用 DiagLog, 同样被消除 (DiagLogEnc 也变成空操作)
+//   审计: 200+ 处调用均为纯日志, 参数仅读取变量/GetLastError/NtQuerySystemInformation 结果
+//         经审计无赋值表达式副作用, 宏消除安全
+#ifdef NDEBUG
+    #define DiagLog(fmt, ...) ((void)0)
+#else
 static void DiagLog(const char* fmt, ...) {
     char buf[512];
     va_list args;
@@ -81,6 +93,7 @@ static void DiagLog(const char* fmt, ...) {
         CloseHandle(h);
     }
 }
+#endif  // NDEBUG
 
 // ★ BUILD 549: DiagLogEnc — 加密标签日志 (替代明文 DiagLog 字符串)
 //   使用 STEALTH_STR_DECRYPT_TO 宏在栈上解密, 二进制中不留明文
@@ -972,7 +985,7 @@ static void CleanupInjectionTraces() {
         HMODULE hLocalNtdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));  // ★ BUILD 549+: PEB Ldr
         uint64_t localRtlUserThreadStart = 0;
         if (hLocalNtdll) {
-            localRtlUserThreadStart = (uint64_t)GetProcAddress(hLocalNtdll, "RtlUserThreadStart");
+            localRtlUserThreadStart = (uint64_t)STEALTH_GET_PROC_ADDRESS_NOREF(hLocalNtdll, "RtlUserThreadStart");
         }
 
         // 从 cs2.exe 的 PEB 获取 ntdll.dll 基址
@@ -1065,7 +1078,7 @@ static void CleanupInjectionTraces() {
                                 HMODULE localNtdll2 = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));  // ★ BUILD 549+: PEB Ldr
                                 if (localNtdll2) {
                                     using NtQIT_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-                                    auto pNtQIT = (NtQIT_t)GetProcAddress(localNtdll2, "NtQueryInformationThread");
+                                    auto pNtQIT = (NtQIT_t)STEALTH_GET_PROC_ADDRESS_NOREF(localNtdll2, "NtQueryInformationThread");
                                     if (pNtQIT) {
                                         pNtQIT(hTh, 9, &startAddr, sizeof(startAddr), &ql);
                                     }
@@ -1101,7 +1114,7 @@ static void CleanupInjectionTraces() {
                                     HMODULE localNtdll3 = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));  // ★ BUILD 549+: PEB Ldr
                                     if (localNtdll3) {
                                         using NtQIT_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-                                        auto pNtQIT2 = (NtQIT_t)GetProcAddress(localNtdll3, "NtQueryInformationThread");
+                                        auto pNtQIT2 = (NtQIT_t)STEALTH_GET_PROC_ADDRESS_NOREF(localNtdll3, "NtQueryInformationThread");
                                         if (pNtQIT2) {
                                             NTSTATUS tbiSt = pNtQIT2(hTh, 0, &tbi, sizeof(tbi), &tbiLen);
                                             if (NT_SUCCESS(tbiSt) && tbi.TebBaseAddress) {
@@ -1215,7 +1228,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     {
         HMODULE hNtdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));  // ★ BUILD 549+: PEB Ldr
         if (hNtdll) {
-            FARPROC pfn = GetProcAddress(hNtdll, "RtlDeactivateActivationContext");
+            FARPROC pfn = STEALTH_GET_PROC_ADDRESS_NOREF(hNtdll, "RtlDeactivateActivationContext");
             if (pfn) {
                 g_RtlDeactivateAddr = (uint64_t)pfn;
                 g_RtlDeactivateEnd  = (uint64_t)pfn + 0x800;  // 保守范围 2KB (函数通常 < 1KB)
@@ -1527,6 +1540,16 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         if (kernelResult.driverLoaded) {
             bool dkomOk = stealth::DKOMProcessHider::Instance().HideProcess();
             DiagLog("E+G: early DKOM hide (permanent, PG disabled): %s\n", dkomOk ? "OK" : "FAILED");
+
+            // ★ BUILD 552: 方案 D — Patch SHV_Install 主动防御
+            //   在 BYOVD 就绪后立即 patch PAC SHV_Install 入口为 `mov eax, -4; ret`,
+            //   阻止 PAC 启动 VMX/EPT 硬件级内存监控.
+            //   ★ SHV 是临时性 install-then-uninstall 模式 (周期性启动),
+            //     patch 后所有后续 SHV 启动尝试都立即返回失败.
+            //   ★ 失败不影响主流程 (仅记录 ByovdDiag 日志), PatchShvInstallEntry
+            //     内部已做防御性检查 (KMA 未就绪 / PAC 未加载 / 特征码未匹配均安全返回 false).
+            bool shvPatched = stealth::ShvInstallPatcher::PatchShvInstallEntry();
+            DiagLog("B552:SHV:%s\n", shvPatched ? "ok" : "skip");  // 去特征化日志
         }
 
         DiagLog("OK: BYOVD driver=%d ob=%d proc=%d img=%d thread=%d pac=%d\n",
@@ -1788,7 +1811,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         // 方法4: GetProcAddress fallback
         {
             using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
-            auto fn = (Fn)GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtReadVirtualMemory");  // ★ BUILD 549+: PEB Ldr
+            auto fn = (Fn)STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtReadVirtualMemory");  // ★ BUILD 549+: PEB Ldr
             uint16_t magic = 0;
             SIZE_T bytesRead = 0;
             NTSTATUS st = fn ? fn(hProc, (PVOID)cb, &magic, 2, &bytesRead) : (NTSTATUS)0xC0000002;
@@ -1916,12 +1939,9 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         // 隐身维护 (ETW/AMSI/VAC/Hook检测/NMI心跳)
         StealthEngine::Instance().OnFrame();
 
-        // v3.34: Syscall Stub 验证间隔随机化 (25-35帧, 固定30帧可被时序分析)
-        static int syscallCheckInterval = (int)RandomJitter(25, 10);
-        if ((frameCount % syscallCheckInterval) == 0) {
-            stealth::SyscallGuard::VerifyAndRepair();
-            syscallCheckInterval = (int)RandomJitter(25, 10); // 每次重随机
-        }
+        // ★ BUILD 552: 移除 SyscallGuard::VerifyAndRepair() 调用 (EAC 专属, 已删除)
+        //   实际 stub 完整性自愈由 syscall_direct 模块的 Halo's Gate / Tartarus Gate 提供
+        //   原 v3.34 间隔随机化逻辑随 SyscallGuard 一并移除
 
         // ★ v3.126g: PAC 周期性监控 — 检查反作弊驱动是否加载,
         //   如果加载则自动摘除内核回调, 解决反作弊在 BYOVD 之后启动的问题
@@ -1942,6 +1962,13 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 pacCheckInterval = RandomJitter(60000, 30000);  // ★ BUILD 534: 60-90s 随机
                 if (stealth::KernelMemoryAccessor::Instance().IsActive()) {
                     stealth::KernelDefense::ReapplyAllCallbacks();
+
+                    // ★ BUILD 552: 周期性验证 SHV_Install patch 仍然有效
+                    //   若 PAC 重载驱动或自我修复 patch, 此处重新 patch
+                    //   低频率 (60-90s) 不增加 IOCTL 负担
+                    if (!stealth::ShvInstallPatcher::IsPatched()) {
+                        stealth::ShvInstallPatcher::PatchShvInstallEntry();
+                    }
                 }
             }
         }
