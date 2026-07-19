@@ -673,6 +673,19 @@ public:
     // 返回 true = 还原成功
     static bool RestoreShvInstallEntry();
 
+    // ★ BUILD 566 v3.225: patch VmxOnWrapper (RVA 0xEAEC4) 为 xor eax,eax; ret (31 C0 C3)
+    //   目的: 让 SHV "看起来启动成功" 但 VMX 永不执行, EPT 永不构造
+    //   优势: 比 patch SHV_Install 更隐蔽 — SHV_Install 仍返回 STATUS_SUCCESS
+    //   机制: VmxOnWrapper 调用 vmxon 指令 (0F 01 C1) 启动 VMX root operation
+    //         patch 后 vmxon 永不执行 → VMX 不启动 → EPT 不构造 → OCR 无画面源
+    //   返回 true = patch 成功 (或已被 patch), false = 失败 (RVA 失效/字节验证失败/写入失败)
+    //   失败处理: 不计入降级模式 (与 PatchShvInstallEntry 独立, 避免 RVA 失效连锁影响)
+    static bool PatchVmxOnWrapper();
+
+    // ★ BUILD 566: 检查 VmxOnWrapper 是否已 patch (前 3 字节为 31 C0 C3)
+    //   返回 true = 已 patch, false = 未 patch / 状态丢失
+    static bool IsVmxOnPatched();
+
 private:
     // 通过特征码在 PAC 驱动 .text 段定位 SHV_Install 入口
     // 特征 1: MOV RCX, 0x80000000 (48 B9 00 00 00 80 00 00 00 00) — 2GB 物理内存限制
@@ -691,6 +704,14 @@ private:
     //   参数 textSectionVA: .text 段起始绝对 VA (= pacModuleBase + textRVA)
     //   参数 textSize: .text 段大小
     static uint64_t FindShvInstallEntry(uint64_t pacModuleBase, uint64_t textSectionVA, uint32_t textSize);
+
+    // ★ BUILD 566: 通过 RVA 0xEAEC4 + vmxon 指令字节验证定位 VmxOnWrapper
+    //   机制: VmxOnWrapper @ PAC 模块固定 RVA 0xEAEC4 (PAC_SHV 逆向分析报告 §3.3)
+    //   验证: 读取前 32 字节, 确认包含 vmxon 指令机器码 (0F 01 C1)
+    //         + 第一个字节非 0xCC/0x00/0x90 (函数边界检查)
+    //   参数 pacModuleBase: PAC 驱动模块基址 (MessageTransfer.sys)
+    //   返回 VmxOnWrapper 绝对 VA, 0 = 未找到/验证失败 (PAC 更新导致 RVA 失效)
+    static uint64_t FindVmxOnWrapperEntry(uint64_t pacModuleBase);
 
     // ★ BUILD 562: SIG2 — BroadcastToAllCpus / WaitForCompletion 固定 RVA
     //   来源: PAC_SHV_逆向分析报告.md §14.1 (绝对 VA = ImageBase 0x140000000 + RVA)
@@ -726,6 +747,30 @@ private:
     //   - OCR 文字识别: 3-8% → 2-5% (SHV 不启动, EPT+OCR 联动失效)
     static constexpr uint8_t PATCH_BYTES[6] = { 0xB8, 0xFB, 0xFF, 0xFF, 0xFF, 0xC3 };
 
+    // ★ BUILD 566: VmxOnWrapper 固定 RVA (PAC_SHV 逆向分析报告 §3.3)
+    //   来源: PAC 版本 1.0.0.2, ImageBase 0x140000000, VmxOnWrapper @ 0x1400EAEC4
+    //   注意: PAC 更新后可能改变, FindVmxOnWrapperEntry 字节验证失败时回退到 SHV_Install patch
+    static constexpr uint32_t VMXON_WRAPPER_RVA = 0xEAEC4;
+
+    // ★ BUILD 566: VmxOnWrapper patch 字节 — xor eax,eax; ret (3 字节)
+    //   31 C0 = xor eax, eax (设置 rax = 0 = STATUS_SUCCESS)
+    //   C3    = ret
+    //   设计: 显式返回 0 让 SHV_Install (8) 检查 failed_cpus = 0 → 返回 STATUS_SUCCESS
+    //         vmxon 永不执行 → VMX root operation 永不进入 → EPT 永不构造
+    //   不选 C3 (单字节 ret): rax 未初始化, 返回值不确定, 可能被 SHV_Install 识别为失败
+    //   不选 B8 00 00 00 00 C3 (6 字节 mov eax,0; ret): 覆盖后续指令, 可能破坏函数
+    static constexpr uint8_t VMXON_PATCH_BYTES[3] = { 0x31, 0xC0, 0xC3 };
+
+    // ★ BUILD 566: vmxon 指令机器码 (用于 FindVmxOnWrapperEntry 字节验证)
+    //   Intel SDM Vol.2: vmxon r/m64 = 0F 01 C1 (3 字节)
+    //   验证逻辑: VmxOnWrapper 前 32 字节内应包含此字节序列
+    static constexpr uint8_t VMXON_INSTR_BYTES[3] = { 0x0F, 0x01, 0xC1 };
+
+    // ★ BUILD 566: VmxOnWrapper 字节验证范围
+    //   读取 VmxOnWrapper 前 32 字节, 验证包含 vmxon 指令
+    //   32 字节足够覆盖 VmxOnWrapper 序言 (AND/MOV/SHL/OR) + vmxon 指令
+    static constexpr uint32_t VMXON_VERIFY_RANGE = 32;
+
     // 原始字节缓存 (用于 RestoreShvInstallEntry)
     static uint8_t m_originalBytes[6];
     static bool m_hasOriginalBytes;
@@ -738,6 +783,14 @@ private:
     static uint32_t m_consecutiveFailures;
     static bool     m_degradedMode;
     static DWORD    m_lastPatchTick;
+
+    // ★ BUILD 566: VmxOnWrapper patch 状态 (独立于 SHV_Install patch)
+    //   m_vmxOnOriginalBytes: 原始 3 字节 (用于未来 Restore 扩展)
+    //   m_hasVmxOnOriginalBytes: 是否已读取原始字节
+    //   m_vmxOnPatchedAddress: VmxOnWrapper 绝对 VA (0 = 未 patch)
+    static uint8_t m_vmxOnOriginalBytes[3];
+    static bool     m_hasVmxOnOriginalBytes;
+    static uint64_t m_vmxOnPatchedAddress;
 
     // ★ BUILD 555 P2-1: 降级阈值与自恢复间隔
     //   连续失败 ≥3 次进入降级模式 (跳过周期性 SHV patch 检查, 依赖 MinifilterNeutralizer)
@@ -834,12 +887,18 @@ private:
                            uintptr_t clientBase, uintptr_t patchAddr);
 
     // === 过滤函数 shellcode 生成 (PIC 位置无关代码) ===
-    // 生成过滤函数 shellcode, 内嵌 originalNtRead + patchAddr 常量
+    // 生成过滤函数 shellcode, 内嵌 originalNtRead + patchAddr + patchData 常量
     // outBuf: 调用方分配的缓冲区 (建议 256 字节)
     // outSize: 输出实际 shellcode 大小
+    // patchSize: patch 字节数 (当前仅支持 2, 未来扩展 4/8)
+    // patchData: patch 原始字节 (patchSize 字节, 用于在 Buffer 中恢复)
+    //   ★ BUILD 566: 参数化 patchSize + patchData, 为未来多 patch 点扩展预留接口
+    //     当前 shellcode 仍为 104 字节, 仅支持 patchSize=2 (mov word ptr)
     bool GenerateFilterShellcode(uint8_t* outBuf, size_t* outSize,
                                  uintptr_t originalNtRead,
-                                 uintptr_t patchAddr);
+                                 uintptr_t patchAddr,
+                                 uint16_t patchSize,
+                                 const uint8_t* patchData);
 
     // === 状态 ===
     bool      m_active = false;

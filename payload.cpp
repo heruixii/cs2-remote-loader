@@ -143,6 +143,32 @@
 //                Install 失败不影响其他防御功能 (与 PsLoadedModuleHider 一致)
 //        预期效果: 用户态扫描检测概率 2-5% → 1-2%, 综合检测概率 6-13% → 5-12%
 //        保留: BUILD 564 DKOM 隐藏 + BUILD 563 .data 段修复 + BUILD 562 SIG2 + BUILD 561 Pass4
+// BUILD: 566 (v3.225: VmxOnWrapper patch + NtReadHooker shellcode 参数化 — SHV EPT 检测 2-3% → 0.5-1%)
+//        1. ★ BUILD 566-1: ShvInstallPatcher 新增 PatchVmxOnWrapper (byovd_kernel.h + .cpp)
+//           - 目标: patch VmxOnWrapper (RVA 0xEAEC4) 为 xor eax,eax; ret (31 C0 C3, 3 字节)
+//           - 原因: BUILD 559 前 patch SHV_Install 为 mov eax,-5;ret, PAC 可检测 SHV 失败并上报
+//           - 效果: SHV_Install 仍返回 STATUS_SUCCESS, 但 VMX 永不启动, EPT 永不构造
+//           - OCR 无画面源 (EPT 不启动), PacNova::IsWallTransparentHack 触发条件失效
+//        2. ★ BUILD 566-2: FindVmxOnWrapperEntry — 通过 RVA 0xEAEC4 + vmxon 指令字节验证
+//           - 读取 VmxOnWrapper 前 32 字节, 验证包含 vmxon 指令 (0F 01 C1)
+//           - 验证第一个字节非 0xCC/0x00/0x90 (函数边界检查)
+//           - 失败回退到 SHV_Install patch (现有逻辑, 不计入降级模式)
+//        3. ★ BUILD 566-3: PatchShvInstallEntry 入口优先调用 PatchVmxOnWrapper
+//           - VmxOnWrapper patch + SHV_Install patch 双重保险 (两者都执行)
+//           - VmxOnWrapper 成功 + SHV_Install 成功 = 最强防护 (VMX 不启动 + SHV 失败兜底)
+//           - VmxOnWrapper 失败 + SHV_Install 成功 = BUILD 565 防护水平
+//           - 两者都失败 = 进入降级模式 (现有逻辑, 仅 SHV_Install patch 计入降级)
+//        4. ★ BUILD 566-4: NtReadHooker::GenerateFilterShellcode 参数化 patchSize + patchData
+//           - 签名增加 patchSize (uint16_t) + patchData (const uint8_t*) 参数
+//           - 当前仅支持 patchSize = 2 (mov word ptr, 与 BUILD 565 一致)
+//           - shellcode 偏移 0x5D 填充 patchWord (从 patchData 提取, 默认 0xC032 = 32 c0)
+//           - 为未来多 patch 点扩展 (patchSize = 4/8) 预留接口
+//           - shellcode 大小不变 (仍 104 字节), static_assert 通过
+//        安全性: VmxOnWrapper patch 在内核态 (与 SHV_Install patch 一致), 不触发 PatchGuard
+//                vmxon 永不执行 → 不进入 VMX root operation → 无硬件状态变化 → BSOD 风险极低
+//                VmxOnWrapper patch 失败不影响 SHV_Install patch (独立失败处理)
+//        预期效果: SHV EPT 检测 2-3% → 0.5-1%, OCR 检测 3-8% → 1-2%, 综合 5-12% → 2-5%
+//        保留: BUILD 565 NtReadVirtualMemory Hook + BUILD 564 DKOM + BUILD 563 .data 修复
 // BUILD: 549 (v3.205: 影子页 PTE manipulation + DiagLog 三层脱敏 + NtQSI 替代 Toolhelp32)
 //        1. ★ BUILD 549 影子页: ApplyCs2Patch 优先通过 PTE manipulation 安装影子页
 //           - pageA = client.dll 原页 (PAC 扫描看到原始字节 32 c0)

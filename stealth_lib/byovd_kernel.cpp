@@ -7730,6 +7730,11 @@ uint32_t ShvInstallPatcher::m_consecutiveFailures = 0;
 bool     ShvInstallPatcher::m_degradedMode = false;
 DWORD    ShvInstallPatcher::m_lastPatchTick = 0;
 
+// ★ BUILD 566: VmxOnWrapper patch 状态静态成员定义
+uint8_t ShvInstallPatcher::m_vmxOnOriginalBytes[3] = {};
+bool     ShvInstallPatcher::m_hasVmxOnOriginalBytes = false;
+uint64_t ShvInstallPatcher::m_vmxOnPatchedAddress = 0;
+
 // ============================================================
 // ★ BUILD 555 P2-1: SHV patch 降级检测实现
 //
@@ -8101,7 +8106,192 @@ uint64_t ShvInstallPatcher::FindShvInstallEntry(uint64_t pacModuleBase, uint64_t
     return 0;
 }
 
+// ============================================================
+// ★ BUILD 566 v3.225: VmxOnWrapper patch 实现
+//
+// 设计目标:
+//   - PATCH SHV_Install 入口为 mov eax,-5;ret (BUILD 559) 让 SHV 不启动, 但 PAC 可检测 SHV 失败
+//   - BUILD 566 改 patch VmxOnWrapper (RVA 0xEAEC4) 为 xor eax,eax;ret (31 C0 C3)
+//   - VmxOnWrapper 是 SHV_Install 启动流程的子函数, 调用 vmxon 指令启用 VMX root
+//   - patch 后: vmxon 永不执行 → VMX 不启动 → EPT 不构造 → OCR 无画面源
+//   - SHV_Install 仍返回 STATUS_SUCCESS (PAC 自检通过, 不触发 ReportVt 上报)
+//
+// 调用关系 (PAC_SHV 逆向分析报告 §3.2-3.3):
+//   SHV_Install (0xEA408)
+//     → (7) BroadcastToAllCpus (0xEADC4) + WaitForCompletion (0xEAE4D)
+//       → 在每 CPU 上执行 g_shvLaunchFn
+//         → VmxOnWrapper (0xEAEC4)
+//           → vmxon 指令 (0F 01 C1) ← ★ patch 此函数让其永不执行
+//           → ret
+//
+// 安全性:
+//   - VmxOnWrapper patch 在内核态 (与 SHV_Install patch 一致), 不触发 PatchGuard
+//   - vmxon 永不执行 → 不进入 VMX root operation → 无硬件状态变化 → BSOD 风险极低
+//   - 失败回退: VmxOnWrapper patch 失败时, PatchShvInstallEntry 仍执行 SHV_Install patch
+//   - 失败不计入降级模式 (与 SHV_Install patch 独立, 避免 RVA 失效连锁影响)
+// ============================================================
+
+uint64_t ShvInstallPatcher::FindVmxOnWrapperEntry(uint64_t pacModuleBase) {
+    if (!pacModuleBase) return 0;
+
+    KernelMemoryAccessor& kma = KernelMemoryAccessor::Instance();
+    if (!kma.IsActive()) return 0;
+
+    // 1. 计算 VmxOnWrapper 绝对 VA = pacModuleBase + RVA 0xEAEC4
+    uint64_t vmxOnAddr = pacModuleBase + VMXON_WRAPPER_RVA;
+
+    // 2. 读取前 32 字节用于 vmxon 指令验证
+    uint8_t buf[VMXON_VERIFY_RANGE] = {};
+    if (!kma.ReadKernelVA(vmxOnAddr, buf, VMXON_VERIFY_RANGE)) {
+        ByovdDiag("BYOVD:VmxOn: failed to read @ 0x%llX\n",
+            (unsigned long long)vmxOnAddr);
+        return 0;
+    }
+
+    // 3. 验证: 前 32 字节内应包含 vmxon 指令 (0F 01 C1)
+    //    VmxOnWrapper 序言 (AND/MOV/SHL/OR) + vmxon 指令 ≈ 15-20 字节, 32 字节足够覆盖
+    bool foundVmxon = false;
+    for (uint32_t i = 0; i + 3 <= VMXON_VERIFY_RANGE; i++) {
+        if (buf[i] == VMXON_INSTR_BYTES[0] &&
+            buf[i + 1] == VMXON_INSTR_BYTES[1] &&
+            buf[i + 2] == VMXON_INSTR_BYTES[2]) {
+            foundVmxon = true;
+            break;
+        }
+    }
+    if (!foundVmxon) {
+        ByovdDiag("BYOVD:VmxOn: vmxon instruction not found in first %u bytes @ 0x%llX (RVA mismatch?)\n",
+            (unsigned)VMXON_VERIFY_RANGE, (unsigned long long)vmxOnAddr);
+        return 0;
+    }
+
+    // 4. 验证: 第一个字节不应是 0xCC/0x00/0x90 (函数边界)
+    //    VmxOnWrapper 应以 AND RCX, ... (48 83 E1 FF 或类似) 开头 (报告 §3.3)
+    uint8_t first = buf[0];
+    if (first == 0x00 || first == 0xCC || first == 0x90) {
+        ByovdDiag("BYOVD:VmxOn: suspicious first byte 0x%02X @ 0x%llX (function boundary?)\n",
+            first, (unsigned long long)vmxOnAddr);
+        return 0;
+    }
+
+    return vmxOnAddr;
+}
+
+bool ShvInstallPatcher::PatchVmxOnWrapper() {
+    // 防御性: 若已 patch, 直接返回成功
+    if (IsVmxOnPatched()) {
+        ByovdDiag("BYOVD:VmxOn: already patched @ 0x%llX\n",
+            (unsigned long long)m_vmxOnPatchedAddress);
+        return true;
+    }
+
+    KernelMemoryAccessor& kma = KernelMemoryAccessor::Instance();
+    if (!kma.IsActive()) {
+        ByovdDiag("BYOVD:VmxOn: KMA not active\n");
+        return false;
+    }
+
+    // 1. 定位 PAC 驱动基址 (与 PatchShvInstallEntry 一致的字符串加密模式)
+    char pacDriverName[32] = {};
+    STEALTH_STR_DECRYPT_TO("MessageTransfer.sys", pacDriverName, sizeof(pacDriverName));
+    uint64_t pacBase = kma.GetKernelModuleBase(pacDriverName);
+    SecureZeroMemory(pacDriverName, sizeof(pacDriverName));
+    if (!pacBase) {
+        // PAC 未加载不算失败 (与 PatchShvInstallEntry BUILD 561 一致)
+        ByovdDiag("BYOVD:VmxOn: PAC driver not loaded\n");
+        return false;
+    }
+
+    // 2. 通过 RVA + 字节验证定位 VmxOnWrapper
+    uint64_t vmxOnAddr = FindVmxOnWrapperEntry(pacBase);
+    if (!vmxOnAddr) {
+        ByovdDiag("BYOVD:VmxOn: VmxOnWrapper not found (RVA mismatch or vmxon instr missing)\n");
+        return false;
+    }
+    ByovdDiag("BYOVD:VmxOn: VmxOnWrapper @ 0x%llX\n", (unsigned long long)vmxOnAddr);
+
+    // 3. 读取原始 3 字节
+    if (!kma.ReadKernelVA(vmxOnAddr, m_vmxOnOriginalBytes, 3)) {
+        ByovdDiag("BYOVD:VmxOn: failed to read original bytes @ 0x%llX\n",
+            (unsigned long long)vmxOnAddr);
+        return false;
+    }
+    m_hasVmxOnOriginalBytes = true;
+    m_vmxOnPatchedAddress = vmxOnAddr;
+
+    // 4. 安全检查: 验证原始字节不是已 patch 状态或填充
+    //    已 patch: 31 C0 C3 (xor eax,eax; ret)
+    if (m_vmxOnOriginalBytes[0] == VMXON_PATCH_BYTES[0] &&
+        m_vmxOnOriginalBytes[1] == VMXON_PATCH_BYTES[1] &&
+        m_vmxOnOriginalBytes[2] == VMXON_PATCH_BYTES[2]) {
+        // 已是 patch 状态 (IsVmxOnPatched 应已捕获, 双重保险)
+        ByovdDiag("BYOVD:VmxOn: already patched (byte-level check)\n");
+        return true;
+    }
+    // 函数边界检查: 第一个字节不应是 0x00/0xCC/0x90
+    if (m_vmxOnOriginalBytes[0] == 0x00 ||
+        m_vmxOnOriginalBytes[0] == 0xCC ||
+        m_vmxOnOriginalBytes[0] == 0x90) {
+        ByovdDiag("BYOVD:VmxOn: suspicious original bytes (first=0x%02X), abort\n",
+            m_vmxOnOriginalBytes[0]);
+        m_hasVmxOnOriginalBytes = false;
+        m_vmxOnPatchedAddress = 0;
+        return false;
+    }
+
+    // 5. 写入 patch: 31 C0 C3 (xor eax,eax; ret)
+    if (!kma.WriteKernelVA(vmxOnAddr, VMXON_PATCH_BYTES, 3)) {
+        ByovdDiag("BYOVD:VmxOn: WriteKernelVA FAILED @ 0x%llX\n",
+            (unsigned long long)vmxOnAddr);
+        m_hasVmxOnOriginalBytes = false;
+        m_vmxOnPatchedAddress = 0;
+        return false;
+    }
+
+    // 6. 读回验证
+    uint8_t verify[3] = {};
+    if (!kma.ReadKernelVA(vmxOnAddr, verify, 3)) {
+        ByovdDiag("BYOVD:VmxOn: verify read FAILED\n");
+        return false;
+    }
+    for (int i = 0; i < 3; i++) {
+        if (verify[i] != VMXON_PATCH_BYTES[i]) {
+            ByovdDiag("BYOVD:VmxOn: verify MISMATCH @ byte %d (got 0x%02X, want 0x%02X)\n",
+                i, verify[i], VMXON_PATCH_BYTES[i]);
+            return false;
+        }
+    }
+
+    ByovdDiag("BYOVD:VmxOn: SUCCESS — VmxOnWrapper patched @ 0x%llX (xor eax,eax; ret — VMX 永不启动)\n",
+        (unsigned long long)vmxOnAddr);
+    return true;
+}
+
+bool ShvInstallPatcher::IsVmxOnPatched() {
+    if (!m_vmxOnPatchedAddress) return false;
+
+    KernelMemoryAccessor& kma = KernelMemoryAccessor::Instance();
+    if (!kma.IsActive()) return false;
+
+    uint8_t current[3] = {};
+    if (!kma.ReadKernelVA(m_vmxOnPatchedAddress, current, 3)) return false;
+
+    for (int i = 0; i < 3; i++) {
+        if (current[i] != VMXON_PATCH_BYTES[i]) return false;
+    }
+    return true;
+}
+
 bool ShvInstallPatcher::PatchShvInstallEntry() {
+    // ★ BUILD 566 v3.225: 优先 patch VmxOnWrapper (隐蔽性更高 — SHV_Install 仍返回 STATUS_SUCCESS)
+    //   VmxOnWrapper patch 成功 → VMX 永不启动 → EPT 永不构造 → OCR 无画面源
+    //   VmxOnWrapper patch 失败 → 回退到 SHV_Install patch (现有逻辑)
+    //   无论 VmxOnWrapper patch 成功与否, 都继续 patch SHV_Install (双重保险)
+    //   VmxOnWrapper patch 失败不计入降级模式 (与 SHV_Install patch 独立)
+    bool vmxOnOk = PatchVmxOnWrapper();
+    ByovdDiag("BYOVD:ShvPatch: VmxOnWrapper patch %s (continuing to SHV_Install patch)\n",
+        vmxOnOk ? "SUCCESS" : "FAILED");
+
     // 防御性: 若已 patch, 直接返回成功
     //   ★ BUILD 555 P2-1: 已 patched 状态不更新失败/成功计数
     //     (IsPatched()=true 时快速返回, 不算新的 patch 尝试, 避免无意义的状态变化)
@@ -8410,13 +8600,34 @@ uintptr_t NtReadHooker::FindNtReadInIAT(HANDLE cs2Process, uintptr_t pvpAliveBas
 
 bool NtReadHooker::GenerateFilterShellcode(uint8_t* outBuf, size_t* outSize,
                                             uintptr_t originalNtRead,
-                                            uintptr_t patchAddr) {
+                                            uintptr_t patchAddr,
+                                            uint16_t patchSize,
+                                            const uint8_t* patchData) {
     if (!outBuf || !outSize) return false;
+
+    // ★ BUILD 566: 参数化 patchSize + patchData, 为未来多 patch 点扩展预留接口
+    //   当前仅支持 patchSize = 2 (mov word ptr [r8], imm16)
+    //   未来扩展: patchSize = 4 (mov dword ptr) / patchSize = 8 (mov qword ptr)
+    //   shellcode 大小不变 (仍 104 字节), static_assert 通过
+    if (patchSize != 2) {
+        ByovdDiag("BYOVD:NtRead: unsupported patchSize=%u (only 2 supported)\n", patchSize);
+        return false;
+    }
+
+    // 从 patchData 提取 2 字节 imm16 (小端)
+    //   默认 32 c0 (原始字节, BUILD 565 行为)
+    //   BUILD 566: 支持调用方传入自定义 patchData
+    uint16_t patchWord = 0;
+    if (patchData) {
+        patchWord = (uint16_t)patchData[0] | ((uint16_t)patchData[1] << 8);
+    } else {
+        patchWord = 0xC032;  // 默认 32 c0 (小端 0xC032)
+    }
 
     // ★ BUILD 565: 过滤函数 shellcode (PIC, 104 字节)
     //   调用原 NtReadVirtualMemory, 若成功且读取范围与 patch 区域重叠,
-    //   在 Buffer 中恢复 32 c0 (原始字节), 返回原 status.
-    //   内嵌常量: originalNtRead @ 偏移 0x16, patchAddr @ 偏移 0x35
+    //   在 Buffer 中恢复 patch 字节 (BUILD 566: 由 patchWord 参数化), 返回原 status.
+    //   内嵌常量: originalNtRead @ 偏移 0x16, patchAddr @ 偏移 0x35, patchWord @ 偏移 0x5D
     static const uint8_t kTemplate[] = {
         // [0x00] push rbp; mov rbp, rsp; sub rsp, 0x40
         0x55, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x40,
@@ -8468,7 +8679,9 @@ bool NtReadHooker::GenerateFilterShellcode(uint8_t* outBuf, size_t* outSize,
         //   原错误: 4C 01 C0 = add rax, r8 (目标 rax, 源 r8; 但后续 mov [r8] 用 r8 原值 Buffer, 写错位置)
         //   修复后: 49 01 C0 = add r8, rax (目标 r8 = Buffer + offset, 源 rax = offset)
         0x49, 0x01, 0xC0,
-        // [0x59] mov word ptr [r8], 0xC032  (32 c0 小端)
+        // [0x59] mov word ptr [r8], patchWord  (★ BUILD 566: 参数化, 常量在 +4 = 0x5D)
+        //   原 BUILD 565: 0x66, 0x41, 0xC7, 0x00, 0x32, 0xC0  (硬编码 0xC032)
+        //   BUILD 566:   0x66, 0x41, 0xC7, 0x00, <patchWord 低>, <patchWord 高>
         0x66, 0x41, 0xC7, 0x00, 0x32, 0xC0,
         // [0x5F] .return: mov eax, [rbp-0x20]  (status)
         0x8B, 0x45, 0xE0,
@@ -8489,6 +8702,9 @@ bool NtReadHooker::GenerateFilterShellcode(uint8_t* outBuf, size_t* outSize,
     // 填充内嵌常量 (8 字节小端)
     *reinterpret_cast<uintptr_t*>(outBuf + 0x16) = originalNtRead;
     *reinterpret_cast<uintptr_t*>(outBuf + 0x35) = patchAddr;
+    // ★ BUILD 566: 填充 patchWord (2 字节小端) 到偏移 0x5D
+    //   覆盖 kTemplate 中硬编码的 0x32 0xC0
+    *reinterpret_cast<uint16_t*>(outBuf + 0x5D) = patchWord;
 
     *outSize = kTemplateSize;
     return true;
@@ -8502,7 +8718,11 @@ bool NtReadHooker::InstallIATHook(HANDLE cs2Process, uintptr_t iatEntryAddr,
     // 1. 生成过滤函数 shellcode
     uint8_t shellcode[256] = {};
     size_t shellcodeSize = sizeof(shellcode);
-    if (!GenerateFilterShellcode(shellcode, &shellcodeSize, originalNtRead, patchAddr)) {
+    // ★ BUILD 566: GenerateFilterShellcode 新增 patchSize + patchData 参数
+    //   patchSize=2, patchData={0x32, 0xC0} (恢复 32 c0 原始字节)
+    uint8_t b566PatchData[2] = { 0x32, 0xC0 };
+    if (!GenerateFilterShellcode(shellcode, &shellcodeSize, originalNtRead, patchAddr,
+                                  2, b566PatchData)) {
         ByovdDiag("B565:IAT: GenerateFilterShellcode FAILED\n");
         return false;
     }
@@ -8678,7 +8898,11 @@ bool NtReadHooker::InstallInlineHook(HANDLE cs2Process, uintptr_t ntReadAddr,
     // 1.2 生成过滤函数 shellcode (originalNtRead = trampoline, 稍后修正)
     uint8_t shellcode[256] = {};
     size_t shellcodeSize = sizeof(shellcode);
-    if (!GenerateFilterShellcode(shellcode, &shellcodeSize, 0, patchAddr)) {
+    // ★ BUILD 566: GenerateFilterShellcode 新增 patchSize + patchData 参数
+    //   patchSize=2, patchData={0x32, 0xC0} (恢复 32 c0 原始字节)
+    uint8_t b566PatchData[2] = { 0x32, 0xC0 };
+    if (!GenerateFilterShellcode(shellcode, &shellcodeSize, 0, patchAddr,
+                                  2, b566PatchData)) {
         ByovdDiag("B565:Inline: GenerateFilterShellcode FAILED\n");
         return false;
     }
