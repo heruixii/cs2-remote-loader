@@ -2,58 +2,91 @@
 
 基于 ManualMap + XTEA 加密的远程加载器，payload 全程不落盘，专为规避完美世界 PAC 反作弊设计。
 
-**当前版本：BUILD 550 / v3.208**
+**当前版本：BUILD 566 加固 / v3.226**
 
-## 架构 (BUILD 550)
+## 架构 (BUILD 566 加固)
 
 ```
-loader.exe (~280KB, 自删)
+loader.exe (~237KB, 自删)
 ├─ 从 HTTP 服务器下载 payload.dat
 ├─ XTEA 内存解密 → payload.dll
 ├─ ManualMap → 注入 CS2 进程
 └─ SelfDelete (自删除)
 
-payload.dll (~413KB, 注入 CS2 内部, -static 静态链接)
-├─ BYOVD 内核防御: 加载 PDFWKRNL.sys → 摘除 PAC Ob/Process/Image 回调
-├─ Minifilter Neutralizer: 中和 MessageTransfer.sys 文件回调
+payload.dll (~440KB, 注入 CS2 内部, -static 静态链接)
+├─ BYOVD 内核防御: 加载 PDFWKRNL.sys → 摘除 PAC Ob/Process/Image/Thread 回调
+├─ Minifilter Neutralizer: 中和 MessageTransfer.sys 文件回调 (5 种多样化 stub)
 ├─ KernelTraceCleaner: 清理驱动痕迹 (MmUnloadedDrivers/PiDDBCacheTable/KernelHashBucketList)
+├─ DKOM 进程隐藏: 摘除 loader2.exe 进程链表项 (Win11 24H2 动态偏移)
 ├─ CS2 内存补丁: ApplyCs2Patch (NOP '32 c0' 保持 client.dll 解密)
 ├─ 影子页 PTE: PAC 扫描见原始字节, CS2 执行补丁字节 (500ms 周期, 10% 占空比)
+├─ ★ BUILD 566: ShvInstallPatcher — VmxOnWrapper + SHV_Install 双重 patch
+│  ├─ PatchVmxOnWrapper (RVA 0xEAEC4): 31 C0 C3 (xor eax,eax; ret) → VMX 永不启动
+│  ├─ PatchShvInstallEntry: B8 FB FF FF FF C3 (mov eax,-5; ret) → SHV 失败兜底
+│  ├─ 独立降级模式: VmxOn 与 SHV 各自 3 次失败阈值 + 5 分钟自恢复
+│  └─ 周期性维护 (60-90s): IsVmxOnPatched + IsPatched → 自动重 patch
+├─ ★ BUILD 565: NtReadHooker — Hook NtReadVirtualMemory 双重保险
+│  ├─ IAT hook PvpAlive + inline hook ntdll
+│  └─ 过滤 client.dll .text 段读取, 返回原始字节 (PAC 扫描见 32 c0)
+├─ ★ BUILD 564: PsLoadedModuleList DKOM — PDFWKRNL.sys 从内核模块链表摘除
 ├─ 截图防护: 检测 5 种截图工具, 临时回退补丁
-├─ DKOM 进程隐藏: 摘除 loader2.exe 进程链表项
 ├─ EkkoSleep 内存加密: Sleep 期间 XOR 加密 payload 内存
-└─ 主循环: 每 5s MaintainCs2Patch → GuardPac → ReapplyAllCallbacks
+└─ 主循环: 每 30-45s MaintainCs2Patch → GuardPac → ReapplyAllCallbacks → VmxOnWrapper 维护
 ```
 
-## BUILD 550 关键改进
+## BUILD 566 加固 (v3.226) 关键改进
 
-### 字符串/ IAT 清理
-- **-static 全局静态链接**: 消除 libgcc_s_seh-1/libstdc++-6/libwinpthread-1 依赖
-- **动态 API 解析**: CreateToolhelp32Snapshot/Process32FirstW/Process32NextW/Thread32First/Thread32Next 通过 GetProcAddress + XTEA 加密名动态解析
-- **PEB Ldr 遍历**: 替代 GetModuleHandleW/GetModuleHandleExW, 消除 IAT 中的敏感 API
-- **RTCore64.sys 嵌入移除**: 死代码清理, 消除 .rdata 中 \Device\RTCore64 / ntoskrnl.exe 等明文
+### VmxOnWrapper patch 独立降级模式 (566-5)
+- **新增方法**: `RecordVmxOnPatchFailure` / `RecordVmxOnPatchSuccess` / `IsVmxOnDegradedMode`
+- **新增状态**: `m_vmxOnConsecutiveFailures` / `m_vmxOnDegradedMode` / `m_vmxOnLastPatchTick`
+- **与 SHV_Install patch 降级状态完全独立** (互不污染)
+- 连续失败 ≥3 次进入降级 (跳过周期性 VmxOnWrapper 检查, 节省 IOCTL)
+- 5 分钟自恢复 (与 SHV_Install 降级一致)
 
-### 影子页 PTE (BUILD 549)
-- CS2 执行补丁代码 (pageB: 90 90) 保持内存解密
-- PAC 扫描见原始字节 (pageA: 32 c0) 无法检测
-- 500ms 周期, 50ms pageA 窗口 (10% 占空比)
+### payload.cpp 主循环周期性维护 (566-6)
+- 每 60-90s 验证 `IsVmxOnPatched()` + `IsPatched()`
+- `needShvRepatch OR needVmxOnRepatch` 合并调用 `PatchShvInstallEntry`
+- 一次 `PatchShvInstallEntry` 调用同时维护两者 (避免重复 IOCTL)
+- `PatchShvInstallEntry` 入口三分支: 降级跳过 / 已 patched 快速返回 / 未 patched 调用+计数
 
-### 日志安全 (BUILD 549)
-- DiagLogEnc 宏: XTEA 加密 + B549:XX 短标签
-- 集中日志: %TEMP%\sd.log (替代 stealth_diag.log)
-- NtQuerySystemInformation 替代 CreateToolhelp32Snapshot (截图工具检测)
+### BUG 修复 (第 3 轮审查)
+- VmxOn 降级模式下必须跳过 `PatchVmxOnWrapper`, 否则 `m_vmxOnLastPatchTick` 持续更新导致 5 分钟自恢复永远无法触发
 
-## 7 层保护体系
+## BUILD 566 (v3.225) 基础
+
+### VmxOnWrapper patch (566-1 ~ 566-4)
+- **PatchVmxOnWrapper** (RVA 0xEAEC4): patch 为 `31 C0 C3` (xor eax,eax; ret, 3 字节)
+  - vmxon 指令永不执行 → VMX root operation 永不进入 → EPT 永不构造
+  - SHV_Install 仍返回 STATUS_SUCCESS (failed_cpus=0), PAC 自检通过
+  - OCR 无画面源 (EPT 不启动), PacNova::IsWallTransparentHack 触发条件失效
+- **FindVmxOnWrapperEntry**: RVA 0xEAEC4 + vmxon 指令字节验证 (0F 01 C1)
+- **PatchShvInstallEntry 入口优先调用 PatchVmxOnWrapper**: VmxOn + SHV 双重保险
+- **NtReadHooker::GenerateFilterShellcode 参数化**: patchSize + patchData, shellcode 104 字节不变
+
+## BUILD 565 (v3.224) 基础
+
+### Hook NtReadVirtualMemory 双重保险
+- **IAT hook PvpAlive**: 替换 PvpAlive.dll IAT 中的 NtReadVirtualMemory 指针
+- **inline hook ntdll**: 在 ntdll!NtReadVirtualMemory 入口写 jmp 到 filter shellcode
+- **过滤逻辑**: 当读取范围与 client.dll .text 段 patch 区域重叠时, 在 Buffer 中恢复原始字节 (32 c0)
+- **效果**: PAC 扫描 client.dll .text 段时看到原始字节, .text 完整性检测概率 1-2% → 0.5-1%
+
+## 7+ 层保护体系
 
 | # | 功能 | 说明 |
 |---|------|------|
-| 1 | **BYOVD 内核防御** | 加载 PDFWKRNL.sys (AMD 合法签名), 摘除 PAC ObRegisterCallbacks / ProcessNotify / ImageNotify 回调 |
-| 2 | **Minifilter Neutralizer** | 内核 R/W 遍历 fltmgr 链表, 将 MessageTransfer 全部操作回调替换为 XOR EAX,EAX; RET stub |
+| 1 | **BYOVD 内核防御** | 加载 PDFWKRNL.sys (AMD 合法签名), 摘除 PAC ObRegisterCallbacks / ProcessNotify / ImageNotify / ThreadNotify 回调 |
+| 2 | **Minifilter Neutralizer** | 内核 R/W 遍历 fltmgr 链表, 将 MessageTransfer 全部操作回调替换为 5 种多样化 XOR EAX,EAX; RET stub |
 | 3 | **KernelTraceCleaner** | 清理 MmUnloadedDrivers / PiDDBCacheTable / ci.dll KernelHashBucketList 中的 PDFWKRNL 痕迹 |
 | 4 | **DKOM 进程隐藏** | 摘除 loader2.exe 进程链表项 (ActiveProcessLinks), 动态偏移扫描 Win11 24H2 |
 | 5 | **EkkoSleep 内存加密** | Sleep 期间 XOR 加密全部 payload 内存 (含 cross-process 同步) |
-| 6 | **ObCallbacks 重应用** | 60-90s 周期重应用 PAC 回调摘除 (防止 PAC 驱动重新注册) |
+| 6 | **ObCallbacks 重应用** | 30-45s 周期重应用 PAC 回调摘除 (防止 PAC 驱动重新注册) |
 | 7 | **VEH 自愈** | 捕获 ntdll!RtlDeactivateActivationContext 崩溃 (最多 3 次), g_vehRestoring 原子标志防递归 |
+| 8 | **★ BUILD 564 DKOM 驱动隐藏** | PsLoadedModuleList DKOM 摘除 PDFWKRNL.sys (内核模块链表) |
+| 9 | **★ BUILD 565 NtRead Hook** | Hook NtReadVirtualMemory 双重保险 (IAT + inline), .text 段扫描过滤 |
+| 10 | **★ BUILD 566 VmxOnWrapper patch** | patch VmxOnWrapper 为 xor eax,eax; ret → VMX 永不启动, EPT 永不构造 |
+| 11 | **★ BUILD 566 SHV_Install patch** | patch SHV_Install 为 mov eax,-5; ret → SHV 失败兜底 (双重保险) |
+| 12 | **★ BUILD 566 加固 周期性维护** | 60-90s 验证 VmxOn + SHV patch, 自动重 patch (独立降级模式) |
 
 ## CS2 内存补丁机制
 
@@ -64,6 +97,34 @@ payload.dll (~413KB, 注入 CS2 内部, -static 静态链接)
 - PTE 指向 pageB 时 CS2 执行补丁代码 (内存解密)
 - 500ms 周期中 50ms 切换到 pageA, 让 PAC 扫描命中原始字节
 - 截图工具检测时临时完全回退到 pageA
+
+**NtRead Hook 双重保险 (BUILD 565)**:
+- 即使影子页失效, NtReadVirtualMemory hook 仍会过滤 .text 段读取
+- PAC 扫描 client.dll .text 段时, hook 在 Buffer 中恢复原始字节 (32 c0)
+- 双重保险: 影子页 (硬件级) + NtRead hook (软件级)
+
+## SHV (Secure Hypervisor View) 对抗 (BUILD 566)
+
+**PAC SHV 架构** (基于逆向分析报告):
+- PAC 通过 MessageTransfer.sys 实现完整 VMX/EPT hypervisor
+- 每个 CPU 上启动 VMX, 使用 EPT 监控内存访问
+- EPT+OCR 联动: 截图游戏画面 → OCR 识别外挂文字 → 上报服务器
+
+**BUILD 566 双重 patch 对抗**:
+1. **VmxOnWrapper patch** (优先, 隐蔽性最高):
+   - patch VmxOnWrapper (RVA 0xEAEC4) 为 `31 C0 C3` (xor eax,eax; ret)
+   - vmxon 指令永不执行 → VMX 永不启动 → EPT 永不构造
+   - SHV_Install 仍返回 STATUS_SUCCESS (failed_cpus=0), PAC 自检通过
+   - OCR 无画面源 (EPT 不启动)
+2. **SHV_Install patch** (兜底):
+   - patch SHV_Install 入口为 `B8 FB FF FF FF C3` (mov eax,-5; ret)
+   - -5 是 CheckPhysicalMemoryLimit 的自然错误码 (物理内存超 2GB EPT 限制)
+   - PAC 误认为是自然失败, 不会怀疑 patch
+
+**BUILD 566 加固 v3.226 持久对抗**:
+- 60-90s 周期性验证 VmxOnWrapper + SHV_Install patch 仍然有效
+- PAC 恢复 patch 字节后自动重 patch
+- 独立降级模式: 连续失败 ≥3 次跳过周期性检查 (节省 IOCTL), 5 分钟自恢复
 
 ## 使用方法
 
@@ -106,8 +167,44 @@ payload.dll (~413KB, 注入 CS2 内部, -static 静态链接)
    - `B549:ML:01` → 主循环运行中
    - `BYOVD: SUCCESS with PDFWKRNL.sys` → 驱动加载成功
    - `callbacks removed (PAC/MessageTransfer)` → 回调摘除成功
+   - ★ `BYOVD:VmxOn: SUCCESS — VmxOnWrapper patched @ 0x...` → VmxOnWrapper patch 成功
+   - ★ `BYOVD:ShvPatch: VmxOnWrapper patch SUCCESS` → PatchShvInstallEntry 入口确认
+   - ★ `BYOVD:ShvPatch: SUCCESS — SHV_Install patched @ 0x...` → SHV_Install patch 成功
 2. 进入游戏后 CS2 自身 ESP 正常显示（内存补丁生效）
 3. 截图工具检测: 使用截图工具时 ESP 临时消失（影子页回退）
+4. 长时间运行 (1小时+): sd.log 无频繁 `BYOVD:VmxOn:` 重 patch 日志 (PAC 未频繁恢复)
+
+### BUILD 566 加固 v3.226 验证日志
+
+**首次启动 (PAC 已加载)**:
+```
+BYOVD:VmxOn: VmxOnWrapper @ 0x...
+BYOVD:VmxOn: SUCCESS — VmxOnWrapper patched @ 0x... (xor eax,eax; ret — VMX 永不启动)
+BYOVD:ShvPatch: VmxOnWrapper patch SUCCESS (continuing to SHV_Install patch)
+BYOVD:ShvPatch: SHV_Install entry @ 0x...
+BYOVD:ShvPatch: SUCCESS — SHV_Install patched @ 0x... (mov eax,-5; ret)
+```
+
+**主循环周期性验证 (PAC 未恢复)**:
+```
+(无 VmxOn 日志 — IsVmxOnPatched 返回 true, 不触发重 patch)
+```
+
+**PAC 恢复 VmxOnWrapper 字节后 (自动重 patch)**:
+```
+BYOVD:VmxOn: VmxOnWrapper @ 0x...
+BYOVD:VmxOn: SUCCESS — VmxOnWrapper patched @ 0x... (重 patch)
+```
+
+**VmxOnWrapper 连续失败 3 次 (进入降级模式)**:
+```
+BYOVD:VmxOn: DEGRADED MODE entered (failures=3)
+```
+
+**5 分钟自恢复**:
+```
+BYOVD:VmxOn: DEGRADED MODE auto-recover after 300123ms
+```
 
 ### 注意事项
 
@@ -118,6 +215,7 @@ payload.dll (~413KB, 注入 CS2 内部, -static 静态链接)
 - **MessageTransfer.sys 不可删除/卸载** — 只停止服务, 避免 CS2 反作弊检测
 - **PDFWKRNL.sys IOCTL 必须异步** — 2s 超时 + 10s 冷却, 防止永久阻塞
 - PAC 更新后 `MessageTransfer` 可能改名, 代码已支持 6 种模糊匹配 + 内核扫描
+- ★ **VmxOnWrapper RVA 0xEAEC4 是 PAC v1.0.0.2 的值**, PAC 更新后可能改变 (FindVmxOnWrapperEntry 字节验证失败时回退到 SHV_Install patch)
 
 ## 编译
 
@@ -126,18 +224,18 @@ payload.dll (~413KB, 注入 CS2 内部, -static 静态链接)
 build.bat
 ```
 
-**BUILD 550 编译要求**:
-- MinGW-w64 g++ (C:\msys64\mingw64\bin\g++)
-- C++20 标准
-- `-static` 全局静态链接 (消除 libgcc/libstdc++/libwinpthread 依赖)
+**BUILD 566 编译要求**:
+- clang++ (C:\msys64\mingw64\bin\clang++)
+- C++20 标准 (-std:c++20)
+- -O2 优化 + -s � stripped + -fpermissive + -DNDEBUG + -fvisibility=hidden
 
 输出文件:
 - `encrypt_tool.exe` — XTEA 加密工具 (管理端)
-- `payload.dll` — 注入负载 (~413KB, 仅依赖 Windows 系统 DLL)
+- `payload.dll` — 注入负载 (~440KB, 仅依赖 Windows 系统 DLL)
 - `payload.dat` — XTEA 加密后的 payload (上传到 HTTP 服务器)
-- `loader.exe` — 自删型下载/解密/注入器 (~280KB)
+- `loader.exe` — 自删型下载/解密/注入器 (~237KB)
 
-**payload.dll 依赖** (BUILD 550 -static 后):
+**payload.dll 依赖** (BUILD 566 -static 后):
 - ADVAPI32.dll, KERNEL32.dll, USER32.dll, msvcrt.dll, ntdll.dll
 - 全部为 Windows 系统 DLL, 无第三方 DLL 依赖
 
@@ -154,7 +252,7 @@ build.bat
 │   ├── syscall_direct.cpp/h    # Hell's Gate + Halo's Gate + StackSpoof
 │   ├── memory_cloak.cpp/h      # EkkoSleep + SelfCloak + ETW/AMSI + 影子页 PTE
 │   ├── cs2_memory.cpp/h        # CS2 内存访问 + ApplyCs2Patch
-│   ├── byovd_kernel.cpp/h      # BYOVD 内核防御 + PAC Neutralizer + TraceCleaner + DKOM
+│   ├── byovd_kernel.cpp/h      # BYOVD 内核防御 + PAC Neutralizer + TraceCleaner + DKOM + ShvInstallPatcher + NtReadHooker
 │   ├── eac_syscall_guard.cpp/h # Syscall stub 完整性防护
 │   ├── anti_debug.cpp/h        # 反调试 (动态 API 解析)
 │   ├── pe_mutator.cpp/h        # PE 变异 (IAT 混淆)
@@ -179,7 +277,21 @@ build.bat
 | 546 | v3.204 | basic.exe 7 层外部保护: cross-process EkkoSleep |
 | 548 | v3.205 | 移除 basic.exe: 集成补丁逻辑到 payload.dll (ApplyCs2Patch) |
 | 549 | v3.206-207 | 影子页 PTE: PAC 扫描见原始字节, DiagLog 加密, PEB Ldr 遍历 |
-| **550** | **v3.208** | **-static 静态链接, 动态 API 解析, RTCore64 嵌入移除** |
+| 550 | v3.208 | -static 静态链接, 动态 API 解析, RTCore64 嵌入移除 |
+| 551 | v3.209 | PsSetCreateThreadNotifyRoutine 摘除 (PAC IAT 确认注册) |
+| 552 | v3.210 | ShvInstallPatcher — patch SHV_Install 入口 (方案 D) |
+| 553 | v3.211 | SIG1 特征码 XOR 加密 + PDFWKRNL.sys IOCTL 异步 (2s 超时 + 10s 冷却) |
+| 554 | v3.212 | VADConcealer 周期性重新隐藏 (60-90s) |
+| 555 | v3.213 | SHV patch 降级模式 (3 次失败阈值 + 5 分钟自恢复) |
+| 556 | v3.214 | 主循环间隔随机化 (30-45s) |
+| 559 | v3.218 | SHV patch 字节改为 mov eax,-5 (CheckPhysicalMemoryLimit 自然错误码) |
+| 561 | v3.221 | IsValidPrologueByte 统一辅助函数 (放宽 0x53/0x56/0x57) |
+| 562 | v3.222 | SIG2 兜底 (BroadcastToAllCpus + WaitForCompletion 配对) |
+| 563 | v3.222 | .data 段修复: GetPacPatterns + g_cachedPacName 改为栈变量 |
+| 564 | v3.223 | PsLoadedModuleList DKOM 隐藏 PDFWKRNL.sys |
+| 565 | v3.224 | Hook NtReadVirtualMemory 双重保险 (IAT + inline) |
+| 566 | v3.225 | VmxOnWrapper patch + NtReadHooker shellcode 参数化 |
+| **566 加固** | **v3.226** | **VmxOnWrapper patch 独立降级模式 + 周期性维护** |
 
 ## 检测概率评估
 
@@ -189,7 +301,11 @@ build.bat
 | 546 | 5-10% | basic.exe 7 层保护, 但仍有独立进程 |
 | 548 | ~80% | CS2 补丁明文可见 (无影子页) |
 | 549 | <10% | 影子页 PTE + DiagLog 加密 |
-| **550** | **<10%** | **+ IAT 清理 + -static 链接 + RTCore64 移除** |
+| 550 | <10% | + IAT 清理 + -static 链接 + RTCore64 移除 |
+| 552 | 7-14% | + SHV EPT 监控 (2-3%) + OCR (3-8%) 未对抗 |
+| 565 | 5-12% | + NtRead Hook (.text 完整性 1-2% → 0.5-1%) |
+| 566 | 2-5% | + VmxOnWrapper patch (EPT 0.5-1% + OCR 1-2%) |
+| **566 加固** | **1.5-4%** | **+ VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch)** |
 
 ## 安全约束
 
@@ -199,3 +315,10 @@ build.bat
 - **DKOM 使用动态偏移** — 写邻居节点 Flink/Blink (prev.Flink=&current, next.Blink=&current)
 - **用户态代码避免 CRT 依赖** — 不使用 std::vector/wstring (手动映射 DLL 堆未初始化)
 - **截图工具检测频率 5s** — NtQuerySystemInformation 替代 CreateToolhelp32Snapshot
+- **PDFWKRNL.sys IOCTL 频率 < 1400/min** — 卡死基线, ShvInstallPatcher 降级模式保护
+- **VmxOnWrapper patch 仅 3 字节写入** — 31 C0 C3 (xor eax,eax; ret), 无新内存访问模式
+- **VmxOn + SHV 降级状态完全独立** — 避免互相污染, 各自 3 次失败阈值 + 5 分钟自恢复
+
+## 详细使用说明
+
+详见 [USAGE.md](file:///d:/技术研发/tmp/USAGE.md) — 完整使用说明 + 故障排查 + 日志解读
