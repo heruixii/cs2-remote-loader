@@ -185,6 +185,20 @@
 //        安全性: VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch), 无新内存访问模式
 //                降级模式下依赖 SHV_Install patch 兜底 (双重保险), BSOD 风险极低
 //        预期效果: VmxOnWrapper patch 持久有效, EPT 永不构造, 综合 2-5% → 1.5-4%
+// BUILD: 567 (v3.229: 蓝屏 0x50 二次修复 — 黑名单改白名单)
+//        ★ BUILD 567 v3.229 FIX (蓝屏 0x50 第二次根因 7/20 0:29:21):
+//          - 现象: v3.228 修复后运行 loader.exe 仍蓝屏 BugCheck 0x50
+//          - 新异常地址: 0xFFFFFD0000000030 (PML4 idx=0x1FA, 系统 PTE 区域)
+//          - 根因: v3.228 黑名单只排除系统缓存区域 (0xFFFFE0-0xFFFFF0),
+//                 但系统 PTE 区域 0xFFFFFD0000000000 未排除, flink 落在此区域触发 0x50 蓝屏
+//          - 根本问题: 黑名单不可行 — 内核有多个区域含未映射页 (系统缓存/分页池/系统PTE/系统映射)
+//          - 修复: 黑名单改白名单, 只允许 flink/blink/current 和 ReadKernelVA/WriteKernelVA 访问:
+//            1) PTE 自映射 0xFFFFF68000000000-0xFFFFF80000000000 (ReadPte/WritePte 使用)
+//            2) 内核镜像  0xFFFFF80000000000-0xFFFFFA0000000000 (ntoskrnl/.data 段)
+//            3) 非分页池  0xFFFFFA0000000000-0xFFFFFC0000000000 (EPROCESS/LDR_DATA_TABLE_ENTRY)
+//          - 4 处修复: LocatePsLoadedModuleList + FindEntryByBaseName + ReadKernelVA + WriteKernelVA
+//          - 安全性: 第 4 轮审查确认所有合法调用方 (ReadPte/ResolveExport/DKOM*/PsLoadedModuleHider)
+//                   读取的地址都在白名单范围内, PTE 自映射区域 PTE 表本身在非分页池始终已映射
 // BUILD: 567 (v3.228: 蓝屏 0x50 修复 — 排除系统缓存区域)
 //        ★ BUILD 567 v3.228 FIX (蓝屏 0x50 根因 7/19 23:41:29):
 //          - 现象: 运行 loader.exe 后蓝屏 BugCheck 0x50 (PAGE_FAULT_IN_NONPAGED_AREA)
@@ -408,7 +422,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.228 启动摘要 (蓝屏 0x50 修复)\n");
+    DiagLog("BUILD 567 v3.229 启动摘要 (蓝屏 0x50 二次修复 — 白名单)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -447,7 +461,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.228 退出摘要\n");
+    DiagLog("BUILD 567 v3.229 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -472,7 +486,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.228 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.229 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
