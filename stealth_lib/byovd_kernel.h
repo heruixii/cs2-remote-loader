@@ -613,10 +613,27 @@ private:
     // ★ BUILD 552: PAC 驱动名通过 STEALTH_STR_DECRYPT_TO 运行时解密 (避免明文进入 .rdata)
     //   原 `static constexpr const char* PAC_DRIVER_NAME = "MessageTransfer.sys";` 已移除
 
-    // patch 字节序列: mov eax, 0FFFFFFFCh; ret
-    //   B8 FC FF FF FF  = mov eax, -4 (STATUS_TOO_MANY_OPEN_FILES)
+    // ★ BUILD 559 隐蔽 SHV 对抗: patch 字节序列从 mov eax,-4 改为 mov eax,-5
+    //   B8 FB FF FF FF  = mov eax, -5 (0xFFFFFFFB)
     //   C3              = ret
-    static constexpr uint8_t PATCH_BYTES[6] = { 0xB8, 0xFC, 0xFF, 0xFF, 0xFF, 0xC3 };
+    //
+    // 改动理由 (基于 PvpAlive.dll 逆向分析 + PAC_SHV 逆向分析报告 §3.2/§3.4):
+    //   1. PAC CheckPhysicalMemoryLimit 内部使用 -5 (0xFFFFFFFB) 作为"物理内存超过 2GB EPT 限制"
+    //      的错误码 (报告 §3.4 L216: MOV [RSP+0x20], 0xFFFFFFFB ; status = -5)
+    //   2. -5 是 PAC 自然失败路径, 会打印 "EPT map limit" 错误并进入降级处理 (§3.2 L105)
+    //   3. 原 -4 (STATUS_TOO_MANY_OPEN_FILES) 是异常错误码, PAC 可能通过返回值校验检测到 patch
+    //   4. 改为 -5 让 SHV 失败看起来像"硬件物理内存过大"的自然失败, PAC 不会怀疑 patch
+    //
+    // 隐蔽性提升:
+    //   - PAC 调用 SHV_Install → 立即返回 -5
+    //   - PAC 误认为是 CheckPhysicalMemoryLimit 检测到物理内存超限
+    //   - PAC 打印 "EPT map limit" 错误日志 (与自然失败一致)
+    //   - PAC 进入降级模式 (依赖用户态扫描, 已被 EkkoSleep + VADConcealer 缓解)
+    //
+    // 检测概率降低:
+    //   - SHV EPT 监控: 3-6% → 2-4% (PAC 更难检测 patch)
+    //   - OCR 文字识别: 3-8% → 2-5% (SHV 不启动, EPT+OCR 联动失效)
+    static constexpr uint8_t PATCH_BYTES[6] = { 0xB8, 0xFB, 0xFF, 0xFF, 0xFF, 0xC3 };
 
     // 原始字节缓存 (用于 RestoreShvInstallEntry)
     static uint8_t m_originalBytes[6];

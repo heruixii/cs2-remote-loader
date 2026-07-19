@@ -7674,7 +7674,7 @@ bool ShvInstallPatcher::PatchShvInstallEntry() {
         }
     }
 
-    ByovdDiag("BYOVD:ShvPatch: SUCCESS — SHV_Install patched @ 0x%llX (mov eax,-4; ret)\n",
+    ByovdDiag("BYOVD:ShvPatch: SUCCESS — SHV_Install patched @ 0x%llX (mov eax,-5; ret — 物理内存超限伪装)\n",
         (unsigned long long)shvInstallAddr);
     // ★ BUILD 555 P2-1: 成功 patch — 重置失败计数, 退出降级模式
     RecordPatchSuccess();

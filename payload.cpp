@@ -2296,10 +2296,14 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             DiagLog("E+G: early DKOM hide (permanent, PG disabled): %s\n", dkomOk ? "OK" : "FAILED");
 
             // ★ BUILD 552: 方案 D — Patch SHV_Install 主动防御
-            //   在 BYOVD 就绪后立即 patch PAC SHV_Install 入口为 `mov eax, -4; ret`,
-            //   阻止 PAC 启动 VMX/EPT 硬件级内存监控.
+            //   ★ BUILD 559 隐蔽 SHV 对抗: patch 内容从 `mov eax,-4;ret` 改为 `mov eax,-5;ret`
+            //     在 BYOVD 就绪后立即 patch PAC SHV_Install 入口为 `mov eax, -5; ret`,
+            //     阻止 PAC 启动 VMX/EPT 硬件级内存监控.
+            //   ★ -5 (0xFFFFFFFB) 是 PAC CheckPhysicalMemoryLimit 内部"物理内存超过 2GB EPT 限制"
+            //     的自然错误码, PAC 会打印 "EPT map limit" 错误并进入降级处理,
+            //     不会怀疑 patch (相比原 -4 STATUS_TOO_MANY_OPEN_FILES 更隐蔽).
             //   ★ SHV 是临时性 install-then-uninstall 模式 (周期性启动),
-            //     patch 后所有后续 SHV 启动尝试都立即返回失败.
+            //     patch 后所有后续 SHV 启动尝试都立即返回 -5 (自然失败).
             //   ★ 失败不影响主流程 (仅记录 ByovdDiag 日志), PatchShvInstallEntry
             //     内部已做防御性检查 (KMA 未就绪 / PAC 未加载 / 特征码未匹配均安全返回 false).
             bool shvPatched = stealth::ShvInstallPatcher::PatchShvInstallEntry();
