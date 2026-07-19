@@ -3053,7 +3053,8 @@ int EACCallbackDisabler::RestoreAll() {
 //   供 payload.cpp 主循环周期性调用, 对抗 PAC 重新注册回调.
 //   不使用 std::string — 固定缓冲区, manual-mapped DLL 安全.
 // ★ 前向声明: GetPacTargetName 和 WStringToString 在本文件后面定义 (static)
-static const wchar_t* GetPacTargetName();
+// ★ BUILD 563: GetPacTargetName → FillPacTargetName (栈缓冲, 消除 .data 段长明文)
+static void FillPacTargetName(wchar_t* buf, size_t bufChars);
 static int WStringToString(const wchar_t* ws, char* outBuf, int outBufSize);
 int EACCallbackDisabler::ReDisablePacCallbacks() {
     auto& kma = KernelMemoryAccessor::Instance();
@@ -3061,15 +3062,23 @@ int EACCallbackDisabler::ReDisablePacCallbacks() {
 
     // 内部调用 GetPacTargetName() + WStringToString() + DisableObCallbacks()
     // 这两个函数是 static, 但本方法在同类同文件中, 可直接访问
+    // ★ BUILD 563: 改为栈缓冲 (FillPacTargetName), 用完 SecureZeroMemory 清零
     char pacNameA[256] = {};
-    WStringToString(GetPacTargetName(), pacNameA, 256);
+    {
+        wchar_t pacNameW[256] = {};
+        FillPacTargetName(pacNameW, 256);
+        WStringToString(pacNameW, pacNameA, 256);
+        SecureZeroMemory(pacNameW, sizeof(pacNameW));
+    }
     if (pacNameA[0] == 0) {
         ByovdDiag("E+G:ReDisablePacCallbacks: tgt-name empty, skip\n");
+        SecureZeroMemory(pacNameA, sizeof(pacNameA));  // ★ BUILD 563: 失败路径也清零
         return 0;
     }
     int removed = DisableObCallbacks(pacNameA);
     ByovdDiag("E+G:ReDisablePacCallbacks: re-removed %d callbacks (name=%s)\n",
         removed, pacNameA);
+    SecureZeroMemory(pacNameA, sizeof(pacNameA));  // ★ BUILD 563: 用完清零
     return removed;
 }
 
@@ -4293,9 +4302,10 @@ bool KernelTraceCleaner::CleanAllTraces() {
 
 // ★ v3.126p: 前向声明 — PAC 模块函数 (实现在 MinifilterNeutralizer 之后)
 // ★ BUILD 497: 固定数组替代 std::wstring — 避免 CRT 堆依赖
+// ★ BUILD 563: GetPacTargetName → FillPacTargetName (栈缓冲, 消除 .data 段长明文)
 static uint64_t FindPacFilterInKernel(uint64_t fltmgrBase, uint64_t fltGlobals, wchar_t* outName, int outNameChars);
 static bool IsPacPattern(const wchar_t* name);
-static const wchar_t* GetPacTargetName();
+static void FillPacTargetName(wchar_t* buf, size_t bufChars);
 //
 // 此前方案: FilterUnload → 卸载 minifilter → PAC 客户端检测到缺失
 // 新方案:   不卸载, 用 BYOVD 内核 R/W 替换所有操作回调为无害 stub
@@ -5673,8 +5683,15 @@ bool MinifilterNeutralizer::NeutralizeMessageTransfer() {
 
     // 2. 查找 tgt minifilter
     // ★ BUILD 497: 固定数组替代 std::wstring — 避免 CRT 堆依赖
-    const wchar_t* pacName = GetPacTargetName();
-    uint64_t filterAddr = FindFilterByName(fltmgrBase, fltGlobals, pacName);
+    // ★ BUILD 563: 改为栈缓冲 (FillPacTargetName), 用完立即 SecureZeroMemory 清零
+    //   pacName 仅在 FindFilterByName 调用中使用一次, 不保留指针
+    uint64_t filterAddr = 0;
+    {
+        wchar_t pacNameW[256] = {};
+        FillPacTargetName(pacNameW, 256);
+        filterAddr = FindFilterByName(fltmgrBase, fltGlobals, pacNameW);
+        SecureZeroMemory(pacNameW, sizeof(pacNameW));
+    }
     if (!filterAddr) {
         // ★ BUILD 518: 移除 FindFilterByDriverScan 调用 — 本质不安全, 导致 BSOD
         //   日志确认 BSOD 发生在此函数执行期间
@@ -5683,11 +5700,11 @@ bool MinifilterNeutralizer::NeutralizeMessageTransfer() {
         // ★ v3.126p: 精确匹配失败 → 尝试内核模糊扫描
         wchar_t kernName[256] = {};
         filterAddr = FindPacFilterInKernel(fltmgrBase, fltGlobals, kernName, 256);
+        SecureZeroMemory(kernName, sizeof(kernName));  // ★ BUILD 563: 用完清零
         if (!filterAddr) {
             ByovdDiag("FLT:NTRL: no tgt-filter found in kernel\n");
             return false;
         }
-        pacName = kernName;
     }
 
     // 3. 中和回调
@@ -6164,11 +6181,19 @@ bool MinifilterNeutralizer::IsMessageTransferNeutralized() {
     uint64_t fltGlobals = FindFltGlobals(fltmgrBase);
     if (!fltGlobals) return true; // 找不到 Globals 不报错
 
-    uint64_t filterAddr = FindFilterByName(fltmgrBase, fltGlobals, GetPacTargetName());
+    // ★ BUILD 563: 改为栈缓冲 (FillPacTargetName), 用完立即 SecureZeroMemory 清零
+    uint64_t filterAddr = 0;
+    {
+        wchar_t pacNameW[256] = {};
+        FillPacTargetName(pacNameW, 256);
+        filterAddr = FindFilterByName(fltmgrBase, fltGlobals, pacNameW);
+        SecureZeroMemory(pacNameW, sizeof(pacNameW));
+    }
     if (!filterAddr) {
         // ★ v3.126p: 精确匹配失败 → 模糊扫描
         wchar_t kernName[256] = {};
         filterAddr = FindPacFilterInKernel(fltmgrBase, fltGlobals, kernName, 256);
+        SecureZeroMemory(kernName, sizeof(kernName));  // ★ BUILD 563: 用完清零
     }
     if (!filterAddr) {
         // minifilter 不在列表中 — 被卸载了, 需要重新安装假的存在性
@@ -6246,24 +6271,23 @@ bool MinifilterNeutralizer::IsMessageTransferNeutralized() {
 
 // ★ v3.126p: PAC 相关关键词 — 用于模糊匹配 PAC 的 minifilter/服务/驱动名
 // ★ BUILD 550: 改为运行时解密 — 原 L"messagetransfer" 等明文字符串出现在 .rdata
-//   GetPacPatterns() 首次调用时用 STEALTH_WSTR_DECRYPT_TO 填充静态缓冲, 之后直接返回指针
-static const wchar_t* const* GetPacPatterns() {
-    static wchar_t patterns[8][32] = {};
-    static const wchar_t* patternPtrs[9] = {};
-    static bool initialized = false;
-    if (!initialized) {
-        STEALTH_WSTR_DECRYPT_TO("messagetransfer", patterns[0], 32);  // 当前已知名称 (2024-2026)
-        STEALTH_WSTR_DECRYPT_TO("pvpac", patterns[1], 32);            // 常见变体 (PvP Anti-Cheat)
-        STEALTH_WSTR_DECRYPT_TO("pw_ac", patterns[2], 32);            // PerfectWorld Anti-Cheat 缩写
-        STEALTH_WSTR_DECRYPT_TO("perfectworldac", patterns[3], 32);   // 完整名称
-        STEALTH_WSTR_DECRYPT_TO("perfectworld", patterns[4], 32);     // 完美世界
-        STEALTH_WSTR_DECRYPT_TO("pwanti", patterns[5], 32);           // PerfectWorld Anti-*
-        // patterns[6], patterns[7] 保持全零 (作为终止符缓冲)
-        for (int i = 0; i < 8; i++) patternPtrs[i] = patterns[i];
-        patternPtrs[8] = nullptr;
-        initialized = true;
-    }
-    return patternPtrs;
+// ★ BUILD 563: 改为调用方传栈缓冲 (FillPacPatterns) — 原 GetPacPatterns() 内
+//   `static wchar_t patterns[8][32]` + `static const wchar_t* patternPtrs[9]` 永久
+//   存在于 .data 段, 解密后的 "messagetransfer/pvpac/perfectworld" 等关键词 PAC 可
+//   随时扫描发现. 修复: 调用方传栈缓冲, 函数末尾调用方 SecureZeroMemory 清零, 明文
+//   窗口从"永久"缩短到"函数执行期间 (~1-10ms)".
+//   参数 patterns: 调用方栈缓冲 wchar_t[8][32] (每个关键词 ≤31 字符)
+//   参数 patternPtrs: 调用方栈缓冲 const wchar_t*[9] (前 8 项指向 patterns[i], 末尾 nullptr)
+static void FillPacPatterns(wchar_t patterns[8][32], const wchar_t* patternPtrs[9]) {
+    STEALTH_WSTR_DECRYPT_TO("messagetransfer", patterns[0], 32);  // 当前已知名称 (2024-2026)
+    STEALTH_WSTR_DECRYPT_TO("pvpac", patterns[1], 32);            // 常见变体 (PvP Anti-Cheat)
+    STEALTH_WSTR_DECRYPT_TO("pw_ac", patterns[2], 32);            // PerfectWorld Anti-Cheat 缩写
+    STEALTH_WSTR_DECRYPT_TO("perfectworldac", patterns[3], 32);   // 完整名称
+    STEALTH_WSTR_DECRYPT_TO("perfectworld", patterns[4], 32);     // 完美世界
+    STEALTH_WSTR_DECRYPT_TO("pwanti", patterns[5], 32);           // PerfectWorld Anti-*
+    // patterns[6], patterns[7] 保持全零 (作为终止符缓冲)
+    for (int i = 0; i < 8; i++) patternPtrs[i] = patterns[i];
+    patternPtrs[8] = nullptr;
 }
 
 // ★ v3.126q: 系统 minifilter 白名单 — 防止模糊匹配误伤 Windows 关键驱动
@@ -6286,17 +6310,25 @@ static bool IsPacPattern(const wchar_t* name) {
 
     // 模糊匹配 PAC 模式
     // ★ BUILD 550: 改用 GetPacPatterns() (原 g_pacPatterns 明文已加密)
-    const wchar_t* const* pats = GetPacPatterns();
-    for (int i = 0; pats[i]; i++) {
+    // ★ BUILD 563: 改为栈缓冲 (FillPacPatterns), 用完 SecureZeroMemory 清零
+    wchar_t patterns[8][32] = {};
+    const wchar_t* patternPtrs[9] = {};
+    FillPacPatterns(patterns, patternPtrs);
+    bool matched = false;
+    for (int i = 0; patternPtrs[i]; i++) {
         const wchar_t* p = name;
         while (*p) {
-            const wchar_t* a = p, *b = pats[i];
+            const wchar_t* a = p, *b = patternPtrs[i];
             while (*a && *b && towlower(*a) == towlower(*b)) { a++; b++; }
-            if (!*b) return true;
+            if (!*b) { matched = true; break; }
             p++;
         }
+        if (matched) break;
     }
-    return false;
+    // ★ BUILD 563: 立即清零, 缩短明文窗口
+    SecureZeroMemory(patterns, sizeof(patterns));
+    SecureZeroMemory(patternPtrs, sizeof(patternPtrs));
+    return matched;
 }
 
 // ★ v3.126p: 统一 PAC 目标名获取 — 支持改名容错
@@ -6307,25 +6339,26 @@ static bool IsPacPattern(const wchar_t* name) {
 //   在 manual-mapped DLL 上下文中激活上下文栈损坏 → ACCESS_VIOLATION 崩溃
 //   (BUILD 534 在 346s 崩溃于 ntdll!RtlDeactivateActivationContext+0x5A2, cmp [rax+0x38],9)
 //   修复: 直接使用硬编码 L"MessageTransfer" (项目唯一 PAC 目标, 不改名)
-static wchar_t g_cachedPacName[256] = {};
-static DWORD   g_lastPacNameCheck = 0;
-
-static const wchar_t* GetPacTargetName() {
-    DWORD now = GetTickCount();
-    if (g_cachedPacName[0] && now - g_lastPacNameCheck < 30000)
-        return g_cachedPacName;
-    g_lastPacNameCheck = now;
-
+// ★ BUILD 563: 改为调用方传栈缓冲 (FillPacTargetName) — 原 GetPacTargetName() 内
+//   `static wchar_t g_cachedPacName[256]` 永久存在于 .data 段, 解密后的
+//   "MessageTransfer" PAC 可随时扫描发现. 修复: 调用方传栈缓冲, 调用方在不需要时
+//   SecureZeroMemory 清零, 明文窗口从"永久(含30秒缓存)"缩短到"调用方使用期间".
+//   取消 30 秒缓存机制 (PAC 名硬编码, 解密成本低; 缓存反而延长明文窗口).
+//   参数 buf: 调用方栈缓冲 wchar_t[]
+//   参数 bufChars: 缓冲区容量 (wchar_t 个数), 必须 ≥ 16
+static void FillPacTargetName(wchar_t* buf, size_t bufChars) {
+    if (!buf || bufChars < 16) return;
     // ★ BUILD 535: 直接使用硬编码 PAC 名 — 不再调用 fltlib.dll RPC
     //   项目唯一 PAC 目标是 MessageTransfer.sys (完美世界 CS2 反作弊 minifilter)
     //   历史改名容错已不需要 (MessageTransfer 不会被改名)
     //   fltlib.dll RPC 枚举路径已移除 (参见函数头注释)
     // ★ BUILD 550: 解密 PAC 名 (原 L"MessageTransfer" 明文)
-    STEALTH_WSTR_DECRYPT_TO("MessageTransfer", g_cachedPacName, 256);
-    return g_cachedPacName;
+    STEALTH_WSTR_DECRYPT_TO("MessageTransfer", buf, (int)bufChars);
 }
 
-static void RefreshPacName() { g_cachedPacName[0] = 0; g_lastPacNameCheck=0; GetPacTargetName(); }
+// ★ BUILD 563: RefreshPacName 简化为空函数 — 原 RefreshPacName 重置 g_cachedPacName
+//   缓存, 但 g_cachedPacName 已删除. 0 处外部调用, 保留空函数定义向后兼容.
+static void RefreshPacName() { }
 
 // ★ BUILD 497: 固定缓冲区替代 std::string — 避免 CRT 堆依赖
 //   返回 outBuf 中实际写入的字节数
@@ -6532,10 +6565,16 @@ static bool IsPacMinifilterLoaded() {
         auto* info = (BYTE*)buf;
         // FILTER_FULL_INFORMATION: Name is at offset 8 (wchar_t[256])
         const wchar_t* filterName = (const wchar_t*)(info + 8);
-        if (_wcsicmp(filterName, GetPacTargetName()) == 0) {
+        // ★ BUILD 563: 改为栈缓冲 (FillPacTargetName), #if 0 内代码不参与编译,
+        //   但保持一致性以备未来恢复时不需要再修改
+        wchar_t pacNameW[256] = {};
+        FillPacTargetName(pacNameW, 256);
+        if (_wcsicmp(filterName, pacNameW) == 0) {
             found = true;
+            SecureZeroMemory(pacNameW, sizeof(pacNameW));
             break;
         }
+        SecureZeroMemory(pacNameW, sizeof(pacNameW));
         bytesReturned = 0;
         hr = pFindNext(filterFind, 0, buf, sizeof(buf), &bytesReturned);
     } while (SUCCEEDED(hr));
@@ -6555,15 +6594,20 @@ static bool DisablePacService() {
         return false;
     }
 
-    const wchar_t* pacName = GetPacTargetName();
+    // ★ BUILD 563: 改为栈缓冲 (FillPacTargetName), 用完 SecureZeroMemory 清零
+    //   pacName 仅在 OpenServiceW 和 ByovdDiag 中使用, 用完即清零
+    wchar_t pacNameW[256] = {};
+    FillPacTargetName(pacNameW, 256);
     // ★ BUILD 507: 仅停止服务, 不删除 — 保留服务注册项让 CS2 检测通过
-    SC_HANDLE svc = OpenServiceW(scm, pacName,
+    SC_HANDLE svc = OpenServiceW(scm, pacNameW,
         SERVICE_STOP | SERVICE_QUERY_STATUS);
     if (!svc) {
-        ByovdDiag("B550:PC: SCM service '%ls' not found\n", pacName);
+        ByovdDiag("B550:PC: SCM service '%ls' not found\n", pacNameW);
+        SecureZeroMemory(pacNameW, sizeof(pacNameW));
         CloseServiceHandle(scm);
         return true; // 未找到 = 可能已经卸载, 不算失败
     }
+    SecureZeroMemory(pacNameW, sizeof(pacNameW));  // ★ BUILD 563: OpenServiceW 后立即清零
 
     // 查询状态
     SERVICE_STATUS_PROCESS ssp = {};
@@ -6619,8 +6663,12 @@ static bool UnloadPacMinifilter() {
         return false;
     }
 
-    const wchar_t* pacName = GetPacTargetName();
-    HRESULT hr = pFilterUnload(pacName);
+    // ★ BUILD 563: 改为栈缓冲 (FillPacTargetName), 用完 SecureZeroMemory 清零
+    //   #if 0 内代码不参与编译, 但保持一致性以备未来恢复
+    wchar_t pacNameW[256] = {};
+    FillPacTargetName(pacNameW, 256);
+    HRESULT hr = pFilterUnload(pacNameW);
+    SecureZeroMemory(pacNameW, sizeof(pacNameW));
     FreeLibrary(hFltLib);
 
     if (SUCCEEDED(hr)) {
@@ -6639,6 +6687,11 @@ static void DeletePacDriverFiles() {
     // 1. 完美平台 plugin 目录中的 MessageTransfer.sys
     //    路径: %ProgramFiles(x86)%\perfectworldarena*\plugin\MessageTransfer.sys
     //    或: %LocalAppData%\perfectworldarena*\plugin\MessageTransfer.sys
+    // ★ BUILD 563: 改为栈缓冲 (FillPacTargetName), 函数末尾 SecureZeroMemory 清零
+    //   原 GetPacTargetName() 返回 .data 段 g_cachedPacName 指针, 永久存在明文
+    wchar_t pacNameW[256] = {};
+    FillPacTargetName(pacNameW, 256);
+
     wchar_t searchPaths[4][MAX_PATH] = {};
     int searchPathCount = 0;
 
@@ -6673,7 +6726,7 @@ static void DeletePacDriverFiles() {
                 if (GetFileAttributesW(pluginDir) != INVALID_FILE_ATTRIBUTES) {
                     // ★ v3.126p: 先搜索确切名称, 未找到则模糊扫描 *.sys
                     wchar_t drvFile[MAX_PATH] = {};
-                    wsprintfW(drvFile, L"%s\\%s.sys", pluginDir, GetPacTargetName());
+                    wsprintfW(drvFile, L"%s\\%s.sys", pluginDir, pacNameW);
                     bool found = (GetFileAttributesW(drvFile) != INVALID_FILE_ATTRIBUTES);
 
                     if (!found) {
@@ -6710,7 +6763,7 @@ static void DeletePacDriverFiles() {
 
     // 2. system32\drivers 中的备份 (★ v3.126p: 动态名称)
     wchar_t sys32Drv[MAX_PATH] = {};
-    wsprintfW(sys32Drv, L"C:\\Windows\\System32\\drivers\\%s.sys", GetPacTargetName());
+    wsprintfW(sys32Drv, L"C:\\Windows\\System32\\drivers\\%s.sys", pacNameW);
     if (!DeleteFileW(sys32Drv)) {
         DWORD err = GetLastError();
         if (err != ERROR_FILE_NOT_FOUND) {
@@ -6719,9 +6772,12 @@ static void DeletePacDriverFiles() {
         }
     } else {
         wchar_t sys32Bak[MAX_PATH] = {};
-        wsprintfW(sys32Bak, L"C:\\Windows\\System32\\drivers\\%s.sys.bak", GetPacTargetName());
+        wsprintfW(sys32Bak, L"C:\\Windows\\System32\\drivers\\%s.sys.bak", pacNameW);
         DeleteFileW(sys32Bak);
     }
+
+    // ★ BUILD 563: 函数末尾清零 pacNameW, 缩短明文窗口
+    SecureZeroMemory(pacNameW, sizeof(pacNameW));
 }
 
 KernelDefense::PacStatus KernelDefense::DisablePac() {
@@ -6820,7 +6876,11 @@ void KernelDefense::GuardPac() {
     // 检查 1: SCM 服务状态
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (scm) {
-        SC_HANDLE svc = OpenServiceW(scm, GetPacTargetName(), SERVICE_QUERY_STATUS);
+        // ★ BUILD 563: 改为栈缓冲 (FillPacTargetName), #if 0 内代码不参与编译
+        wchar_t pacNameW[256] = {};
+        FillPacTargetName(pacNameW, 256);
+        SC_HANDLE svc = OpenServiceW(scm, pacNameW, SERVICE_QUERY_STATUS);
+        SecureZeroMemory(pacNameW, sizeof(pacNameW));
         if (svc) {
             SERVICE_STATUS_PROCESS ssp = {};
             DWORD bytesNeeded = 0;
@@ -6888,8 +6948,14 @@ KernelDefense::Result KernelDefense::EnableAll() {
     // ★ v3.126p: PAC 回调摘除 — 动态名称（唯一目标）
     auto& cbDisabler = EACCallbackDisabler::Instance();
     // ★ BUILD 501: 固定缓冲区替代 std::string — 避免 CRT 堆依赖
+    // ★ BUILD 563: 改为栈缓冲 (FillPacTargetName), 用完 SecureZeroMemory 清零
     char pacNameA[256] = {};
-    WStringToString(GetPacTargetName(), pacNameA, 256);
+    {
+        wchar_t pacNameW[256] = {};
+        FillPacTargetName(pacNameW, 256);
+        WStringToString(pacNameW, pacNameA, 256);
+        SecureZeroMemory(pacNameW, sizeof(pacNameW));
+    }
     int pacOb = cbDisabler.DisableObCallbacks(pacNameA);
     int pacProc = cbDisabler.DisableProcessNotifyCallbacks(pacNameA);
     int pacImg = cbDisabler.DisableImageNotifyCallbacks(pacNameA);
@@ -6906,6 +6972,8 @@ KernelDefense::Result KernelDefense::EnableAll() {
         result.imageCallbacksRemoved += pacImg;
         result.threadCallbacksRemoved += pacThread;
     }
+    // ★ BUILD 563: pacNameA 不再使用, 立即清零缩短明文窗口
+    SecureZeroMemory(pacNameA, sizeof(pacNameA));
 
     // ★ BUILD 528: tgt minifilter 中和已废弃 — Win11 上 FLT_FILTER 布局无法定位,
     //   BUILD 525-527 均失败。改用 E+G 组合方案 (DKOM+EkkoSleep+ObCallbacks)。
@@ -7014,9 +7082,16 @@ void KernelDefense::ReapplyAllCallbacks() {
 
     // ★ v3.126p: PAC — 动态名称
     // ★ BUILD 501: 固定缓冲区替代 std::string — 避免 CRT 堆依赖
+    // ★ BUILD 563: 改为栈缓冲 (FillPacTargetName), 用完 SecureZeroMemory 清零
     char pacNameBuf[256] = {};
-    WStringToString(GetPacTargetName(), pacNameBuf, 256);
+    {
+        wchar_t pacNameW[256] = {};
+        FillPacTargetName(pacNameW, 256);
+        WStringToString(pacNameW, pacNameBuf, 256);
+        SecureZeroMemory(pacNameW, sizeof(pacNameW));
+    }
     total += cbDisabler.DisableAll(pacNameBuf);
+    SecureZeroMemory(pacNameBuf, sizeof(pacNameBuf));  // ★ BUILD 563: DisableAll 后立即清零
 
     if (total > 0) {
         ByovdDiag("BYOVD:KernelDefense: ReapplyAllCallbacks removed %d callbacks\n", total);

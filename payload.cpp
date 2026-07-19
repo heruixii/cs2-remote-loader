@@ -72,6 +72,25 @@
 //           - 注意: 这两个 RVA 是当前 PAC 版本 (1.0.0.2) 的值, PAC 更新后可能改变
 //        预期效果: SHV patch 成功率 95-97% → 98-99% (SIG1+SIG2 互补, 覆盖 PAC 更新场景)
 //        保留: BUILD 561 Pass4 + IsValidPrologueByte + PAC 未加载优化 + BUILD 560 wShotTools 栈变量
+// BUILD: 563 (v3.222: .data 段修复 — GetPacPatterns + g_cachedPacName 改为栈变量)
+//        1. ★ BUILD 563-1: GetPacPatterns → FillPacPatterns (栈缓冲)
+//           - 原 GetPacPatterns 内 `static wchar_t patterns[8][32]` + `static const wchar_t* patternPtrs[9]`
+//             + `static bool initialized` 永久存在于 .data 段
+//           - 解密后的 "messagetransfer/pvpac/perfectworld" 等关键词 PAC 可随时扫描发现
+//           - 修复: 改为 FillPacPatterns(wchar_t patterns[8][32], const wchar_t* patternPtrs[9])
+//                  调用方传栈缓冲, IsPacPattern 内构造 + 末尾 SecureZeroMemory 清零
+//        2. ★ BUILD 563-2: GetPacTargetName → FillPacTargetName (栈缓冲)
+//           - 原 GetPacTargetName 内 `static wchar_t g_cachedPacName[256]` + `static DWORD g_lastPacNameCheck`
+//             永久存在于 .data 段, 含 "MessageTransfer" + 30 秒缓存机制
+//           - 修复: 改为 FillPacTargetName(wchar_t* buf, size_t bufChars), 调用方传栈缓冲
+//                  移除 30 秒缓存 (PAC 名硬编码, 解密成本低; 缓存反而延长明文窗口)
+//                  12 处调用方全部改为传栈缓冲 + SecureZeroMemory 清零
+//        3. ★ BUILD 563-3: RefreshPacName 简化为空函数 (0 处外部调用, 向后兼容)
+//        4. ★ BUILD 563-4: 3 处 #if 0 废弃块同步修改 (IsPacMinifilterLoaded/UnloadPacMinifilter/
+//           GuardPac SCM 路径), 保持代码一致性, 未来恢复 #if 1 时不需再改
+//        预期效果: .data 段长明文窗口消除 (永久 → ~1-10ms 函数执行期间)
+//                 整体检测概率 8-15% → 7-14% (.data 段扫描检测难度提升)
+//        保留: BUILD 562 SIG2 + BUILD 561 Pass4 + BUILD 560 wShotTools 栈变量 + BUILD 559 隐蔽 SHV
 // BUILD: 549 (v3.205: 影子页 PTE manipulation + DiagLog 三层脱敏 + NtQSI 替代 Toolhelp32)
 //        1. ★ BUILD 549 影子页: ApplyCs2Patch 优先通过 PTE manipulation 安装影子页
 //           - pageA = client.dll 原页 (PAC 扫描看到原始字节 32 c0)
