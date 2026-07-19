@@ -14,6 +14,9 @@ disable_basic.flag
 # RTCore64 驱动文件 (不提交)
 RTCore64.sys
 
+# 运行目录 (分发用, 不提交)
+run/
+
 # 排除项: 需要提交到 GitHub 的文件
 !payload.dat
 !loader.exe

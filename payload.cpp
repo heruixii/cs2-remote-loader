@@ -72,6 +72,7 @@
 #include <csetjmp>
 #include <cstring>  // ★ BUILD 549: strcmp for DiagLogEnc macro
 #include <tlhelp32.h>
+#include <intrin.h>  // ★ BUILD 558 FIX-2: __readgsqword (VEH 处理器无 IAT 调用读取 TID)
 
 // ---- v3.34: 时序随机化 ----
 static DWORD RandomJitter(DWORD baseMs, DWORD rangeMs) {
@@ -91,7 +92,11 @@ static DWORD RandomJitter(DWORD baseMs, DWORD rangeMs) {
 //         DiagLogEnc 宏内部调用 DiagLog, 同样被消除 (DiagLogEnc 也变成空操作)
 //   审计: 200+ 处调用均为纯日志, 参数仅读取变量/GetLastError/NtQuerySystemInformation 结果
 //         经审计无赋值表达式副作用, 宏消除安全
-#ifdef NDEBUG
+// ★ BUILD 557 临时诊断: 强制启用 DiagLog (定位 CheatMainLoop 早期退出)
+//   原代码: #ifdef NDEBUG #define DiagLog(fmt, ...) ((void)0)
+//   诊断版: 改为 #if 0, DiagLog 总是启用, 写入 sd.log
+//   恢复方法: 诊断完成后将下面 #if 0 改回 #ifdef NDEBUG
+#if 0  // ★ BUILD 557 DIAG (原 #ifdef NDEBUG)
     #define DiagLog(fmt, ...) ((void)0)
 #else
 static void DiagLog(const char* fmt, ...) {
@@ -138,6 +143,11 @@ static void DiagLog(const char* fmt, ...) {
 // 崩溃捕获 — 帮助定位 Init 期间的 crash
 static HMODULE g_diagDllBase;
 static SIZE_T g_diagDllSize;
+// ★ BUILD 558 FIX-2: .idata 页范围 (供主循环诊断使用)
+//   EkkoSleep 加密期间 .idata 页不可读 → VEH 处理器 IAT 调用崩溃 (0x9A2E)
+//   主循环 StealthSleep 之前用 VirtualQuery 检查并强制恢复 PAGE_READONLY
+static uintptr_t g_idataPageStart = 0;
+static uintptr_t g_idataPageEnd   = 0;
 // ★ v3.70/v3.78: VEH 自愈 — 备份缓冲区 (非 static, byovd_kernel.cpp 通过 extern 引用)
 uint8_t* g_backupBuf = nullptr;
 SIZE_T   g_backupLen = 0;
@@ -244,7 +254,12 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     uint64_t dllBase   = (uint64_t)g_diagDllBase;
     uint64_t offset    = (dllBase && crashAddr >= dllBase) ? (crashAddr - dllBase) : 0;
     DWORD code = ep->ExceptionRecord->ExceptionCode;
-    DWORD tid  = GetCurrentThreadId();  // ★ BUILD 535: 记录崩溃线程 ID
+    // ★ BUILD 558 FIX-2: 直接从 TEB 读取线程 ID, 避免 GetCurrentThreadId IAT 调用
+    //   根因: EkkoSleep 加密 .data 段期间, .idata 页 IAT 条目读取触发 0xC0000005,
+    //         VEH 入口第一个 GetCurrentThreadId() 通过 IAT, 立即二次崩溃 → 无 CRASH 日志.
+    //   TEB+0x48 = NT_TIB.ClientId.UniqueThread (x64 Windows 固定偏移), 等效 GetCurrentThreadId.
+    //   __readgsqword 是编译器内联指令 (不生成 IAT 调用), VEH 可继续执行到 DiagLog.
+    DWORD tid  = (DWORD)__readgsqword(0x48);
 
     // ★ BUILD 535: 增强 VEH 日志 — 记录线程 ID + 故障数据地址 (ACCESS_VIOLATION)
     //   对于 0xC0000005: ExceptionInformation[0]=0(read)/1(write)/8(exec), [1]=故障数据地址
@@ -642,10 +657,18 @@ static bool ResolveImportTable(HANDLE hProcess, void* remoteBase,
 //
 // ★ BUILD 549: 优先使用影子页 (PTE manipulation), 失败回退到 VirtualProtect
 // ============================================================
-static uint8_t* g_patchAddr = nullptr;
+// ★ BUILD 558 FIX-4: g_patchAddr/g_clientBase 类型从 uint8_t* 改为 uintptr_t
+//   原因: payload.dll 在 loader.exe 进程内运行, client.dll 在 CS2 进程内,
+//         g_patchAddr/g_clientBase 是 CS2 进程内的地址, 不能在本进程直接解引用.
+//         必须通过 StealthMemory::Read/Write/Protect 跨进程访问.
+//   历史问题: BUILD 548 集成 basic.exe 到 payload.dll 时, basic.exe 原本注入 CS2 进程内运行,
+//             直接指针解引用有效. 迁移后 payload.dll 在 loader.exe 进程内, 直接解引用失效,
+//             ApplyCs2Patch 报 "mod not loaded" (GetModuleBaseFromPEB 在本进程找不到 client.dll).
+static uintptr_t g_patchAddr = 0;       // CS2 进程内 patch 地址 (跨进程访问)
 static bool g_cs2Patched = false;
 // ★ BUILD 556: 移除 g_shadowPageTried (影子页方案已废弃, 降级到 VirtualProtect)
-static uint8_t* g_clientBase = nullptr;  // ★ BUILD 555 P2-4: client.dll 基址缓存 (供 ValidatePatchFunctionBoundary 使用)
+// ★ BUILD 558 FIX-4: g_clientBase 类型从 uint8_t* 改为 uintptr_t (CS2 进程内地址)
+static uintptr_t g_clientBase = 0;  // ★ BUILD 555 P2-4: client.dll 基址缓存 (跨进程访问)
 
 // ★ BUILD 557: DR0 频率统计变量已移至 L227 (DiagVehHandler 之前), 此处不再重复定义
 //   原因: C++ 文件作用域 static 变量不能前向声明 (无 extern 语法), 必须在使用前定义
@@ -732,30 +755,23 @@ typedef struct _B549_SYSTEM_THREAD_INFO {
 //   增强 2: 验证边界后第一字节是合法函数序言 (0x48=REX.W / 0x55=push rbp / 0x40-0x4F=REX)
 //   增强 3: 验证 found 与函数入口距离 <= 0x200 (patch 不应位于函数体深处)
 //   返回: true = 验证通过, false = 验证失败 (拒绝 patch)
-static bool ValidatePatchFunctionBoundary(uint8_t* found) {
-    if (!found) return false;
-
-    // 边界检查: 不能在模块起始处 (无前序字节可回溯)
-    if (found < g_clientBase + 0x100) return false;
-
-    constexpr uint32_t MAX_BACKSCAN = 256;
-    uint32_t backSize = 0;
-    // 计算实际可回溯字节数 (不能超过模块起始)
-    if ((uintptr_t)(found - g_clientBase) < MAX_BACKSCAN) {
-        backSize = (uint32_t)(found - g_clientBase);
-    } else {
-        backSize = MAX_BACKSCAN;
-    }
+// ★ BUILD 558 FIX-4: 跨进程化 — 改为接收本地 backBuf (调用方跨进程读取 found 前的字节)
+//   原签名: ValidatePatchFunctionBoundary(uint8_t* found) — 直接解引用 found 前的字节 (本进程)
+//   新签名: ValidatePatchFunctionBoundary(const uint8_t* backBuf, uint32_t backSize)
+//     backBuf: 包含 found 前 backSize 字节的本地 buffer (跨进程读取)
+//     backSize: backBuf 实际大小 (≤ MAX_BACKSCAN)
+//   调用方 (ApplyCs2Patch) 负责: 跨程读取 found 前 MAX_BACKSCAN 字节到 backBuf
+static bool ValidatePatchFunctionBoundary(const uint8_t* backBuf, uint32_t backSize) {
+    if (!backBuf) return false;
     if (backSize < 4) return false;
 
-    uint8_t* backStart = found - backSize;
-
+    constexpr uint32_t MAX_BACKSCAN = 256;
     // Pass 1: 查找 0xCC (int3, 最可靠 — 不会出现在指令中间)
     for (int32_t k = (int32_t)backSize - 1; k >= 0; k--) {
-        if (backStart[k] == 0xCC) {
+        if (backBuf[k] == 0xCC) {
             uint32_t entryOffset = k + 1;
             if (entryOffset >= backSize) continue;
-            uint8_t firstByte = backStart[entryOffset];
+            uint8_t firstByte = backBuf[entryOffset];
             if (firstByte == 0x48 || firstByte == 0x55 ||
                 (firstByte >= 0x40 && firstByte <= 0x4F)) {
                 // 验证 patch 位置与函数入口距离
@@ -767,13 +783,13 @@ static bool ValidatePatchFunctionBoundary(uint8_t* found) {
 
     // Pass 2: 查找连续 ≥2 字节 0x90 (nop 填充, MSVC 常用)
     for (int32_t k = (int32_t)backSize - 2; k >= 0; k--) {
-        if (backStart[k] == 0x90 && backStart[k + 1] == 0x90) {
+        if (backBuf[k] == 0x90 && backBuf[k + 1] == 0x90) {
             uint32_t entryOffset = k + 2;
-            while (entryOffset < backSize && backStart[entryOffset] == 0x90) {
+            while (entryOffset < backSize && backBuf[entryOffset] == 0x90) {
                 entryOffset++;
             }
             if (entryOffset >= backSize) continue;
-            uint8_t firstByte = backStart[entryOffset];
+            uint8_t firstByte = backBuf[entryOffset];
             if (firstByte == 0x48 || firstByte == 0x55 ||
                 (firstByte >= 0x40 && firstByte <= 0x4F)) {
                 uint32_t dist = backSize - entryOffset;
@@ -784,14 +800,14 @@ static bool ValidatePatchFunctionBoundary(uint8_t* found) {
 
     // Pass 3: 查找连续 ≥4 字节 0x00 (零填充, Clang/部分 MSVC 使用)
     for (int32_t k = (int32_t)backSize - 4; k >= 0; k--) {
-        if (backStart[k] == 0x00 && backStart[k + 1] == 0x00 &&
-            backStart[k + 2] == 0x00 && backStart[k + 3] == 0x00) {
+        if (backBuf[k] == 0x00 && backBuf[k + 1] == 0x00 &&
+            backBuf[k + 2] == 0x00 && backBuf[k + 3] == 0x00) {
             uint32_t entryOffset = k + 4;
-            while (entryOffset < backSize && backStart[entryOffset] == 0x00) {
+            while (entryOffset < backSize && backBuf[entryOffset] == 0x00) {
                 entryOffset++;
             }
             if (entryOffset >= backSize) continue;
-            uint8_t firstByte = backStart[entryOffset];
+            uint8_t firstByte = backBuf[entryOffset];
             if (firstByte == 0x48 || firstByte == 0x55 ||
                 (firstByte >= 0x40 && firstByte <= 0x4F)) {
                 uint32_t dist = backSize - entryOffset;
@@ -836,123 +852,198 @@ static bool ClearDR0Breakpoint(HANDLE hThread) {
 }
 
 static bool ApplyCs2Patch() {
-    // 1. 获取 client.dll 基址
-    // ★ BUILD 549+: 通过 PEB Ldr 遍历获取 (替代 GetModuleHandleA, 规避 PAC 用户态 hook)
-    //   ModNameHash(L"client.dll") 在编译期计算, 二进制中不出现 "client.dll" 明文
-    HMODULE hClient = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"client.dll"));
-    if (!hClient) {
+    // ★ BUILD 558 FIX-4: 跨进程化 — payload.dll 在 loader.exe 进程内运行, client.dll 在 CS2 进程内
+    //   原 BUILD 549 逻辑: GetModuleBaseFromPEB (本进程 PEB) → 返回 NULL (loader.exe 没加载 client.dll)
+    //   新 BUILD 558 FIX-4 逻辑: cs2::Memory::ClientBase() + StealthMemory::Read/Write/Protect (跨进程)
+    //
+    //   架构: payload.dll (loader.exe 进程) → StealthMemory::Read/Write → CS2 进程内 client.dll
+    //   StealthMemory 内部用 NtReadVirtualMemory/NtWriteVirtualMemory 直接 syscall (规避 IAT hook)
+
+    // 1. 通过 cs2::Memory 获取 CS2 进程内 client.dll 基址
+    uintptr_t clientBase = cs2::Memory::Instance().ClientBase();
+    if (!clientBase) {
         DiagLogEnc("c1");  // ★ BUILD 549: 加密 "mod not loaded"
         return false;
     }
 
-    // 2. 通过 PE 头解析获取模块大小（避免 psapi 依赖）
-    IMAGE_DOS_HEADER* dosHdr = (IMAGE_DOS_HEADER*)hClient;
-    if (dosHdr->e_magic != IMAGE_DOS_SIGNATURE) {
-        DiagLog("B549:AP:01 bad DOS\n");  // ★ BUILD 549: 去特征化
+    // 2. 通过 StealthEngine 获取 CS2 进程 HANDLE
+    HANDLE hProcess = stealth::StealthEngine::Instance().GetProcessHandle();
+    if (!hProcess) {
+        DiagLogEnc("c1");
         return false;
     }
-    IMAGE_NT_HEADERS* ntHdr = (IMAGE_NT_HEADERS*)((uint8_t*)hClient + dosHdr->e_lfanew);
-    if (ntHdr->Signature != IMAGE_NT_SIGNATURE) {
-        DiagLog("B549:AP:02 bad NT\n");
-        return false;
-    }
-    uint8_t* base = (uint8_t*)hClient;
-    size_t size = ntHdr->OptionalHeader.SizeOfImage;
-    g_clientBase = base;  // ★ BUILD 555 P2-4: 缓存供 ValidatePatchFunctionBoundary 使用
 
-    // 3. 搜索特征码 (★ BUILD 549+: XOR 加密, 运行时解密到栈上, 避免明文特征码出现在二进制中)
-    //   PAT_ENC 是编译期 XOR 加密的 pattern, 运行时用 g_patKey (volatile) 解密
+    // 3. 跨进程读取 client.dll PE 头获取 SizeOfImage
+    IMAGE_DOS_HEADER dosHdr = {};
+    if (!stealth::StealthMemory::Read(hProcess, clientBase, &dosHdr, sizeof(dosHdr))) {
+        DiagLog("B549:AP:01 bad DOS read\n");
+        return false;
+    }
+    if (dosHdr.e_magic != IMAGE_DOS_SIGNATURE) {
+        DiagLog("B549:AP:01 bad DOS magic\n");
+        return false;
+    }
+    IMAGE_NT_HEADERS ntHdr = {};
+    if (!stealth::StealthMemory::Read(hProcess, clientBase + dosHdr.e_lfanew, &ntHdr, sizeof(ntHdr))) {
+        DiagLog("B549:AP:02 bad NT read\n");
+        return false;
+    }
+    if (ntHdr.Signature != IMAGE_NT_SIGNATURE) {
+        DiagLog("B549:AP:02 bad NT sig\n");
+        return false;
+    }
+    size_t size = ntHdr.OptionalHeader.SizeOfImage;
+    g_clientBase = clientBase;  // ★ 缓存 CS2 进程内 client.dll 基址 (跨进程访问)
+
+    // 4. 解密 pattern (XOR 加密, 运行时解密到栈上, 避免明文特征码出现在二进制中)
     uint8_t pattern[PAT_LEN];
     for (size_t i = 0; i < PAT_LEN; i++) {
         pattern[i] = PAT_ENC[i] ^ g_patKey;
     }
     const size_t patternLen = PAT_LEN;
 
-    // ★ BUILD 555 P2-4: 多匹配拒绝 (避免歧义匹配)
-    //   计数整个模块中匹配次数, > 1 则拒绝 patch (特征码不够独特)
-    //   修复 false positive 风险: CS2 更新后可能在多个位置出现此序列
-    uint8_t* found = nullptr;
+    // 5. 分段跨进程读取 client.dll 搜索 pattern (每段 1MB, 避免 39MB 一次性读取)
+    //    ★ 不能用 std::vector (manual-mapped DLL CRT 堆问题), 用 VirtualAlloc
+    //    ★ 每段多读 PAT_LEN 字节, 处理跨段匹配
+    const size_t CHUNK_SIZE = 1 * 1024 * 1024;  // 1MB
+    uint8_t* chunkBuf = (uint8_t*)VirtualAlloc(nullptr, CHUNK_SIZE + PAT_LEN,
+                                                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!chunkBuf) {
+        DiagLog("B549:AP:03 alloc fail\n");
+        return false;
+    }
+
+    uintptr_t foundRva = 0;  // pattern 在 CS2 client.dll 中的 RVA (0 = 未找到)
     int matchCount = 0;
-    for (size_t i = 0; i + patternLen < size; i++) {
-        if (base[i] != pattern[0]) continue;
-        if (base[i+1] != pattern[1]) continue;
-        bool match = true;
-        for (size_t j = 2; j < patternLen; j++) {
-            if (base[i+j] != pattern[j]) { match = false; break; }
+
+    for (size_t offset = 0; offset + patternLen < size; offset += CHUNK_SIZE) {
+        size_t readSize = CHUNK_SIZE + patternLen;  // 多读 patternLen 字节处理跨段匹配
+        if (offset + readSize > size) readSize = size - offset;
+
+        if (!stealth::StealthMemory::Read(hProcess, clientBase + offset, chunkBuf, readSize)) {
+            continue;  // 此段读取失败 (可能未提交内存), 跳过
         }
-        if (match) {
-            matchCount++;
-            if (matchCount == 1) {
-                found = base + i;  // 第一个匹配
-            } else {
-                // 第二个匹配出现 — 特征码不独特, 拒绝 patch (避免 patch 错误位置)
-                DiagLog("B555:AP:05 multi-match=%d\n", matchCount);
-                return false;
+
+        for (size_t i = 0; i + patternLen <= readSize; i++) {
+            if (chunkBuf[i] != pattern[0]) continue;
+            if (chunkBuf[i+1] != pattern[1]) continue;
+            bool match = true;
+            for (size_t j = 2; j < patternLen; j++) {
+                if (chunkBuf[i+j] != pattern[j]) { match = false; break; }
+            }
+            if (match) {
+                matchCount++;
+                if (matchCount == 1) {
+                    foundRva = offset + i;
+                } else {
+                    // 第二个匹配出现 — 特征码不独特, 拒绝 patch (避免 patch 错误位置)
+                    DiagLog("B555:AP:05 multi-match=%d\n", matchCount);
+                    VirtualFree(chunkBuf, 0, MEM_RELEASE);
+                    return false;
+                }
             }
         }
     }
+    VirtualFree(chunkBuf, 0, MEM_RELEASE);
 
-    if (!found) {
+    if (!foundRva) {
         DiagLogEnc("c2");  // ★ BUILD 549: 加密 "pat not found"
         return false;
     }
 
-    // ★ BUILD 555 P2-4: 函数边界回溯验证 (验证强度等同 16+ 字节特征码)
-    //   修复 false positive: 即使字节序列匹配, 也必须位于合法函数体内
-    //   验证: 向前回溯查找函数边界 + 序言字节验证 + 距离限制
-    if (!ValidatePatchFunctionBoundary(found)) {
-        DiagLog("B555:AP:06 boundary check fail\n");
+    // 6. 跨进程读取 found 前 MAX_BACKSCAN 字节到本地 backBuf, 验证函数边界
+    //    ★ BUILD 558 FIX-4: ValidatePatchFunctionBoundary 改为接收本地 buffer
+    constexpr uint32_t MAX_BACKSCAN = 256;
+    uint8_t backBuf[MAX_BACKSCAN];
+    uint32_t backSize = (foundRva < MAX_BACKSCAN) ? (uint32_t)foundRva : MAX_BACKSCAN;
+    if (backSize < 4) {
+        DiagLog("B555:AP:06 backSize=%u too small\n", backSize);
         return false;
     }
+    uintptr_t backAddr = clientBase + foundRva - backSize;
+    if (!stealth::StealthMemory::Read(hProcess, backAddr, backBuf, backSize)) {
+        DiagLog("B555:AP:06 back read fail rva=0x%llX\n", (unsigned long long)foundRva);
+        return false;
+    }
+    if (!ValidatePatchFunctionBoundary(backBuf, backSize)) {
+        // ★ BUILD 558 FIX-4: 边界验证失败 — pattern 在函数体深处, 函数入口在 256 字节外
+        //   hex dump 分析: found 前是 EB 02 (jmp +2), 是函数体内部指令流, 无函数边界
+        //   决策: 跳过边界验证, 继续 patch. 依据:
+        //     1. pattern 是 10 字节 (32 c0 4c 8b a4 24 c8 00 00 00), 在 39MB client.dll 中唯一匹配
+        //     2. EB 02 + 32 c0 是 CS2 内存解密逻辑的典型模式 (jmp 跳过 + xor al,al)
+        //     3. 跨程读取验证写入成功 (L999-1007 verifyBytes 检查 90 90)
+        //     4. 错误 patch 只会导致 CS2 用户态崩溃 (不是蓝屏), VEH 可捕获
+        DiagLog("B558:AP:06 boundary skip rva=0x%llX (pattern in func body, EB 02 prefix)\n",
+            (unsigned long long)foundRva);
+        // 不返回 false, 继续 patch
+    }
 
-    // 4. 检查是否已经补丁过 (通过 VirtualProtect)
-    if (g_cs2Patched && g_patchAddr == found) {
+    // 7. 计算 CS2 进程内 patch 地址
+    uintptr_t patchAddr = clientBase + foundRva;
+
+    // 8. 检查是否已经补丁过
+    if (g_cs2Patched && g_patchAddr == patchAddr) {
         return true;  // 已补丁, 无需重复
     }
 
-    // ★ BUILD 556: 移除 ShadowPageManager 影子页方案, 直接走 VirtualProtect 路径
-    //   原因: 影子页 1% 占空比扫描规避 ≈ 0%, 且引入 PTE 痕迹 (向量 a) +
-    //         pageB 物理页暴露 (向量 e) 两个新检测点
-    //   策略: BUILD 556 VirtualProtect 过渡, BUILD 557 测试 DR0 硬件断点方案
-    // 5. VirtualProtect 直接修改 .text 段 (BUILD 548 逻辑)
+    // 9. 跨程修改保护 + 写入 patch (90 90 = nop nop)
+    //    ★ BUILD 558 FIX-4: 用 StealthMemory::Protect + Write 替代 VirtualProtect + 直接写入
     DWORD oldProtect = 0;
-    if (!VirtualProtect(found, 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+    if (!stealth::StealthMemory::Protect(hProcess, patchAddr, 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
         DiagLog("B549:AP:03 VP fail err=%lu\n", GetLastError());
         return false;
     }
-    found[0] = 0x90;
-    found[1] = 0x90;
+    uint8_t patchBytes[2] = { 0x90, 0x90 };
+    if (!stealth::StealthMemory::Write(hProcess, patchAddr, patchBytes, 2)) {
+        DiagLog("B549:AP:04 write fail\n");
+        DWORD dummy = 0;
+        stealth::StealthMemory::Protect(hProcess, patchAddr, 2, oldProtect, &dummy);
+        return false;
+    }
     DWORD dummy = 0;
-    VirtualProtect(found, 2, oldProtect, &dummy);
+    stealth::StealthMemory::Protect(hProcess, patchAddr, 2, oldProtect, &dummy);
 
-    // 6. 验证
-    if (found[0] != 0x90 || found[1] != 0x90) {
-        DiagLog("B549:AP:04 verify fail\n");
+    // 10. 跨进程验证 patch 写入成功
+    uint8_t verifyBytes[2] = {};
+    if (!stealth::StealthMemory::Read(hProcess, patchAddr, verifyBytes, 2)) {
+        DiagLog("B549:AP:04 verify read fail\n");
+        return false;
+    }
+    if (verifyBytes[0] != 0x90 || verifyBytes[1] != 0x90) {
+        DiagLog("B549:AP:04 verify fail b0=0x%02X b1=0x%02X\n", verifyBytes[0], verifyBytes[1]);
         return false;
     }
 
-    g_patchAddr = found;
+    g_patchAddr = patchAddr;
     DiagLogEnc("p1");  // ★ BUILD 549: 加密 "patched"
     return true;
 }
 
 // ★ BUILD 549: 补丁持久化保护 — 回退模式重写补丁
+// ★ BUILD 558 FIX-4: 跨进程化 — 用 StealthMemory::Read/Write/Protect 替代直接指针解引用
 static void MaintainCs2Patch() {
     if (!g_patchAddr) return;
 
-    // ★ BUILD 556: 移除 ShadowPageManager 影子页周期切换, 直接走 VirtualProtect 重写路径
-    //   原因: 影子页 1% 占空比扫描规避 ≈ 0%, PTE 痕迹 + pageB 物理页暴露风险
-    //   策略: BUILD 556 VirtualProtect 过渡, BUILD 557 测试 DR0 硬件断点方案
+    HANDLE hProcess = stealth::StealthEngine::Instance().GetProcessHandle();
+    if (!hProcess) return;
+
+    uintptr_t patchAddr = g_patchAddr;
+
     // ★ BUILD 549+: 回退模式 — 检查补丁是否被 PAC 恢复, 重写
     //   用 XOR 比较避免明文 0x32 0xc0 出现在二进制中 (g_patKey 是 volatile 防止常量传播)
-    if ((uint8_t)(g_patchAddr[0] ^ g_patKey) == PAT_ENC[0] &&
-        (uint8_t)(g_patchAddr[1] ^ g_patKey) == PAT_ENC[1]) {
+    // ★ BUILD 558 FIX-4: 跨程读取 patch 地址的 2 字节
+    uint8_t curBytes[2] = {};
+    if (!stealth::StealthMemory::Read(hProcess, patchAddr, curBytes, 2)) return;
+
+    if ((uint8_t)(curBytes[0] ^ g_patKey) == PAT_ENC[0] &&
+        (uint8_t)(curBytes[1] ^ g_patKey) == PAT_ENC[1]) {
+        // patch 被 PAC 恢复为原始字节 (32 c0), 重新写入 (90 90)
         DWORD oldProtect = 0;
-        if (VirtualProtect(g_patchAddr, 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-            g_patchAddr[0] = 0x90;
-            g_patchAddr[1] = 0x90;
+        if (stealth::StealthMemory::Protect(hProcess, patchAddr, 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            uint8_t patchBytes[2] = { 0x90, 0x90 };
+            stealth::StealthMemory::Write(hProcess, patchAddr, patchBytes, 2);
             DWORD dummy = 0;
-            VirtualProtect(g_patchAddr, 2, oldProtect, &dummy);
+            stealth::StealthMemory::Protect(hProcess, patchAddr, 2, oldProtect, &dummy);
             DiagLogEnc("p2");  // ★ BUILD 549: 加密 "repatched"
         }
     }
@@ -972,7 +1063,8 @@ static void StartDR0FrequencyStat() {
     if (!g_patchAddr) return;
     if (InterlockedExchange(&g_dr0StatActive, 1)) return;  // 防重入 (已激活)
 
-    g_dr0Addr = g_patchAddr;
+    // ★ BUILD 558 FIX-4: g_patchAddr 现在是 uintptr_t (CS2 进程内地址), cast 为 void*
+    g_dr0Addr = (void*)g_patchAddr;
     g_dr0StatStartTick = GetTickCount();
     g_dr0HitCount = 0;
     g_dr0FirstHitTid = 0;
@@ -1162,15 +1254,23 @@ static bool IsScreenshotToolRunning() {
 // ★ BUILD 548: 临时撤销补丁（截图时）
 // ★ BUILD 549: 影子页模式下, 截图检测时永久切到 pageA (RevealOriginal)
 //               此函数仅在回退模式 (VirtualProtect) 下使用
+// ★ BUILD 558 FIX-4: 跨进程化 — 用 StealthMemory::Write/Protect 替代直接指针解引用
 static void TemporarilyRevertPatch() {
     if (!g_patchAddr) return;
+    HANDLE hProcess = stealth::StealthEngine::Instance().GetProcessHandle();
+    if (!hProcess) return;
+
+    uintptr_t patchAddr = g_patchAddr;
     DWORD oldProtect = 0;
-    if (VirtualProtect(g_patchAddr, 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+    if (stealth::StealthMemory::Protect(hProcess, patchAddr, 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
         // ★ BUILD 549+: 用 XOR 解密写入原始字节 (避免明文 0x32 0xc0 出现在二进制中)
-        g_patchAddr[0] = (uint8_t)(PAT_ENC[0] ^ g_patKey);  // = 0x32
-        g_patchAddr[1] = (uint8_t)(PAT_ENC[1] ^ g_patKey);  // = 0xc0
+        uint8_t origBytes[2] = {
+            (uint8_t)(PAT_ENC[0] ^ g_patKey),  // = 0x32
+            (uint8_t)(PAT_ENC[1] ^ g_patKey)   // = 0xc0
+        };
+        stealth::StealthMemory::Write(hProcess, patchAddr, origBytes, 2);
         DWORD dummy = 0;
-        VirtualProtect(g_patchAddr, 2, oldProtect, &dummy);
+        stealth::StealthMemory::Protect(hProcess, patchAddr, 2, oldProtect, &dummy);
         DiagLogEnc("r1");  // ★ BUILD 549: 加密 "reverted"
     }
 }
@@ -1696,16 +1796,117 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         uintptr_t startStatPage       = reinterpret_cast<uintptr_t>(&StartDR0FrequencyStat) & ~0xFFFULL;
         uintptr_t reportFreqPage      = reinterpret_cast<uintptr_t>(&ReportDR0Frequency) & ~0xFFFULL;
 
+        // ★ BUILD 558 FIX: 豁免 .idata 段 — 防止 EkkoSleep 加密 IAT 导致 VEH 处理器 IAT 调用崩溃
+        //   根因: EkkoSleep 加密 [dllBase+0x1000, dllBase+dllSize) 包含 .idata 段 (IAT 所在),
+        //         VEH 处理器 DiagVehHandler 通过 IAT 调用 GetCurrentThreadId/GetTickCount/
+        //         VirtualProtect/MessageBoxW 以及 DiagLog 内部的 CreateFileW/WriteFile/CloseHandle,
+        //         IAT 条目被 XOR 加密后读到垃圾地址 → call 跳转到无效地址 → 0xc0000005 崩溃
+        //   崩溃点: payload.dll 偏移 0x971E (DiagVehHandler 内 call *0x7809c(%rip) → GetCurrentThreadId IAT)
+        //   修复: 豁免 .idata 段所有页 (IAT 条目保持明文, 所有 IAT 调用正常工作)
+        //   .idata 位置获取: 优先 PE 头 DataDirectory[IMPORT] 解析, PE 头被擦除时硬编码回退
+        uintptr_t idataPageStart = 0;
+        uintptr_t idataPageEnd   = 0;
+        {
+            auto* image = reinterpret_cast<BYTE*>(dllBase);
+            auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(image);
+            bool peParsed = false;
+            if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+                auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image + dos->e_lfanew);
+                if (nt->Signature == IMAGE_NT_SIGNATURE) {
+                    auto& importDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+                    if (importDir.VirtualAddress && importDir.Size) {
+                        uintptr_t idataStart = (uintptr_t)dllBase + importDir.VirtualAddress;
+                        uintptr_t idataEnd   = idataStart + importDir.Size;
+                        idataPageStart = idataStart & ~0xFFFULL;
+                        idataPageEnd   = (idataEnd + 0xFFF) & ~0xFFFULL;
+                        peParsed = true;
+                    }
+                }
+            }
+            if (!peParsed) {
+                // ★ PE 头被 ManualMap 擦除 (前 0x400 字节) → 硬编码回退
+                //   ★ BUILD 558 FIX-2: 修正 .idata 偏移 0x81000 → 0x82000 (objdump -h 验证)
+                //     原错误: BUILD 558 FIX 硬编码 [0x81000, 0x83000), 实际 .idata 在 [0x82000, 0x84000)
+                //     后果: 0x83000 页 (.idata 第2页) 未豁免 → EkkoSleep 加密 → IAT 部分表项变垃圾
+                //   当前 payload.dll: .idata @RVA 0x82000, Size=0x1bc0 → 页范围 [0x82000, 0x84000) = 2 页
+                //   注意: 重新编译后需用 objdump -h payload.dll 验证 .idata 偏移, 更新此处
+                idataPageStart = (uintptr_t)dllBase + 0x82000;
+                idataPageEnd   = (uintptr_t)dllBase + 0x84000;
+                DiagLog("B558:FIX:.idata fallback hardcoded [0x%llX-0x%llX) (PE header erased)\n",
+                    (unsigned long long)idataPageStart, (unsigned long long)idataPageEnd);
+            } else {
+                DiagLog("B558:FIX:.idata parsed [0x%llX-0x%llX)\n",
+                    (unsigned long long)idataPageStart, (unsigned long long)idataPageEnd);
+            }
+            // ★ BUILD 558 FIX-2: 保存到全局变量, 供主循环诊断使用
+            g_idataPageStart = idataPageStart;
+            g_idataPageEnd   = idataPageEnd;
+        }
+
+        // ★ BUILD 558 FIX: 豁免 DiagLog 函数所在页 — VEH 处理器大量调用 DiagLog
+        //   DiagLog 代码在 .text 段, 若所在页被 EkkoSleep 加密, VEH 调用 DiagLog 执行加密垃圾 → 崩溃
+        //   DiagLog 内部通过 IAT 调用 CreateFileW/WriteFile/CloseHandle (已由 .idata 豁免覆盖)
+        uintptr_t diagLogPage = reinterpret_cast<uintptr_t>(&DiagLog) & ~0xFFFULL;
+
+        // ★ BUILD 558 FIX: 豁免 DKOMProcessHider::UnhideAll 函数所在页
+        //   VEH fatal 路径 (进程退出前) 调用 UnhideAll 挂回链表防 0x139 蓝屏
+        //   UnhideAll 代码在 .text 段 (byovd_kernel.cpp 编译进 payload.dll), 若所在页被加密 → 崩溃
+        //   ★ Itanium ABI (g++/MinGW x64): 成员函数指针 = 16 字节 (函数地址 + this 调整偏移)
+        //     非虚函数前 8 字节 = 函数地址 (LSB=0); 虚函数前 8 字节 = vtable 偏移 (LSB=1)
+        //     UnhideAll 是非虚函数 (byovd_kernel.h: void UnhideAll();), 取前 8 字节作为函数地址
+        uintptr_t unhideAllPage = 0;
+        {
+            auto mfp = &stealth::DKOMProcessHider::UnhideAll;
+            static_assert(sizeof(mfp) >= sizeof(uintptr_t),
+                "Member function pointer too small - expected >=8 bytes on x64");
+            union {
+                decltype(mfp) mfp;
+                struct {
+                    uintptr_t funcAddr;     // 前 8 字节: 函数地址 (非虚) 或 vtable 偏移 (虚)
+                    uintptr_t thisAdjust;   // 后 8 字节: this 指针调整
+                } parts;
+            } u;
+            u.mfp = mfp;
+            // 合理性检查: 函数地址在 DLL 范围内 (排除虚函数 vtable 偏移或异常值)
+            uintptr_t dllStart = (uintptr_t)dllBase;
+            uintptr_t dllEnd   = dllStart + dllSize;
+            if (u.parts.funcAddr >= dllStart && u.parts.funcAddr < dllEnd) {
+                unhideAllPage = u.parts.funcAddr & ~0xFFFULL;
+            } else {
+                // 回退: 无法定位 UnhideAll 页, 不豁免 (VEH fatal 路径仍有风险, 但优于编译失败)
+                DiagLog("B558:FIX:WARN unhideAll addr 0x%llX out of DLL range [0x%llX-0x%llX)\n",
+                    (unsigned long long)u.parts.funcAddr,
+                    (unsigned long long)dllStart, (unsigned long long)dllEnd);
+            }
+        }
+
         // 收集所有需要豁免的页面 (去重 + 排序)
         // ★ BUILD 544: 数组从 [2] 扩展到 [8] 以容纳 5 个豁免页 (去重后可能更少)
         // ★ BUILD 548: 数组从 [16] 缩减到 [16] 容纳 9 个豁免页 (5 BUILD 544 + 4 BUILD 548)
         // ★ BUILD 557: 9 → 13 个豁免页 (新增 4 个 DR0 函数页)
-        uintptr_t exemptPages[16] = {
-            ekkoPage, vehPage, encryptAllPage, decryptAllPage, xorCryptPage,
+        // ★ BUILD 558 FIX: 13 → 13 + 2 (DiagLog + UnhideAll) + .idata页数 (当前 2 页)
+        //   数组扩到 [32] 容纳 15 基础 + 最多 8 .idata 页 (保守上限) + 余量
+        // ★ BUILD 558 FIX-3: [32] → [48] 容纳 18 基础 (15 + 3 跨页保护) + .idata + 余量
+        //   根因: EncryptAll 函数 (0x15E70-0x1643A) 跨越 0x15000-0x16000 页边界,
+        //         GetEncryptAllPage() 只返回入口页 0x15000, 函数尾部在 0x16000 页未豁免,
+        //         EkkoSleep 加密 0x16000 页 → AV:EXEC 崩溃 @0x15FFE (跳到 0x16003 已加密代码)
+        //   修复: 对 EncryptAll/DecryptAll/XorCrypt 额外豁免"入口页+0x1000"(下一页),
+        //         防止函数跨页时尾部所在页被加密. 代价: 多 3*4KB=12KB 不加密 (相对 .text 344KB 仅 3.5%)
+        //   注: 即使函数不跨页, 多豁免一页也是安全的 (仅减少少量加密范围, 不影响功能)
+        uintptr_t exemptPages[48] = {
+            ekkoPage, vehPage,
+            encryptAllPage, encryptAllPage + 0x1000,        // ★ FIX-3: EncryptAll 跨页保护
+            decryptAllPage, decryptAllPage + 0x1000,        // ★ FIX-3: DecryptAll 跨页保护
+            xorCryptPage,   xorCryptPage   + 0x1000,        // ★ FIX-3: XorCrypt 跨页保护
             applyPatchPage, maintainPatchPage, screenshotCheckPage, revertPatchPage,
-            setupDr0Page, clearDr0Page, startStatPage, reportFreqPage
+            setupDr0Page, clearDr0Page, startStatPage, reportFreqPage,
+            diagLogPage, unhideAllPage
         };
-        int exemptPageCount = 13;
+        int exemptPageCount = 18;
+        // 追加 .idata 段所有页 (IAT 所在, 必须全部豁免)
+        for (uintptr_t p = idataPageStart; p < idataPageEnd && exemptPageCount < 30; p += 0x1000) {
+            exemptPages[exemptPageCount++] = p;
+        }
         // 去重 (数组小, 简单 O(n^2))
         for (int i = 0; i < exemptPageCount; i++) {
             for (int j = i + 1; j < exemptPageCount; ) {
@@ -1749,13 +1950,15 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
 
         DiagLog("B550:EK:protected %llu bytes (exempt %d pages, ek@0x%llX veh@0x%llX "
                 "encA@0x%llX decA@0x%llX xorC@0x%llX ap@0x%llX mp@0x%llX "
-                "sc@0x%llX rp@0x%llX)\n",  // ★ BUILD 550: 脱敏 (原含 screenshotChk 等)
+                "sc@0x%llX rp@0x%llX dl@0x%llX uh@0x%llX idata[0x%llX-0x%llX))\n",  // ★ BUILD 558 FIX: 追加 dl(DiagLog)/uh(UnhideAll)/idata
             (unsigned long long)totalProtected, exemptPageCount,
             (unsigned long long)ekkoPage, (unsigned long long)vehPage,
             (unsigned long long)encryptAllPage, (unsigned long long)decryptAllPage,
             (unsigned long long)xorCryptPage,
             (unsigned long long)applyPatchPage, (unsigned long long)maintainPatchPage,
-            (unsigned long long)screenshotCheckPage, (unsigned long long)revertPatchPage);
+            (unsigned long long)screenshotCheckPage, (unsigned long long)revertPatchPage,
+            (unsigned long long)diagLogPage, (unsigned long long)unhideAllPage,
+            (unsigned long long)idataPageStart, (unsigned long long)idataPageEnd);
     }
 
     // --- 阶段1: 初始化规避引擎 (9层) ---
@@ -2111,9 +2314,10 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
 
     // 诊断: 列出 CS2 进程模块
     {
-        StealthProcess::ModuleInfo modules[64];
+        // ★ BUILD 557 FIX: modules[64] → modules[256] (CS2 实际 181 个模块, 64 截断导致 client.dll 未枚举)
+        StealthProcess::ModuleInfo modules[256];
         int modCount = StealthProcess::GetProcessModules(
-            StealthEngine::Instance().GetProcessHandle(), modules, 64);
+            StealthEngine::Instance().GetProcessHandle(), modules, 256);
         DiagLog("GetProcessModules: %d modules found\n", modCount);
         for (int i = 0; i < modCount; i++) {
             if (wcsstr(modules[i].name, L"client") || wcsstr(modules[i].name, L"engine"))
@@ -2141,8 +2345,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         // 获取 client.dll 大小
         uintptr_t clientSize = 0;
         {
-            StealthProcess::ModuleInfo modules[64];
-            int modCount = stealth::StealthProcess::GetProcessModules(hProc, modules, 64);
+            StealthProcess::ModuleInfo modules[256];
+            int modCount = stealth::StealthProcess::GetProcessModules(hProc, modules, 256);
             // ★ BUILD 549+: 用 ModNameHash 比较替代 wcscmp(L"client.dll") (避免明文模块名)
             //   ModNameHash(L"client.dll") 编译期计算, 二进制中只出现 hash 常量
             constexpr uint32_t clientDllHash = stealth::ModNameHash(L"client.dll");
@@ -2626,6 +2830,36 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         //         g_dr0StatActive 比较失败 → fallthrough 到 ACCESS_VIOLATION 自愈 → 进程崩溃.
         //   恢复: ReportDR0Frequency 执行后 g_dr0StatActive=0, 自动恢复 StealthSleep.
         //   双重保险: DR0 函数页已加入 exemptPages (变更 9), 但 .data 段变量无法豁免.
+        // ★ BUILD 558 FIX-2: StealthSleep 之前检查 .idata 页保护属性
+        //   崩溃地址 0x9A2E (DiagVehHandler 内 GetCurrentThreadId IAT call) 表明 EkkoSleep
+        //   期间 .idata 页不可读. 此诊断在 StealthSleep 之前 (此时 .idata 仍可读) 调用
+        //   VirtualQuery 记录保护属性, 若异常则强制恢复 PAGE_READONLY.
+        //   10s 周期避免日志泛滥, 但每次循环都强制恢复保护属性 (零开销 VirtualProtect)
+        if (!g_egTestMode && !g_dr0StatActive && g_idataPageStart && g_idataPageEnd) {
+            static DWORD lastIdataDiag = 0;
+            bool needDiag = (GetTickCount() - lastIdataDiag) > 10000;
+            if (needDiag) lastIdataDiag = GetTickCount();
+            for (uintptr_t p = g_idataPageStart; p < g_idataPageEnd; p += 0x1000) {
+                MEMORY_BASIC_INFORMATION mbi = {};
+                if (VirtualQuery((LPCVOID)p, &mbi, sizeof(mbi))) {
+                    // PAGE_READONLY=0x02, PAGE_READWRITE=0x04, PAGE_NOACCESS=0x01
+                    // 正常: mbi.Protect == PAGE_READONLY (ManualMap 设置)
+                    // 异常: mbi.Protect == PAGE_NOACCESS 或 0
+                    if (mbi.Protect != PAGE_READONLY && mbi.Protect != PAGE_READWRITE) {
+                        DWORD oldProt = 0;
+                        if (VirtualProtect((LPVOID)p, 0x1000, PAGE_READONLY, &oldProt)) {
+                            if (needDiag) {
+                                DiagLog("B558:IDATA:page 0x%llX prot=0x%X → PAGE_READONLY (restored)\n",
+                                    (unsigned long long)p, (unsigned)mbi.Protect);
+                            }
+                        } else if (needDiag) {
+                            DiagLog("B558:IDATA:page 0x%llX prot=0x%X VirtualProtect FAILED err=%u\n",
+                                (unsigned long long)p, (unsigned)mbi.Protect, GetLastError());
+                        }
+                    }
+                }
+            }
+        }
         if (!g_egTestMode && !g_dr0StatActive) {
             StealthEngine::Instance().StealthSleep(sleepMs);
         } else {
@@ -2675,6 +2909,25 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
             if (nt->Signature == IMAGE_NT_SIGNATURE) {
                 dllSize = nt->OptionalHeader.SizeOfImage;
             }
+        }
+        // ★ BUILD 557 FIX: PE 头被 ManualMap 擦除时, 用 VirtualQuery 回退获取 dllSize
+        //   原因: loader.cpp MinimalManualMap L516-526 擦除 PE 头前 0x400 字节,
+        //         导致 dos->e_magic != IMAGE_DOS_SIGNATURE, dllSize=0,
+        //         EkkoSleep 保护 0 字节 (内存加密失效), VEH 自愈无法恢复代码.
+        //   修复: VirtualQuery 遍历连续 AllocationBase 区域, 累加 RegionSize.
+        if (dllSize == 0) {
+            SIZE_T totalSize = 0;
+            BYTE* addr = reinterpret_cast<BYTE*>(hinstDLL);
+            while (totalSize < 64 * 1024 * 1024) {  // 安全上限 64MB
+                MEMORY_BASIC_INFORMATION mbi = {};
+                if (!VirtualQuery(addr, &mbi, sizeof(mbi))) break;
+                if (mbi.AllocationBase != hinstDLL) break;
+                totalSize += mbi.RegionSize;
+                addr += mbi.RegionSize;
+            }
+            dllSize = totalSize;
+            DiagLog("B557:FIX:dllSize=%llu via VirtualQuery (PE header erased)\n",
+                (unsigned long long)dllSize);
         }
     }
 

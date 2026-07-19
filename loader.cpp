@@ -69,6 +69,32 @@ static LONG WINAPI LoaderCrashHandler(PEXCEPTION_POINTERS ep) {
     return EXCEPTION_EXECUTE_HANDLER; // 终止进程
 }
 
+// ★ BUILD 558 FIX-3: VEH 处理器 — 捕获 DllMain 崩溃地址
+//   问题: SetUnhandledExceptionFilter (UEH) 可能被 CRT 初始化覆盖, 或崩溃是 fast fail
+//   解决: VEH 优先级高于 UEH, 能捕获更多异常类型 (包括 CRT 内部异常)
+//   策略: 只记录 ACCESS_VIOLATION (0xC0000005), 避免干扰正常 SEH (如 _setjmp)
+static void* g_payloadBase = nullptr;  // payload.dll 基址 (VEH 判断崩溃范围)
+static size_t g_payloadSize = 0;
+static LONG WINAPI LoaderVehHandler(PEXCEPTION_POINTERS ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    // 只记录 ACCESS_VIOLATION, 避免干扰 CRT 正常 SEH
+    if (code == 0xC0000005 /* ACCESS_VIOLATION */) {
+        uint64_t addr = (uint64_t)ep->ExceptionRecord->ExceptionAddress;
+        uint64_t base = (uint64_t)g_payloadBase;
+        uint64_t end  = base + g_payloadSize;
+        // 判断崩溃地址是否在 payload.dll 范围内
+        const char* scope = "OUTSIDE";
+        uint64_t offset = 0;
+        if (base && addr >= base && addr < end) {
+            scope = "INSIDE";
+            offset = addr - base;
+        }
+        LoaderDiag("LOADER-VEH: AV addr=0x%llX [%s payload] offset=0x%llX base=0x%llX\n",
+            addr, scope, offset, base);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;  // 不处理, 让其他处理器处理
+}
+
 // v3.37: 确保管理员权限
 // 首次运行时无 --elevated 标记 → 通过 ShellExecute runas 重新启动自身
 // 重启后带 --elevated 标记 → 直接继续, 避免无限循环
@@ -458,12 +484,19 @@ static MinimalMapResult MinimalManualMap(const uint8_t* dllData, size_t dllSize)
         auto* importDesc = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(
             imageBase + importDir.VirtualAddress);
 
+        // ★ BUILD 558 FIX-3: IAT NULL 条目统计 (检测 GetProcAddress 失败)
+        int iatNullCount = 0;
+        int iatTotalCount = 0;
+
         for (int i = 0; importDesc[i].Name; i++) {
             auto dllName = reinterpret_cast<const char*>(
                 imageBase + importDesc[i].Name);
             HMODULE hMod = LoadLibraryA(dllName);
             if (!hMod) hMod = GetModuleHandleA(dllName);
-            if (!hMod) continue;
+            if (!hMod) {
+                LoaderDiag("  IAT: FAIL LoadLibrary %s — skipping (IAT will have NULLs)\n", dllName);
+                continue;
+            }
 
             auto* thunk = reinterpret_cast<uintptr_t*>(
                 imageBase + importDesc[i].FirstThunk);
@@ -473,6 +506,7 @@ static MinimalMapResult MinimalManualMap(const uint8_t* dllData, size_t dllSize)
                     : importDesc[i].FirstThunk));
 
             for (int j = 0; origThunk[j]; j++) {
+                iatTotalCount++;
                 if (origThunk[j] & IMAGE_ORDINAL_FLAG64) {
                     thunk[j] = reinterpret_cast<uintptr_t>(
                         GetProcAddress(hMod, MAKEINTRESOURCEA(
@@ -483,8 +517,22 @@ static MinimalMapResult MinimalManualMap(const uint8_t* dllData, size_t dllSize)
                     thunk[j] = reinterpret_cast<uintptr_t>(
                         GetProcAddress(hMod, importByName->Name));
                 }
+                // ★ BUILD 558 FIX-3: 检测 NULL IAT 条目 (GetProcAddress 失败)
+                if (thunk[j] == 0) {
+                    iatNullCount++;
+                    const char* funcName = "<ordinal>";
+                    if (!(origThunk[j] & IMAGE_ORDINAL_FLAG64)) {
+                        funcName = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(
+                            imageBase + origThunk[j])->Name;
+                    }
+                    LoaderDiag("  IAT NULL: dll=%s func=%s (GetProcAddress failed)\n",
+                        dllName, funcName);
+                }
             }
         }
+        LoaderDiag("  IAT verify: %d/%d entries NULL (DLL=%s)\n",
+            iatNullCount, iatTotalCount,
+            iatNullCount > 0 ? "WILL CRASH" : "OK");
     }
 
     // --- 6. 设置区段保护 ---
@@ -541,6 +589,11 @@ static MinimalMapResult MinimalManualMap(const uint8_t* dllData, size_t dllSize)
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // ★ v3.38: 最早注册未处理异常处理器 (在 DllMain 之前, 捕获 loader 本体崩溃)
     SetUnhandledExceptionFilter(LoaderCrashHandler);
+    // ★ BUILD 558 FIX-3: VEH 优先级高于 UEH, 捕获 DllMain 早期崩溃 (含 CRT 内部异常)
+    //   UEH 在前几次测试中未触发 (sd.log 不存在, 也无 LOADER-CRASH 日志),
+    //   怀疑 CRT 初始化覆盖了 UEH, 或崩溃走 fast-fail 路径绕过 UEH.
+    //   VEH 在 KiUserExceptionDispatcher 流程中先于 UEH 调用, 能捕获更多异常类型.
+    AddVectoredExceptionHandler(0 /*最后调用, 不阻塞 SEH/VEH 链*/, LoaderVehHandler);
     LoaderDiag("=== LOADER v3.89 START (BUILD 407: fixed IOCTL sizeType 4=DWORD, removed PageTableWalker) ===\n");
 
     // v3.37: 强制管理员权限 — 自动以 runas + --elevated 重新启动
@@ -620,6 +673,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     LoaderDiag("STEP5: OK (base=0x%p size=%zu entry=0x%p)\n",
         mapResult.imageBase, mapResult.imageSize, mapResult.entryPoint);
 
+    // ★ BUILD 558 FIX-3: 设置 payload.dll 基址/大小, 供 LoaderVehHandler 判断崩溃范围
+    //   VEH 触发时通过此范围计算 "INSIDE payload" + offset, 用于精确定位崩溃函数
+    g_payloadBase = mapResult.imageBase;
+    g_payloadSize = mapResult.imageSize;
+    LoaderDiag("STEP5.5: VEH range set [0x%p, +0x%zu) — LOADER-VEH will tag AV inside this range\n",
+        g_payloadBase, g_payloadSize);
+
     // --- 0. 成功加载后自删除 (规避磁盘扫描) ---
     LoaderDiag("STEP6: SelfDelete...\n");
     SelfDelete();
@@ -628,6 +688,38 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // --- 4. 调用 DllMain(DLL_PROCESS_ATTACH) ---
     // DllMain 在当前线程上直接运行 CheatMainLoop (不创建额外线程),
     // 从此处开始 loader.exe 进程进入无限循环, 永不返回
+
+    // ★ BUILD 558 FIX-3: IAT 验证 — DllMain 调用前检查关键 IAT 条目
+    //   崩溃现象: DllMain 调用后无 sd.log, WER 报告 c0000005 StackHash_0000 (unknown module)
+    //   怀疑: loader MinimalManualMap IAT 解析失败, IAT[DisableThreadLibraryCalls]=0
+    //         → DllMain @ 0x9aa0 第一个 IAT 调用 (0x9ad8: call *IAT[0x82778]) 立即崩溃
+    //   验证: 读取 4 个关键 IAT 条目 (RVA 来自 objdump -p payload.dll)
+    //     0x826f0 = AddVectoredExceptionHandler (KERNEL32.dll)
+    //     0x82778 = DisableThreadLibraryCalls (KERNEL32.dll) ← DllMain 第一个 IAT 调用
+    //     0x82988 = Sleep (KERNEL32.dll)
+    //     0x829f8 = VirtualQuery (KERNEL32.dll)
+    //   注意: RVA 硬编码, 重新编译 payload.dll 后需用 objdump -p 更新
+    {
+        auto* base = mapResult.imageBase;
+        uintptr_t iatVEH   = *reinterpret_cast<uintptr_t*>(base + 0x826f0);
+        uintptr_t iatDTLC  = *reinterpret_cast<uintptr_t*>(base + 0x82778);
+        uintptr_t iatSleep = *reinterpret_cast<uintptr_t*>(base + 0x82988);
+        uintptr_t iatVQ    = *reinterpret_cast<uintptr_t*>(base + 0x829f8);
+        LoaderDiag("STEP6.5: IAT verify: VEH@0x826f0=0x%llX DTLC@0x82778=0x%llX Sleep@0x82988=0x%llX VQ@0x829f8=0x%llX\n",
+            (unsigned long long)iatVEH, (unsigned long long)iatDTLC,
+            (unsigned long long)iatSleep, (unsigned long long)iatVQ);
+        if (iatVEH == 0 || iatDTLC == 0 || iatSleep == 0 || iatVQ == 0) {
+            LoaderDiag("STEP6.5: *** WARNING *** IAT has NULL entries! DllMain will crash at first IAT call.\n");
+            // 输出前 16 个 IAT 条目用于诊断
+            for (int i = 0; i < 16; i++) {
+                uintptr_t val = *reinterpret_cast<uintptr_t*>(base + 0x826f0 + i * 8);
+                LoaderDiag("  IAT[0x%llX] = 0x%llX\n",
+                    (unsigned long long)(0x826f0 + i * 8),
+                    (unsigned long long)val);
+            }
+        }
+    }
+
     LoaderDiag("STEP7: Calling DllMain @ 0x%p...\n", mapResult.entryPoint);
     using DllMainFn = BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID);
     auto dllMain = reinterpret_cast<DllMainFn>(mapResult.entryPoint);

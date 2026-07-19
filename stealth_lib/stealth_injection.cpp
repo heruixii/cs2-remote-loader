@@ -176,8 +176,8 @@ ManualMapper::MapResult ManualMapper::MapDllFromBuffer(
                 // 尝试从远程进程获取模块基址
                 // 系统DLL已在远程进程中加载, 使用 StealthProcess 枚举
                 // ★ BUILD 500: 使用固定数组替代 std::vector — GetProcessModules 返回 int
-                StealthProcess::ModuleInfo remoteModules[64];
-                int modCount = StealthProcess::GetProcessModules(hProcess, remoteModules, 64);
+                StealthProcess::ModuleInfo remoteModules[256];
+                int modCount = StealthProcess::GetProcessModules(hProcess, remoteModules, 256);
                 for (int j = 0; j < modCount; j++) {
                     // 比较模块名 (简化: 不区分大小写)
                     char modNameA[260] = {};

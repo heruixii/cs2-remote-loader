@@ -23,8 +23,8 @@ bool Memory::ResolveModules() {
     constexpr uint32_t clientHash = stealth::ModNameHash(L"client.dll");
     constexpr uint32_t engineHash = stealth::ModNameHash(L"engine2.dll");
 
-    stealth::StealthProcess::ModuleInfo modules[64];
-    int modCount = stealth::StealthProcess::GetProcessModules(hProc, modules, 64);
+    stealth::StealthProcess::ModuleInfo modules[256];
+    int modCount = stealth::StealthProcess::GetProcessModules(hProc, modules, 256);
     for (int i = 0; i < modCount; i++) {
         if (stealth::ModNameHashRT(modules[i].name) == clientHash) {
             m_clientBase = modules[i].baseAddress;

