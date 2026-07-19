@@ -185,6 +185,22 @@
 //        安全性: VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch), 无新内存访问模式
 //                降级模式下依赖 SHV_Install patch 兜底 (双重保险), BSOD 风险极低
 //        预期效果: VmxOnWrapper patch 持久有效, EPT 永不构造, 综合 2-5% → 1.5-4%
+// BUILD: 567 (v3.235: VAD-DKOM 执行顺序修复 + EPROCESS 缓存 + DKOM WriteUnsafe)
+//        ★ BUILD 567 v3.235 FIX (VAD-DKOM 执行顺序 + DKOM 写入修复 7/20):
+//          - 现象: v3.234 测试 E+G: early DKOM hide: FAILED + B554:GEP: FAIL walk=512
+//                  CS2 运行 60+ 秒后仍然闪退 (比 v3.232/v3.233 的 15-17 秒有改善)
+//          - 根因 1: DKOM SelfLoopHarden/UnhideProcessByPid 使用 kma.Write (白名单)
+//                    EPROCESS 在非分页池扩展 (0xFFFF8000-0xFFFFF680), 白名单拒绝 → DKOM 失败
+//          - 根因 2: VAD GetEPROCESSByPid 没有循环检测, Windows ActiveProcessLinks 是双向循环链表
+//                    会跑满 maxWalk=512 次, 找不到 loader.exe
+//          - 根因 3: VAD-DKOM 执行顺序问题 — DKOM 先执行断链 loader.exe, VAD 后执行找不到 loader.exe
+//                    (用户诊断: "找不到loader.exe会不会是因为loader.exe会隐藏进程" — 正确!)
+//          - 修复 1: DKOM SelfLoopHarden/UnhideProcessByPid 改用 WriteUnsafe (绕过白名单)
+//          - 修复 2: VAD GetEPROCESSByPid 添加 start 循环检测 + maxWalk=1024 + 每100次诊断日志
+//          - 修复 3: VADConcealer 添加 s_cachedLoaderEprocess 缓存 EPROCESS 地址
+//          - 修复 4: 调整执行顺序 — VAD 先执行 (缓存 EPROCESS), DKOM 后执行 (断链不影响 VAD)
+//          - 安全性: EPROCESS 地址在进程生命周期内不变, DKOM 断链不修改 EPROCESS 地址
+//                    VAD 缓存的 EPROCESS 在 DKOM 隐藏后仍可访问 VAD 树
 // BUILD: 567 (v3.234: 安全边界扩大 — 覆盖非分页池扩展/PFN 数据库)
 //        ★ BUILD 567 v3.234 FIX (VAD 隐藏失败根因二次修复 7/20 02:10):
 //          - 现象: v3.233 测试 B554:EEP: systemEPROCESS=0xFFFF928F9F6DC040 inWhitelist=0 inSystemPte=0
@@ -499,7 +515,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.234 启动摘要 (安全边界扩大 — 覆盖非分页池扩展/PFN 数据库)\n");
+    DiagLog("BUILD 567 v3.235 启动摘要 (VAD-DKOM 执行顺序修复 + EPROCESS 缓存 + DKOM WriteUnsafe)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -538,7 +554,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.234 退出摘要\n");
+    DiagLog("BUILD 567 v3.235 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -563,7 +579,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.234 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.235 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
@@ -2707,10 +2723,26 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
 
         g_byovdDriverLoaded = kernelResult.driverLoaded;
 
+        // ★ BUILD 567 v3.235: VAD 隐藏 (先执行, 缓存 EPROCESS)
+        //   原因: DKOM 成功后会断链 loader.exe, VAD GetEPROCESSByPid 遍历 ActiveProcessLinks
+        //         找不到 loader.exe → VAD 隐藏失败.
+        //   修复: VAD 先执行 (链表完整, 能找到 loader.exe), 缓存 EPROCESS 地址;
+        //         DKOM 后续断链不影响 VAD (VAD 用缓存的 EPROCESS 访问 VAD 树).
+        //   注意: VAD 必须在 BYOVD driver loaded 之后 (需要内核 R/W 访问 VAD 节点).
+        //   周期: 60-90s 主循环重新调用 (PAC 可能恢复 VAD 标志), 用缓存的 EPROCESS.
+        if (kernelResult.driverLoaded) {
+            DWORD loaderPid = GetCurrentProcessId();  // payload.dll 在 loader.exe 进程内
+            uintptr_t bases[1] = { (uintptr_t)g_diagDllBase };
+            int vadOk = stealth::VADConcealer::ConcealAllRegions(loaderPid, bases, 1);
+            DiagLog("B554:VAD:%d/1 base=0x%llX (pre-DKOM, cache eprocess)\n",
+                vadOk, (unsigned long long)g_diagDllBase);
+        }
+
         // ★ BUILD 537: Gamma-A — 早期 DKOM 隐藏 (永久断链, 无需周期缓解)
         //   EnableAll() 成功加载驱动后立即隐藏 loader 进程,
         //   缩短进程在 ActiveProcessLinks 中的可见窗口.
         //   ★ PG 已通过 bcdedit /debug on 禁用, DKOM 可永久断链, 无需 Unhide/Rehide 循环
+        //   ★ BUILD 567 v3.235: 移到 VAD 隐藏之后 (VAD 需要在链表完整时缓存 EPROCESS)
         if (kernelResult.driverLoaded) {
             bool dkomOk = stealth::DKOMProcessHider::Instance().HideProcess();
             DiagLog("E+G: early DKOM hide (permanent, PG disabled): %s\n", dkomOk ? "OK" : "FAILED");
@@ -2777,21 +2809,10 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         DiagLog("BYOVD: freed %d guard regions\n",
             guardRegionCount);
 
-        // ★ BUILD 554 P0-1: 启用 VADConcealer (修复 A1 死代码缺陷)
-        //   原因: CleanupInjectionTraces 在 #if 0 中从未执行 (BUILD 549+),
-        //         导致 payload.dll 的 MEM_PRIVATE | PAGE_EXECUTE_READWRITE 区域
-        //         完全暴露给 PAC VAD 树扫描.
-        //   策略: 在 EnableAll + SHV patch + ApplyCs2Patch + guard pages 释放后
-        //         立即调用 VADConcealer 隐藏 payload.dll 内存区域.
-        //   实现: 通过 BYOVD 内核 R/W 修改 VAD 树, 将 MEM_PRIVATE 改为 MEM_MAPPED.
-        //   周期: 60-90s 主循环重新调用 (PAC 可能恢复 VAD 标志).
-        {
-            DWORD cs2Pid = GetCurrentProcessId();  // payload.dll 在 CS2 进程内
-            uintptr_t bases[1] = { (uintptr_t)g_diagDllBase };
-            int vadOk = stealth::VADConcealer::ConcealAllRegions(cs2Pid, bases, 1);
-            DiagLog("B554:VAD:%d/1 base=0x%llX\n", vadOk,
-                (unsigned long long)g_diagDllBase);
-        }
+        // ★ BUILD 554 P0-1: VAD 隐藏已移到 DKOM 隐藏之前 (BUILD 567 v3.235)
+        //   原因: DKOM 成功断链 loader.exe 后, VAD GetEPROCESSByPid 找不到 loader.exe.
+        //   修复: VAD 先执行 (见上方 L2710-2723), 缓存 EPROCESS; DKOM 后续断链不影响 VAD.
+        //   周期: 60-90s 主循环重新调用 (PAC 可能恢复 VAD 标志), 用缓存的 EPROCESS.
     }
 
         // ★ BUILD 548: EPT dump 触发逻辑已移除 (不再需要 EPT dump 诊断)

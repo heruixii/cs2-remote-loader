@@ -1736,6 +1736,25 @@ bool KernelMemoryAccessor::ReadKernelVAUnsafe(uint64_t va, void* outBuf, size_t 
     return PhysicalReadViaIOCTL(m_hDevice, g_probedReadIoctl, va, outBuf, size);
 }
 
+// ★ BUILD 567 v3.235: EPROCESS 专用写入 (绕过白名单)
+//   背景: v3.234 修复 DKOM 读取后, 发现 DKOM 写入 (PerformUnlink/SelfLoopHarden/UnhideProcessByPid)
+//        也用 WriteKernelVA (白名单), 写入 EPROCESS (非分页池扩展) 失败
+//   方案: 绕过白名单, 安全边界 [0xFFFF8000, 0xFFFFFE00) 与 ReadKernelVAUnsafe 一致
+//   安全性: EPROCESS 是有效内核内存, 写入不应导致 0x50 蓝屏
+//           DKOM 断链 + SelfLoopHarden 逻辑已验证 (BUILD 558 FIX), 不会触发 0x139
+bool KernelMemoryAccessor::WriteKernelVAUnsafe(uint64_t va, const void* inBuf, size_t size) {
+    if (!m_active) return false;
+    // ★ v3.235: 安全边界 [0xFFFF8000, 0xFFFFFE00) — 与 ReadKernelVAUnsafe 一致
+    if (va < 0xFFFF800000000000ULL) return false;
+    if (va >= 0xFFFFFE0000000000ULL) return false;
+
+    // ★ BUILD 489: 根据驱动类型分发
+    if (g_isPdfwKrnl) {
+        return PdfwWriteKernelVA(m_hDevice, va, inBuf, size);
+    }
+    return PhysicalWriteViaIOCTL(m_hDevice, g_probedWriteIoctl, va, inBuf, size);
+}
+
 // ============================================================
 // ★ BUILD 549: PTE Manipulation API (Shadow Page)
 //   通过 PTE 自映射实现影子页 — CS2 执行补丁字节 (pageB), PAC 扫描看到原始字节 (pageA)
@@ -3412,18 +3431,19 @@ bool DKOMProcessHider::EnsureOffsetsResolved(KernelMemoryAccessor& kma, uint64_t
         (unsigned long long)systemEPROCESS);
 
     for (uint32_t off = 0x100; off < 0x800; off += 8) {
-        uint64_t val = kma.Read<uint64_t>(systemEPROCESS + off);
+        // ★ BUILD 567 v3.235: 使用 ReadUnsafe (systemEPROCESS 可能在非分页池扩展区域)
+        uint64_t val = kma.ReadUnsafe<uint64_t>(systemEPROCESS + off);
         if (val != 4) continue;
 
         // 候选 UniqueProcessId 偏移 = off
         // 验证 off+8 (Flink) 和 off+16 (Blink) 是否为内核地址
-        uint64_t flink = kma.Read<uint64_t>(systemEPROCESS + off + 8);
-        uint64_t blink = kma.Read<uint64_t>(systemEPROCESS + off + 16);
+        uint64_t flink = kma.ReadUnsafe<uint64_t>(systemEPROCESS + off + 8);
+        uint64_t blink = kma.ReadUnsafe<uint64_t>(systemEPROCESS + off + 16);
         if (flink < 0xFFFF800000000000ULL || blink < 0xFFFF800000000000ULL) continue;
 
         // 二次验证: 通过 Flink 遍历到下一个 EPROCESS, 读取其 PID
         uint64_t nextEPROC = flink - (off + 8);
-        uint64_t nextPid = kma.Read<uint64_t>(nextEPROC + off);
+        uint64_t nextPid = kma.ReadUnsafe<uint64_t>(nextEPROC + off);
         if (nextPid == 0 || nextPid >= 100000) continue;
 
         // 验证通过
@@ -3473,7 +3493,7 @@ uint64_t DKOMProcessHider::FindEPROCESSByPid(KernelMemoryAccessor& kma, DWORD pi
             return 0;
         }
 
-        uint64_t currentPid = kma.Read<uint64_t>(current + m_pidOffset);
+        uint64_t currentPid = kma.ReadUnsafe<uint64_t>(current + m_pidOffset);
 
         // ★ System PID==4 断言 — iter==1 时 current==systemEPROCESS, PID 必须为 4
         if (iter == 1 && currentPid != 4) {
@@ -3487,7 +3507,7 @@ uint64_t DKOMProcessHider::FindEPROCESSByPid(KernelMemoryAccessor& kma, DWORD pi
         }
 
         // 移动到下一个 EPROCESS
-        uint64_t flink = kma.Read<uint64_t>(current + m_linksOffset);
+        uint64_t flink = kma.ReadUnsafe<uint64_t>(current + m_linksOffset);
         if (!flink || flink < 0xFFFF800000000000ULL) {
             ByovdDiag("DKOM.FindByPid: chain broken at iter=%u EPROC=0x%llX flink=0x%llX (pid=%u not found)\n",
                 iter, (unsigned long long)current, (unsigned long long)flink, pid);
@@ -3536,8 +3556,9 @@ bool DKOMProcessHider::PerformUnlink(KernelMemoryAccessor& kma, HiddenEntry* ent
                                       DWORD pid, uint64_t eproc) {
     // 读取 Flink / Blink (ActiveProcessLinks 在 m_linksOffset)
     // ★ BUILD 537: 紧凑读-改-写, 中间不插入任何阻塞 I/O (避免 TOCTOU 竞态)
-    uint64_t flink = kma.Read<uint64_t>(eproc + m_linksOffset);
-    uint64_t blink = kma.Read<uint64_t>(eproc + m_linksOffset + 8);
+    // ★ BUILD 567 v3.235: 使用 ReadUnsafe (EPROCESS 可能在非分页池扩展区域)
+    uint64_t flink = kma.ReadUnsafe<uint64_t>(eproc + m_linksOffset);
+    uint64_t blink = kma.ReadUnsafe<uint64_t>(eproc + m_linksOffset + 8);
 
     if (!flink || !blink) {
         ByovdDiag("DKOM.PerformUnlink: FAIL flink/blink is NULL (pid=%u EPROC=0x%llX flink=0x%llX blink=0x%llX)\n",
@@ -3566,8 +3587,9 @@ bool DKOMProcessHider::PerformUnlink(KernelMemoryAccessor& kma, HiddenEntry* ent
     //                       current 未被跳过, 内核遍历正常, 无 BSOD
     //   两写均成功: current 被完全跳过, DKOM 成功
     //   (反向顺序 w1 先写会留下 next.Blink→current 的悬挂指针, 内核遍历必 BSOD)
-    bool w2 = kma.Write(flink + 8, blink);  // next.Blink = prev (先写, 失败安全)
-    bool w1 = kma.Write(blink, flink);      // prev.Flink = next (后写, 成功后 current 被跳过)
+    // ★ BUILD 567 v3.235: 使用 WriteUnsafe (EPROCESS 可能在非分页池扩展区域)
+    bool w2 = kma.WriteUnsafe(flink + 8, blink);  // next.Blink = prev (先写, 失败安全)
+    bool w1 = kma.WriteUnsafe(blink, flink);      // prev.Flink = next (后写, 成功后 current 被跳过)
 
     if (!w1 || !w2) {
         // 链表可能部分破坏, 但写入顺序保证不 BSOD;
@@ -3603,8 +3625,10 @@ bool DKOMProcessHider::PerformUnlink(KernelMemoryAccessor& kma, HiddenEntry* ent
 bool DKOMProcessHider::SelfLoopHarden(KernelMemoryAccessor& kma, HiddenEntry* entry) {
     uint64_t currentLinksVA = entry->eprocess + m_linksOffset;
 
-    bool w1 = kma.Write(currentLinksVA,     currentLinksVA);  // current.Flink = &current (self-loop)
-    bool w2 = kma.Write(currentLinksVA + 8, currentLinksVA);  // current.Blink = &current (self-loop)
+    // ★ BUILD 567 v3.235: 使用 WriteUnsafe (EPROCESS 可能在非分页池扩展区域 0xFFFF8000-0xFFFFF680,
+    //   白名单 [0xFFFFF680, 0xFFFFFD00) 拒绝写入, 导致 SelfLoopHarden 失败 → 0x139 蓝屏风险)
+    bool w1 = kma.WriteUnsafe(currentLinksVA,     currentLinksVA);  // current.Flink = &current (self-loop)
+    bool w2 = kma.WriteUnsafe(currentLinksVA + 8, currentLinksVA);  // current.Blink = &current (self-loop)
 
     if (!w1 || !w2) {
         ByovdDiag("DKOM.SelfLoopHarden: FAIL w1(Flink)=%d w2(Blink)=%d (pid=%u currentLinks=0x%llX) "
@@ -3688,10 +3712,11 @@ bool DKOMProcessHider::HideProcessByPid(DWORD pid) {
         // ★ BUILD 558 FIX: SelfLoopHarden 失败 — 必须回滚 PerformUnlink, 恢复链表完整性
         //   不设置 hidden=true, 避免 UnhideAll 误操作孤立节点
         //   回滚: 写 next.Blink=&current, prev.Flink=&current (恢复 current 在链表中)
+        // ★ BUILD 567 v3.235: 使用 WriteUnsafe (EPROCESS 可能在非分页池扩展区域)
         ByovdDiag("DKOM.HideByPid: SelfLoopHarden FAIL — rolling back PerformUnlink (pid=%u)\n", pid);
         uint64_t currentLinksVA = eproc + m_linksOffset;
-        kma.Write(entry->flinkBackup + 8, currentLinksVA);  // next.Blink = &current (恢复)
-        kma.Write(entry->blinkBackup, currentLinksVA);      // prev.Flink = &current (恢复)
+        kma.WriteUnsafe(entry->flinkBackup + 8, currentLinksVA);  // next.Blink = &current (恢复)
+        kma.WriteUnsafe(entry->blinkBackup, currentLinksVA);      // prev.Flink = &current (恢复)
         entry->eprocess    = 0;
         entry->flinkBackup = 0;
         entry->blinkBackup = 0;
@@ -3749,8 +3774,9 @@ bool DKOMProcessHider::UnhideProcessByPid(DWORD pid) {
     uint64_t currentLinksVA = entry->eprocess + m_linksOffset;
 
     // 读取 prev->Flink 和 next->Blink 的当前值, 检查链表是否被修改
-    uint64_t prevFlinkNow = kma.Read<uint64_t>(entry->blinkBackup);     // prev->Flink 当前值
-    uint64_t nextBlinkNow = kma.Read<uint64_t>(entry->flinkBackup + 8); // next->Blink 当前值
+    // ★ BUILD 567 v3.235: 使用 ReadUnsafe (prev/next EPROCESS 可能在非分页池扩展区域)
+    uint64_t prevFlinkNow = kma.ReadUnsafe<uint64_t>(entry->blinkBackup);     // prev->Flink 当前值
+    uint64_t nextBlinkNow = kma.ReadUnsafe<uint64_t>(entry->flinkBackup + 8); // next->Blink 当前值
 
     bool listIntact = (prevFlinkNow == entry->flinkBackup && nextBlinkNow == entry->blinkBackup);
 
@@ -3763,10 +3789,11 @@ bool DKOMProcessHider::UnhideProcessByPid(DWORD pid) {
         //           prev → current → (current.Flink=&current 自循环) → 死循环
         //         必须恢复 current.Flink=next, current.Blink=prev 才能完整链入.
         //   兼容性: 若 SelfLoopHarden 未被调用 (旧版), w3/w4 写入与原值相同, 无副作用.
-        bool w1 = kma.Write(entry->blinkBackup, currentLinksVA);       // prev.Flink = &current.ActiveProcessLinks
-        bool w2 = kma.Write(entry->flinkBackup + 8, currentLinksVA);   // next.Blink = &current.ActiveProcessLinks
-        bool w3 = kma.Write(currentLinksVA, entry->flinkBackup);       // current.Flink = next (恢复原始值)
-        bool w4 = kma.Write(currentLinksVA + 8, entry->blinkBackup);   // current.Blink = prev (恢复原始值)
+        // ★ BUILD 567 v3.235: 使用 WriteUnsafe (EPROCESS 可能在非分页池扩展区域)
+        bool w1 = kma.WriteUnsafe(entry->blinkBackup, currentLinksVA);       // prev.Flink = &current.ActiveProcessLinks
+        bool w2 = kma.WriteUnsafe(entry->flinkBackup + 8, currentLinksVA);   // next.Blink = &current.ActiveProcessLinks
+        bool w3 = kma.WriteUnsafe(currentLinksVA, entry->flinkBackup);       // current.Flink = next (恢复原始值)
+        bool w4 = kma.WriteUnsafe(currentLinksVA + 8, entry->blinkBackup);   // current.Blink = prev (恢复原始值)
 
         ByovdDiag("DKOM.UnhideByPid: list intact — w1(prev.Flink)=%d w2(next.Blink)=%d "
                   "w3(cur.Flink)=%d w4(cur.Blink)=%d "
@@ -3793,8 +3820,9 @@ bool DKOMProcessHider::UnhideProcessByPid(DWORD pid) {
             (unsigned long long)nextBlinkNow, (unsigned long long)entry->blinkBackup,
             (unsigned long long)entry->eprocess);
 
-        bool w1 = kma.Write(currentLinksVA,     currentLinksVA);  // current->Flink = &current (self-loop)
-        bool w2 = kma.Write(currentLinksVA + 8, currentLinksVA);  // current->Blink = &current (self-loop)
+        // ★ BUILD 567 v3.235: 使用 WriteUnsafe (EPROCESS 可能在非分页池扩展区域)
+        bool w1 = kma.WriteUnsafe(currentLinksVA,     currentLinksVA);  // current->Flink = &current (self-loop)
+        bool w2 = kma.WriteUnsafe(currentLinksVA + 8, currentLinksVA);  // current->Blink = &current (self-loop)
 
         ByovdDiag("DKOM.UnhideByPid: self-loop w1(Flink)=%d w2(Blink)=%d (pid=%u currentLinks=0x%llX)\n",
             w1?1:0, w2?1:0, pid, (unsigned long long)currentLinksVA);
@@ -7704,6 +7732,8 @@ struct VadOffsets {
 uint32_t VADConcealer::s_pidOffset     = 0;
 uint32_t VADConcealer::s_linksOffset   = 0;
 uint32_t VADConcealer::s_vadRootOffset = 0;
+// ★ BUILD 567 v3.235: loader.exe EPROCESS 地址缓存 (避免 DKOM 断链后 VAD 找不到 loader.exe)
+uint64_t VADConcealer::s_cachedLoaderEprocess = 0;
 
 // ★ BUILD 555: 动态解析 UniqueProcessId / ActiveProcessLinks 偏移
 //   算法复用 DKOMProcessHider::EnsureOffsetsResolved (byovd_kernel.cpp L3144)
@@ -7905,7 +7935,11 @@ static uint64_t GetEPROCESSByPid(KernelMemoryAccessor& kma, DWORD targetPid, uin
     }
 
     uint64_t current = sysEprocess;
-    int maxWalk = 512;
+    // ★ BUILD 567 v3.235: 添加循环检测 — Windows ActiveProcessLinks 是双向循环链表,
+    //   遍历完整个链表后会回到 sysEprocess. 原代码缺少 start 检测, 会跑满 maxWalk=512 次.
+    //   对比 DKOM FindEPROCESSByPid (L3470) 已有 start 检测 + maxIter=1024.
+    uint64_t start = sysEprocess;
+    int maxWalk = 1024;  // ★ v3.235: 512 → 1024 (与 DKOM FindEPROCESSByPid 一致)
     int walkCount = 0;
     while (maxWalk-- > 0) {
         walkCount++;
@@ -7917,9 +7951,26 @@ static uint64_t GetEPROCESSByPid(KernelMemoryAccessor& kma, DWORD targetPid, uin
             return current;
         }
 
+        // ★ v3.235: 每 100 次输出诊断日志 (排查链表遍历问题)
+        if (walkCount % 100 == 0) {
+            VadDiag("B554:GEP: walk=%d current=0x%llX pid=%llu (looking for %u)\n",
+                      walkCount, (unsigned long long)current, (unsigned long long)pid, targetPid);
+        }
+
         uint64_t flink = kma.ReadUnsafe<uint64_t>(current + linksOffset);
-        if (!flink || flink < 0xFFFF800000000000ULL) break;
+        if (!flink || flink < 0xFFFF800000000000ULL) {
+            VadDiag("B554:GEP: chain broken at walk=%d EPROC=0x%llX flink=0x%llX (pid=%u)\n",
+                      walkCount, (unsigned long long)current, (unsigned long long)flink, targetPid);
+            break;
+        }
         current = flink - linksOffset;
+
+        // ★ v3.235: 循环检测 — 回到起点说明遍历完整个链表 (loader.exe 不在链表里, 可能被隐藏)
+        if (current == start) {
+            VadDiag("B554:GEP: cycle back to start at walk=%d (pid=%u not in ActiveProcessLinks — hidden?)\n",
+                      walkCount, targetPid);
+            break;
+        }
     }
     VadDiag("B554:GEP: FAIL pid=%u not found (walk=%d)\n", targetPid, walkCount);
     return 0;
@@ -8004,11 +8055,24 @@ bool VADConcealer::ConcealRegion(DWORD pid, uintptr_t regionBase, SIZE_T regionS
         return false;
     }
 
-    // 获取 cs2.exe 的 EPROCESS (使用动态偏移)
-    uint64_t eprocess = GetEPROCESSByPid(kma, pid, ntosBase, s_pidOffset, s_linksOffset);
+    // 获取 loader.exe 的 EPROCESS (使用动态偏移)
+    // ★ BUILD 567 v3.235: 优先使用缓存的 EPROCESS (DKOM 隐藏后链表找不到 loader.exe)
+    //   原因: DKOM 成功断链 loader.exe 后, GetEPROCESSByPid 遍历 ActiveProcessLinks 找不到.
+    //   修复: VAD 在 DKOM 之前执行时缓存 EPROCESS; 后续调用 (含主循环) 直接用缓存.
+    //   安全性: EPROCESS 地址在进程生命周期内不变, DKOM 断链不修改 EPROCESS 地址.
+    uint64_t eprocess = s_cachedLoaderEprocess;
     if (!eprocess) {
-        VadDiag("B554:CR: FAIL GetEPROCESSByPid (pid=%u)\n", pid);
-        return false;
+        eprocess = GetEPROCESSByPid(kma, pid, ntosBase, s_pidOffset, s_linksOffset);
+        if (!eprocess) {
+            VadDiag("B554:CR: FAIL GetEPROCESSByPid (pid=%u, no cache)\n", pid);
+            return false;
+        }
+        s_cachedLoaderEprocess = eprocess;  // 缓存, 后续 DKOM 隐藏后仍可用
+        VadDiag("B554:CR: cached eprocess=0x%llX (pid=%u)\n",
+                  (unsigned long long)eprocess, pid);
+    } else {
+        VadDiag("B554:CR: using cached eprocess=0x%llX (pid=%u, bypass ActiveProcessLinks)\n",
+                  (unsigned long long)eprocess, pid);
     }
 
     // ★ BUILD 555: 动态解析 VadRoot 偏移 (替代硬编码 0x7D8/0x658)

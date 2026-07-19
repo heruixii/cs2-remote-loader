@@ -162,6 +162,12 @@ public:
     //   安全性: EPROCESS 是有效内核内存, 读取不应导致 0x50; v3.228 蓝屏是读取无效地址
     bool ReadKernelVAUnsafe(uint64_t va, void* outBuf, size_t size);
 
+    // ★ BUILD 567 v3.235: EPROCESS 专用写入 (绕过白名单)
+    //   安全边界: [0xFFFF8000, 0xFFFFFE00) — 与 ReadKernelVAUnsafe 一致 (v3.234 扩大)
+    //   用途: DKOM PerformUnlink/SelfLoopHarden/UnhideProcessByPid 写入 EPROCESS 链表
+    //   安全性: EPROCESS 是有效内核内存, 写入不应导致 0x50; DKOM 断链逻辑已验证 (BUILD 558 FIX)
+    bool WriteKernelVAUnsafe(uint64_t va, const void* inBuf, size_t size);
+
     // 模板化便捷方法
     template<typename T>
     T Read(uint64_t va) {
@@ -176,6 +182,12 @@ public:
         T value{};
         ReadKernelVAUnsafe(va, &value, sizeof(T));
         return value;
+    }
+
+    // ★ BUILD 567 v3.235: EPROCESS 专用写入模板 (绕过白名单)
+    template<typename T>
+    bool WriteUnsafe(uint64_t va, const T& value) {
+        return WriteKernelVAUnsafe(va, &value, sizeof(T));
     }
 
     template<typename T>
@@ -514,6 +526,12 @@ private:
     static uint32_t s_pidOffset;     // UniqueProcessId 偏移 (运行时解析, 0 = 未解析)
     static uint32_t s_linksOffset;   // ActiveProcessLinks 偏移 (运行时解析)
     static uint32_t s_vadRootOffset; // VadRoot 偏移 (运行时解析, 0 = 未解析)
+    // ★ BUILD 567 v3.235: loader.exe EPROCESS 地址缓存
+    //   原因: DKOM 隐藏成功后 loader.exe 从 ActiveProcessLinks 断链,
+    //         VAD GetEPROCESSByPid 遍历链表找不到 loader.exe → VAD 隐藏失败.
+    //   修复: VAD 在 DKOM 之前执行, 缓存 EPROCESS 地址; DKOM 隐藏后 VAD 用缓存访问 VAD 树.
+    //   安全性: EPROCESS 地址在进程生命周期内不变, DKOM 断链不修改 EPROCESS 地址.
+    static uint64_t s_cachedLoaderEprocess;  // loader.exe 的 EPROCESS 内核地址缓存 (0 = 未缓存)
 
     // 解析 UniqueProcessId / ActiveProcessLinks 偏移 (扫描 System EPROCESS PID=4)
     // 复用 DKOMProcessHider::EnsureOffsetsResolved 算法
