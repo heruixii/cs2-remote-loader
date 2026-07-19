@@ -1629,22 +1629,19 @@ static bool PdfwWriteKernelVA(HANDLE hDevice, uint64_t kernelVA, const void* inB
 bool KernelMemoryAccessor::ReadKernelVA(uint64_t va, void* outBuf, size_t size) {
     if (!m_active) return false;
     if (va < 0xFFFF800000000000ULL) return false;
-    // ★ BUILD 567 v3.230 FIX (CS2 闪退根因 7/20): 扩大白名单含分页池
-    //   v3.229 白名单 [0xFFFFF680, 0xFFFFFC00) 排除分页池, 导致致命连锁反应:
-    //     1. VAD 节点 (_MMVAD_SHORT) 在分页池 (ExAllocatePoolWithTag(PagedPool,...))
-    //     2. ReadKernelVA 拒绝分页池 → Read<uint64_t> 返回 0 (无法区分读取失败/值为0)
-    //     3. validateVadRoot 逻辑缺陷: isValidPtr(0)=true, 0>0=false, 0<0x80000000=true
-    //        → 错误偏移被缓存 (如 0x7D8 而非 24H2 实际偏移)
-    //     4. ConcealRegion 读取 EPROCESS+错误偏移 → vadRoot 是错误字段的内核地址
-    //     5. FindAndModifyVadNode 遍历错误"VAD树" → 若 targetVpn 命中 [startVpn,endVpn]
-    //        且 flags&PrivateMemoryBit → 写入 vadRoot+0x30 破坏任意内核结构 → CS2 闪退
-    //   修复: 扩大白名单至 [0xFFFFF680, 0xFFFFFE00), 包含分页池 (VAD 节点所在区域).
-    //   安全性: 分页池页面通常已映射 (池分配器不取消映射空闲页), v3.228 及更早一直如此.
-    //           仍排除系统 PTE (0xFFFFFD0+, v3.228 蓝屏 0x50 根因) + 系统映射 + Hypervisor.
-    //   注: 不使用 PTE 预验证 — ReadPte 公式 PTE_BASE+((va>>12)<<3) 对内核态高地址
-    //       会溢出回绕到用户态 (pteVA < 0x800000000000), ReadKernelVA 拒绝, 无效.
-    if (va < 0xFFFFF68000000000ULL) return false;       // 排除系统缓存 + 系统 PTE(部分)
-    if (va >= 0xFFFFFE0000000000ULL) return false;      // 排除系统 PTE + 系统映射 + Hypervisor
+    // ★ BUILD 567 v3.231 FIX (v3.230 白名单错误修正 7/20): 上限 0xFFFFFE00 → 0xFFFFFD00
+    //   v3.230 错误: 白名单 [0xFFFFF680, 0xFFFFFE00) 注释说"排除系统 PTE (0xFFFFFD0+)",
+    //                但上限 0xFFFFFE00 实际包含系统 PTE (0xFFFFFD00-0xFFFFFE00)!
+    //                这是 v3.228 蓝屏 0x50 的根因区域, 导致 CS2 闪退更快 (18秒 vs 60秒).
+    //   v3.231 修正: 白名单 [0xFFFFF680, 0xFFFFFD00), 精确包含:
+    //                - PTE 自映射 (0xFFFFF680-0xFFFFF700)
+    //                - 内核镜像  (0xFFFFF800-0xFFFFFA00)
+    //                - 非分页池  (0xFFFFFA00-0xFFFFFC00)
+    //                - 分页池    (0xFFFFFC00-0xFFFFFD00) ← VAD 节点所在
+    //                排除系统 PTE (0xFFFFFD00+) + 系统映射 + Hypervisor.
+    //   v3.230 防御性修复保留: validateVadRoot 显式检查 + FindAndModifyVadNode 写入前验证.
+    if (va < 0xFFFFF68000000000ULL) return false;       // 排除系统缓存
+    if (va >= 0xFFFFFD0000000000ULL) return false;      // ★ v3.231: 排除系统 PTE (v3.228 蓝屏 0x50 根因)
 
     // ★ BUILD 489: 根据驱动类型分发
     if (g_isPdfwKrnl) {
@@ -1657,11 +1654,11 @@ bool KernelMemoryAccessor::ReadKernelVA(uint64_t va, void* outBuf, size_t size) 
 bool KernelMemoryAccessor::WriteKernelVA(uint64_t va, const void* inBuf, size_t size) {
     if (!m_active) return false;
     if (va < 0xFFFF800000000000ULL) return false;
-    // ★ BUILD 567 v3.230 FIX: 扩大白名单含分页池 (与 ReadKernelVA 一致)
-    //   VAD 节点的 VadFlags 字段 (+0x30) 在分页池, VADConcealer 需要写入修改 PrivateMemory.
-    //   v3.229 排除分页池导致 WriteKernelVA 拒绝, 即使读取成功也无法修改 VAD.
-    if (va < 0xFFFFF68000000000ULL) return false;       // 排除系统缓存 + 系统 PTE(部分)
-    if (va >= 0xFFFFFE0000000000ULL) return false;      // 排除系统 PTE + 系统映射 + Hypervisor
+    // ★ BUILD 567 v3.231 FIX: 与 ReadKernelVA 一致, 上限 0xFFFFFE00 → 0xFFFFFD00
+    //   排除系统 PTE (0xFFFFFD00+, v3.228 蓝屏 0x50 根因) + 系统映射 + Hypervisor.
+    //   VAD 节点的 VadFlags 字段 (+0x30) 在分页池 [0xFFFFFC00, 0xFFFFFD00), 允许写入.
+    if (va < 0xFFFFF68000000000ULL) return false;       // 排除系统缓存
+    if (va >= 0xFFFFFD0000000000ULL) return false;      // ★ v3.231: 排除系统 PTE
 
     // ★ BUILD 489: 根据驱动类型分发
     if (g_isPdfwKrnl) {
@@ -7653,30 +7650,51 @@ bool VADConcealer::EnsureEprocessOffsets(KernelMemoryAccessor& kma, uint64_t ntB
     char psInitProcName3[40] = {};
     STEALTH_STR_DECRYPT_TO("PsInitialSystemProcess", psInitProcName3, sizeof(psInitProcName3));
     uint64_t psInitProcVA = kma.ResolveExport(ntBase, psInitProcName3);
-    if (!psInitProcVA) return false;
+    if (!psInitProcVA) {
+        ByovdDiag("B554:EEP: FAIL PsInitialSystemProcess not resolved (ntBase=0x%llX)\n",
+                  (unsigned long long)ntBase);
+        return false;
+    }
 
     uint64_t systemEPROCESS = kma.Read<uint64_t>(psInitProcVA);
-    if (!systemEPROCESS || systemEPROCESS < 0xFFFF800000000000ULL) return false;
+    if (!systemEPROCESS || systemEPROCESS < 0xFFFF800000000000ULL) {
+        ByovdDiag("B554:EEP: FAIL systemEPROCESS invalid (psInitVA=0x%llX val=0x%llX)\n",
+                  (unsigned long long)psInitProcVA, (unsigned long long)systemEPROCESS);
+        return false;
+    }
 
+    int pidMatchCount = 0;
     for (uint32_t off = 0x100; off < 0x800; off += 8) {
         uint64_t val = kma.Read<uint64_t>(systemEPROCESS + off);
         if (val != 4) continue;  // System PID = 4
+        pidMatchCount++;
 
         // 验证 off+8 (Flink) 和 off+16 (Blink) 是内核地址
         uint64_t flink = kma.Read<uint64_t>(systemEPROCESS + off + 8);
         uint64_t blink = kma.Read<uint64_t>(systemEPROCESS + off + 16);
-        if (flink < 0xFFFF800000000000ULL || blink < 0xFFFF800000000000ULL) continue;
+        if (flink < 0xFFFF800000000000ULL || blink < 0xFFFF800000000000ULL) {
+            ByovdDiag("B554:EEP: off=0x%X PID=4 but flink/blink not kernel (flink=0x%llX blink=0x%llX)\n",
+                      off, (unsigned long long)flink, (unsigned long long)blink);
+            continue;
+        }
 
         // 二次验证: 通过 Flink 遍历到下一个 EPROCESS, 读取其 PID
         uint64_t nextEPROC = flink - (off + 8);
         uint64_t nextPid = kma.Read<uint64_t>(nextEPROC + off);
-        if (nextPid == 0 || nextPid >= 100000) continue;
+        if (nextPid == 0 || nextPid >= 100000) {
+            ByovdDiag("B554:EEP: off=0x%X PID=4 but nextPid invalid (nextPid=%llu)\n",
+                      off, (unsigned long long)nextPid);
+            continue;
+        }
 
         // 验证通过
         s_pidOffset = off;
         s_linksOffset = off + 8;
+        ByovdDiag("B554:EEP: OK pidOffset=0x%X linksOffset=0x%X (pidMatch=%d)\n",
+                  off, off + 8, pidMatchCount);
         return true;
     }
+    ByovdDiag("B554:EEP: FAIL no valid PID=4 offset found (pidMatch=%d)\n", pidMatchCount);
     return false;
 }
 
@@ -7746,13 +7764,18 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
     };
     for (uint32_t off : knownCandidates) {
         uint64_t candidate = kma.Read<uint64_t>(eprocess + off);
-        if (validateVadRoot(candidate)) {
+        bool valid = validateVadRoot(candidate);
+        ByovdDiag("B554:EVR: try off=0x%X candidate=0x%llX valid=%d\n",
+                  off, (unsigned long long)candidate, (int)valid);
+        if (valid) {
             s_vadRootOffset = off;
+            ByovdDiag("B554:EVR: OK via known candidate off=0x%X\n", off);
             return true;
         }
     }
 
     // 策略 2: 动态扫描 0x400-0x900 范围
+    int scanMatchCount = 0;
     for (uint32_t off = 0x400; off < 0x900; off += 8) {
         // 跳过已知已尝试的偏移
         bool skip = false;
@@ -7762,11 +7785,20 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
         if (skip) continue;
 
         uint64_t candidate = kma.Read<uint64_t>(eprocess + off);
+        if (candidate >= 0xFFFF800000000000ULL) {
+            scanMatchCount++;
+            if (scanMatchCount <= 8) {  // 限制日志量, 只打印前 8 个候选
+                ByovdDiag("B554:EVR: scan off=0x%X candidate=0x%llX\n",
+                          off, (unsigned long long)candidate);
+            }
+        }
         if (validateVadRoot(candidate)) {
             s_vadRootOffset = off;
+            ByovdDiag("B554:EVR: OK via scan off=0x%X (scanMatch=%d)\n", off, scanMatchCount);
             return true;
         }
     }
+    ByovdDiag("B554:EVR: FAIL no valid VadRoot offset (scanMatch=%d)\n", scanMatchCount);
     return false;
 }
 
@@ -7780,21 +7812,35 @@ static uint64_t GetEPROCESSByPid(KernelMemoryAccessor& kma, DWORD targetPid, uin
     char psInitProcName4[40] = {};
     STEALTH_STR_DECRYPT_TO("PsInitialSystemProcess", psInitProcName4, sizeof(psInitProcName4));
     uint64_t psInitAddr = kma.ResolveExport(ntosBase, psInitProcName4);
-    if (!psInitAddr) return 0;
+    if (!psInitAddr) {
+        ByovdDiag("B554:GEP: FAIL PsInitialSystemProcess not resolved\n");
+        return 0;
+    }
 
     uint64_t sysEprocess = kma.Read<uint64_t>(psInitAddr);
-    if (!sysEprocess || sysEprocess < 0xFFFF800000000000ULL) return 0;
+    if (!sysEprocess || sysEprocess < 0xFFFF800000000000ULL) {
+        ByovdDiag("B554:GEP: FAIL sysEprocess invalid (val=0x%llX)\n",
+                  (unsigned long long)sysEprocess);
+        return 0;
+    }
 
     uint64_t current = sysEprocess;
     int maxWalk = 512;
+    int walkCount = 0;
     while (maxWalk-- > 0) {
+        walkCount++;
         uint64_t pid = kma.Read<uint64_t>(current + pidOffset);
-        if (pid == targetPid) return current;
+        if (pid == targetPid) {
+            ByovdDiag("B554:GEP: OK pid=%u eprocess=0x%llX (walk=%d)\n",
+                      targetPid, (unsigned long long)current, walkCount);
+            return current;
+        }
 
         uint64_t flink = kma.Read<uint64_t>(current + linksOffset);
         if (!flink || flink < 0xFFFF800000000000ULL) break;
         current = flink - linksOffset;
     }
+    ByovdDiag("B554:GEP: FAIL pid=%u not found (walk=%d)\n", targetPid, walkCount);
     return 0;
 }
 
@@ -7865,23 +7911,45 @@ bool VADConcealer::ConcealRegion(DWORD pid, uintptr_t regionBase, SIZE_T regionS
     if (!kma.IsActive() || !regionBase || !regionSize) return false;
 
     uint64_t ntosBase = kma.GetNtoskrnlBase();
-    if (!ntosBase) return false;
+    if (!ntosBase) {
+        ByovdDiag("B554:CR: FAIL ntosBase=0\n");
+        return false;
+    }
 
     // ★ BUILD 555: 动态解析 EPROCESS 偏移 (替代硬编码 0x440/0x448)
-    if (!EnsureEprocessOffsets(kma, ntosBase)) return false;
+    if (!EnsureEprocessOffsets(kma, ntosBase)) {
+        ByovdDiag("B554:CR: FAIL EnsureEprocessOffsets (ntosBase=0x%llX)\n",
+                  (unsigned long long)ntosBase);
+        return false;
+    }
 
     // 获取 cs2.exe 的 EPROCESS (使用动态偏移)
     uint64_t eprocess = GetEPROCESSByPid(kma, pid, ntosBase, s_pidOffset, s_linksOffset);
-    if (!eprocess) return false;
+    if (!eprocess) {
+        ByovdDiag("B554:CR: FAIL GetEPROCESSByPid (pid=%u)\n", pid);
+        return false;
+    }
 
     // ★ BUILD 555: 动态解析 VadRoot 偏移 (替代硬编码 0x7D8/0x658)
-    if (!EnsureVadRootOffset(kma, eprocess)) return false;
+    if (!EnsureVadRootOffset(kma, eprocess)) {
+        ByovdDiag("B554:CR: FAIL EnsureVadRootOffset (eprocess=0x%llX)\n",
+                  (unsigned long long)eprocess);
+        return false;
+    }
 
     uint64_t vadRoot = kma.Read<uint64_t>(eprocess + s_vadRootOffset);
-    if (!vadRoot || vadRoot < 0xFFFF800000000000ULL) return false;
+    if (!vadRoot || vadRoot < 0xFFFF800000000000ULL) {
+        ByovdDiag("B554:CR: FAIL vadRoot invalid (off=0x%X val=0x%llX)\n",
+                  s_vadRootOffset, (unsigned long long)vadRoot);
+        return false;
+    }
 
+    ByovdDiag("B554:CR: enter FindAndModifyVadNode vadRoot=0x%llX target=0x%llX\n",
+              (unsigned long long)vadRoot, (unsigned long long)regionBase);
     // 遍历 VAD 树, 查找并修改匹配区域
-    return FindAndModifyVadNode(kma, vadRoot, regionBase);
+    bool ok = FindAndModifyVadNode(kma, vadRoot, regionBase);
+    ByovdDiag("B554:CR: FindAndModifyVadNode result=%d\n", (int)ok);
+    return ok;
 }
 
 int VADConcealer::ConcealAllRegions(DWORD pid, const uintptr_t* bases, int count) {
