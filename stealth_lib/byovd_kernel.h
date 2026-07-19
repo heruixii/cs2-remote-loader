@@ -608,7 +608,26 @@ private:
     // 返回 SHV_Install 入口绝对 VA, 0 = 未找到
     // ★ SHV_Install 入口在特征 1 之前若干字节 (函数序言: push rbp / sub rsp 等)
     //   扫描时向前回溯查找函数边界 (0xCC int3 填充 或 0x90 nop 填充)
-    static uint64_t FindShvInstallEntry(uint64_t pacDriverBase, uint32_t textSize);
+    //
+    // ★ BUILD 562: 多特征码兜底 — SIG1 失败后尝试 SIG2
+    //   SIG2: CALL BroadcastToAllCpus + CALL WaitForCompletion 配对
+    //   字节模式: E8 xx xx xx xx E8 xx xx xx xx (两个连续 CALL rel32)
+    //   验证: 第一个 CALL 目标 = pacModuleBase + SIG2_BROADCAST_RVA (0xEADC4)
+    //         第二个 CALL 目标 = pacModuleBase + SIG2_WAIT_RVA (0xEAE4D)
+    //   可靠性: BroadcastToAllCpus + WaitForCompletion 是 SHV_Install 特有的配对调用
+    //   参数 pacModuleBase: PAC 驱动模块基址 (用于 SIG2 目标地址验证)
+    //   参数 textSectionVA: .text 段起始绝对 VA (= pacModuleBase + textRVA)
+    //   参数 textSize: .text 段大小
+    static uint64_t FindShvInstallEntry(uint64_t pacModuleBase, uint64_t textSectionVA, uint32_t textSize);
+
+    // ★ BUILD 562: SIG2 — BroadcastToAllCpus / WaitForCompletion 固定 RVA
+    //   来源: PAC_SHV_逆向分析报告.md §14.1 (绝对 VA = ImageBase 0x140000000 + RVA)
+    //   BroadcastToAllCpus @ RVA 0xEADC4 (IPI 广播到所有 CPU)
+    //   WaitForCompletion   @ RVA 0xEAE4D (等待 IPI 完成)
+    //   注意: 这两个 RVA 是当前 PAC 版本 (1.0.0.2) 的值, PAC 更新后可能改变
+    //         SIG2 作为 SIG1 兜底, 两者互补提高 patch 成功率
+    static constexpr uint32_t SIG2_BROADCAST_RVA = 0xEADC4;
+    static constexpr uint32_t SIG2_WAIT_RVA      = 0xEAE4D;
 
     // ★ BUILD 552: PAC 驱动名通过 STEALTH_STR_DECRYPT_TO 运行时解密 (避免明文进入 .rdata)
     //   原 `static constexpr const char* PAC_DRIVER_NAME = "MessageTransfer.sys";` 已移除

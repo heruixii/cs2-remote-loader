@@ -53,6 +53,25 @@
 //           - 副作用: 真正的 patch 失败 (PAC 加载但写入失败) 仍触发降级模式
 //        预期效果: SHV patch 成功率 90-95% → 95-97%, 整体检测概率 12-20% → 10-17%
 //        保留: BUILD 560 wShotTools 栈变量 + BUILD 559 隐蔽 SHV (-5 自然失败码) + BUILD 558 7 层保护
+// BUILD: 562 (v3.221: SIG2 多特征码兜底 — CALL BroadcastToAllCpus + WaitForCompletion 配对)
+//        1. ★ BUILD 562-1: FindShvInstallEntry 签名扩展 — 新增 pacModuleBase 参数
+//           - 原签名: (uint64_t pacDriverBase, uint32_t textSize) — pacDriverBase 实为 .text 段地址
+//           - 新签名: (uint64_t pacModuleBase, uint64_t textSectionVA, uint32_t textSize)
+//           - 原因: SIG2 需要 pacModuleBase + RVA 计算目标地址 (BroadcastToAllCpus/WaitForCompletion)
+//        2. ★ BUILD 562-2: SIG2 多特征码兜底 — SIG1 失败后尝试 SIG2
+//           - SIG2 字节模式: E8 xx xx xx xx E8 xx xx xx xx (两个连续 CALL rel32)
+//           - 验证: 第一个 CALL 目标 = pacModuleBase + 0xEADC4 (BroadcastToAllCpus RVA)
+//                  第二个 CALL 目标 = pacModuleBase + 0xEAE4D (WaitForCompletion RVA)
+//           - 可靠性: BroadcastToAllCpus + WaitForCompletion 配对在 SHV_Install 中特有
+//             (PAC_SHV 逆向分析报告 §3.2 L146-147 确认 SHV_Install 调用这两个函数启动 per-CPU SHV)
+//           - 不需要 XOR 加密: E8 是通用 CALL 操作码, 不构成特征
+//           - 边界查找复用 Pass 1-4 + IsValidPrologueByte (与 SIG1 相同)
+//        3. ★ BUILD 562-3: byovd_kernel.h 添加 SIG2_BROADCAST_RVA/SIG2_WAIT_RVA 常量
+//           - SIG2_BROADCAST_RVA = 0xEADC4 (BroadcastToAllCpus, 报告 §14.1)
+//           - SIG2_WAIT_RVA = 0xEAE4D (WaitForCompletion, 报告 §14.1)
+//           - 注意: 这两个 RVA 是当前 PAC 版本 (1.0.0.2) 的值, PAC 更新后可能改变
+//        预期效果: SHV patch 成功率 95-97% → 98-99% (SIG1+SIG2 互补, 覆盖 PAC 更新场景)
+//        保留: BUILD 561 Pass4 + IsValidPrologueByte + PAC 未加载优化 + BUILD 560 wShotTools 栈变量
 // BUILD: 549 (v3.205: 影子页 PTE manipulation + DiagLog 三层脱敏 + NtQSI 替代 Toolhelp32)
 //        1. ★ BUILD 549 影子页: ApplyCs2Patch 优先通过 PTE manipulation 安装影子页
 //           - pageA = client.dll 原页 (PAC 扫描看到原始字节 32 c0)

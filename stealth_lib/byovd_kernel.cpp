@@ -7400,7 +7400,7 @@ static inline bool IsValidPrologueByte(uint8_t b) {
     return false;
 }
 
-uint64_t ShvInstallPatcher::FindShvInstallEntry(uint64_t pacDriverBase, uint32_t textSize) {
+uint64_t ShvInstallPatcher::FindShvInstallEntry(uint64_t pacModuleBase, uint64_t textSectionVA, uint32_t textSize) {
     // 通过特征码扫描定位 SHV_Install 入口
     // 特征 (PAC_SHV_逆向分析报告 §3.2 L101-105):
     //   MOV RCX, 0x80000000        ; 48 B9 00 00 00 80 00 00 00 00 (10 字节)
@@ -7408,8 +7408,14 @@ uint64_t ShvInstallPatcher::FindShvInstallEntry(uint64_t pacDriverBase, uint32_t
     //
     // SHV_Install 入口在特征 1 之前若干字节 (函数序言: sub rsp / push 等)
     // 向前回溯查找函数边界 (0xCC int3 填充 或 对齐填充 0x90/0x00)
+    //
+    // ★ BUILD 562: 多特征码兜底 — SIG1 失败后尝试 SIG2
+    //   SIG2: CALL BroadcastToAllCpus + CALL WaitForCompletion 配对 (报告 §3.2 L146-147)
+    //   字节模式: E8 xx xx xx xx E8 xx xx xx xx (两个连续 CALL rel32)
+    //   验证: 第一个 CALL 目标 = pacModuleBase + 0xEADC4 (BroadcastToAllCpus)
+    //         第二个 CALL 目标 = pacModuleBase + 0xEAE4D (WaitForCompletion)
 
-    if (!pacDriverBase || textSize < 0x1000) return 0;
+    if (!textSectionVA || textSize < 0x1000) return 0;
 
     KernelMemoryAccessor& kma = KernelMemoryAccessor::Instance();
     if (!kma.IsActive()) return 0;
@@ -7433,6 +7439,9 @@ uint64_t ShvInstallPatcher::FindShvInstallEntry(uint64_t pacDriverBase, uint32_t
     uint8_t buf[CHUNK_SIZE + OVERLAP];
     uint32_t scanned = 0;
 
+    // ============================================================
+    // ★ BUILD 562: SIG1 扫描 (MOV RCX, 0x80000000 + CALL rel32)
+    // ============================================================
     while (scanned < textSize) {
         uint32_t readSize = CHUNK_SIZE;
         if (scanned + readSize > textSize) {
@@ -7440,7 +7449,7 @@ uint64_t ShvInstallPatcher::FindShvInstallEntry(uint64_t pacDriverBase, uint32_t
         }
         if (readSize < sizeof(SIG1) + 5) break;  // 不足以容纳特征码
 
-        uint64_t chunkAddr = pacDriverBase + scanned;
+        uint64_t chunkAddr = textSectionVA + scanned;
         if (!kma.ReadKernelVA(chunkAddr, buf, readSize)) {
             // 读失败, 跳过此块
             scanned += CHUNK_SIZE;
@@ -7479,79 +7488,46 @@ uint64_t ShvInstallPatcher::FindShvInstallEntry(uint64_t pacDriverBase, uint32_t
             uint64_t backscanStart = sigVA - backscanSize;
 
             if (backscanSize > 0 && kma.ReadKernelVA(backscanStart, backscan, backscanSize)) {
-                // ★ BUILD 553: 扩展边界查找 (修复 BUILD 552 B2 缺陷)
-                //   原实现仅查找 0xCC (int3), 但现代编译器 (MSVC/Clang) 函数对齐填充
-                //   常用 0x90 (nop) 或 0x00 (零填充), 导致边界查找失败 → patch 失败.
-                //   新策略: 三级边界查找, 优先级 0xCC > 0x90 连续 ≥2 > 0x00 连续 ≥4
-                //   验证: 找到边界后, 下一字节必须是合法函数序言
-                //         (0x48=REX.W mov/sub, 0x55=push rbp, 0x40-0x4F=REX prefix)
-
-                // Pass 1: 查找 0xCC (int3, 最可靠 — 不会出现在指令中间)
+                // ★ BUILD 561: Pass 1-4 边界查找 (统一使用 IsValidPrologueByte)
+                // Pass 1: 0xCC (int3)
                 for (int32_t k = backscanSize - 1; k >= 0; k--) {
                     if (backscan[k] == 0xCC) {
                         uint32_t entryOffset = k + 1;
                         if (entryOffset >= backscanSize) continue;
-                        // ★ BUILD 561: 使用 IsValidPrologueByte 统一序言验证 (含放宽的 0x53/56/57)
                         if (IsValidPrologueByte(backscan[entryOffset])) {
                             return backscanStart + entryOffset;
                         }
                     }
                 }
-
-                // Pass 2: 查找连续 ≥2 字节 0x90 (nop 填充, MSVC 常用)
-                //   单字节 0x90 可能是 xchg eax,eax 指令, 需要 ≥2 字节才视为填充
+                // Pass 2: 0x90 连续 ≥2
                 for (int32_t k = backscanSize - 2; k >= 0; k--) {
                     if (backscan[k] == 0x90 && backscan[k + 1] == 0x90) {
-                        // 找到连续 nop, 从此处向后扫描直到第一个非 0x90 字节
                         uint32_t entryOffset = k + 2;
-                        while (entryOffset < backscanSize && backscan[entryOffset] == 0x90) {
-                            entryOffset++;
-                        }
+                        while (entryOffset < backscanSize && backscan[entryOffset] == 0x90) entryOffset++;
                         if (entryOffset >= backscanSize) continue;
-                        // ★ BUILD 561: 使用 IsValidPrologueByte 统一序言验证
                         if (IsValidPrologueByte(backscan[entryOffset])) {
                             return backscanStart + entryOffset;
                         }
                     }
                 }
-
-                // Pass 3: 查找连续 ≥4 字节 0x00 (零填充, Clang/部分 MSVC 使用)
-                //   0x00 在指令中间很常见 (如 add eax, 0), 必须 ≥4 字节才视为填充
+                // Pass 3: 0x00 连续 ≥4
                 for (int32_t k = backscanSize - 4; k >= 0; k--) {
                     if (backscan[k] == 0x00 && backscan[k + 1] == 0x00 &&
                         backscan[k + 2] == 0x00 && backscan[k + 3] == 0x00) {
-                        // 找到连续 0x00, 从此处向后扫描直到第一个非 0x00 字节
                         uint32_t entryOffset = k + 4;
-                        while (entryOffset < backscanSize && backscan[entryOffset] == 0x00) {
-                            entryOffset++;
-                        }
+                        while (entryOffset < backscanSize && backscan[entryOffset] == 0x00) entryOffset++;
                         if (entryOffset >= backscanSize) continue;
-                        // ★ BUILD 561: 使用 IsValidPrologueByte 统一序言验证
                         if (IsValidPrologueByte(backscan[entryOffset])) {
                             return backscanStart + entryOffset;
                         }
                     }
                 }
-
-                // ★ BUILD 561: Pass 4 — 查找 0xC3 (ret) + 0xCC (int3) 模式 (函数末尾 ret + 填充)
-                //   原因: MSVC/Clang 编译的函数末尾常为 `ret; int3` 模式 (ret 后填充 int3 对齐)
-                //         Pass 1 仅查找孤立 0xCC, 但若前一函数末尾是 ret+int3, Pass 1 也能命中
-                //         Pass 4 作为兜底: 当 Pass 1-3 均失败时, 显式查找 ret+int3 模式
-                //   可靠性: 0xC3+0xCC 在指令中间极罕见
-                //     - 0xC3 作为 ret 后必跟下一条指令 (函数边界)
-                //     - 0xCC int3 不会在指令中间出现 (除非是 int3 指令本身, 但那是显式断点)
-                //     - 即使 0xC3 作为 imm8 操作数 (如 mov al, 0xC3), 后续字节是下一条指令操作码,
-                //       恰好为 0xCC 的概率极低 (~1/256)
-                //   向后兼容: Pass 1-3 仍优先, Pass 4 仅在 1-3 均失败时尝试
+                // ★ BUILD 561: Pass 4: 0xC3 (ret) + 0xCC (int3)
                 for (int32_t k = backscanSize - 2; k >= 0; k--) {
                     if (backscan[k] == 0xC3 && backscan[k + 1] == 0xCC) {
-                        // 找到 ret+int3, 跳过后续连续 0xCC 填充
                         uint32_t entryOffset = k + 2;
-                        while (entryOffset < backscanSize && backscan[entryOffset] == 0xCC) {
-                            entryOffset++;
-                        }
+                        while (entryOffset < backscanSize && backscan[entryOffset] == 0xCC) entryOffset++;
                         if (entryOffset >= backscanSize) continue;
-                        // ★ BUILD 561: 使用 IsValidPrologueByte 统一序言验证
                         if (IsValidPrologueByte(backscan[entryOffset])) {
                             return backscanStart + entryOffset;
                         }
@@ -7560,10 +7536,6 @@ uint64_t ShvInstallPatcher::FindShvInstallEntry(uint64_t pacDriverBase, uint32_t
             }
 
             // ★ BUILD 553: 所有边界查找策略均失败, 保守返回 0 (避免误 patch)
-            //   原实现注释提到"返回 sigVA - 16 作为候选", 但这可能导致误 patch
-            //   其他函数, 风险不可接受. 保守返回 0 让 PatchShvInstallEntry 处理失败.
-            //   失败后果: SHV 仍可激活, 但 BUILD 552 已确认 SHV 是临时模式,
-            //   即使首次 SHV_Install 成功, 后续周期性 SHV_Install 也会因 patch 而失败.
             ByovdDiag("BYOVD:ShvPatch: SIG1 found @ 0x%llX but no function boundary detected\n",
                 (unsigned long long)sigVA);
             return 0;
@@ -7573,7 +7545,142 @@ uint64_t ShvInstallPatcher::FindShvInstallEntry(uint64_t pacDriverBase, uint32_t
         // 不需要 overlap, 因为特征码 15 字节 < CHUNK_SIZE
     }
 
-    ByovdDiag("BYOVD:ShvPatch: SIG1 not found in .text (size=0x%X)\n", textSize);
+    // SIG1 未找到, 记录日志
+    ByovdDiag("BYOVD:ShvPatch: SIG1 not found in .text (size=0x%X), trying SIG2...\n", textSize);
+
+    // ============================================================
+    // ★ BUILD 562: SIG2 扫描 (CALL BroadcastToAllCpus + CALL WaitForCompletion 配对)
+    //   字节模式: E8 xx xx xx xx E8 xx xx xx xx (两个连续 CALL rel32)
+    //   验证: 第一个 CALL 目标 = pacModuleBase + 0xEADC4 (BroadcastToAllCpus)
+    //         第二个 CALL 目标 = pacModuleBase + 0xEAE4D (WaitForCompletion)
+    //   可靠性: BroadcastToAllCpus + WaitForCompletion 配对在 SHV_Install 中是特有的
+    //           (报告 §3.2 L146-147 确认 SHV_Install 调用这两个函数启动 per-CPU SHV)
+    //   不需要 XOR 加密: E8 是通用 CALL 操作码, 不构成特征
+    // ============================================================
+    if (!pacModuleBase) {
+        ByovdDiag("BYOVD:ShvPatch: SIG2 skipped — pacModuleBase=0\n");
+        return 0;
+    }
+
+    uint64_t broadcastTarget = pacModuleBase + SIG2_BROADCAST_RVA;
+    uint64_t waitTarget      = pacModuleBase + SIG2_WAIT_RVA;
+
+    scanned = 0;
+    while (scanned < textSize) {
+        uint32_t readSize = CHUNK_SIZE;
+        if (scanned + readSize > textSize) {
+            readSize = textSize - scanned;
+        }
+        if (readSize < 10) break;  // 不足以容纳双 CALL (5+5)
+
+        uint64_t chunkAddr = textSectionVA + scanned;
+        if (!kma.ReadKernelVA(chunkAddr, buf, readSize)) {
+            scanned += CHUNK_SIZE;
+            continue;
+        }
+
+        // 在 buf[0..readSize-10] 中查找双 CALL rel32 模式
+        for (uint32_t i = 0; i + 10 <= readSize; i++) {
+            // 两个连续 CALL rel32 (E8 xx xx xx xx E8 xx xx xx xx)
+            if (buf[i] != 0xE8 || buf[i + 5] != 0xE8) continue;
+
+            // 计算两个 CALL 的目标地址
+            // CALL rel32 目标 = call指令地址 + 5 + rel32
+            int32_t rel1 = (int32_t)((uint32_t)buf[i + 1] |
+                                      ((uint32_t)buf[i + 2] << 8) |
+                                      ((uint32_t)buf[i + 3] << 16) |
+                                      ((uint32_t)buf[i + 4] << 24));
+            int32_t rel2 = (int32_t)((uint32_t)buf[i + 6] |
+                                      ((uint32_t)buf[i + 7] << 8) |
+                                      ((uint32_t)buf[i + 8] << 16) |
+                                      ((uint32_t)buf[i + 9] << 24));
+
+            uint64_t call1VA = chunkAddr + i + 5 + (int64_t)rel1;
+            uint64_t call2VA = chunkAddr + i + 10 + (int64_t)rel2;
+
+            // 验证目标地址
+            if (call1VA != broadcastTarget) continue;
+            if (call2VA != waitTarget) continue;
+
+            // ★ 找到 SIG2! 绝对 VA = chunkAddr + i
+            uint64_t sigVA = chunkAddr + i;
+            ByovdDiag("BYOVD:ShvPatch: SIG2 found @ 0x%llX (BroadcastToAllCpus+WaitForCompletion pair)\n",
+                (unsigned long long)sigVA);
+
+            // SHV_Install 入口在 sigVA 之前 (回溯边界查找)
+            //   SIG2 在 SHV_Install 函数体的后半部分 (§3.2 L146-147, 在 MOV RAX,CR3 之后)
+            //   回溯距离可能比 SIG1 更大, 但仍限制在 256 字节内
+            //   (SHV_Install 函数体 ~256 字节, SIG2 在函数末尾附近)
+            constexpr uint32_t MAX_BACKSCAN = 256;
+            uint8_t backscan[MAX_BACKSCAN];
+            uint32_t backscanSize = (i < MAX_BACKSCAN) ? i : MAX_BACKSCAN;
+            uint64_t backscanStart = sigVA - backscanSize;
+
+            if (backscanSize > 0 && kma.ReadKernelVA(backscanStart, backscan, backscanSize)) {
+                // Pass 1: 0xCC (int3)
+                for (int32_t k = backscanSize - 1; k >= 0; k--) {
+                    if (backscan[k] == 0xCC) {
+                        uint32_t entryOffset = k + 1;
+                        if (entryOffset >= backscanSize) continue;
+                        if (IsValidPrologueByte(backscan[entryOffset])) {
+                            ByovdDiag("BYOVD:ShvPatch: SIG2 boundary found via Pass1 (0xCC) @ 0x%llX\n",
+                                (unsigned long long)(backscanStart + entryOffset));
+                            return backscanStart + entryOffset;
+                        }
+                    }
+                }
+                // Pass 2: 0x90 连续 ≥2
+                for (int32_t k = backscanSize - 2; k >= 0; k--) {
+                    if (backscan[k] == 0x90 && backscan[k + 1] == 0x90) {
+                        uint32_t entryOffset = k + 2;
+                        while (entryOffset < backscanSize && backscan[entryOffset] == 0x90) entryOffset++;
+                        if (entryOffset >= backscanSize) continue;
+                        if (IsValidPrologueByte(backscan[entryOffset])) {
+                            ByovdDiag("BYOVD:ShvPatch: SIG2 boundary found via Pass2 (0x90×2) @ 0x%llX\n",
+                                (unsigned long long)(backscanStart + entryOffset));
+                            return backscanStart + entryOffset;
+                        }
+                    }
+                }
+                // Pass 3: 0x00 连续 ≥4
+                for (int32_t k = backscanSize - 4; k >= 0; k--) {
+                    if (backscan[k] == 0x00 && backscan[k + 1] == 0x00 &&
+                        backscan[k + 2] == 0x00 && backscan[k + 3] == 0x00) {
+                        uint32_t entryOffset = k + 4;
+                        while (entryOffset < backscanSize && backscan[entryOffset] == 0x00) entryOffset++;
+                        if (entryOffset >= backscanSize) continue;
+                        if (IsValidPrologueByte(backscan[entryOffset])) {
+                            ByovdDiag("BYOVD:ShvPatch: SIG2 boundary found via Pass3 (0x00×4) @ 0x%llX\n",
+                                (unsigned long long)(backscanStart + entryOffset));
+                            return backscanStart + entryOffset;
+                        }
+                    }
+                }
+                // Pass 4: 0xC3 (ret) + 0xCC (int3)
+                for (int32_t k = backscanSize - 2; k >= 0; k--) {
+                    if (backscan[k] == 0xC3 && backscan[k + 1] == 0xCC) {
+                        uint32_t entryOffset = k + 2;
+                        while (entryOffset < backscanSize && backscan[entryOffset] == 0xCC) entryOffset++;
+                        if (entryOffset >= backscanSize) continue;
+                        if (IsValidPrologueByte(backscan[entryOffset])) {
+                            ByovdDiag("BYOVD:ShvPatch: SIG2 boundary found via Pass4 (0xC3+0xCC) @ 0x%llX\n",
+                                (unsigned long long)(backscanStart + entryOffset));
+                            return backscanStart + entryOffset;
+                        }
+                    }
+                }
+            }
+
+            // SIG2 边界查找失败, 保守返回 0
+            ByovdDiag("BYOVD:ShvPatch: SIG2 found @ 0x%llX but no function boundary detected\n",
+                (unsigned long long)sigVA);
+            return 0;
+        }
+
+        scanned += CHUNK_SIZE;
+    }
+
+    ByovdDiag("BYOVD:ShvPatch: SIG2 not found in .text (size=0x%X)\n", textSize);
     return 0;
 }
 
@@ -7663,7 +7770,9 @@ bool ShvInstallPatcher::PatchShvInstallEntry() {
     ByovdDiag("BYOVD:ShvPatch: .text RVA=0x%X size=0x%X\n", textRVA, textSize);
 
     // 3. 特征码扫描定位 SHV_Install 入口
-    uint64_t shvInstallAddr = FindShvInstallEntry(pacBase + textRVA, textSize);
+    //    ★ BUILD 562: 传入 pacBase (模块基址) 用于 SIG2 目标地址验证
+    //      SIG1 仅需 .text 段地址, SIG2 需要 pacBase + RVA 计算目标地址
+    uint64_t shvInstallAddr = FindShvInstallEntry(pacBase, pacBase + textRVA, textSize);
     if (!shvInstallAddr) {
         ByovdDiag("BYOVD:ShvPatch: SHV_Install entry not found via signature scan\n");
         RecordPatchFailure();
