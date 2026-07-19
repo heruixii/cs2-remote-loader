@@ -5,6 +5,7 @@
 #include "memory_cloak.h"
 #include "platform.h"
 #include "syscall_direct.h"
+#include "module_resolver.h"  // ★ BUILD 550: GetModuleBaseFromPEB + ModNameHash (替代 GetModuleHandleW)
 #include <cmath>
 #include <psapi.h>
 #include <intrin.h>
@@ -340,7 +341,8 @@ ModuleStomper::FindCandidateInSelf(SIZE_T requiredSize) {
     };
 
     for (auto* modName : candidates) {
-        HMODULE hMod = GetModuleHandleW(modName);
+        // ★ BUILD 550: PEB Ldr 遍历替代 GetModuleHandleW (规避 PAC 用户态 hook)
+        HMODULE hMod = stealth::GetModuleBaseFromPEB(stealth::ModNameHashRT(modName));
         if (!hMod) continue;
 
         MODULEINFO modInfo;
@@ -499,19 +501,42 @@ bool ModuleStomper::RestoreStomped(const StompCandidate& candidate,
 }
 
 bool ModuleStomper::IsInLegitimateModule(uintptr_t addr) {
-    HMODULE hMod;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-                           reinterpret_cast<LPCWSTR>(addr), &hMod) && hMod) {
-        WCHAR modPath[MAX_PATH] = {};
-        GetModuleFileNameW(hMod, modPath, MAX_PATH);
-        // ★ BUILD 496: 手动小写比较替代 std::wstring
-        for (int i = 0; i < MAX_PATH && modPath[i]; i++) {
-            modPath[i] = towlower(modPath[i]);
+    // ★ BUILD 550: PEB Ldr 遍历替代 GetModuleHandleExW (规避 PAC 用户态 hook)
+    //   原实现: GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, addr, &hMod)
+    //   新实现: 遍历 PEB Ldr, 检查 addr 是否落在某模块的 [DllBase, DllBase+SizeOfImage) 范围
+    PPEB peb = reinterpret_cast<PPEB>(__readgsqword(0x60));
+    if (!peb || !peb->Ldr) return false;
+    // ★ BUILD 550: MinGW 下 _PEB_LDR_DATA 无 InLoadOrderModuleList 字段, 用宏访问
+    PLIST_ENTRY head = LDR_INLOAD_HEAD(peb->Ldr);
+    PLIST_ENTRY entry = head->Flink;
+    while (entry && entry != head) {
+        auto* dataEntry = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY_FULL, InLoadOrderLinks);
+        HMODULE dllBase = static_cast<HMODULE>(LDR_ENTRY_DLLBASE(dataEntry));
+        if (dllBase) {
+            // 获取模块大小 (从 PE 头读取 SizeOfImage)
+            auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(dllBase);
+            if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+                auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(
+                    reinterpret_cast<uint8_t*>(dllBase) + dos->e_lfanew);
+                if (nt->Signature == IMAGE_NT_SIGNATURE) {
+                    uintptr_t base = reinterpret_cast<uintptr_t>(dllBase);
+                    uintptr_t end = base + nt->OptionalHeader.SizeOfImage;
+                    if (addr >= base && addr < end) {
+                        // 找到所属模块, 检查路径是否合法
+                        // ★ BUILD 496: 手动小写比较替代 std::wstring
+                        WCHAR modPath[MAX_PATH] = {};
+                        GetModuleFileNameW(dllBase, modPath, MAX_PATH);
+                        for (int i = 0; i < MAX_PATH && modPath[i]; i++) {
+                            modPath[i] = towlower(modPath[i]);
+                        }
+                        return (wcsstr(modPath, L"\\system32\\") != nullptr ||
+                                wcsstr(modPath, L"\\windows\\") != nullptr ||
+                                wcsstr(modPath, L"\\steamapps\\") != nullptr);
+                    }
+                }
+            }
         }
-
-        return (wcsstr(modPath, L"\\system32\\") != nullptr ||
-                wcsstr(modPath, L"\\windows\\") != nullptr ||
-                wcsstr(modPath, L"\\steamapps\\") != nullptr);
+        entry = entry->Flink;
     }
     return false;
 }
@@ -536,7 +561,7 @@ void* PhantomSection::AllocateAsImageSection(SIZE_T size, const wchar_t* disguis
     using NtCreateSection_t = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
         PLARGE_INTEGER, ULONG, ULONG, HANDLE);
     static auto NtCreateSection = reinterpret_cast<NtCreateSection_t>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateSection"));
+        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtCreateSection"));
 
     if (!NtCreateSection) return nullptr;
 
@@ -563,7 +588,7 @@ void* PhantomSection::AllocateAsImageSection(SIZE_T size, const wchar_t* disguis
     using NtMapViewOfSection_t = NTSTATUS(NTAPI*)(HANDLE, HANDLE, PVOID*, ULONG_PTR,
         SIZE_T, PLARGE_INTEGER, PSIZE_T, ULONG, ULONG, ULONG);
     static auto NtMapViewOfSection = reinterpret_cast<NtMapViewOfSection_t>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtMapViewOfSection"));
+        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtMapViewOfSection"));
 
     if (NtMapViewOfSection) {
         NtMapViewOfSection(hSection, GetCurrentProcess(), &baseAddr,
@@ -583,7 +608,7 @@ uintptr_t PhantomSection::AllocatePhantomInProcess(HANDLE hProcess, SIZE_T size)
     using NtCreateSection_t = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
         PLARGE_INTEGER, ULONG, ULONG, HANDLE);
     static auto NtCreateSection = reinterpret_cast<NtCreateSection_t>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateSection"));
+        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtCreateSection"));
 
     if (!NtCreateSection) return 0;
 
@@ -602,7 +627,7 @@ uintptr_t PhantomSection::AllocatePhantomInProcess(HANDLE hProcess, SIZE_T size)
     using NtMapViewOfSection_t = NTSTATUS(NTAPI*)(HANDLE, HANDLE, PVOID*, ULONG_PTR,
         SIZE_T, PLARGE_INTEGER, PSIZE_T, ULONG, ULONG, ULONG);
     static auto NtMapViewOfSection = reinterpret_cast<NtMapViewOfSection_t>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtMapViewOfSection"));
+        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtMapViewOfSection"));
 
     if (NtMapViewOfSection) {
         NtMapViewOfSection(hSection, hProcess, &remoteAddr,
@@ -648,14 +673,14 @@ HMODULE PhantomSection::GetDisguiseModuleBase() {
     // ★ Fix B2: 返回 ntdll.dll 基址用于 VAD AllocationBase 伪装
     // ntdll.dll 是所有 Windows 进程的默认加载模块, 
     // 将其作为 AllocationBase 可使隐藏区域看起来像 ntdll 的正常映射
-    return GetModuleHandleW(L"ntdll.dll");
+    return stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
 }
 
 PhantomSection::NtQVM_t PhantomSection::GetRealNtQueryVirtualMemory() {
     static NtQVM_t s_realNtQVM = nullptr;
     if (!s_realNtQVM) {
         s_realNtQVM = reinterpret_cast<NtQVM_t>(
-            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryVirtualMemory"));
+            GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQueryVirtualMemory"));
     }
     return s_realNtQVM;
 }
@@ -947,7 +972,9 @@ bool SelfCloaker::UnlinkSelfLdrEntry() {
     if (!ldr) return false;
 
     // 获取 EXE 自身句柄
-    HMODULE exeBase = GetModuleHandleW(nullptr);
+    // ★ BUILD 550: 直接从 PEB+0x10 (ImageBaseAddress) 读取 (替代 GetModuleHandleW(nullptr))
+    //   winternl.h 的 PEB 结构体未暴露 ImageBaseAddress 字段, 用偏移读取
+    HMODULE exeBase = *reinterpret_cast<HMODULE*>(reinterpret_cast<BYTE*>(peb) + 0x10);
     if (!exeBase) return false;
 
     // 遍历 InLoadOrderModuleList 找到 EXE 条目
@@ -997,7 +1024,7 @@ bool TelemetrySilencer::DisableETW() {
     if (s_etwPatch.addr) return true; // 已经 patched
 
     // 目标: ntdll!EtwEventWrite
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    HMODULE ntdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
     if (!ntdll) return false;
 
     auto* etwAddr = reinterpret_cast<BYTE*>(

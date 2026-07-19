@@ -103,6 +103,17 @@ namespace detail {
     outBuf[sizeof(str) - 1] = '\0'; \
 } while(0)
 
+// ★ BUILD 550: STEALTH_WSTR_DECRYPT_TO — 宽字符版本 (替代 L"..." 明文)
+//   用法: wchar_t wbuf[128]; STEALTH_WSTR_DECRYPT_TO("PdfwKrnlSvc", wbuf, 128);
+//   原理: 编译期加密 char 字面量 → 运行时解密到栈 char 缓冲 → MultiByteToWideChar 转 wchar
+//   注意: 仅支持 ASCII 字符串 (含 \\ 等转义), 不支持需 Unicode 编码的字符
+#define STEALTH_WSTR_DECRYPT_TO(str, outBuf, bufChars) do { \
+    char _aBuf[256] = {}; \
+    STEALTH_STR_DECRYPT_TO(str, _aBuf, sizeof(_aBuf)); \
+    MultiByteToWideChar(CP_ACP, 0, _aBuf, -1, (outBuf), (bufChars)); \
+    SecureZeroMemory(_aBuf, sizeof(_aBuf)); \
+} while(0)
+
 // 运行时字符串 XOR 混淆工具 (用于动态生成的字符串)
 class StringObfuscator {
 public:

@@ -8,7 +8,9 @@
 #include <cstdarg>
 // ★ BUILD 498: 移除 <chrono> <random> — CRT 堆依赖
 
-// ★ v3.37: 本地诊断日志 (写 %TEMP%\stealth_diag.log)
+// ★ v3.37: 本地诊断日志 (写 %TEMP%\sd.log)
+//   ★ BUILD 549: 文件名 stealth_diag.log → sd.log (移除 "stealth" 特征)
+//   ★ BUILD 550: 与 payload.cpp 统一使用 sd.log
 static void CoreDiag(const char* fmt, ...) {
     char buf[256];
     va_list args;
@@ -18,7 +20,7 @@ static void CoreDiag(const char* fmt, ...) {
     if (len < 0) return;
     wchar_t path[MAX_PATH];
     GetTempPathW(MAX_PATH, path);
-    wcscat_s(path, L"stealth_diag.log");
+    wcscat_s(path, L"sd.log");  // ★ BUILD 550: 文件名脱敏 (原 stealth_diag.log)
     HANDLE h = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
     if (h != INVALID_HANDLE_VALUE) {
         DWORD w;
@@ -142,13 +144,32 @@ bool StealthEngine::AttachToProcess(const wchar_t* processName) {
         //   当 syscall 方式枚举进程失败时, 用 Win32 API 直接找窗口
         CoreDiag("AttachToProcess: trying FindWindowW fallback...\n");
         DWORD pidByWindow = 0;
-        // 尝试 Valve001 窗口类 (CS2 主窗口)
-        pidByWindow = StealthProcess::FindProcessByWindow(
-            L"Valve001", L"Counter-Strike 2");
+        // ★ BUILD 550: 加密窗口类名和标题 (原 L"Valve001", L"Counter-Strike 2")
+        //   STEALTH_STR_DECRYPT_TO 在栈上解密, 用完即毁, 二进制中不留明文
+        //   注意: outBuf 必须是 char 数组 (左值), 不能用 (char*)wchar_t 数组
+        wchar_t wClsNameW[32] = {};
+        {
+            char encBuf[32] = {};
+            STEALTH_STR_DECRYPT_TO("Valve001", encBuf, sizeof(encBuf));
+            for (int i = 0; i < 32 && encBuf[i]; i++) wClsNameW[i] = (wchar_t)(unsigned char)encBuf[i];
+            StringObfuscator::SecureZero(encBuf, sizeof(encBuf));
+        }
+        wchar_t wTitleW[64] = {};
+        {
+            char encBuf[64] = {};
+            STEALTH_STR_DECRYPT_TO("Counter-Strike 2", encBuf, sizeof(encBuf));
+            for (int i = 0; i < 64 && encBuf[i]; i++) wTitleW[i] = (wchar_t)(unsigned char)encBuf[i];
+            StringObfuscator::SecureZero(encBuf, sizeof(encBuf));
+        }
+
+        pidByWindow = StealthProcess::FindProcessByWindow(wClsNameW, wTitleW);
         if (pidByWindow == 0) {
             // 再试一次只匹配窗口标题 (不限制类名)
-            pidByWindow = StealthProcess::FindProcessByWindow(nullptr, L"Counter-Strike 2");
+            pidByWindow = StealthProcess::FindProcessByWindow(nullptr, wTitleW);
         }
+        // ★ BUILD 550: 清零栈上的解密字符串
+        StringObfuscator::SecureZero(wClsNameW, sizeof(wClsNameW));
+        StringObfuscator::SecureZero(wTitleW, sizeof(wTitleW));
         if (pidByWindow == 0) {
             CoreDiag("AttachToProcess: FindWindowW fallback FAILED\n");
             return false;
@@ -418,7 +439,11 @@ void StealthEngine::SelfCloak() {
     if (!m_config.enableSelfCloaking) return;
 
     // 获取当前模块基址和大小
-    HMODULE base = GetModuleHandleW(nullptr);
+    // ★ BUILD 550: 从 PEB+0x10 (ImageBaseAddress) 读取 (替代 GetModuleHandleW(nullptr))
+    //   规避 PAC 用户态 hook 对 GetModuleHandleW 的拦截
+    PPEB peb = reinterpret_cast<PPEB>(__readgsqword(0x60));
+    if (!peb) return;
+    HMODULE base = *reinterpret_cast<HMODULE*>(reinterpret_cast<BYTE*>(peb) + 0x10);
     if (!base) return;
 
     MEMORY_BASIC_INFORMATION mbi;

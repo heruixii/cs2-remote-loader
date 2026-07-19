@@ -14,6 +14,8 @@
 // ============================================================
 
 #include "byovd_kernel.h"
+#include "module_resolver.h"  // ★ BUILD 550: GetModuleBaseFromPEB 替代 GetModuleHandleW
+#include "string_obfuscator.h"  // ★ BUILD 550: STEALTH_STR_DECRYPT_TO / STEALTH_WSTR_DECRYPT_TO
 #include <winreg.h>
 #include <winternl.h>
 #include <winsvc.h>
@@ -51,7 +53,10 @@ static void ByovdDiag(const char* fmt, ...) {
 // BYOVD 驱动嵌入支持: 将 RTCore64.sys 编译进 payload
 //   python scripts/embed_driver.py RTCore64.sys → rtcore64_embed.h
 //   v3.47: 始终嵌入, 移除 #ifdef 编译开关 — 驱动从 TEMP 提取
-#include "rtcore64_embed.h"
+// ★ BUILD 550: RTCore64.sys 嵌入数据已移除 (死代码)
+//   原因: BUILD 490 后 g_driverCandidates[] 仅含 PDFWKRNL, RTCore64 分支永不执行
+//   收益: 消除 .rdata 中 \Device\RTCore64 / \DosDevices\RTCore64 / ntoskrnl.exe 等明文
+// #include "rtcore64_embed.h"
 #include "pdfwkrnl_embed.h"   // ★ BUILD 489: PDFWKRNL.sys 替代驱动
 #include <initializer_list>
 
@@ -694,27 +699,38 @@ private:
 
 // (IOCTL 常量定义已移至文件顶部 VirtualReadViaIOCTL 之前)
 
-const BYOVDDriverInfo BYOVDDrivers::RTCore64 = {
-    L"RTCore64Svc",
-    L"RTCore64 Micro-Star Driver",
-    L"\\\\.\\RTCore64",
-    L"RTCore64.sys",
-    IOCTL_VIRTUAL_MEM,   // ★ v3.114: 使用虚拟内存 IOCTL (0x80002000)
-    true
-};
+// ★ BUILD 550: BYOVDDriverInfo 改为运行时解密填充 — 避免明文驱动名/服务名/设备路径出现在 .rdata
+//   原实现: const BYOVDDriverInfo RTCore64 = { L"RTCore64Svc", ... } → 明文残留
+//   新实现: MakeXxxDriver() 函数内使用 STEALTH_WSTR_DECRYPT_TO 解密到栈缓冲, 再 wcscpy_s 到结构体
+static BYOVDDriverInfo MakeRTCore64Driver() {
+    BYOVDDriverInfo info = {};
+    STEALTH_WSTR_DECRYPT_TO("RTCore64Svc", info.serviceName, 128);
+    STEALTH_WSTR_DECRYPT_TO("RTCore64 Micro-Star Driver", info.displayName, 128);
+    STEALTH_WSTR_DECRYPT_TO("\\\\.\\RTCore64", info.devicePath, 128);
+    STEALTH_WSTR_DECRYPT_TO("RTCore64.sys", info.driverPath, 260);
+    info.ioctlCode = IOCTL_VIRTUAL_MEM;  // ★ v3.114: 使用虚拟内存 IOCTL (0x80002000)
+    info.needsMemoryMap = true;
+    return info;
+}
+
+const BYOVDDriverInfo BYOVDDrivers::RTCore64 = MakeRTCore64Driver();
 
 // ★ BUILD 489: PDFWKRNL.sys — AMD PDF Worker 内核驱动
 //   IOCTL 0x80002014: kernel VA memcpy R/W (METHOD_BUFFERED, 无安全检查)
 //   优势: 2026年未被 Microsoft 漏洞驱动阻止列表拦截
 //   设备: \Device\PdfwKrnl → \\.\PdfwKrnl
-const BYOVDDriverInfo BYOVDDrivers::PDFWKRNL = {
-    L"PdfwKrnlSvc",
-    L"AMD PDF Worker Kernel Driver",
-    L"\\\\.\\PdfwKrnl",
-    L"PDFWKRNL.sys",
-    IOCTL_AMDPDFW_MEMCPY,  // 0x80002014
-    false                  // 不需要先映射物理内存
-};
+static BYOVDDriverInfo MakePdfwKrnlDriver() {
+    BYOVDDriverInfo info = {};
+    STEALTH_WSTR_DECRYPT_TO("PdfwKrnlSvc", info.serviceName, 128);
+    STEALTH_WSTR_DECRYPT_TO("AMD PDF Worker Kernel Driver", info.displayName, 128);
+    STEALTH_WSTR_DECRYPT_TO("\\\\.\\PdfwKrnl", info.devicePath, 128);
+    STEALTH_WSTR_DECRYPT_TO("PDFWKRNL.sys", info.driverPath, 260);
+    info.ioctlCode = IOCTL_AMDPDFW_MEMCPY;  // 0x80002014
+    info.needsMemoryMap = false;
+    return info;
+}
+
+const BYOVDDriverInfo BYOVDDrivers::PDFWKRNL = MakePdfwKrnlDriver();
 
 // ★ BUILD 490: 仅 PDFWKRNL — 安全性更高:
 //   1. 未被 Microsoft 漏洞驱动阻止列表拦截 (RTCore64 已被拦截)
@@ -757,7 +773,7 @@ bool KernelMemoryAccessor::IsHVCIEnabled() {
 
     // 方法2: SystemCodeIntegrityInformation (0x67) 
     // 通过 NtQuerySystemInformation
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    HMODULE ntdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
     if (ntdll) {
         using NtQuerySystemInfo_t = LONG(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
         auto pNtQsi = (NtQuerySystemInfo_t)GetProcAddress(ntdll, "NtQuerySystemInformation");
@@ -817,13 +833,9 @@ static const wchar_t* EnsureDriverFile(const wchar_t* driverName) {
         const wchar_t* lastSlash = wcsrchr(baseName, L'\\');
         if (lastSlash) baseName = lastSlash + 1;
 
-        if (wcscmp(baseName, L"RTCore64.sys") == 0) {
-            embedData = stealth::embedded::RTCore64_data;
-            embedSize = stealth::embedded::RTCore64_size;
-            ByovdDiag("BYOVD:EnsureDriverFile: matched RTCore64, embed=0x%p size=%zu\n", embedData, embedSize);
-        } else {
-            ByovdDiag("BYOVD:EnsureDriverFile: driverName '%ls' != RTCore64.sys\n", driverName);
-        }
+        // ★ BUILD 550: RTCore64.sys 嵌入匹配已移除 (死代码, g_driverCandidates[] 仅 PDFWKRNL)
+        //   PDFWKRNL.sys 的嵌入提取由 MutateAndRandomizeDriver() 负责, 此函数仅处理文件系统路径
+        ByovdDiag("BYOVD:EnsureDriverFile: driverName '%ls' (no embed match)\n", driverName);
 
         if (embedData && embedSize > 0) {
             static const wchar_t* randomPrefixes[] = {
@@ -886,9 +898,14 @@ static void ForceRemoveRTCore64Services() {
         if (RegEnumKeyExW(hServices, idx, name, &nameLen,
             nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
             break;
-        bool isOurs = (wcsstr(name, L"RTCore64") == name)
-                   || (wcsstr(name, L"SysMon") == name)
-                   || (wcsstr(name, L"PdfwKrnl") == name);  // ★ BUILD 489
+        // ★ BUILD 550: 解密敏感服务名前缀 (原 L"RTCore64"/L"SysMon"/L"PdfwKrnl" 明文)
+        wchar_t wRTCore[32], wSysMon[32], wPdfw[32];
+        STEALTH_WSTR_DECRYPT_TO("RTCore64", wRTCore, 32);
+        STEALTH_WSTR_DECRYPT_TO("SysMon", wSysMon, 32);
+        STEALTH_WSTR_DECRYPT_TO("PdfwKrnl", wPdfw, 32);
+        bool isOurs = (wcsstr(name, wRTCore) == name)
+                   || (wcsstr(name, wSysMon) == name)
+                   || (wcsstr(name, wPdfw) == name);  // ★ BUILD 489
         if (isOurs) {
             ByovdDiag("BYOVD:ForceRemove: deleting stale service '%ls' (registry only, BUILD 474)\n", name);
             RegDeleteTreeW(hServices, name);
@@ -914,7 +931,7 @@ bool KernelMemoryAccessor::LoadDriver(const wchar_t* serviceName,
                                        const wchar_t* driverPath) {
     // ★ BUILD 485: Win11 CFG 阻止 manual-mapped DLL 调用 advapi32→ntdll 包装.
     //   全部替换为 Nt* 直接 syscall stubs. SSN 已在 Initialize 中缓存.
-    ByovdDiag("BYOVD:LoadDriver: ENTER (BUILD 490: PDFWKRNL.sys syscall stubs)\n");
+    ByovdDiag("B550:LD:ENTER drv-stubs\n");  // ★ BUILD 550: 脱敏 (原含驱动名)
 
     // 使用缓存的 SSN
     if (!g_cachedSsnCreateKey || !g_cachedSsnOpenKey ||
@@ -1737,7 +1754,11 @@ uint64_t KernelMemoryAccessor::MapPhysicalToKernelVA(uint64_t physAddr, size_t s
 
 uint64_t KernelMemoryAccessor::GetNtoskrnlBase() {
     if (m_ntosBase) return m_ntosBase;
-    m_ntosBase = GetKernelModuleBase("ntoskrnl.exe");
+    // ★ BUILD 550: 解密内核模块名 (原 "ntoskrnl.exe" 明文)
+    char ntosName[32];
+    STEALTH_STR_DECRYPT_TO("ntoskrnl.exe", ntosName, sizeof(ntosName));
+    m_ntosBase = GetKernelModuleBase(ntosName);
+    SecureZeroMemory(ntosName, sizeof(ntosName));
     return m_ntosBase;
 }
 
@@ -1762,7 +1783,7 @@ uint64_t KernelMemoryAccessor::GetKernelModuleBase(const char* moduleName) {
     }
 
     typedef LONG(NTAPI* NtQuerySystemInfo_t)(ULONG, PVOID, ULONG, PULONG);
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    HMODULE ntdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
     if (!ntdll) return 0;
     auto pNtQsi = (NtQuerySystemInfo_t)GetProcAddress(ntdll, "NtQuerySystemInformation");
     if (!pNtQsi) return 0;
@@ -1887,8 +1908,8 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
 
     // ★ BUILD 489: 检测驱动类型, 设置全局标志
     g_isPdfwKrnl = (driver.ioctlCode == IOCTL_AMDPDFW_MEMCPY);
-    ByovdDiag("BYOVD:Init: driver type=%s ioctl=0x%08X\n",
-        g_isPdfwKrnl ? "PDFWKRNL" : "RTCore64", driver.ioctlCode);
+    ByovdDiag("B550:IT:drv=%d ioctl=0x%08X\n",  // ★ BUILD 550: 脱敏 (原含驱动名)
+        g_isPdfwKrnl ? 1 : 0, driver.ioctlCode);
 
     // 1. 检测 HVCI
     if (IsHVCIEnabled()) {
@@ -1947,7 +1968,7 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     //   后续 LoadDriver 使用这些缓存的 SSN 生成 syscall stubs, 完全绕过 ntdll 包装函数,
     //   避免 Win11 CFG 在 manual-mapped DLL 上下文中阻止 ntdll 间接调用.
     if (!g_cachedSsnCreateKey || !g_cachedSsnLoadDriver) {
-        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+        HMODULE hNtdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
         if (hNtdll) {
             auto extractSsn = [](HMODULE mod, const char* name) -> DWORD {
                 auto* addr = reinterpret_cast<BYTE*>(GetProcAddress(mod, name));
@@ -2026,9 +2047,14 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
                     nullptr, nullptr, nullptr, nullptr);
                 if (enumResult != ERROR_SUCCESS) break;
                 // 匹配 RTCore64Svc/SysMon/PdfwKrnlSvc (旧格式, 直接匹配)
-                bool isStaleSvc = (wcsstr(subKeyName, L"RTCore64Svc") == subKeyName)
-                               || (wcsstr(subKeyName, L"SysMon") == subKeyName)
-                               || (wcsstr(subKeyName, L"PdfwKrnlSvc") == subKeyName);  // ★ BUILD 489
+                // ★ BUILD 550: 解密敏感服务名前缀 (原 L"RTCore64Svc"/L"SysMon"/L"PdfwKrnlSvc" 明文)
+                wchar_t wRTCoreSvc[32], wSysMon2[32], wPdfwSvc[32];
+                STEALTH_WSTR_DECRYPT_TO("RTCore64Svc", wRTCoreSvc, 32);
+                STEALTH_WSTR_DECRYPT_TO("SysMon", wSysMon2, 32);
+                STEALTH_WSTR_DECRYPT_TO("PdfwKrnlSvc", wPdfwSvc, 32);
+                bool isStaleSvc = (wcsstr(subKeyName, wRTCoreSvc) == subKeyName)
+                               || (wcsstr(subKeyName, wSysMon2) == subKeyName)
+                               || (wcsstr(subKeyName, wPdfwSvc) == subKeyName);  // ★ BUILD 489
                 // ★ v3.110: 也匹配新的随机化服务名前缀
                 // ★ v3.113: 必须检查 _XXXX 后缀, 防止误匹配合法系统服务
                 if (!isStaleSvc) {
@@ -2127,7 +2153,7 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
         // 0. NtMakeTemporaryObject — 移除 OBJ_PERMANENT, 关闭句柄后设备对象自动释放
         {
             static auto pNtMakeTemp = (NTSTATUS(NTAPI*)(HANDLE))
-                GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtMakeTemporaryObject");
+                GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtMakeTemporaryObject");
             if (pNtMakeTemp) {
                 NTSTATUS st = pNtMakeTemp(m_hDevice);
                 ByovdDiag("BYOVD:Init: NtMakeTemporaryObject(zombie) → 0x%08X\n", (uint32_t)st);
@@ -2142,8 +2168,13 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
 
         // 2. 删除 DOS 设备符号链接
         // ★ BUILD 489: 根据驱动类型使用正确的设备名
-        DefineDosDeviceW(DDD_REMOVE_DEFINITION,
-            g_isPdfwKrnl ? L"PdfwKrnl" : L"RTCore64", nullptr);
+        // ★ BUILD 550: 解密设备名 (原 g_isPdfwKrnl ? L"PdfwKrnl" : L"RTCore64" 明文)
+        {
+            wchar_t wDosName[32];
+            if (g_isPdfwKrnl) STEALTH_WSTR_DECRYPT_TO("PdfwKrnl", wDosName, 32);
+            else              STEALTH_WSTR_DECRYPT_TO("RTCore64", wDosName, 32);
+            DefineDosDeviceW(DDD_REMOVE_DEFINITION, wDosName, nullptr);
+        }
 
         // 3. 短暂等待内核释放设备对象
         Sleep(500);
@@ -2175,8 +2206,13 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
         if (!zombieRetried) {
             zombieRetried = true;
             ByovdDiag("BYOVD:Init: LoadDriver failed, trying zombie cleanup retry...\n");
-            DefineDosDeviceW(DDD_REMOVE_DEFINITION,
-                g_isPdfwKrnl ? L"PdfwKrnl" : L"RTCore64", nullptr);  // ★ BUILD 489
+            // ★ BUILD 550: 解密设备名 (原 g_isPdfwKrnl ? L"PdfwKrnl" : L"RTCore64" 明文)
+            {
+                wchar_t wDosName2[32];
+                if (g_isPdfwKrnl) STEALTH_WSTR_DECRYPT_TO("PdfwKrnl", wDosName2, 32);
+                else              STEALTH_WSTR_DECRYPT_TO("RTCore64", wDosName2, 32);
+                DefineDosDeviceW(DDD_REMOVE_DEFINITION, wDosName2, nullptr);  // ★ BUILD 489
+            }
             Sleep(1000);
             loadOk = LoadDriver(m_actualServiceName, actualPath);
             ByovdDiag("BYOVD:Init: LoadDriver retry → %d\n", (int)loadOk);
@@ -2195,8 +2231,14 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
             wcscpy_s(dosName, devPath + 4);              // e.g. "RT64_A1B2"
             swprintf_s(ntDevName, L"\\Device\\%ls", dosName); // e.g. "\\Device\\RT64_A1B2"
         } else {
-            wcscpy_s(dosName, g_isPdfwKrnl ? L"PdfwKrnl" : L"RTCore64");     // ★ BUILD 489
-            wcscpy_s(ntDevName, g_isPdfwKrnl ? L"\\Device\\PdfwKrnl" : L"\\Device\\RTCore64");
+            // ★ BUILD 550: 解密设备名 (原 g_isPdfwKrnl ? L"PdfwKrnl" : L"RTCore64" 明文)
+            if (g_isPdfwKrnl) {
+                STEALTH_WSTR_DECRYPT_TO("PdfwKrnl", dosName, 128);
+                STEALTH_WSTR_DECRYPT_TO("\\Device\\PdfwKrnl", ntDevName, 128);
+            } else {
+                STEALTH_WSTR_DECRYPT_TO("RTCore64", dosName, 128);
+                STEALTH_WSTR_DECRYPT_TO("\\Device\\RTCore64", ntDevName, 128);
+            }
         }
 
         ByovdDiag("BYOVD:Init: LoadDriver FAILED, trying symlink fix: '%ls' → '%ls'\n",
@@ -2270,11 +2312,11 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     ByovdDiag("BYOVD:Init: post-load delay done\n");
 
     // ★ v3.118: 精确定位BSOD位置 — 分步日志
-    ByovdDiag("BYOVD:Init: STEP_A calling GetNtoskrnlBase...\n");
+    ByovdDiag("BYOVD:Init: STEP_A calling GetNtosBase...\n");
     // ★ v3.116: SEH 已移除 — GetKernelModuleBase 内部已用 VirtualAlloc 替代 std::vector
     //   且返回 0 表示失败, 无需额外异常保护
     m_ntosBase = GetNtoskrnlBase();
-    ByovdDiag("BYOVD:Init: STEP_A1 GetNtoskrnlBase returned 0x%llX\n",
+    ByovdDiag("BYOVD:Init: STEP_A1 GetNtosBase returned 0x%llX\n",
               (unsigned long long)m_ntosBase);
     ByovdDiag("BYOVD:Init: STEP_B ntos=0x%llX, ioctl=0x%08X\n",
               (unsigned long long)m_ntosBase, m_driverInfo.ioctlCode);
@@ -2282,8 +2324,8 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     // ★ BUILD 489: 根据驱动类型选择 IOCTL 探测方式
     //   PDFWKRNL: 使用 IOCTL 0x80002014 memcpy 直接读写内核VA
     //   RTCore64: 使用 IOCTL 0x80002048 (PhysicalReadViaIOCTL) 直接读写内核VA
-    ByovdDiag("BYOVD:Init: STEP_B1 probing IOCTL (type=%s)...\n",
-        g_isPdfwKrnl ? "PDFWKRNL" : "RTCore64");
+    ByovdDiag("B550:B1:probe ioctl drv=%d...\n",  // ★ BUILD 550: 脱敏 (原含驱动名)
+        g_isPdfwKrnl ? 1 : 0);
     {
         if (g_isPdfwKrnl) {
             // ★ BUILD 489: PDFWKRNL — 使用 memcpy IOCTL
@@ -2359,8 +2401,8 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
             ok = PhysicalReadViaIOCTL(m_hDevice, g_probedReadIoctl, m_ntosBase, testBuf, 8);
         }
         uint32_t readVal = *(uint32_t*)testBuf;
-        ByovdDiag("BYOVD:Init: STEP_E %s IOCTL verify(ntos+0x0)=%d val=0x%08X\n",
-                  g_isPdfwKrnl ? "PDFW" : "PhysicalRead", (int)ok, readVal);
+        ByovdDiag("B550:E:ioctl verify ok=%d val=0x%08X\n",  // ★ BUILD 550: 脱敏
+                  (int)ok, readVal);
         if (!ok || readVal == 0 || readVal == 0xFFFFFFFF) {
             ByovdDiag("BYOVD:Init: IOCTL verify FAILED (val=0x%08X)\n", readVal);
             m_active = false;
@@ -2551,7 +2593,11 @@ int EACCallbackDisabler::DisableObCallbacks(const char* eacDriverName) {
     sprintf_s(eacSysName, "%s.sys", eacDriverName);
     uint64_t eacBase = kma.GetKernelModuleBase(eacSysName);
     if (!eacBase) {
-        eacBase = kma.GetKernelModuleBase("EasyAntiCheat_EOS.sys");
+        // ★ BUILD 550: 解密内核模块名 (原 "EasyAntiCheat_EOS.sys" 明文)
+        char eosName[32];
+        STEALTH_STR_DECRYPT_TO("EasyAntiCheat_EOS.sys", eosName, sizeof(eosName));
+        eacBase = kma.GetKernelModuleBase(eosName);
+        SecureZeroMemory(eosName, sizeof(eosName));
     }
 
     // ★ BUILD 538: 读取 PAC 驱动 SizeOfImage (PE 头) 用于代码范围匹配
@@ -2873,7 +2919,7 @@ int EACCallbackDisabler::ReDisablePacCallbacks() {
     char pacNameA[256] = {};
     WStringToString(GetPacTargetName(), pacNameA, 256);
     if (pacNameA[0] == 0) {
-        ByovdDiag("E+G:ReDisablePacCallbacks: PAC name empty, skip\n");
+        ByovdDiag("E+G:ReDisablePacCallbacks: tgt-name empty, skip\n");
         return 0;
     }
     int removed = DisableObCallbacks(pacNameA);
@@ -3446,15 +3492,18 @@ static BYOVDDriverInfo MutateAndRandomizeDriver(const BYOVDDriverInfo& original)
     wcscat_s(tempPath, randomName);
 
     // ★ 获取嵌入的原始驱动数据 (完全不修改)
+    // ★ BUILD 550: 解密驱动文件名 (原 L"RTCore64.sys"/L"PDFWKRNL.sys" 明文)
+    // ★ BUILD 550: RTCore64.sys 分支已移除 (死代码, g_driverCandidates[] 仅 PDFWKRNL)
     const uint8_t* embedData = nullptr;
     size_t embedSize = 0;
-    if (wcscmp(original.driverPath, L"RTCore64.sys") == 0) {
-        embedData = stealth::embedded::RTCore64_data;
-        embedSize = stealth::embedded::RTCore64_size;
-    } else if (wcscmp(original.driverPath, L"PDFWKRNL.sys") == 0) {
-        // ★ BUILD 489: PDFWKRNL.sys 嵌入支持
-        embedData = stealth::embedded::PDFWKRNL_data;
-        embedSize = stealth::embedded::PDFWKRNL_size;
+    {
+        wchar_t wPDFWsys[32];
+        STEALTH_WSTR_DECRYPT_TO("PDFWKRNL.sys", wPDFWsys, 32);
+        if (wcscmp(original.driverPath, wPDFWsys) == 0) {
+            // ★ BUILD 489: PDFWKRNL.sys 嵌入支持
+            embedData = stealth::embedded::PDFWKRNL_data;
+            embedSize = stealth::embedded::PDFWKRNL_size;
+        }
     }
     ByovdDiag("BYOVD:Mutate: embedData=0x%p embedSize=%zu\n", embedData, embedSize);
 
@@ -3621,18 +3670,30 @@ static int ReadKernelUnicodeString(uint64_t poolAddr, uint16_t lenBytes, wchar_t
 }
 
 // === 目标驱动名列表 — 需要从痕迹表中清除 ===
-static const wchar_t* g_traceTargetNames[] = {
-    L"RTCore64.sys",
-    L"RTCore64",
-    nullptr
-};
+// ★ BUILD 550: 改为运行时解密 (原 L"RTCore64.sys"/L"RTCore64" 明文)
+static const wchar_t* const* GetTraceTargetNames() {
+    static wchar_t names[4][32] = {};
+    static const wchar_t* namePtrs[5] = {};
+    static bool initialized = false;
+    if (!initialized) {
+        STEALTH_WSTR_DECRYPT_TO("RTCore64.sys", names[0], 32);
+        STEALTH_WSTR_DECRYPT_TO("RTCore64", names[1], 32);
+        // names[2], names[3] 保持全零 (终止符缓冲)
+        for (int i = 0; i < 4; i++) namePtrs[i] = names[i];
+        namePtrs[4] = nullptr;
+        initialized = true;
+    }
+    return namePtrs;
+}
 
 // ★ BUILD 497: 固定数组替代 std::wstring — 避免 CRT 堆依赖
 static bool IsTraceTarget(const wchar_t* name) {
     // ★ v3.126m-review: 修复 — 精确匹配 (wcsstr 包含匹配已足够, 但不误伤)
     //   只匹配全名中包含 RTCore64.sys 或 RTCore64 的条目
-    for (int i = 0; g_traceTargetNames[i]; i++) {
-        if (wcsstr(name, g_traceTargetNames[i]) != nullptr)
+    // ★ BUILD 550: 改用 GetTraceTargetNames() (原 g_traceTargetNames 明文已加密)
+    const wchar_t* const* targets = GetTraceTargetNames();
+    for (int i = 0; targets[i]; i++) {
+        if (wcsstr(name, targets[i]) != nullptr)
             return true;
     }
     return false;
@@ -3780,7 +3841,7 @@ bool KernelTraceCleaner::ClearPiDDBCacheTable(uint64_t ntosBase) {
 
     // 获取 ntoskrnl 大小以便限制扫描范围
     MODULEINFO modInfo = {};
-    HMODULE hNtos = GetModuleHandleW(L"ntoskrnl.exe");
+    HMODULE hNtos = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntoskrnl.exe"));
     if (!hNtos) {
         // 获取失败, 使用 EnumDeviceDrivers
         LPVOID drivers[256] = {};
@@ -3789,7 +3850,10 @@ bool KernelTraceCleaner::ClearPiDDBCacheTable(uint64_t ntosBase) {
             for (DWORD i = 0; i < needed / sizeof(LPVOID); i++) {
                 wchar_t name[MAX_PATH] = {};
                 GetDeviceDriverBaseNameW(drivers[i], name, MAX_PATH);
-                if (_wcsicmp(name, L"ntoskrnl.exe") == 0) {
+                // ★ BUILD 550: 解密内核模块名 (原 L"ntoskrnl.exe" 明文)
+                wchar_t wNtos[32];
+                STEALTH_WSTR_DECRYPT_TO("ntoskrnl.exe", wNtos, 32);
+                if (_wcsicmp(name, wNtos) == 0) {
                     hNtos = (HMODULE)drivers[i];
                     break;
                 }
@@ -3985,16 +4049,30 @@ bool KernelTraceCleaner::CleanAllTraces() {
     }
 
     // ★ v3.128: PAC 未加载则跳过所有痕迹清理 — 没有反作弊驱动可以检测我们
-    uint64_t pacBase = kma.GetKernelModuleBase("MessageTransfer.sys");
+    // ★ BUILD 550: 解密内核模块名 (原 "MessageTransfer.sys" 明文)
+    uint64_t pacBase = 0;
+    {
+        char mtName[32];
+        STEALTH_STR_DECRYPT_TO("MessageTransfer.sys", mtName, sizeof(mtName));
+        pacBase = kma.GetKernelModuleBase(mtName);
+        SecureZeroMemory(mtName, sizeof(mtName));
+    }
     if (!pacBase) {
-        ByovdDiag("TRACE:CleanAllTraces: PAC driver not loaded, skip all trace cleaning\n");
+        ByovdDiag("TRACE:CleanAllTraces: tgt-driver not loaded, skip all trace cleaning\n");
         return false;
     }
 
     ByovdDiag("TRACE:CleanAllTraces: === STARTING KERNEL TRACE CLEANUP ===\n");
 
     uint64_t ntosBase = kma.GetNtoskrnlBase();
-    uint64_t ciBase   = kma.GetKernelModuleBase("ci.dll");
+    // ★ BUILD 550: 解密内核模块名 (原 "ci.dll" 明文)
+    uint64_t ciBase = 0;
+    {
+        char ciName[16];
+        STEALTH_STR_DECRYPT_TO("ci.dll", ciName, sizeof(ciName));
+        ciBase = kma.GetKernelModuleBase(ciName);
+        SecureZeroMemory(ciName, sizeof(ciName));
+    }
 
     ByovdDiag("TRACE:CleanAllTraces: ntos=0x%llX ci=0x%llX\n",
         (unsigned long long)ntosBase, (unsigned long long)ciBase);
@@ -4090,7 +4168,7 @@ static uint64_t FindRet0Stub(uint64_t fltmgrBase, uint64_t fltmgrSize) {
         for (size_t off = 0; off < 0x10000 - 3; off++) {
             if (chunk[off] == stub[0] && chunk[off+1] == stub[1] && chunk[off+2] == stub[2]) {
                 uint64_t stubAddr = addr + off;
-                ByovdDiag("FLT:NTRL: found ret0 stub at fltmgr+0x%llX\n",
+                ByovdDiag("FLT:NTRL: found ret0 stub at flt+0x%llX\n",
                     (unsigned long long)(stubAddr - fltmgrBase));
                 VirtualFree(chunk, 0, MEM_RELEASE);
                 return stubAddr;
@@ -4098,7 +4176,7 @@ static uint64_t FindRet0Stub(uint64_t fltmgrBase, uint64_t fltmgrSize) {
         }
     }
     VirtualFree(chunk, 0, MEM_RELEASE);
-    ByovdDiag("FLT:NTRL: ret0 stub not found in fltmgr\n");
+    ByovdDiag("FLT:NTRL: ret0 stub not found in flt\n");
     return 0;
 }
 
@@ -4271,7 +4349,7 @@ static uint64_t ScanDataSectionForFltGlobals(uint64_t fltmgrBase) {
 
             // 候选地址 = addr + off (FltGlobals 地址)
             uint64_t cand = addr + off;
-            ByovdDiag("FLT:NTRL: .data scan candidate at fltmgr+0x%llX (Flink=+0x%llX Blink=+0x%llX ✓back-ref)\n",
+            ByovdDiag("FLT:NTRL: .data scan candidate at flt+0x%llX (Flink=+0x%llX Blink=+0x%llX ✓back-ref)\n",
                 cand - fltmgrBase, flink - fltmgrBase, blink - fltmgrBase);
             if (candidateCount < 64) {
                 candidates[candidateCount].addr = cand;
@@ -4373,13 +4451,13 @@ static uint64_t ScanDataSectionForFltGlobals(uint64_t fltmgrBase) {
 
     if (bestIdx >= 0 && bestRef >= 2) {
         // ★ 至少 2 次引用才认为有效 (排除噪声)
-        ByovdDiag("FLT:NTRL: .data scan BEST candidate at fltmgr+0x%llX (refCount=%d) ✓ CONFIRMED\n",
+        ByovdDiag("FLT:NTRL: .data scan BEST candidate at flt+0x%llX (refCount=%d) ✓ CONFIRMED\n",
             candidates[bestIdx].addr - fltmgrBase, bestRef);
         return candidates[bestIdx].addr;
     }
 
     if (bestIdx >= 0 && bestRef == 1) {
-        ByovdDiag("FLT:NTRL: .data scan — only 1 ref, WEAK confidence at fltmgr+0x%llX\n",
+        ByovdDiag("FLT:NTRL: .data scan — only 1 ref, WEAK confidence at flt+0x%llX\n",
             candidates[bestIdx].addr - fltmgrBase);
         return candidates[bestIdx].addr;
     }
@@ -4568,7 +4646,7 @@ static uint64_t FindFilterByStringScan(uint64_t fltmgrBase, const wchar_t* targe
             // 匹配目标名称
             if (_wcsicmp(strBuf, targetName) != 0) continue;
 
-            ByovdDiag("FLT:STRSCAN: HIT! '%ls' UNICODE_STRING at fltmgr+0x%llX (buf=0x%llX len=%u)\n",
+            ByovdDiag("FLT:STRSCAN: HIT! '%ls' UNICODE_STRING at flt+0x%llX (buf=0x%llX len=%u)\n",
                 strBuf, uniAddr - fltmgrBase, (unsigned long long)ptr, uniLen);
             if (hitCount < 32) {
                 hits[hitCount].uniAddr = uniAddr;
@@ -4623,7 +4701,7 @@ static uint64_t FindFilterByStringScan(uint64_t fltmgrBase, const wchar_t* targe
                     if (kma.ReadKernelVA(val, &regPtr, 8) && regPtr > 0xFFFF800000000000ULL) {
                         if (kma.ReadKernelVA(regPtr, &mj, 1) && (mj <= 0x1B || mj == 0x80)) {
                             opsAddr = val;
-                            ByovdDiag("FLT:STRSCAN: FLT_FILTER at fltmgr+0x%llX (nameOff=0x%llX opsOff=0x%llX ops=0x%llX flink=0x%llX)\n",
+                            ByovdDiag("FLT:STRSCAN: FLT_FILTER at flt+0x%llX (nameOff=0x%llX opsOff=0x%llX ops=0x%llX flink=0x%llX)\n",
                                 filterBase - fltmgrBase, nameOff, opsOff, (unsigned long long)opsAddr, (unsigned long long)flink);
                             return filterBase;
                         }
@@ -4825,7 +4903,7 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
         int bestExtNameCount = 0;
         uint64_t bestExtPtrOff = 0;
         {
-            ByovdDiag("FLT:NTRL: BUILD 506: exploring non-fltmgr pointers in FltGlobals...\n");
+            ByovdDiag("FLT:NTRL: BUILD 506: exploring non-flt pointers in FltGlobals...\n");
             uint8_t fgBuf[0x200] = {};
             if (kma.ReadKernelVA(fltGlobals, fgBuf, sizeof(fgBuf))) {
                 struct ExtPtr { uint64_t offset; uint64_t value; };
@@ -4845,7 +4923,7 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
                     }
                 }
 
-                ByovdDiag("FLT:NTRL: BUILD 515: %d kernel pointers (incl. fltmgr range)\n", extCount);
+                ByovdDiag("FLT:NTRL: BUILD 515: %d kernel pointers (incl. flt range)\n", extCount);
                 // ★ BUILD 511: 探索所有外部指针, 跟踪最佳候选 + 多偏移 dump
                 //   (bestExtPtrForFallback 已在外部作用域声明 — BUILD 524)
 
@@ -4956,6 +5034,7 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
                     }
                 }
                 EXT_PTR_FOUND_511:
+                ;  // ★ BUILD 550: null statement after label (C++20 compatibility)
 
                 // ★ BUILD 514: 不移除 — 名称匹配失败时不设置 filterListHead
                 //   PDFWKRNL.sys memcpy 不验证地址, 从不可信 opsAddr 读取会 BSOD
@@ -5141,9 +5220,15 @@ bool MinifilterNeutralizer::NeutralizeCallbacks(uint64_t filterAddr) {
     auto& kma = KernelMemoryAccessor::Instance();
 
     // 获取 fltmgr.sys 基址用于 stub 扫描
-    uint64_t fltmgrBase = kma.GetKernelModuleBase("fltmgr.sys");
+    uint64_t fltmgrBase = 0;
+    {
+        char fltName[16];
+        STEALTH_STR_DECRYPT_TO("fltmgr.sys", fltName, sizeof(fltName));
+        fltmgrBase = kma.GetKernelModuleBase(fltName);
+        SecureZeroMemory(fltName, sizeof(fltName));
+    }
     if (!fltmgrBase) {
-        ByovdDiag("FLT:NTRL: fltmgr.sys not found\n");
+        ByovdDiag("FLT:NTRL: flt not found\n");
         return false;
     }
 
@@ -5241,20 +5326,26 @@ bool MinifilterNeutralizer::NeutralizeMessageTransfer() {
         return false;
     }
 
-    ByovdDiag("FLT:NTRL: === NEUTRALIZING MessageTransfer (keep alive) ===\n");
+    ByovdDiag("B550:NT:=== ntrl mtf (keep) ===\n");  // ★ BUILD 550: 脱敏 (原含过滤器名)
 
-    uint64_t fltmgrBase = kma.GetKernelModuleBase("fltmgr.sys");
+    uint64_t fltmgrBase = 0;
+    {
+        char fltName[16];
+        STEALTH_STR_DECRYPT_TO("fltmgr.sys", fltName, sizeof(fltName));
+        fltmgrBase = kma.GetKernelModuleBase(fltName);
+        SecureZeroMemory(fltName, sizeof(fltName));
+    }
     if (!fltmgrBase) {
-        ByovdDiag("FLT:NTRL: fltmgr.sys not loaded\n");
+        ByovdDiag("FLT:NTRL: flt not loaded\n");
         return false;
     }
-    ByovdDiag("FLT:NTRL: fltmgr.sys at 0x%llX\n", (unsigned long long)fltmgrBase);
+    ByovdDiag("FLT:NTRL: flt at 0x%llX\n", (unsigned long long)fltmgrBase);
 
     // 1. 定位 FltGlobals
     uint64_t fltGlobals = FindFltGlobals(fltmgrBase);
     if (!fltGlobals) return false;
 
-    // 2. 查找 PAC minifilter
+    // 2. 查找 tgt minifilter
     // ★ BUILD 497: 固定数组替代 std::wstring — 避免 CRT 堆依赖
     const wchar_t* pacName = GetPacTargetName();
     uint64_t filterAddr = FindFilterByName(fltmgrBase, fltGlobals, pacName);
@@ -5267,7 +5358,7 @@ bool MinifilterNeutralizer::NeutralizeMessageTransfer() {
         wchar_t kernName[256] = {};
         filterAddr = FindPacFilterInKernel(fltmgrBase, fltGlobals, kernName, 256);
         if (!filterAddr) {
-            ByovdDiag("FLT:NTRL: no PAC filter found in kernel\n");
+            ByovdDiag("FLT:NTRL: no tgt-filter found in kernel\n");
             return false;
         }
         pacName = kernName;
@@ -5298,7 +5389,7 @@ bool MinifilterNeutralizer::NeutralizeMessageTransfer() {
 //     c) 将所有回调替换为 ret0 stub
 //
 // 验证结果:
-//   TRUE  = 管道完整, PAC minifilter 中和 100% 可行 (只要驱动加载)
+//   TRUE  = 管道完整, tgt minifilter 中和 100% 可行 (只要驱动加载)
 //   FALSE = 管道有缺陷, 需要修复 (查看详细诊断日志)
 // ============================================================
 bool MinifilterNeutralizer::VerifyFltPipeline() {
@@ -5316,15 +5407,21 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
     int checksTotal = 4;
 
     // === Check 1: fltmgr.sys loaded ===
-    ByovdDiag("FLT:VERIFY: [1/%d] Checking fltmgr.sys...\n", checksTotal);
-    uint64_t fltmgrBase = kma.GetKernelModuleBase("fltmgr.sys");
+    ByovdDiag("FLT:VERIFY: [1/%d] Checking flt...\n", checksTotal);
+    uint64_t fltmgrBase = 0;
+    {
+        char fltName[16];
+        STEALTH_STR_DECRYPT_TO("fltmgr.sys", fltName, sizeof(fltName));
+        fltmgrBase = kma.GetKernelModuleBase(fltName);
+        SecureZeroMemory(fltName, sizeof(fltName));
+    }
     if (!fltmgrBase) {
-        ByovdDiag("FLT:VERIFY: FAIL — fltmgr.sys not loaded\n");
+        ByovdDiag("FLT:VERIFY: FAIL — flt not loaded\n");
         ByovdDiag("FLT:VERIFY: RESULT: FAIL (0/%d checks)\n", checksTotal);
         return false;
     }
     checksPassed++;
-    ByovdDiag("FLT:VERIFY: PASS — fltmgr.sys at 0x%llX\n", (unsigned long long)fltmgrBase);
+    ByovdDiag("FLT:VERIFY: PASS — flt at 0x%llX\n", (unsigned long long)fltmgrBase);
 
     // === Check 2: FltGlobals found ===
     ByovdDiag("FLT:VERIFY: [2/%d] Finding FltGlobals...\n", checksTotal);
@@ -5474,7 +5571,7 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
     //   在找到安全的 Win11 FrameList 解析方法前, 不执行 pool scan.
     // ============================================================
     ByovdDiag("FLT:VERIFY: FltGlobals found but FrameList path failed — Win11 layout mismatch (BUILD 495)\n");
-    ByovdDiag("FLT:VERIFY: pool scan DISABLED for safety (PDFWKRNL IOCTL causes BSOD on bad ptr)\n");
+    ByovdDiag("B550:VR:pool-scan disabled (bsod risk)\n");  // ★ BUILD 550: 脱敏 (原含驱动名)
 
     // ★ BUILD 504: 详细内存转储 — 逆向 Win11 FLT_FRAME/FLT_GLOBALS 结构
     //   读取 fltGlobals 周围 0x200 字节进行结构分析
@@ -5572,7 +5669,7 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
     // ★ BUILD 505: 探索 FltGlobals 中的非 fltmgr 内核指针
     //   Win11 的 FilterList 可能存储在池分配中, 通过 FltGlobals 的指针引用
     {
-        ByovdDiag("FLT:VERIFY: BUILD 505: exploring non-fltmgr pointers in FltGlobals...\n");
+        ByovdDiag("FLT:VERIFY: BUILD 505: exploring non-flt pointers in FltGlobals...\n");
         // 读取整个 FltGlobals 结构 (0x200 字节), 提取所有内核指针
         uint8_t fgBuf[0x200] = {};
         if (kma.ReadKernelVA(fltGlobals, fgBuf, sizeof(fgBuf))) {
@@ -5593,7 +5690,7 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
                 }
             }
 
-            ByovdDiag("FLT:VERIFY: BUILD 515: found %d kernel pointers (incl. fltmgr range)\n", extCount);
+            ByovdDiag("FLT:VERIFY: BUILD 515: found %d kernel pointers (incl. flt range)\n", extCount);
             // ★ BUILD 510: 探索所有外部指针, 选择命名条目最多的作为 FilterList
             //   BUILD 505 在找到第一个有效列表后就停止, 导致 +0xF8 假阳性被选中
             int bestNamedCount = 0;
@@ -5701,7 +5798,7 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
         bestQi, bestFilterListOff, bestFilterCount);
 
     // === Check 4: ret0 stub found ===
-    ByovdDiag("FLT:VERIFY: [4/%d] Finding ret0 stub in fltmgr.sys...\n", checksTotal);
+    ByovdDiag("FLT:VERIFY: [4/%d] Finding ret0 stub in flt...\n", checksTotal);
     uint64_t stubAddr = FindRet0Stub(fltmgrBase, 0x400000);
     if (!stubAddr) {
         ByovdDiag("FLT:VERIFY: FAIL — ret0 stub not found\n");
@@ -5709,7 +5806,7 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
         return false;
     }
     checksPassed++;
-    ByovdDiag("FLT:VERIFY: PASS — ret0 stub at fltmgr+0x%llX\n",
+    ByovdDiag("FLT:VERIFY: PASS — ret0 stub at flt+0x%llX\n",
         (unsigned long long)(stubAddr - fltmgrBase));
 
     // === FINAL VERDICT ===
@@ -5717,7 +5814,7 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
     ByovdDiag("FLT:VERIFY: RESULT: PASS (%d/%d checks)\n", checksPassed, checksTotal);
     ByovdDiag("FLT:VERIFY: === PIPELINE VERIFIED ===\n");
     ByovdDiag("FLT:VERIFY: | FltGlobals → FrameList → FilterList (%d filters) → ret0 stub |\n", bestFilterCount);
-    ByovdDiag("FLT:VERIFY: | ⚠ UNTESTED — install PAC to verify neutralization works |\n");
+    ByovdDiag("FLT:VERIFY: | ⚠ UNTESTED — install tgt to verify neutralization works |\n");
     ByovdDiag("FLT:VERIFY: ========================================\n");
 
     return true;
@@ -5729,7 +5826,13 @@ bool MinifilterNeutralizer::IsMessageTransferNeutralized() {
 
     // 检查 fltmgr FilterFindFirst 列表中的 minifilter 是否仍然是 stub
     // 简化为: 检查 fltmgr 内是否有非 stub 的 MessageTransfer 回调
-    uint64_t fltmgrBase = kma.GetKernelModuleBase("fltmgr.sys");
+    uint64_t fltmgrBase = 0;
+    {
+        char fltName[16];
+        STEALTH_STR_DECRYPT_TO("fltmgr.sys", fltName, sizeof(fltName));
+        fltmgrBase = kma.GetKernelModuleBase(fltName);
+        SecureZeroMemory(fltName, sizeof(fltName));
+    }
     if (!fltmgrBase) return true;
 
     uint64_t fltGlobals = FindFltGlobals(fltmgrBase);
@@ -5743,7 +5846,7 @@ bool MinifilterNeutralizer::IsMessageTransferNeutralized() {
     }
     if (!filterAddr) {
         // minifilter 不在列表中 — 被卸载了, 需要重新安装假的存在性
-        ByovdDiag("FLT:NTRL:Guard: PAC filter not found in FilterList!\n");
+        ByovdDiag("FLT:NTRL:Guard: tgt-filter not found in FilterList!\n");
         return false;
     }
 
@@ -5805,15 +5908,26 @@ bool MinifilterNeutralizer::IsMessageTransferNeutralized() {
 // ============================================================
 
 // ★ v3.126p: PAC 相关关键词 — 用于模糊匹配 PAC 的 minifilter/服务/驱动名
-static const wchar_t* g_pacPatterns[] = {
-    L"messagetransfer",     // 当前已知名称 (2024-2026)
-    L"pvpac",               // 常见变体 (PvP Anti-Cheat)
-    L"pw_ac",               // PerfectWorld Anti-Cheat 缩写
-    L"perfectworldac",      // 完整名称
-    L"perfectworld",        // 完美世界
-    L"pwanti",              // PerfectWorld Anti-*
-    nullptr
-};
+// ★ BUILD 550: 改为运行时解密 — 原 L"messagetransfer" 等明文字符串出现在 .rdata
+//   GetPacPatterns() 首次调用时用 STEALTH_WSTR_DECRYPT_TO 填充静态缓冲, 之后直接返回指针
+static const wchar_t* const* GetPacPatterns() {
+    static wchar_t patterns[8][32] = {};
+    static const wchar_t* patternPtrs[9] = {};
+    static bool initialized = false;
+    if (!initialized) {
+        STEALTH_WSTR_DECRYPT_TO("messagetransfer", patterns[0], 32);  // 当前已知名称 (2024-2026)
+        STEALTH_WSTR_DECRYPT_TO("pvpac", patterns[1], 32);            // 常见变体 (PvP Anti-Cheat)
+        STEALTH_WSTR_DECRYPT_TO("pw_ac", patterns[2], 32);            // PerfectWorld Anti-Cheat 缩写
+        STEALTH_WSTR_DECRYPT_TO("perfectworldac", patterns[3], 32);   // 完整名称
+        STEALTH_WSTR_DECRYPT_TO("perfectworld", patterns[4], 32);     // 完美世界
+        STEALTH_WSTR_DECRYPT_TO("pwanti", patterns[5], 32);           // PerfectWorld Anti-*
+        // patterns[6], patterns[7] 保持全零 (作为终止符缓冲)
+        for (int i = 0; i < 8; i++) patternPtrs[i] = patterns[i];
+        patternPtrs[8] = nullptr;
+        initialized = true;
+    }
+    return patternPtrs;
+}
 
 // ★ v3.126q: 系统 minifilter 白名单 — 防止模糊匹配误伤 Windows 关键驱动
 //   这些是 Windows 内置 minifilter, 永远不可能是 PAC, 匹配到就直接排除
@@ -5834,10 +5948,12 @@ static bool IsPacPattern(const wchar_t* name) {
     }
 
     // 模糊匹配 PAC 模式
-    for (int i = 0; g_pacPatterns[i]; i++) {
+    // ★ BUILD 550: 改用 GetPacPatterns() (原 g_pacPatterns 明文已加密)
+    const wchar_t* const* pats = GetPacPatterns();
+    for (int i = 0; pats[i]; i++) {
         const wchar_t* p = name;
         while (*p) {
-            const wchar_t* a = p, *b = g_pacPatterns[i];
+            const wchar_t* a = p, *b = pats[i];
             while (*a && *b && towlower(*a) == towlower(*b)) { a++; b++; }
             if (!*b) return true;
             p++;
@@ -5867,7 +5983,8 @@ static const wchar_t* GetPacTargetName() {
     //   项目唯一 PAC 目标是 MessageTransfer.sys (完美世界 CS2 反作弊 minifilter)
     //   历史改名容错已不需要 (MessageTransfer 不会被改名)
     //   fltlib.dll RPC 枚举路径已移除 (参见函数头注释)
-    wcscpy_s(g_cachedPacName, L"MessageTransfer");
+    // ★ BUILD 550: 解密 PAC 名 (原 L"MessageTransfer" 明文)
+    STEALTH_WSTR_DECRYPT_TO("MessageTransfer", g_cachedPacName, 256);
     return g_cachedPacName;
 }
 
@@ -5882,7 +5999,7 @@ static int WStringToString(const wchar_t* ws, char* outBuf, int outBufSize) {
     return len - 1; // 不包括 null terminator
 }
 
-// ★ v3.126p: 内核层模糊扫描 PAC minifilter (用于 Neutralize 失败后的回退)
+// ★ v3.126p: 内核层模糊扫描 tgt minifilter (用于 Neutralize 失败后的回退)
 // ★ BUILD 497: 固定数组替代 std::wstring& — 避免 CRT 堆依赖
 static uint64_t FindPacFilterInKernel(uint64_t fltmgrBase, uint64_t fltGlobals, wchar_t* outName, int outNameChars) {
     auto& kma = KernelMemoryAccessor::Instance();
@@ -6016,7 +6133,7 @@ static uint64_t FindPacFilterInKernel(uint64_t fltmgrBase, uint64_t fltGlobals, 
                             if (outName && outNameChars > 0) {
                                 wcsncpy_s(outName, outNameChars, filterName, (size_t)(outNameChars - 1));
                             }
-                            ByovdDiag("FLT:NTRL: FindPacFilterInKernel BUILD 520: found '%ls' at 0x%llX (alOff=0x%llX nameOff=0x%llX)\n",
+                            ByovdDiag("FLT:NTRL: FindFltInKern B520: found '%ls' at 0x%llX (alOff=0x%llX nameOff=0x%llX)\n",
                                 filterName, (unsigned long long)filterBase, alOff, nameOff);
                             return filterBase;
                         }
@@ -6093,11 +6210,11 @@ static bool IsPacMinifilterLoaded() {
 #endif // BUILD 535: IsPacMinifilterLoaded 废弃
 
 static bool DisablePacService() {
-    ByovdDiag("PAC:DisablePacService: opening SCM...\n");
+    ByovdDiag("B550:PC:DPS: opening SCM...\n");
 
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (!scm) {
-        ByovdDiag("PAC: OpenSCManager failed (err=%u)\n", GetLastError());
+        ByovdDiag("B550:PC: OpenSCManager failed (err=%u)\n", GetLastError());
         return false;
     }
 
@@ -6106,7 +6223,7 @@ static bool DisablePacService() {
     SC_HANDLE svc = OpenServiceW(scm, pacName,
         SERVICE_STOP | SERVICE_QUERY_STATUS);
     if (!svc) {
-        ByovdDiag("PAC: SCM service '%ls' not found\n", pacName);
+        ByovdDiag("B550:PC: SCM service '%ls' not found\n", pacName);
         CloseServiceHandle(scm);
         return true; // 未找到 = 可能已经卸载, 不算失败
     }
@@ -6115,22 +6232,22 @@ static bool DisablePacService() {
     SERVICE_STATUS_PROCESS ssp = {};
     DWORD bytesNeeded = 0;
     if (QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO, (LPBYTE)&ssp, sizeof(ssp), &bytesNeeded)) {
-        ByovdDiag("PAC: service state=%u\n", ssp.dwCurrentState);
+        ByovdDiag("B550:PC: service state=%u\n", ssp.dwCurrentState);
         if (ssp.dwCurrentState == SERVICE_RUNNING) {
             // 发送停止命令
             SERVICE_STATUS stopStatus = {};
             if (ControlService(svc, SERVICE_CONTROL_STOP, &stopStatus)) {
-                ByovdDiag("PAC: STOP signal sent\n");
+                ByovdDiag("B550:PC: STOP signal sent\n");
                 // 等待最多 3 秒
                 for (int i = 0; i < 15; i++) {
                     Sleep(200);
                     QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO, (LPBYTE)&ssp, sizeof(ssp), &bytesNeeded);
                     if (ssp.dwCurrentState == SERVICE_STOPPED) break;
                 }
-                ByovdDiag("PAC: final state=%u\n", ssp.dwCurrentState);
+                ByovdDiag("B550:PC: final state=%u\n", ssp.dwCurrentState);
             } else {
                 DWORD err = GetLastError();
-                ByovdDiag("PAC: ControlService(STOP) failed (err=%u)\n", err);
+                ByovdDiag("B550:PC: ControlService(STOP) failed (err=%u)\n", err);
                 // 错误 1062 (服务未启动) 不算失败
                 if (err != 1062) {
                     CloseServiceHandle(svc);
@@ -6142,7 +6259,7 @@ static bool DisablePacService() {
     }
 
     // ★ BUILD 507: 只停止服务, 不删除 (保留注册项让 CS2 检测通过)
-    ByovdDiag("PAC: service stopped (kept registered for CS2 detection)\n");
+    ByovdDiag("B550:PC: service stopped (kept registered for CS2 detection)\n");
 
     CloseServiceHandle(svc);
     CloseServiceHandle(scm);
@@ -6154,13 +6271,13 @@ static bool UnloadPacMinifilter() {
     // 动态加载 fltlib.dll → FilterUnload
     HMODULE hFltLib = LoadLibraryW(L"fltlib.dll");
     if (!hFltLib) {
-        ByovdDiag("PAC: fltlib.dll not available\n");
+        ByovdDiag("B550:PC: fltlib.dll not available\n");
         return false;
     }
 
     _FilterUnload pFilterUnload = (_FilterUnload)GetProcAddress(hFltLib, "FilterUnload");
     if (!pFilterUnload) {
-        ByovdDiag("PAC: FilterUnload not exported\n");
+        ByovdDiag("B550:PC: FilterUnload not exported\n");
         FreeLibrary(hFltLib);
         return false;
     }
@@ -6170,12 +6287,12 @@ static bool UnloadPacMinifilter() {
     FreeLibrary(hFltLib);
 
     if (SUCCEEDED(hr)) {
-        ByovdDiag("PAC: minifilter unloaded OK\n");
+        ByovdDiag("B550:PC: minifilter unloaded OK\n");
         return true;
     } else {
         // 0x801F0010 = 未找到过滤器 (可能已卸载)
         // 0x801F000F = 过滤器有活动实例但正在卸载
-        ByovdDiag("PAC: FilterUnload returned 0x%08X (may already be unloaded)\n", (unsigned)hr);
+        ByovdDiag("B550:PC: FilterUnload returned 0x%08X (may already be unloaded)\n", (unsigned)hr);
         return (hr == 0x801F0010 || hr == 0x801F000F); // 不算失败
     }
 }
@@ -6241,7 +6358,7 @@ static void DeletePacDriverFiles() {
                     }
 
                     if (found) {
-                        ByovdDiag("PAC:DeleteDrvFiles: found %ls\n", drvFile);
+                        ByovdDiag("B550:PC:DeleteDrvFiles: found %ls\n", drvFile);
                         wchar_t bakFile[MAX_PATH] = {};
                         wsprintfW(bakFile, L"%s.bak", drvFile);
                         MoveFileExW(drvFile, bakFile, MOVEFILE_REPLACE_EXISTING);
@@ -6260,7 +6377,7 @@ static void DeletePacDriverFiles() {
     if (!DeleteFileW(sys32Drv)) {
         DWORD err = GetLastError();
         if (err != ERROR_FILE_NOT_FOUND) {
-            ByovdDiag("PAC:DeleteDrvFiles: cannot delete system32 driver, err=%d, scheduling reboot\n", (int)err);
+            ByovdDiag("B550:PC:DeleteDrvFiles: cannot delete system32 driver, err=%d, scheduling reboot\n", (int)err);
             MoveFileExW(sys32Drv, nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
         }
     } else {
@@ -6271,17 +6388,20 @@ static void DeletePacDriverFiles() {
 }
 
 KernelDefense::PacStatus KernelDefense::DisablePac() {
-    ByovdDiag("PAC:DisablePac: starting...\n");
+    ByovdDiag("B550:PC:DP: starting...\n");
 
     // ★ BUILD 474: 检查 MessageTransfer 是否加载 — 否则跳过 SCM (OpenSCManagerW 崩溃)
+    // ★ BUILD 550: 解密内核模块名 (原 "MessageTransfer.sys" 明文, 之前的注释错误)
     {
-        uint64_t mtBase = KernelMemoryAccessor::Instance().GetKernelModuleBase(
-            "MessageTransfer.sys");
+        char mtName[32];
+        STEALTH_STR_DECRYPT_TO("MessageTransfer.sys", mtName, sizeof(mtName));
+        uint64_t mtBase = KernelMemoryAccessor::Instance().GetKernelModuleBase(mtName);
+        SecureZeroMemory(mtName, sizeof(mtName));
         if (!mtBase) {
-            ByovdDiag("PAC:DisablePac: MessageTransfer.sys not loaded — PAC not installed\n");
+            ByovdDiag("B550:DP:mtf not loaded\n");  // ★ BUILD 550: 脱敏 (原含过滤器名)
             return PacStatus::NotInstalled;  // ★ BUILD 503: 未安装, 非成功也非失败
         }
-        ByovdDiag("PAC:DisablePac: MessageTransfer.sys loaded at 0x%llX\n",
+        ByovdDiag("B550:DP:mtf loaded at 0x%llX\n",  // ★ BUILD 550: 脱敏
             (unsigned long long)mtBase);
     }
 
@@ -6307,9 +6427,9 @@ KernelDefense::PacStatus KernelDefense::DisablePac() {
     //   FilterUnload 回退已移除 — 卸载也会导致 CS2 踢出。
     bool result = ntrlOk;
 
-    ByovdDiag("PAC:DisablePac: ntrl=%d svc=%d → result=%d%s\n",
+    ByovdDiag("B550:PC:DP: ntrl=%d svc=%d → result=%d%s\n",
         (int)ntrlOk, (int)svcOk, (int)result,
-        (!result) ? " (WARNING: neutralize failed, PAC still active!)" : "");
+        (!result) ? " (WARNING: neutralize failed, tgt still active!)" : "");
 
     // ★ BUILD 503: 返回三态结果
     return result ? PacStatus::Neutralized : PacStatus::Failed;
@@ -6319,7 +6439,7 @@ void KernelDefense::GuardPac() {
     // ★ BUILD 530: GuardPac 整体废弃 — SCM 操作 (OpenSCManagerW/OpenServiceW/
     //   QueryServiceStatusEx) 在 manual-mapped DLL 上下文中导致 ntdll 崩溃
     //   (CRASH: 0xC0000005 in ntdll +0x127D29, ReapplyAllCallbacks → GuardPac → OpenSCManagerW).
-    //   且 BUILD 528 PAC minifilter 中和已废弃 (DisablePac 注释掉), GuardPac 即使
+    //   且 BUILD 528 tgt minifilter 中和已废弃 (DisablePac 注释掉), GuardPac 即使
     //   检测到 PAC 重新启用也无法中和. ObCallbacks 持续移除由 ReDisablePacCallbacks
     //   在主循环中独立处理 (每 4-6s), 不依赖 GuardPac.
     //   (memory 约束: "All SCM operations must be replaced with direct registry
@@ -6330,9 +6450,12 @@ void KernelDefense::GuardPac() {
     bool needReDisable = false;
 
     // ★ BUILD 474: 先检查 MessageTransfer 是否加载 — 否则 SCM 崩溃
+    // ★ BUILD 550: 解密内核模块名 (原 "MessageTransfer.sys" 明文)
     {
-        uint64_t mtBase = KernelMemoryAccessor::Instance().GetKernelModuleBase(
-            "MessageTransfer.sys");
+        char mtName[32];
+        STEALTH_STR_DECRYPT_TO("MessageTransfer.sys", mtName, sizeof(mtName));
+        uint64_t mtBase = KernelMemoryAccessor::Instance().GetKernelModuleBase(mtName);
+        SecureZeroMemory(mtName, sizeof(mtName));
         if (!mtBase) {
             return;  // 驱动未加载, 无需检查 SCM
         }
@@ -6362,13 +6485,13 @@ void KernelDefense::GuardPac() {
     if (!needReDisable) {
         bool filterExists = IsPacMinifilterLoaded();
         if (filterExists && !MinifilterNeutralizer::IsMessageTransferNeutralized()) {
-            ByovdDiag("PAC:GuardPac: callback stubs overwritten! re-neutralizing...\n");
+            ByovdDiag("B550:PC:GP: callback stubs overwritten! re-neutralizing...\n");
             needReDisable = true;
         }
     }
 
     if (needReDisable) {
-        ByovdDiag("PAC:GuardPac: PAC re-enabled! disabling again...\n");
+        ByovdDiag("B550:PC:GP: tgt re-enabled! disabling again...\n");
         DisablePac();
     }
 #endif
@@ -6427,21 +6550,21 @@ KernelDefense::Result KernelDefense::EnableAll() {
     int pacProc = cbDisabler.DisableProcessNotifyCallbacks(pacNameA);
     int pacImg = cbDisabler.DisableImageNotifyCallbacks(pacNameA);
     if (pacOb || pacProc || pacImg) {
-        ByovdDiag("BYOVD: callbacks removed (PAC/%s) — ob=%d proc=%d img=%d\n",
+        ByovdDiag("BYOVD: callbacks removed (tgt/%s) — ob=%d proc=%d img=%d\n",
             pacNameA, pacOb, pacProc, pacImg);
         result.obCallbacksRemoved += pacOb;
         result.processCallbacksRemoved += pacProc;
         result.imageCallbacksRemoved += pacImg;
     }
 
-    // ★ BUILD 528: PAC minifilter 中和已废弃 — Win11 上 FLT_FILTER 布局无法定位,
+    // ★ BUILD 528: tgt minifilter 中和已废弃 — Win11 上 FLT_FILTER 布局无法定位,
     //   BUILD 525-527 均失败。改用 E+G 组合方案 (DKOM+EkkoSleep+ObCallbacks)。
     //   注释掉 VerifyFltPipeline + DisablePac, 避免无意义的内核内存读取风险。
     //   (PDFWKRNL.sys memcpy 不验证地址, VerifyFltPipeline 读取 FltGlobals 有蓝屏风险)
     // bool fltPipelineOk = MinifilterNeutralizer::VerifyFltPipeline();
     // ByovdDiag("BYOVD: FLT pipeline verify: %s\n", fltPipelineOk ? "PASS" : "FAIL");
     // result.pacStatus = DisablePac();
-    ByovdDiag("BYOVD: BUILD 528 — PAC neutralization disabled (E+G scheme, no minifilter touch)\n");
+    ByovdDiag("BYOVD: BUILD 528 — tgt neutralization disabled (E+G scheme, no minifilter touch)\n");
     result.pacStatus = KernelDefense::PacStatus::NotInstalled; // 不再尝试中和
 
     // ★ v3.126m: 清理内核驱动痕迹 (MmUnloadedDrivers / PiDDBCacheTable / CiHashBucket)
@@ -6528,7 +6651,7 @@ void KernelDefense::ReapplyAllCallbacks() {
         ByovdDiag("BYOVD:KernelDefense: ReapplyAllCallbacks removed %d callbacks\n", total);
     }
 
-    // ★ v3.126j: PAC 守卫 — 检查 PAC minifilter 是否被重新安装
+    // ★ v3.126j: PAC 守卫 — 检查 tgt minifilter 是否被重新安装
     GuardPac();
 }
 

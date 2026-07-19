@@ -6,6 +6,7 @@
 
 #include "syscall_direct.h"
 #include "platform.h"
+#include "module_resolver.h"  // ★ BUILD 550: GetModuleBaseFromPEB + ModNameHash (替代 GetModuleHandleW)
 #include <winternl.h>
 #include <psapi.h>
 #include <initializer_list>
@@ -54,7 +55,7 @@ SyscallResolver& SyscallResolver::Instance() {
 }
 
 DWORD SyscallResolver::ExtractSyscallNumber(const char* funcName) {
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    HMODULE ntdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
     if (!ntdll) return 0;
 
     auto* funcAddr = reinterpret_cast<BYTE*>(GetProcAddress(ntdll, funcName));
@@ -78,7 +79,7 @@ DWORD SyscallResolver::ExtractSyscallNumber(const char* funcName) {
 }
 
 bool SyscallResolver::IsStubHooked(const char* funcName) {
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    HMODULE ntdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
     if (!ntdll) return true;
 
     auto* funcAddr = reinterpret_cast<BYTE*>(GetProcAddress(ntdll, funcName));
@@ -175,7 +176,7 @@ DWORD SyscallResolver::ScanNearbySyscall(BYTE* targetAddr, int searchRange) {
 }
 
 DWORD SyscallResolver::RecoverSSNviaHalo(const char* funcName) {
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    HMODULE ntdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
     if (!ntdll) return 0;
 
     auto* funcAddr = reinterpret_cast<BYTE*>(GetProcAddress(ntdll, funcName));
@@ -224,7 +225,7 @@ uintptr_t SyscallResolver::GetSyscallRetGadget() {
     if (m_syscallRetGadget) return m_syscallRetGadget;
 
     // 在 ntdll.dll 中搜索 syscall;ret (0F 05 C3) gadget
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    HMODULE ntdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
     if (!ntdll) return 0;
 
     auto* dos = reinterpret_cast<PIMAGE_DOS_HEADER>(ntdll);
@@ -265,7 +266,7 @@ uintptr_t SyscallResolver::GetRetGadget() {
     if (m_retGadget) return m_retGadget;
 
     // 在 ntdll.dll 中搜索 ret (C3)
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    HMODULE ntdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
     if (!ntdll) return 0;
 
     MODULEINFO modInfo;
@@ -285,7 +286,7 @@ uintptr_t SyscallResolver::GetRetGadget() {
 bool SyscallResolver::Initialize() {
     if (m_initialized) return true;
 
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    HMODULE ntdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
     if (!ntdll) return false;
 
     // 1. 正常提取 SSN (Hell's Gate)
@@ -331,7 +332,7 @@ SIZE_T CallStackSpoofer::GetFunctionStackSize(uintptr_t funcAddr) {
     // .pdata 中的 RUNTIME_FUNCTION 条目包含 UnwindData
     // UNWIND_INFO.SizeOfProlog 和 ChainedInfo 包含栈信息
 
-    HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    HMODULE kernel32 = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"kernel32.dll"));
     if (!kernel32) return 0;
 
     auto* dos = reinterpret_cast<PIMAGE_DOS_HEADER>(kernel32);
@@ -385,7 +386,7 @@ bool CallStackSpoofer::FindFatFrames() {
     if (m_initialized) return m_fatFrameCount > 0;
 
     // 扫描 kernel32.dll 找到栈分配 >= 120 bytes 的函数
-    HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    HMODULE kernel32 = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"kernel32.dll"));
     if (!kernel32) return false;
 
     MODULEINFO modInfo;
@@ -554,7 +555,8 @@ bool FindRetGadgets(uintptr_t* outGadgets, int* outCount, int targetCount) {
     size_t perModule = static_cast<size_t>(targetCount) / 3 + 4;
 
     for (auto* dllName : dlls) {
-        HMODULE mod = GetModuleHandleW(dllName);
+        // ★ BUILD 550: PEB Ldr 遍历替代 GetModuleHandleW (规避 PAC 用户态 hook)
+        HMODULE mod = stealth::GetModuleBaseFromPEB(stealth::ModNameHashRT(dllName));
         if (mod) {
             ScanModuleForRetGadgets(mod, outGadgets, outCount, targetCount, perModule);
         }
@@ -562,7 +564,7 @@ bool FindRetGadgets(uintptr_t* outGadgets, int* outCount, int targetCount) {
 
     // 如果不够, 继续从 ntdll 补充
     if (*outCount < targetCount) {
-        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        HMODULE ntdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
         if (ntdll) {
             ScanModuleForRetGadgets(ntdll, outGadgets, outCount, targetCount,
                 static_cast<size_t>(targetCount) - *outCount);
@@ -976,7 +978,7 @@ NTSTATUS ExecuteSyscall(const char* funcName, DWORD ssn,
 
     if (!stub) {
         // 最终回退: 使用 ntdll 中的原版函数
-        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        HMODULE ntdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
         auto fn = reinterpret_cast<FARPROC>(GetProcAddress(ntdll, funcName));
         if (!fn) return STATUS_NOT_SUPPORTED;
         return setupArgs(reinterpret_cast<SyscallFn>(fn));
@@ -1003,7 +1005,7 @@ NTSTATUS name(__VA_ARGS__, SyscallMethod method) { \
         /* 最终回退: 调用原始 ntdll 导出函数 */ \
         using Fn_t = NTSTATUS(NTAPI*)(__VA_ARGS__); \
         static auto fn = reinterpret_cast<Fn_t>( \
-            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), ntdllFn)); \
+            GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), ntdllFn)); \
         if (fn) return fn(__VA_ARGS__); \
         return STATUS_NOT_SUPPORTED; \
     } \
@@ -1025,7 +1027,7 @@ NTSTATUS name(__VA_ARGS__, SyscallMethod method) { \
     if (!stub) { \
         using Fn_t = NTSTATUS(NTAPI*)(__VA_ARGS__); \
         static auto fn = reinterpret_cast<Fn_t>( \
-            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), ntdllFn)); \
+            GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), ntdllFn)); \
         if (fn) return fn(__VA_ARGS__); \
         return STATUS_NOT_SUPPORTED; \
     } \
@@ -1062,7 +1064,7 @@ NTSTATUS SysAllocateVirtualMemory(
     if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
     if (!stub) {
         using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID*, ULONG_PTR, PSIZE_T, ULONG, ULONG);
-        auto fn = reinterpret_cast<Fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtAllocateVirtualMemory"));
+        auto fn = reinterpret_cast<Fn>(GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtAllocateVirtualMemory"));
         return fn ? fn(hProcess, baseAddr, zeroBits, regionSize, allocType, protect) : STATUS_NOT_SUPPORTED;
     }
     using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID*, ULONG_PTR, PSIZE_T, ULONG, ULONG);
@@ -1094,7 +1096,7 @@ NTSTATUS SysProtectVirtualMemory(
     if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
     if (!stub) {
         using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID*, PSIZE_T, ULONG, PULONG);
-        auto fn = reinterpret_cast<Fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtProtectVirtualMemory"));
+        auto fn = reinterpret_cast<Fn>(GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtProtectVirtualMemory"));
         return fn ? fn(hProcess, baseAddr, regionSize, newProtect, oldProtect) : STATUS_NOT_SUPPORTED;
     }
     using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID*, PSIZE_T, ULONG, PULONG);
@@ -1126,7 +1128,7 @@ NTSTATUS SysWriteVirtualMemory(
     if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
     if (!stub) {
         using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
-        auto fn = reinterpret_cast<Fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtWriteVirtualMemory"));
+        auto fn = reinterpret_cast<Fn>(GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtWriteVirtualMemory"));
         return fn ? fn(hProcess, baseAddr, buffer, bytesToWrite, bytesWritten) : STATUS_NOT_SUPPORTED;
     }
     using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
@@ -1158,7 +1160,7 @@ NTSTATUS SysReadVirtualMemory(
     if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
     if (!stub) {
         using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
-        auto fn = reinterpret_cast<Fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtReadVirtualMemory"));
+        auto fn = reinterpret_cast<Fn>(GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtReadVirtualMemory"));
         return fn ? fn(hProcess, baseAddr, buffer, bytesToRead, bytesRead) : STATUS_NOT_SUPPORTED;
     }
     using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
@@ -1190,7 +1192,7 @@ NTSTATUS SysOpenProcess(
     if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
     if (!stub) {
         using Fn = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID);
-        auto fn = reinterpret_cast<Fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtOpenProcess"));
+        auto fn = reinterpret_cast<Fn>(GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtOpenProcess"));
         return fn ? fn(hProcess, desiredAccess, objAttr, clientId) : STATUS_NOT_SUPPORTED;
     }
     using Fn = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID);
@@ -1222,7 +1224,7 @@ NTSTATUS SysQuerySystemInformation(
     if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
     if (!stub) {
         using Fn = NTSTATUS(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
-        auto fn = reinterpret_cast<Fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation"));
+        auto fn = reinterpret_cast<Fn>(GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQuerySystemInformation"));
         return fn ? fn(infoClass, info, infoLen, returnLen) : STATUS_NOT_SUPPORTED;
     }
     using Fn = NTSTATUS(NTAPI*)(ULONG, PVOID, ULONG, PULONG);
@@ -1254,7 +1256,7 @@ NTSTATUS SysQueryInformationProcess(
     if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
     if (!stub) {
         using Fn = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-        auto fn = reinterpret_cast<Fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+        auto fn = reinterpret_cast<Fn>(GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQueryInformationProcess"));
         return fn ? fn(hProcess, infoClass, info, infoLen, returnLen) : STATUS_NOT_SUPPORTED;
     }
     using Fn = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
@@ -1283,7 +1285,7 @@ NTSTATUS SysClose(HANDLE handle, SyscallMethod method) {
     if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
     if (!stub) {
         using Fn = NTSTATUS(NTAPI*)(HANDLE);
-        auto fn = reinterpret_cast<Fn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtClose"));
+        auto fn = reinterpret_cast<Fn>(GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtClose"));
         return fn ? fn(handle) : STATUS_NOT_SUPPORTED;
     }
     using Fn = NTSTATUS(NTAPI*)(HANDLE);

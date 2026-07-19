@@ -6,6 +6,7 @@
 #include "platform.h"
 #include "syscall_direct.h"
 #include "stealth_process.h"
+#include "module_resolver.h"  // ★ BUILD 550: ModNameHash 替代明文模块名比较
 #include <psapi.h>
 // ★ BUILD 500: 移除 <random> <chrono> — CRT 堆依赖, 用简易 LCG RNG 替代
 
@@ -53,9 +54,13 @@ HMODULE PeMutator::GetSelfModule() {
         }
     }
 
-    // 方法2: 回退使用 GetModuleHandleW
+    // 方法2: 回退 — 从 PEB+0x10 (ImageBaseAddress) 读取
+    // ★ BUILD 550: 替代 GetModuleHandleW(nullptr) (规避 PAC 用户态 hook)
     if (!result) {
-        result = GetModuleHandleW(nullptr); // EXE 本身
+        PPEB peb2 = reinterpret_cast<PPEB>(__readgsqword(0x60));
+        if (peb2) {
+            result = *reinterpret_cast<HMODULE*>(reinterpret_cast<BYTE*>(peb2) + 0x10);
+        }
     }
 
     return result;
@@ -194,7 +199,11 @@ bool PeMutator::ObfuscateImportTable() {
     //
     // 更好的策略: 启用 stealth_config.obfuscateImports = false,
     // 改为在编译后使用 pe_postprocessor.py 修改文件中的导入名称。
-
+    //
+    // ★ BUILD 550: 整个函数 #if 0 包裹 — 该函数从未被调用 (dead code),
+    //   且 sensitiveApis[] 数组中的 "CreateToolhelp32Snapshot" 等明文 API 名
+    //   仍会出现在 .rdata 段, 增加检测特征。改用编译后 pe_postprocessor.py 处理。
+#if 0
     auto* nt = GetNtHeaders();
     if (!nt) return false;
 
@@ -208,19 +217,19 @@ bool PeMutator::ObfuscateImportTable() {
         "AdjustTokenPrivileges"
     };
 
-    auto* firstDesc = reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR>(
+    auto* firstDesc = reinterpret_cast<PIMAGE_IMPORT_DESCRIPTOR*>(
         GetSelfBase() + importDir.VirtualAddress);
 
     for (auto* desc = firstDesc; desc->Name; desc++) {
         // 只操作 OriginalFirstThunk (INT), 不操作 FirstThunk (IAT)
         if (!desc->OriginalFirstThunk) continue;
 
-        auto* thunk = reinterpret_cast<PIMAGE_THUNK_DATA>(
+        auto* thunk = reinterpret_cast<PIMAGE_THUNK_DATA*>(
             GetSelfBase() + desc->OriginalFirstThunk);
 
         for (int i = 0; thunk[i].u1.AddressOfData; i++) {
             if (!(thunk[i].u1.Ordinal & IMAGE_ORDINAL_FLAG)) {
-                auto* importByName = reinterpret_cast<PIMAGE_IMPORT_BY_NAME>(
+                auto* importByName = reinterpret_cast<PIMAGE_IMPORT_BY_NAME*>(
                     GetSelfBase() + thunk[i].u1.AddressOfData);
 
                 for (auto* sensitive : sensitiveApis) {
@@ -237,7 +246,7 @@ bool PeMutator::ObfuscateImportTable() {
                             "GetTickCount\x00\x00\x00\x00",
                             "InitializeCritX\x00\x00",
                             "SetLastError\x00\x00\x00\x00",
-                            "GetModuleHandleA",
+                            "GetConsoleWindow",
                             "LocalFree\x00\x00\x00\x00\x00\x00",
                             "WaitForSingleObX\x00"
                         };
@@ -252,7 +261,7 @@ bool PeMutator::ObfuscateImportTable() {
             }
         }
     }
-
+#endif
     return true;
 }
 
@@ -510,12 +519,13 @@ bool IntegrityBypass::IsNetVarValid(uintptr_t value, uintptr_t min, uintptr_t ma
 }
 
 bool IntegrityBypass::IsVACLoaded(HANDLE hProcess) {
-    // VAC 模块特征名称
-    const wchar_t* vacModules[] = {
-        L"GameOverlayRenderer.dll",   // Steam Overlay (VAC 组件)
-        L"steamclient.dll",           // Steam 客户端
-        L"tier0.dll",                 // Source 引擎基础
-        L"serverbrowser.dll",
+    // ★ BUILD 550: VAC 模块名用编译期 hash 比较 (原明文 L"GameOverlayRenderer.dll" 等)
+    //   二进制中不出现明文 Steam/Source 模块名
+    constexpr uint32_t vacHashes[] = {
+        stealth::ModNameHash(L"GameOverlayRenderer.dll"),
+        stealth::ModNameHash(L"steamclient.dll"),
+        stealth::ModNameHash(L"tier0.dll"),
+        stealth::ModNameHash(L"serverbrowser.dll"),
     };
 
     HMODULE hMods[1024] = {};
@@ -527,8 +537,9 @@ bool IntegrityBypass::IsVACLoaded(HANDLE hProcess) {
     for (DWORD i = 0; i < modCount; i++) {
         WCHAR modName[MAX_PATH] = {};
         if (GetModuleBaseNameW(hProcess, hMods[i], modName, MAX_PATH)) {
-            for (auto* vacMod : vacModules) {
-                if (_wcsicmp(modName, vacMod) == 0) {
+            uint32_t modHash = stealth::ModNameHashRT(modName);
+            for (auto h : vacHashes) {
+                if (modHash == h) {
                     return true;
                 }
             }
@@ -539,6 +550,10 @@ bool IntegrityBypass::IsVACLoaded(HANDLE hProcess) {
 }
 
 uintptr_t IntegrityBypass::GetVACModuleBase(HANDLE hProcess) {
+    // ★ BUILD 550: hash 比较 (原明文 _wcsicmp(L"GameOverlayRenderer.dll") 等)
+    constexpr uint32_t overlayHash = stealth::ModNameHash(L"GameOverlayRenderer.dll");
+    constexpr uint32_t steamclientHash = stealth::ModNameHash(L"steamclient.dll");
+
     HMODULE hMods[1024];
     DWORD cbNeeded;
 
@@ -546,9 +561,9 @@ uintptr_t IntegrityBypass::GetVACModuleBase(HANDLE hProcess) {
         for (DWORD i = 0; i < cbNeeded / sizeof(HMODULE); i++) {
             WCHAR modName[MAX_PATH] = {};
             GetModuleBaseNameW(hProcess, hMods[i], modName, MAX_PATH);
+            uint32_t modHash = stealth::ModNameHashRT(modName);
 
-            if (_wcsicmp(modName, L"GameOverlayRenderer.dll") == 0 ||
-                _wcsicmp(modName, L"steamclient.dll") == 0) {
+            if (modHash == overlayHash || modHash == steamclientHash) {
                 return reinterpret_cast<uintptr_t>(hMods[i]);
             }
         }

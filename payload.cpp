@@ -1,4 +1,4 @@
-// ============================================================
+﻿// ============================================================
 // payload.cpp — 远程加载 DLL Payload
 //
 // 编译为 DLL, 经 XTEA 加密后托管在 HTTP 服务器上,
@@ -7,6 +7,17 @@
 //
 // DllMain 在 ManualMap 完成后被调用, 直接在当前线程启动主循环,
 // 不创建额外线程 (规避 PsSetCreateThreadNotifyRoutine 内核回调)。
+// BUILD: 550 (v3.208: -static 静态链接 + 动态 API 解析 + RTCore64 嵌入移除)
+//        1. ★ BUILD 550 -static 全局静态链接: 消除 libgcc_s_seh/libstdc++/libwinpthread 依赖
+//           payload.dll 仅依赖 Windows 系统 DLL (ADVAPI32/KERNEL32/USER32/msvcrt/ntdll)
+//        2. ★ BUILD 550 动态 API 解析 (IAT 清理):
+//           - CreateToolhelp32Snapshot/Process32FirstW/Process32NextW/Thread32First/Thread32Next
+//             通过 GetProcAddress + STEALTH_STR_DECRYPT_TO 动态解析, API 名 XTEA 编译期加密
+//           - GetModuleHandleW/GetModuleHandleExW 替换为 PEB Ldr 遍历 (GetModuleBaseFromPEB)
+//        3. ★ BUILD 550 RTCore64.sys 嵌入数据移除 (死代码清理):
+//           - g_driverCandidates[] 仅含 PDFWKRNL (BUILD 490), RTCore64 分支永不执行
+//           - 消除 .rdata 中 \Device\RTCore64 / \DosDevices\RTCore64 / ntoskrnl.exe 明文
+//        保留: BUILD 549 影子页 PTE + DiagLog 加密 + BUILD 548 集成补丁 + BUILD 546 7 层保护
 // BUILD: 549 (v3.205: 影子页 PTE manipulation + DiagLog 三层脱敏 + NtQSI 替代 Toolhelp32)
 //        1. ★ BUILD 549 影子页: ApplyCs2Patch 优先通过 PTE manipulation 安装影子页
 //           - pageA = client.dll 原页 (PAC 扫描看到原始字节 32 c0)
@@ -323,10 +334,8 @@ static bool g_halfTestMode = false;
 typedef LONG(NTAPI* _NtUnmapViewOfSection)(HANDLE, PVOID);
 static _NtUnmapViewOfSection g_pNtUnmapViewOfSection = nullptr;
 
-// ★ BUILD 549+: 前向声明 — ModNameHashRT/GetModuleBaseFromPEB 定义在后面 (L575/L589),
-//   但 ResolveImportTable (L328) 需要使用。如果不前向声明, 编译器在 L377 报 "not declared in this scope"
-static uint32_t ModNameHashRT(const wchar_t* s);
-static HMODULE GetModuleBaseFromPEB(uint32_t nameHash);
+// ★ BUILD 550: ModNameHashRT/GetModuleBaseFromPEB 已移至 stealth_lib/module_resolver.h
+//   作为 inline 函数, 通过 stealth_core.h → module_resolver.h 间接包含, 无需前向声明
 
 // ★ v3.126f: 手动解析远程进程中的导入表 (IAT) — 批量写入, 减少 ntdll 调用
 //   避免逐个 WriteProcessMemory 在 ntdll 中崩溃的问题。
@@ -379,7 +388,7 @@ static bool ResolveImportTable(HANDLE hProcess, void* remoteBase,
             wideDllName[wlen] = (wchar_t)(unsigned char)dllName[wlen];
         }
         wideDllName[wlen] = L'\0';
-        HMODULE hMod = GetModuleBaseFromPEB(ModNameHashRT(wideDllName));
+        HMODULE hMod = stealth::GetModuleBaseFromPEB(stealth::ModNameHashRT(wideDllName));
         if (!hMod) {
             hMod = LoadLibraryA(dllName);  // 回退 (LoadLibraryA 仍可能被 hook, 但 dllName 不在二进制中)
             if (!hMod) continue;
@@ -553,89 +562,17 @@ typedef struct _B549_SYSTEM_THREAD_INFO {
 } B549_SYSTEM_THREAD_INFO;  // sizeof = 0x50
 
 // ============================================================
-// ★ BUILD 549+: PEB Ldr 遍历 + 编译期模块名哈希 (替代 GetModuleHandleA/W)
-//   规避: PAC 用户态 hook GetModuleHandleA/W, 通过 PEB 直接读取模块基址
-//   二进制中: 不出现 "client.dll"/"ntdll.dll" 等明文模块名 (使用编译期 djb2 哈希)
-//
-//   x64 内存布局:
-//     GS:0x60              → PEB
-//     PEB+0x18             → PEB_LDR_DATA* Ldr
-//     Ldr+0x20             → LIST_ENTRY InMemoryOrderModuleList (Flink/Blink)
-//     LDR_DATA_TABLE_ENTRY+0x10  → InMemoryOrderLinks (Flink 指向此处)
-//     LDR_DATA_TABLE_ENTRY+0x30  → DllBase
-//     LDR_DATA_TABLE_ENTRY+0x58  → BaseDllName (UNICODE_STRING, Buffer@+0x08)
+// ★ BUILD 550: ModNameHash/ModNameHashRT/GetModuleBaseFromPEB 已移至共享头文件
+//   stealth_lib/module_resolver.h (stealth:: 命名空间)
+//   payload.cpp 通过 stealth_core.h → module_resolver.h 间接包含
+//   所有调用使用 stealth::ModNameHash / stealth::GetModuleBaseFromPEB
 // ============================================================
-
-// 编译期 djb2 哈希 (wchar_t, 不区分大小写)
-//   用法: constexpr uint32_t h = ModNameHash(L"client.dll"); // 编译期计算
-//         二进制中只出现 h 的常量值, 不出现 L"client.dll"
-constexpr uint32_t ModNameHash(const wchar_t* s, uint32_t h = 5381) {
-    return (!*s) ? h : ModNameHash(s + 1,
-        ((h << 5) + h) + (uint32_t)(
-            (*s >= L'A' && *s <= L'Z') ? (*s + (L'a' - L'A')) : *s
-        ));
-}
-
-// 运行时 djb2 哈希 (用于动态字符串, 如 ResolveImportTable 的 dllName)
-static uint32_t ModNameHashRT(const wchar_t* s) {
-    if (!s) return 0;
-    uint32_t h = 5381;
-    while (*s) {
-        wchar_t c = *s;
-        if (c >= L'A' && c <= L'Z') c = c + (L'a' - L'A');
-        h = ((h << 5) + h) + (uint32_t)c;
-        s++;
-    }
-    return h;
-}
-
-// 通过 PEB Ldr 遍历获取模块基址 (替代 GetModuleHandleA/W)
-//   nameHash: 编译期或运行时计算的 djb2 哈希 (不区分大小写)
-static HMODULE GetModuleBaseFromPEB(uint32_t nameHash) {
-    if (!nameHash) return nullptr;
-
-    // x64: PEB 在 GS:0x60 (TEB+0x60 = PEB)
-    uint64_t peb;
-    __asm__ __volatile__("movq %%gs:0x60, %0" : "=r"(peb));
-    if (!peb) return nullptr;
-
-    // PEB->Ldr (PEB+0x18)
-    uint8_t* ldr = *(uint8_t**)(peb + 0x18);
-    if (!ldr) return nullptr;
-
-    // Ldr->InMemoryOrderModuleList (Ldr+0x20) — LIST_ENTRY, Flink 指向下一个 entry 的 InMemoryOrderLinks
-    auto* listHead = (LIST_ENTRY*)(ldr + 0x20);
-    auto* entry = listHead->Flink;
-    if (!entry) return nullptr;
-
-    // 遍历链表 (InMemoryOrderLinks 在 LDR_DATA_TABLE_ENTRY+0x10)
-    while (entry != listHead) {
-        auto* dataTableEntry = (uint8_t*)entry - 0x10;  // 回退到 LDR_DATA_TABLE_ENTRY 起始
-        auto dllBase = *(HMODULE*)(dataTableEntry + 0x30);  // DllBase
-        auto* baseDllName = (UNICODE_STRING*)(dataTableEntry + 0x58);  // BaseDllName
-
-        if (dllBase && baseDllName->Buffer && baseDllName->Length > 0) {
-            // 运行时计算 djb2 哈希 (不区分大小写)
-            uint32_t hash = 5381;
-            USHORT nameLen = baseDllName->Length / sizeof(WCHAR);
-            for (USHORT i = 0; i < nameLen; i++) {
-                WCHAR c = baseDllName->Buffer[i];
-                if (c >= L'A' && c <= L'Z') c = c + (L'a' - L'A');
-                hash = ((hash << 5) + hash) + (uint32_t)c;
-            }
-            if (hash == nameHash) return dllBase;
-        }
-        entry = entry->Flink;
-    }
-
-    return nullptr;
-}
 
 static bool ApplyCs2Patch() {
     // 1. 获取 client.dll 基址
     // ★ BUILD 549+: 通过 PEB Ldr 遍历获取 (替代 GetModuleHandleA, 规避 PAC 用户态 hook)
     //   ModNameHash(L"client.dll") 在编译期计算, 二进制中不出现 "client.dll" 明文
-    HMODULE hClient = GetModuleBaseFromPEB(ModNameHash(L"client.dll"));
+    HMODULE hClient = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"client.dll"));
     if (!hClient) {
         DiagLogEnc("c1");  // ★ BUILD 549: 加密 "mod not loaded"
         return false;
@@ -1032,7 +969,7 @@ static void CleanupInjectionTraces() {
         // 再计算 RVA
 
         // 获取本地 ntdll 的 RtlUserThreadStart 地址
-        HMODULE hLocalNtdll = GetModuleBaseFromPEB(ModNameHash(L"ntdll.dll"));  // ★ BUILD 549+: PEB Ldr
+        HMODULE hLocalNtdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));  // ★ BUILD 549+: PEB Ldr
         uint64_t localRtlUserThreadStart = 0;
         if (hLocalNtdll) {
             localRtlUserThreadStart = (uint64_t)GetProcAddress(hLocalNtdll, "RtlUserThreadStart");
@@ -1125,7 +1062,7 @@ static void CleanupInjectionTraces() {
                                 // 查询 Win32StartAddress (class 9)
                                 PVOID startAddr = nullptr;
                                 ULONG ql = 0;
-                                HMODULE localNtdll2 = GetModuleBaseFromPEB(ModNameHash(L"ntdll.dll"));  // ★ BUILD 549+: PEB Ldr
+                                HMODULE localNtdll2 = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));  // ★ BUILD 549+: PEB Ldr
                                 if (localNtdll2) {
                                     using NtQIT_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
                                     auto pNtQIT = (NtQIT_t)GetProcAddress(localNtdll2, "NtQueryInformationThread");
@@ -1161,7 +1098,7 @@ static void CleanupInjectionTraces() {
                                     // TEB 地址 = NtQueryInformationThread(ThreadBasicInformation) → TebBaseAddress
                                     THREAD_BASIC_INFORMATION tbi = {};
                                     ULONG tbiLen = 0;
-                                    HMODULE localNtdll3 = GetModuleBaseFromPEB(ModNameHash(L"ntdll.dll"));  // ★ BUILD 549+: PEB Ldr
+                                    HMODULE localNtdll3 = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));  // ★ BUILD 549+: PEB Ldr
                                     if (localNtdll3) {
                                         using NtQIT_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
                                         auto pNtQIT2 = (NtQIT_t)GetProcAddress(localNtdll3, "NtQueryInformationThread");
@@ -1238,11 +1175,11 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         wcscat_s(probePath, L"pac_probe.flag");
         g_egTestMode = (GetFileAttributesW(probePath) != INVALID_FILE_ATTRIBUTES);
         if (g_egTestMode) {
-            DiagLog("=== E+G TEST MODE (BUILD 529): no CS2, no patch, endurance run ===\n");
-            DiagLog("E+G TEST: flag found at %ls\n", probePath);
-            DiagLog("E+G TEST: will skip CS2 attach + patch, run E+G protection only\n");
+            DiagLog("B550:TM:eg-test no-tgt no-patch\n");  // ★ BUILD 550: 脱敏 (原含 CS2)
+            DiagLog("B550:TM:flag=%ls\n", probePath);
+            DiagLog("B550:TM:skip tgt-attach+patch, eg-only\n");
         } else {
-            DiagLog("E+G TEST: no flag — normal mode (CS2 attach + patch)\n");
+            DiagLog("B550:TM:normal mode (tgt+patch)\n");
         }
 
         // ★ BUILD 537: 半测试模式检查 — half_test.flag 存在时附加 CS2 但跳过 basic.exe
@@ -1253,9 +1190,9 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             wcscat_s(halfPath, L"half_test.flag");
             g_halfTestMode = (GetFileAttributesW(halfPath) != INVALID_FILE_ATTRIBUTES);
             if (g_halfTestMode) {
-                DiagLog("=== HALF TEST MODE (BUILD 537): CS2 attach YES, patch NO ===\n");
-                DiagLog("HALF TEST: flag found at %ls\n", halfPath);
-                DiagLog("HALF TEST: will attach CS2 + run E+G protection, but skip patch\n");
+                DiagLog("B550:HM:half-test tgt-yes patch-no\n");  // ★ BUILD 550: 脱敏
+                DiagLog("B550:HM:flag=%ls\n", halfPath);
+                DiagLog("B550:HM:attach tgt + eg, skip patch\n");
             }
         }
 
@@ -1276,7 +1213,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     //   用于 VEH 捕获 worker 线程激活上下文栈 NULL 崩溃 (cmp [rax+0x38],9 解引用 NULL)
     g_mainThreadId = GetCurrentThreadId();
     {
-        HMODULE hNtdll = GetModuleBaseFromPEB(ModNameHash(L"ntdll.dll"));  // ★ BUILD 549+: PEB Ldr
+        HMODULE hNtdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));  // ★ BUILD 549+: PEB Ldr
         if (hNtdll) {
             FARPROC pfn = GetProcAddress(hNtdll, "RtlDeactivateActivationContext");
             if (pfn) {
@@ -1373,17 +1310,15 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             totalProtected += segSz;
         }
 
-        DiagLog("OK: EkkoSleep protected %llu bytes (exempt: ekko@0x%llX veh@0x%llX "
-                "encryptAll@0x%llX decryptAll@0x%llX xorCrypt@0x%llX "
-                "applyPatch@0x%llX maintainPatch@0x%llX screenshotChk@0x%llX "
-                "revertPatch@0x%llX, count=%d)\n",
-            (unsigned long long)totalProtected,
+        DiagLog("B550:EK:protected %llu bytes (exempt %d pages, ek@0x%llX veh@0x%llX "
+                "encA@0x%llX decA@0x%llX xorC@0x%llX ap@0x%llX mp@0x%llX "
+                "sc@0x%llX rp@0x%llX)\n",  // ★ BUILD 550: 脱敏 (原含 screenshotChk 等)
+            (unsigned long long)totalProtected, exemptPageCount,
             (unsigned long long)ekkoPage, (unsigned long long)vehPage,
             (unsigned long long)encryptAllPage, (unsigned long long)decryptAllPage,
             (unsigned long long)xorCryptPage,
             (unsigned long long)applyPatchPage, (unsigned long long)maintainPatchPage,
-            (unsigned long long)screenshotCheckPage, (unsigned long long)revertPatchPage,
-            exemptPageCount);
+            (unsigned long long)screenshotCheckPage, (unsigned long long)revertPatchPage);
     }
 
     // --- 阶段1: 初始化规避引擎 (9层) ---
@@ -1401,19 +1336,43 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
 
     // --- 阶段3: 附加到 CS2 进程 ---
     // ★ BUILD 529: 测试模式跳过 CS2 附加 (测试2 无 CS2 长时间运行验证 E+G 保护层)
-    if (!g_egTestMode && !StealthEngine::Instance().AttachToProcess(L"cs2.exe")) {
+    // ★ BUILD 550: 加密 "cs2.exe" 进程名 (原明文 L"cs2.exe")
+    wchar_t procNameW[32] = {};
+    {
+        char encBuf[32] = {};
+        STEALTH_STR_DECRYPT_TO("cs2.exe", encBuf, sizeof(encBuf));
+        for (int i = 0; i < 32 && encBuf[i]; i++) procNameW[i] = (wchar_t)(unsigned char)encBuf[i];
+        StringObfuscator::SecureZero(encBuf, sizeof(encBuf));
+    }
+    if (!g_egTestMode && !StealthEngine::Instance().AttachToProcess(procNameW)) {
         DiagLog("FAIL: AttachToProcess\n");
         stealth::KernelDefense::DisableAll();
         StealthEngine::Instance().Shutdown();
-        // ★ v3.111: 提示用户启动 CS2
-        MessageBoxW(NULL,
-            L"未找到 CS2 进程 (cs2.exe)。\n\n"
-            L"请先启动 Counter-Strike 2，然后重新运行 loader.exe。",
-            L"CS2 未运行", MB_OK | MB_ICONINFORMATION);
+        // ★ BUILD 550: 加密用户消息 (原明文 L"未找到 CS2 进程 (cs2.exe)..." 等)
+        //   MessageBoxW 参数用栈上解密的 wchar_t, 用完即毁
+        wchar_t msgBody[256] = {};
+        wchar_t msgTitle[64] = {};
+        {
+            char encBody[256] = {};
+            STEALTH_STR_DECRYPT_TO("Game process not found.\n\nPlease start the game first, then re-run loader.", encBody, sizeof(encBody));
+            for (int i = 0; i < 256 && encBody[i]; i++) msgBody[i] = (wchar_t)(unsigned char)encBody[i];
+            StringObfuscator::SecureZero(encBody, sizeof(encBody));
+        }
+        {
+            char encTitle[64] = {};
+            STEALTH_STR_DECRYPT_TO("Game not running", encTitle, sizeof(encTitle));
+            for (int i = 0; i < 64 && encTitle[i]; i++) msgTitle[i] = (wchar_t)(unsigned char)encTitle[i];
+            StringObfuscator::SecureZero(encTitle, sizeof(encTitle));
+        }
+        MessageBoxW(NULL, msgBody, msgTitle, MB_OK | MB_ICONINFORMATION);
+        StringObfuscator::SecureZero(msgBody, sizeof(msgBody));
+        StringObfuscator::SecureZero(msgTitle, sizeof(msgTitle));
+        StringObfuscator::SecureZero(procNameW, sizeof(procNameW));
         return 2;
     }
+    StringObfuscator::SecureZero(procNameW, sizeof(procNameW));
     if (g_egTestMode) {
-        DiagLog("E+G TEST: skipping CS2 attach (test mode)\n");
+        DiagLog("B550:TM:skip tgt-attach (test mode)\n");  // ★ BUILD 550: 脱敏
     } else {
         DiagLog("OK: AttachToProcess, PID=%u HANDLE=%p\n",
             StealthEngine::Instance().GetProcessId(),
@@ -1686,9 +1645,9 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             int modCount = stealth::StealthProcess::GetProcessModules(hProc, modules, 64);
             // ★ BUILD 549+: 用 ModNameHash 比较替代 wcscmp(L"client.dll") (避免明文模块名)
             //   ModNameHash(L"client.dll") 编译期计算, 二进制中只出现 hash 常量
-            constexpr uint32_t clientDllHash = ModNameHash(L"client.dll");
+            constexpr uint32_t clientDllHash = stealth::ModNameHash(L"client.dll");
             for (int i = 0; i < modCount; i++) {
-                if (ModNameHashRT(modules[i].name) == clientDllHash) {
+                if (stealth::ModNameHashRT(modules[i].name) == clientDllHash) {
                     clientSize = modules[i].size;
                     break;
                 }
@@ -1790,7 +1749,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         int w = GetSystemMetrics(SM_CXSCREEN);
         int h = GetSystemMetrics(SM_CYSCREEN);
         cs2::Memory::Instance().SetScreenSize(w, h);
-        DiagLog("OK: screen=%dx%d (ESP rendered by CS2 itself after patch)\n", w, h);
+        DiagLog("B550:SC:screen=%dx%d\n", w, h);  // ★ BUILD 550: 脱敏 (原含 CS2/ESP)
     }
 
     // --- 阶段7: 主循环 (反检测维护 + 基础.exe 存活监控) ---
@@ -1829,7 +1788,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         // 方法4: GetProcAddress fallback
         {
             using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
-            auto fn = (Fn)GetProcAddress(GetModuleBaseFromPEB(ModNameHash(L"ntdll.dll")), "NtReadVirtualMemory");  // ★ BUILD 549+: PEB Ldr
+            auto fn = (Fn)GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtReadVirtualMemory");  // ★ BUILD 549+: PEB Ldr
             uint16_t magic = 0;
             SIZE_T bytesRead = 0;
             NTSTATUS st = fn ? fn(hProc, (PVOID)cb, &magic, 2, &bytesRead) : (NTSTATUS)0xC0000002;
@@ -1915,9 +1874,9 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         DiagLog("--- End Entity Chain Trace ---\n");
     }
     } else if (g_halfTestMode) {
-        DiagLog("HALF TEST: skipping all CS2 operations (half test mode — no Memory::Initialize to avoid return 3 exit)\n");
+        DiagLog("B550:HM:skip all tgt-ops (half-test)\n");  // ★ BUILD 550: 脱敏
     } else {
-        DiagLog("E+G TEST: skipping all CS2 operations (test mode)\n");
+        DiagLog("B550:TM:skip all tgt-ops (test mode)\n");
     }
 
     DiagLogEnc("m1");  // ★ BUILD 549: 加密 "main loop start"
@@ -1944,7 +1903,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             if (hCs2) {
                 DWORD cs2ExitCode = STILL_ACTIVE;
                 if (GetExitCodeProcess(hCs2, &cs2ExitCode) && cs2ExitCode != STILL_ACTIVE) {
-                    DiagLog("B549:CS2 exit=%u safe exit\n", cs2ExitCode);  // ★ BUILD 549: 去特征化
+                    DiagLog("B550:EX:tgt-exit=%u safe-exit\n", cs2ExitCode);  // ★ BUILD 550: 脱敏 (原含 CS2)
                     // ★ BUILD 549: 先卸载影子页 (恢复原 PTE + 释放 pageB), 必须在 DisableAll 卸载驱动前
                     stealth::ShadowPageManager::Instance().Uninstall();
                     stealth::KernelDefense::DisableAll();  // 包含 UnhideProcess
@@ -2053,7 +2012,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             lastHandleReopenTime = now;
             handleReopenInterval = RandomJitter(10000, 10000);
             bool reopenOk = stealth::StealthEngine::Instance().ReopenProcessHandle();
-            DiagLog("E+G: CS2 handle re-randomized: %s\n", reopenOk ? "OK" : "FAILED");
+            DiagLog("B550:EG:handle re-rand %s\n", reopenOk ? "OK" : "FAIL");  // ★ BUILD 550: 脱敏
         }
 
         // ★ BUILD 537: Gamma-A — 移除 PatchGuard 缓解循环 (PG 已禁用, 无需 Unhide/Rehide)

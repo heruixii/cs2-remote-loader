@@ -1,8 +1,9 @@
-﻿// ============================================================
+// ============================================================
 // cs2_memory.cpp — CS2 游戏内存读写实现
 // ============================================================
 
 #include "cs2_memory.h"
+#include "module_resolver.h"  // ★ BUILD 550: ModNameHash 替代 wcscmp(L"client.dll")
 #include <cmath>
 
 namespace cs2 {
@@ -17,12 +18,17 @@ bool Memory::ResolveModules() {
     HANDLE hProc = engine.GetProcessHandle();
     if (!hProc) return false;
 
+    // ★ BUILD 550: 用 ModNameHash 比较替代 wcscmp(L"client.dll"/L"engine2.dll")
+    //   编译期计算 hash, 二进制中不出现明文模块名
+    constexpr uint32_t clientHash = stealth::ModNameHash(L"client.dll");
+    constexpr uint32_t engineHash = stealth::ModNameHash(L"engine2.dll");
+
     stealth::StealthProcess::ModuleInfo modules[64];
     int modCount = stealth::StealthProcess::GetProcessModules(hProc, modules, 64);
     for (int i = 0; i < modCount; i++) {
-        if (wcscmp(modules[i].name, L"client.dll") == 0) {
+        if (stealth::ModNameHashRT(modules[i].name) == clientHash) {
             m_clientBase = modules[i].baseAddress;
-        } else if (wcscmp(modules[i].name, L"engine2.dll") == 0) {
+        } else if (stealth::ModNameHashRT(modules[i].name) == engineHash) {
             m_engineBase = modules[i].baseAddress;
         }
     }

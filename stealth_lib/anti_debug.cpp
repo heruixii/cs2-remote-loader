@@ -5,11 +5,60 @@
 #include "anti_debug.h"
 #include "syscall_direct.h"
 #include "platform.h"
+#include "module_resolver.h"  // ★ BUILD 550: GetModuleBaseFromPEB + ModNameHash (替代 GetModuleHandleW)
+#include "string_obfuscator.h"  // ★ BUILD 550: STEALTH_STR_DECRYPT_TO (动态解析 Toolhelp API)
 #include <winternl.h>
 #include <intrin.h>
 #include <TlHelp32.h>
 #include <psapi.h>
 #include <cstdio>
+
+// ============================================================
+// ★ BUILD 550: 动态解析 Toolhelp API — 消除 IAT 中敏感 API 名
+//   原因: CreateToolhelp32Snapshot/Process32FirstW/Process32NextW/
+//         Thread32First/Thread32Next 在 IAT 中暴露, 可能被 PAC IAT 扫描
+//   修复: 用 GetProcAddress + STEALTH_STR_DECRYPT_TO 动态解析,
+//         API 名被 XTEA 编译期加密, 不出现在 .rdata
+// ============================================================
+namespace {
+    struct ToolhelpApis {
+        HANDLE (WINAPI *createSnap)(DWORD, DWORD);
+        BOOL (WINAPI *procFirst)(HANDLE, LPPROCESSENTRY32W);
+        BOOL (WINAPI *procNext)(HANDLE, LPPROCESSENTRY32W);
+        BOOL (WINAPI *threadFirst)(HANDLE, LPTHREADENTRY32);
+        BOOL (WINAPI *threadNext)(HANDLE, LPTHREADENTRY32);
+    };
+
+    bool InitToolhelpApis(ToolhelpApis& apis) {
+        memset(&apis, 0, sizeof(apis));
+        HMODULE k32 = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"kernel32.dll"));
+        if (!k32) return false;
+
+        char apiName[64] = {};
+        STEALTH_STR_DECRYPT_TO("CreateToolhelp32Snapshot", apiName, sizeof(apiName));
+        apis.createSnap = reinterpret_cast<decltype(apis.createSnap)>(GetProcAddress(k32, apiName));
+        SecureZeroMemory(apiName, sizeof(apiName));
+
+        STEALTH_STR_DECRYPT_TO("Process32FirstW", apiName, sizeof(apiName));
+        apis.procFirst = reinterpret_cast<decltype(apis.procFirst)>(GetProcAddress(k32, apiName));
+        SecureZeroMemory(apiName, sizeof(apiName));
+
+        STEALTH_STR_DECRYPT_TO("Process32NextW", apiName, sizeof(apiName));
+        apis.procNext = reinterpret_cast<decltype(apis.procNext)>(GetProcAddress(k32, apiName));
+        SecureZeroMemory(apiName, sizeof(apiName));
+
+        STEALTH_STR_DECRYPT_TO("Thread32First", apiName, sizeof(apiName));
+        apis.threadFirst = reinterpret_cast<decltype(apis.threadFirst)>(GetProcAddress(k32, apiName));
+        SecureZeroMemory(apiName, sizeof(apiName));
+
+        STEALTH_STR_DECRYPT_TO("Thread32Next", apiName, sizeof(apiName));
+        apis.threadNext = reinterpret_cast<decltype(apis.threadNext)>(GetProcAddress(k32, apiName));
+        SecureZeroMemory(apiName, sizeof(apiName));
+
+        return apis.createSnap && apis.procFirst && apis.procNext
+            && apis.threadFirst && apis.threadNext;
+    }
+}
 
 // ============================================================
 // gcc SEH 替代: VEH 基于 thread_local 异常跟踪
@@ -306,7 +355,7 @@ DebugCheckResult AntiDebug::CheckTimingQPC() {
 DebugCheckResult AntiDebug::CheckINT3Breakpoints() {
     // 扫描常用函数开头是否有 INT3 (0xCC)
 
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    HMODULE ntdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
     if (!ntdll) return DebugCheckResult::Error;
 
     const char* funcs[] = {
@@ -381,21 +430,23 @@ DebugCheckResult AntiDebug::CheckParentProcess() {
     // 但 PROCESS_BASIC_INFORMATION 的结构因版本而异
     // 使用 NtQueryInformationProcess 的 ProcessBasicInformation
 
-    // 备用方法: 使用 toolhelp snapshot
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    // 备用方法: 使用 toolhelp snapshot (★ BUILD 550: 动态解析, 消除 IAT 暴露)
+    ToolhelpApis apis = {};
+    if (!InitToolhelpApis(apis)) return DebugCheckResult::Error;
+    HANDLE hSnap = apis.createSnap(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return DebugCheckResult::Error;
 
     PROCESSENTRY32W pe32 = { sizeof(pe32) };
     DWORD parentPid = 0;
     DWORD myPid = GetCurrentProcessId();
 
-    if (Process32FirstW(hSnap, &pe32)) {
+    if (apis.procFirst(hSnap, &pe32)) {
         do {
             if (pe32.th32ProcessID == myPid) {
                 parentPid = pe32.th32ParentProcessID;
                 break;
             }
-        } while (Process32NextW(hSnap, &pe32));
+        } while (apis.procNext(hSnap, &pe32));
     }
     CloseHandle(hSnap);
 
@@ -656,18 +707,21 @@ int AntiDebug::EnumerateAllThreads(DWORD* outBuf, int maxThreads) {
     int count = 0;
     DWORD myPid = GetCurrentProcessId();
 
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    // ★ BUILD 550: 动态解析 Toolhelp API (消除 IAT 暴露)
+    ToolhelpApis apis = {};
+    if (!InitToolhelpApis(apis)) return 0;
+    HANDLE hSnap = apis.createSnap(TH32CS_SNAPTHREAD, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return 0;
 
     THREADENTRY32 te32 = { sizeof(te32) };
-    if (Thread32First(hSnap, &te32)) {
+    if (apis.threadFirst(hSnap, &te32)) {
         do {
             if (te32.th32OwnerProcessID == myPid) {
                 if (count < maxThreads) {
                     outBuf[count++] = te32.th32ThreadID;
                 }
             }
-        } while (Thread32Next(hSnap, &te32));
+        } while (apis.threadNext(hSnap, &te32));
     }
 
     CloseHandle(hSnap);
@@ -677,7 +731,7 @@ int AntiDebug::EnumerateAllThreads(DWORD* outBuf, int maxThreads) {
 void AntiDebug::HideAllThreads() {
     using NtSetInformationThread_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG);
     static auto fn = reinterpret_cast<NtSetInformationThread_t>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationThread"));
+        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtSetInformationThread"));
 
     if (!fn) return;
 
@@ -695,7 +749,7 @@ void AntiDebug::HideAllThreads() {
 void AntiDebug::HideCurrentThread() {
     using NtSetInformationThread_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG);
     static auto fn = reinterpret_cast<NtSetInformationThread_t>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationThread"));
+        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtSetInformationThread"));
 
     if (!fn) return;
     fn(GetCurrentThread(), 0x11, nullptr, 0);
@@ -711,7 +765,7 @@ bool AntiDebug::TerminateDebugger() {
     using NtQueryInformationProcess_t = NTSTATUS(NTAPI*)(
         HANDLE, ULONG, PVOID, ULONG, PULONG);
     static auto fn = reinterpret_cast<NtQueryInformationProcess_t>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQueryInformationProcess"));
 
     if (!fn) return false;
 
@@ -731,12 +785,16 @@ bool AntiDebug::TerminateDebugger() {
         L"ollydbg.exe", L"ida64.exe", L"ida.exe"
     };
 
+    // ★ BUILD 550: 动态解析 Toolhelp API (消除 IAT 暴露)
+    ToolhelpApis apis = {};
+    if (!InitToolhelpApis(apis)) return false;
+
     for (auto* debugger : debuggers) {
-        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        HANDLE hSnap = apis.createSnap(TH32CS_SNAPPROCESS, 0);
         if (hSnap == INVALID_HANDLE_VALUE) continue;
 
         PROCESSENTRY32W pe32 = { sizeof(pe32) };
-        if (Process32FirstW(hSnap, &pe32)) {
+        if (apis.procFirst(hSnap, &pe32)) {
             do {
                 if (_wcsicmp(pe32.szExeFile, debugger) == 0) {
                     hDebuggerProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
@@ -745,7 +803,7 @@ bool AntiDebug::TerminateDebugger() {
                         CloseHandle(hDebuggerProcess);
                     }
                 }
-            } while (Process32NextW(hSnap, &pe32));
+            } while (apis.procNext(hSnap, &pe32));
         }
         CloseHandle(hSnap);
     }

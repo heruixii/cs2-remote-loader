@@ -19,6 +19,7 @@
 
 #include "syscall_direct.h"
 #include "string_obfuscator.h"
+#include "module_resolver.h"   // ★ BUILD 550: PEB Ldr 遍历 + 编译期模块名哈希 (替代 GetModuleHandleA/W)
 #include "stealth_process.h"
 #include "pe_mutator.h"
 #include "memory_cloak.h"

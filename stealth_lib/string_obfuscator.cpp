@@ -149,7 +149,28 @@ bool ApiResolver::IsAddressInLegitModule(uintptr_t addr) {
 
     bool inSystem32 = WcsStr(pathLower, L"\\system32\\");
     bool inSysWow64 = WcsStr(pathLower, L"\\syswow64\\");
-    bool inKnownGood = WcsStr(pathLower, L"\\steam\\") || WcsStr(pathLower, L"\\counter-strike");
+    // ★ BUILD 550: 加密 Steam/Counter-Strike 路径关键词 (原明文 L"\\steam\\", L"\\counter-strike")
+    //   运行时栈上解密, 用完即毁
+    bool inKnownGood = false;
+    {
+        char enc1[32] = {};
+        STEALTH_STR_DECRYPT_TO("\\steam\\", enc1, sizeof(enc1));
+        WCHAR w1[32] = {};
+        for (int i = 0; i < 32 && enc1[i]; i++) w1[i] = (WCHAR)(unsigned char)enc1[i];
+        if (WcsStr(pathLower, w1)) inKnownGood = true;
+        StringObfuscator::SecureZero(enc1, sizeof(enc1));
+        StringObfuscator::SecureZero(w1, sizeof(w1));
+
+        if (!inKnownGood) {
+            char enc2[32] = {};
+            STEALTH_STR_DECRYPT_TO("\\counter-strike", enc2, sizeof(enc2));
+            WCHAR w2[32] = {};
+            for (int i = 0; i < 32 && enc2[i]; i++) w2[i] = (WCHAR)(unsigned char)enc2[i];
+            if (WcsStr(pathLower, w2)) inKnownGood = true;
+            StringObfuscator::SecureZero(enc2, sizeof(enc2));
+            StringObfuscator::SecureZero(w2, sizeof(w2));
+        }
+    }
 
     return inSystem32 || inSysWow64 || inKnownGood;
 }

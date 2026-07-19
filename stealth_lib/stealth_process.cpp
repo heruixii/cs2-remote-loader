@@ -180,50 +180,13 @@ int StealthProcess::EnumerateProcesses(const wchar_t* targetName, ProcessInfo* o
     }
 
     // ============================================================
-    // 方法2: CreateToolhelp32Snapshot 回退 (当 syscall 方式失败时)
+    // 方法2: 已废弃 — CreateToolhelp32Snapshot 会被 PAC 用户态 hook 检测
+    // ★ BUILD 550: 移除 Toolhelp32 回退路径, NtQuerySystemInformation 失败时直接返回
+    //   原回退调用 CreateToolhelp32Snapshot/Process32FirstW/Process32NextW,
+    //   这些 API 在导入表中暴露特征, 且 PAC 用户态 hook 可拦截。
+    //   NtQuerySystemInformation (syscall) 已足够可靠, 无需回退。
     // ============================================================
-    ProcDiag("EnumerateProcesses: fallback to CreateToolhelp32Snapshot\n");
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap == INVALID_HANDLE_VALUE) {
-        ProcDiag("  CreateToolhelp32Snapshot: FAILED err=%u\n", GetLastError());
-        return count;
-    }
-
-    PROCESSENTRY32W pe = { sizeof(pe) };
-    int totalProcesses = 0;
-    int matchedProcesses = 0;
-
-    if (Process32FirstW(hSnap, &pe)) {
-        do {
-            totalProcesses++;
-
-            // 手动转小写比较
-            WCHAR lowerName[MAX_PATH] = {};
-            wcscpy_s(lowerName, pe.szExeFile);
-            MakeLowerW(lowerName, wcslen(lowerName));
-
-            // 记录前10个进程名和所有匹配的
-            if (totalProcesses <= 10 || (targetName && wcsstr(lowerName, lowerTarget))) {
-                ProcDiag("  SNAP[%d]: PID=%u name='%ls'\n",
-                    totalProcesses, pe.th32ProcessID, pe.szExeFile);
-            }
-
-            if (!targetName || wcsstr(lowerName, lowerTarget)) {
-                if (count < maxResults) {
-                    ProcessInfo& info = outBuf[count];
-                    info.pid = pe.th32ProcessID;
-                    wcscpy_s(info.name, pe.szExeFile);
-                    info.handle = nullptr;
-                    count++;
-                }
-                matchedProcesses++;
-            }
-        } while (Process32NextW(hSnap, &pe));
-    }
-
-    CloseHandle(hSnap);
-    ProcDiag("EnumerateProcesses(SNAP): total=%d matched=%d\n",
-        totalProcesses, matchedProcesses);
+    ProcDiag("EnumerateProcesses: NtQSI failed, no fallback (BUILD 550)\n");
     return count;
 }
 
@@ -419,22 +382,11 @@ int StealthProcess::GetProcessModules(HANDLE hProcess, ModuleInfo* outBuf, int m
     );
 
     if (!NT_SUCCESS(status) || !pbi.PebBaseAddress) {
-        // 回退: 使用 Module32First (仅当直接方法失败时)
-        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetProcessId(hProcess));
-        if (hSnap == INVALID_HANDLE_VALUE) return 0;
-
-        MODULEENTRY32W me32 = { sizeof(me32) };
-        if (Module32FirstW(hSnap, &me32)) {
-            do {
-                if (count >= maxResults) break;
-                ModuleInfo& info = outBuf[count];
-                wcscpy_s(info.name, me32.szModule);
-                info.baseAddress = reinterpret_cast<uintptr_t>(me32.modBaseAddr);
-                info.size = me32.modBaseSize;
-                count++;
-            } while (Module32NextW(hSnap, &me32));
-        }
-        CloseHandle(hSnap);
+        // ★ BUILD 550: 移除 CreateToolhelp32Snapshot/Module32FirstW 回退
+        //   原回退调用 Toolhelp32 APIs 在导入表中暴露特征, 且 PAC 用户态 hook 可拦截。
+        //   NtQueryInformationProcess 失败时直接返回 0 (调用方已有 fallback 逻辑)。
+        ProcDiag("GetProcessModules: NtQueryInformationProcess failed, no fallback (BUILD 550)\n");
+        return 0;
     } else {
         PEB remotePeb = {};
         SIZE_T bytesRead = 0;

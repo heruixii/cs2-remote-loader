@@ -2,6 +2,15 @@
 *.o
 *.obj
 
+# 日志文件 (不提交)
+*.log
+sd.log
+stealth_diag.log
+
+# 测试标志文件 (不提交)
+half_test.flag
+disable_basic.flag
+
 # RTCore64 驱动文件 (不提交)
 RTCore64.sys
 

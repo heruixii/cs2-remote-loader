@@ -5,6 +5,7 @@
 
 #include "eac_syscall_guard.h"
 #include "syscall_direct.h"
+#include "module_resolver.h"  // ★ BUILD 550: GetModuleBaseFromPEB + ModNameHash (替代 GetModuleHandleW)
 #include <sddl.h>      // ConvertStringSidToSidW
 
 namespace stealth {
@@ -97,7 +98,7 @@ bool HandleACLGuard::LockHandle(HANDLE hProcess) {
     // 3. 将安全描述符应用到句柄
     secInfo = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
 
-    ntdll = GetModuleHandleW(L"ntdll.dll");
+    ntdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
     if (!ntdll) goto cleanup;
 
     pNtSetSecurityObject = reinterpret_cast<NtSetSecurityObject_t>(
@@ -138,7 +139,7 @@ const SyscallGuard::CriticalStub SyscallGuard::s_criticalStubs[] = {
 const int SyscallGuard::s_criticalStubCount = sizeof(s_criticalStubs) / sizeof(s_criticalStubs[0]);
 
 bool SyscallGuard::IsStubIntact(const char* funcName) {
-    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    HMODULE ntdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
     if (!ntdll) return false;
 
     auto addr = reinterpret_cast<const uint8_t*>(
@@ -168,7 +169,7 @@ bool SyscallGuard::RestoreSingleStub(const char* funcName, HMODULE hDiskNtdll) {
     // 注: 不实际修改 ntdll .text 段 — EAC 完整性扫描会检测到 RWX+memcpy
     // 改用 Halo's Gate 在间接 syscall 层面规避 Hook (由 syscall_direct 模块处理)
     // 这里仅报告: 若 stub 被篡改, 说明环境不安全
-    HMODULE hLocalNtdll = GetModuleHandleW(L"ntdll.dll");
+    HMODULE hLocalNtdll = stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
     if (!hLocalNtdll || !hDiskNtdll) return false;
 
     auto localAddr = reinterpret_cast<uint8_t*>(

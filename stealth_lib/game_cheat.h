@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 // ============================================================
 // game_cheat.h — CS2 透视外挂 (ESP + 规避引擎)
 // 仅保留透视/可视化功能, 无自瞄/鼠标模拟
@@ -48,8 +48,16 @@ public:
         }
 
         // Step 2: 附加到 CS2 进程
-        if (!StealthEngine::Instance().AttachToProcess(L"cs2.exe")) {
-            return false;
+        // ★ BUILD 550: 加密 "cs2.exe" 进程名 (原明文 L"cs2.exe")
+        {
+            wchar_t procNameW[32] = {};
+            char encBuf[32] = {};
+            STEALTH_STR_DECRYPT_TO("cs2.exe", encBuf, sizeof(encBuf));
+            for (int i = 0; i < 32 && encBuf[i]; i++) procNameW[i] = (wchar_t)(unsigned char)encBuf[i];
+            bool ok = StealthEngine::Instance().AttachToProcess(procNameW);
+            stealth::StringObfuscator::SecureZero(encBuf, sizeof(encBuf));
+            stealth::StringObfuscator::SecureZero(procNameW, sizeof(procNameW));
+            if (!ok) return false;
         }
 
         // Step 2.5: 封锁句柄 (DACL → 仅允许自身进程访问)
