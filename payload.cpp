@@ -284,6 +284,8 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     //   DR0 命中时 CPU 触发 #DB, Windows 包装为 STATUS_SINGLE_STEP.
     //   不修改 RIP — 让 90 90 正常执行 (BUILD 557 纯计数, 不跳过指令).
     //   Windows 内核 NtContinue 自动设置 EFLAGS.RF, 重试指令不重复触发同一断点.
+    // ★ BUILD 558 FIX-5 正式版: 移除 v6 诊断日志 (SS# 记录), 回到 v5 稳定状态.
+    //   原因: DR0 在 patch 之后启动, 32 c0 已被 NOP, hits 必然为 0, 诊断无意义.
     if (code == 0x80000004 && g_dr0StatActive) {
         uint64_t ea = (uint64_t)ep->ExceptionRecord->ExceptionAddress;
         if (ea == (uint64_t)g_dr0Addr) {
@@ -737,6 +739,15 @@ typedef struct _B549_SYSTEM_THREAD_INFO {
     ULONG         Padding1;          // +0x4c (对齐到 8)
 } B549_SYSTEM_THREAD_INFO;  // sizeof = 0x50
 
+// ★ BUILD 558 FIX-5: static_assert 验证结构大小和字段偏移 (编译时检查)
+//   防止编译器对齐差异导致偏移错误 (NtQSI 解析 SYSTEM_PROCESS_INFORMATION 必需)
+static_assert(sizeof(B549_SYSTEM_PROCESS_INFO) == 0x100, "B549_SYSTEM_PROCESS_INFO size must be 0x100 (256 bytes)");
+static_assert(sizeof(B549_SYSTEM_THREAD_INFO) == 0x50, "B549_SYSTEM_THREAD_INFO size must be 0x50 (80 bytes)");
+static_assert(offsetof(B549_SYSTEM_PROCESS_INFO, NextEntryOffset) == 0x00, "NextEntryOffset offset mismatch");
+static_assert(offsetof(B549_SYSTEM_PROCESS_INFO, NumberOfThreads) == 0x04, "NumberOfThreads offset mismatch");
+static_assert(offsetof(B549_SYSTEM_PROCESS_INFO, UniqueProcessId) == 0x50, "UniqueProcessId offset mismatch");
+static_assert(offsetof(B549_SYSTEM_THREAD_INFO, ClientId) == 0x28, "SYSTEM_THREAD_INFO.ClientId offset must be 0x28");
+
 // ============================================================
 // ★ BUILD 550: ModNameHash/ModNameHashRT/GetModuleBaseFromPEB 已移至共享头文件
 //   stealth_lib/module_resolver.h (stealth:: 命名空间)
@@ -837,7 +848,9 @@ static bool SetupDR0Breakpoint(HANDLE hThread, void* addr) {
     ctx.Dr0 = reinterpret_cast<DWORD64>(addr);
     ctx.Dr7 &= ~0x30003ULL;   // 清 bit 0,1,16,17,18,19 (L0/G0/RW0/LEN0)
     ctx.Dr7 |= 0x101ULL;      // 置 L0 (0x1) + LE (0x100)
-    return SetThreadContext(hThread, &ctx) != 0;
+    if (!SetThreadContext(hThread, &ctx)) return false;
+    // ★ BUILD 558 FIX-5 正式版: 移除 v6 DR0 verify 诊断 (hits=0 已确认为设计缺陷, 非 DR0 写入失败)
+    return true;
 }
 
 // ★ BUILD 557: ClearDR0Breakpoint — 清除 DR0 断点 (防御性清除所有相关位)
@@ -1070,43 +1083,76 @@ static void StartDR0FrequencyStat() {
     g_dr0FirstHitTid = 0;
     g_dr0FirstHitTick = 0;
 
-    DWORD selfPid = GetCurrentProcessId();
-    DWORD selfTid = GetCurrentThreadId();
+    // ★ BUILD 558 FIX-5: 必须枚举 CS2 线程 (不是 loader.exe 线程)
+    //   原因: 32 c0 指令在 CS2 的 client.dll 中执行, DR0 断点必须设置在 CS2 线程上.
+    //         payload.dll 在 loader.exe 进程内运行, GetCurrentProcessId() 返回 loader.exe PID,
+    //         但 loader.exe 被 DKOM SelfLoopHarden 隐藏, NtQSI 找不到它 (threads=0).
+    //         必须用 StealthEngine::GetProcessId() 获取 CS2 PID, 枚举 CS2 线程.
+    DWORD cs2Pid = stealth::StealthEngine::Instance().GetProcessId();
+    if (cs2Pid == 0) {
+        DiagLog("B557:DR0:cs2pid=0 FAIL\n");
+        InterlockedExchange(&g_dr0StatActive, 0);
+        return;
+    }
 
-    // NtQuerySystemInformation (class 5 = SystemProcessInformation) 枚举线程
-    BYTE buf[64 * 1024];
+    // ★ BUILD 558 FIX-5: NtQSI 缓冲区扩容 + 重试 (64KB 栈 → 1MB 堆 + 倍增重试)
+    //   原因: CS2 + 所有进程的线程信息 > 64KB, NtQSI 返回 0xC0000004 (STATUS_INFO_LENGTH_MISMATCH)
+    //   参考: stealth_process.cpp EnumerateProcesses 的重试模式 (1MB 初始, 倍增, 最多 5 次)
+    ULONG bufSize = 0x100000;  // 1MB 初始
+    BYTE* buf = nullptr;
     ULONG retLen = 0;
-    NTSTATUS st = stealth::SysQuerySystemInformation(5, buf, sizeof(buf), &retLen);
+    NTSTATUS st;
+    int qsiRetries = 5;
+    do {
+        if (buf) VirtualFree(buf, 0, MEM_RELEASE);
+        buf = (BYTE*)VirtualAlloc(nullptr, bufSize, MEM_COMMIT, PAGE_READWRITE);
+        if (!buf) { InterlockedExchange(&g_dr0StatActive, 0); return; }
+        st = stealth::SysQuerySystemInformation(5, buf, bufSize, &retLen);
+        if (st == (NTSTATUS)0xC0000004) bufSize *= 2;  // STATUS_INFO_LENGTH_MISMATCH → 倍增
+        if (--qsiRetries <= 0 && !NT_SUCCESS(st)) break;
+    } while (st == (NTSTATUS)0xC0000004);
     if (!NT_SUCCESS(st)) {
         DiagLog("B557:DR0:qsi FAIL 0x%08X\n", (unsigned)st);
+        VirtualFree(buf, 0, MEM_RELEASE);
         InterlockedExchange(&g_dr0StatActive, 0);
         return;
     }
 
     int okCount = 0, failCount = 0, threadCount = 0;
+    int failOpen = 0, failSuspend = 0, failSetup = 0;  // ★ BUILD 558 FIX-5 v5: 区分 fail 原因
     BYTE* p = buf;
     while (true) {
         auto* pi = (B549_SYSTEM_PROCESS_INFO*)p;
         if (pi->NextEntryOffset == 0) break;
         p += pi->NextEntryOffset;
-        if ((DWORD)(uintptr_t)pi->UniqueProcessId != selfPid) continue;
+        // ★ BUILD 558 FIX-5: 查找 CS2 进程 (不是 loader.exe), 枚举 CS2 线程
+        if ((DWORD)(uintptr_t)pi->UniqueProcessId != cs2Pid) continue;
 
-        // 找到当前进程, 遍历其线程
+        // 找到 CS2 进程, 遍历其线程
         // SYSTEM_THREAD_INFORMATION 数组紧跟在 SYSTEM_PROCESS_INFORMATION 之后
         BYTE* threadBase = p + sizeof(B549_SYSTEM_PROCESS_INFO);
         for (ULONG ti = 0; ti < pi->NumberOfThreads; ti++) {
             auto* thi = (B549_SYSTEM_THREAD_INFO*)(threadBase + ti * sizeof(B549_SYSTEM_THREAD_INFO));
             DWORD tid = (DWORD)(uintptr_t)thi->ClientId.UniqueThread;
-            if (tid == selfTid) continue;  // 跳过 loader 主线程 (避免自身被断点干扰)
+            // ★ BUILD 558 FIX-5: 不需要跳过 loader 线程, 因为枚举的是 CS2 线程
             threadCount++;
 
             HANDLE hThread = nullptr;
-            STEALTH_OPEN_THREAD(hThread, THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, tid);
-            if (!hThread) { failCount++; continue; }
+            // ★ BUILD 558 FIX-5 正式版: 回退 v7 的 ClientId.UniqueProcess 修改 (ok=0, 比 v5 更糟)
+            //   恢复使用 STEALTH_OPEN_THREAD 宏 (v5 状态), UniqueProcess = NULL
+            //   原因: v7 设置 UniqueProcess=cs2Pid 后, NtOpenThread 严格校验 (PID,TID) 对,
+            //         全部返回 INVALID_CID (0xC000000B), ok=0 fail=145 (v5 是 ok=55 fail=90).
+            //   DR0 hits=0 已确认为设计缺陷 (patch 之后启动), 不是 OpenThread 失败导致.
+            STEALTH_OPEN_THREAD(hThread,
+                THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, tid);
+            if (!hThread) {
+                failCount++; failOpen++;
+                continue;
+            }
 
             if (SuspendThread(hThread) == (DWORD)-1) {
                 CloseHandle(hThread);
-                failCount++;
+                failCount++; failSuspend++;
                 continue;
             }
 
@@ -1114,13 +1160,14 @@ static void StartDR0FrequencyStat() {
             ResumeThread(hThread);
             CloseHandle(hThread);
 
-            if (ok) okCount++; else failCount++;
+            if (ok) okCount++; else { failCount++; failSetup++; }
         }
         break;  // 当前进程只会有一个匹配
     }
 
-    DiagLog("B557:DR0:start addr=0x%llX ok=%d fail=%d threads=%d\n",
-        (unsigned long long)g_dr0Addr, okCount, failCount, threadCount);
+    DiagLog("B557:DR0:start addr=0x%llX ok=%d fail=%d threads=%d (open=%d susp=%d setup=%d)\n",
+        (unsigned long long)g_dr0Addr, okCount, failCount, threadCount, failOpen, failSuspend, failSetup);
+    VirtualFree(buf, 0, MEM_RELEASE);  // ★ BUILD 558 FIX-5: 释放 NtQSI 缓冲区
 }
 
 // ★ BUILD 557: ReportDR0Frequency — 60s 后输出频率到 sd.log, 清除所有 DR0
@@ -1142,25 +1189,37 @@ static void ReportDR0Frequency() {
             hits, elapsed, freqHz, g_dr0FirstHitTid);
 
     // 枚举所有 CS2 线程, 清除 DR0 (复用 StartDR0FrequencyStat 的枚举模式)
-    DWORD selfPid = GetCurrentProcessId();
-    DWORD selfTid = GetCurrentThreadId();
-    BYTE buf[64 * 1024];
+    // ★ BUILD 558 FIX-5: 必须枚举 CS2 线程 (不是 loader.exe 线程), 用 StealthEngine::GetProcessId()
+    DWORD cs2Pid = stealth::StealthEngine::Instance().GetProcessId();
+    // ★ BUILD 558 FIX-5: NtQSI 缓冲区扩容 + 重试 (64KB 栈 → 1MB 堆 + 倍增重试)
+    ULONG bufSize = 0x100000;  // 1MB 初始
+    BYTE* buf = nullptr;
     ULONG retLen = 0;
-    NTSTATUS st = stealth::SysQuerySystemInformation(5, buf, sizeof(buf), &retLen);
-    if (NT_SUCCESS(st)) {
+    NTSTATUS st;
+    int qsiRetries = 5;
+    do {
+        if (buf) VirtualFree(buf, 0, MEM_RELEASE);
+        buf = (BYTE*)VirtualAlloc(nullptr, bufSize, MEM_COMMIT, PAGE_READWRITE);
+        if (!buf) break;  // 分配失败, 跳过 DR0 清除 (g_dr0StatActive 仍会被重置)
+        st = stealth::SysQuerySystemInformation(5, buf, bufSize, &retLen);
+        if (st == (NTSTATUS)0xC0000004) bufSize *= 2;
+        if (--qsiRetries <= 0 && !NT_SUCCESS(st)) break;
+    } while (st == (NTSTATUS)0xC0000004);
+    if (buf && NT_SUCCESS(st)) {
         int okCount = 0, failCount = 0;
         BYTE* p = buf;
         while (true) {
             auto* pi = (B549_SYSTEM_PROCESS_INFO*)p;
             if (pi->NextEntryOffset == 0) break;
             p += pi->NextEntryOffset;
-            if ((DWORD)(uintptr_t)pi->UniqueProcessId != selfPid) continue;
+            // ★ BUILD 558 FIX-5: 查找 CS2 进程 (不是 loader.exe)
+            if ((DWORD)(uintptr_t)pi->UniqueProcessId != cs2Pid) continue;
 
             BYTE* threadBase = p + sizeof(B549_SYSTEM_PROCESS_INFO);
             for (ULONG ti = 0; ti < pi->NumberOfThreads; ti++) {
                 auto* thi = (B549_SYSTEM_THREAD_INFO*)(threadBase + ti * sizeof(B549_SYSTEM_THREAD_INFO));
                 DWORD tid = (DWORD)(uintptr_t)thi->ClientId.UniqueThread;
-                if (tid == selfTid) continue;
+                // ★ BUILD 558 FIX-5: 不需要跳过 loader 线程, 枚举的是 CS2 线程
 
                 HANDLE hThread = nullptr;
                 STEALTH_OPEN_THREAD(hThread, THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, tid);
@@ -1176,7 +1235,10 @@ static void ReportDR0Frequency() {
             break;
         }
         DiagLog("B557:DR0:cleared ok=%d fail=%d (stat done)\n", okCount, failCount);
+    } else if (buf) {
+        DiagLog("B557:DR0:clear qsi FAIL 0x%08X\n", (unsigned)st);
     }
+    if (buf) VirtualFree(buf, 0, MEM_RELEASE);  // ★ BUILD 558 FIX-5: 释放 NtQSI 缓冲区
 
     // 全部 DR0 清除后, 关闭 VEH 计数 (StealthSleep 自动恢复)
     InterlockedExchange(&g_dr0StatActive, 0);
@@ -1186,14 +1248,22 @@ static void ReportDR0Frequency() {
 //   原 BUILD 548: CreateToolhelp32Snapshot (每秒调用, 可能被 hook)
 //   新 BUILD 549: SysQuerySystemInformation (syscall 直接调用, 频率降到 5s)
 static bool IsScreenshotToolRunning() {
-    ULONG bufferSize = 0x40000;  // 256KB
-    BYTE* buffer = (BYTE*)VirtualAlloc(nullptr, bufferSize, MEM_COMMIT, PAGE_READWRITE);
-    if (!buffer) return false;
-
+    // ★ BUILD 558 FIX-5: NtQSI 缓冲区扩容 + 重试 (256KB → 1MB 初始 + 倍增重试)
+    //   原因: 256KB 不够 (CS2 + 所有进程), NtQSI 返回 0xC0000004
+    ULONG bufferSize = 0x100000;  // 1MB 初始
+    BYTE* buffer = nullptr;
     ULONG returnLength = 0;
-    // SystemProcessInformation = 5
-    NTSTATUS status = stealth::SysQuerySystemInformation(
-        5, buffer, bufferSize, &returnLength);
+    NTSTATUS status;
+    int qsiRetries = 5;
+    do {
+        if (buffer) VirtualFree(buffer, 0, MEM_RELEASE);
+        buffer = (BYTE*)VirtualAlloc(nullptr, bufferSize, MEM_COMMIT, PAGE_READWRITE);
+        if (!buffer) return false;
+        // SystemProcessInformation = 5
+        status = stealth::SysQuerySystemInformation(5, buffer, bufferSize, &returnLength);
+        if (status == (NTSTATUS)0xC0000004) bufferSize *= 2;  // STATUS_INFO_LENGTH_MISMATCH → 倍增
+        if (--qsiRetries <= 0 && !NT_SUCCESS(status)) break;
+    } while (status == (NTSTATUS)0xC0000004);
 
     bool found = false;
     if (NT_SUCCESS(status)) {
@@ -1224,9 +1294,22 @@ static bool IsScreenshotToolRunning() {
                         STEALTH_WSTR_DECRYPT_TO("obs64.exe",              wShotTools[6],  32);
                         STEALTH_WSTR_DECRYPT_TO("Streamlabs OBS.exe",     wShotTools[7],  32);
                         STEALTH_WSTR_DECRYPT_TO("Discord.exe",            wShotTools[8],  32);
-                        STEALTH_WSTR_DECRYPT_TO("GameBar.exe",            wShotTools[9],  32);
-                        STEALTH_WSTR_DECRYPT_TO("GameBarFTServer.exe",    wShotTools[10], 32);
-                        STEALTH_WSTR_DECRYPT_TO("Steam.exe",              wShotTools[11], 32);
+                        // ★ BUILD 558 FIX-5 v5: 移除 GameBar.exe + GameBarFTServer.exe (Xbox Game Bar)
+                        //   原因: Xbox Game Bar 是 Win10/11 自带组件, 玩游戏时自动后台运行 (按 Win+G 唤出).
+                        //         CS2 玩家机器 99% 同时运行 GameBar.exe + GameBarFTServer.exe,
+                        //         导致 IsScreenshotToolRunning 持续返回 true, TemporarilyRevertPatch 被调用,
+                        //         补丁永久撤销 (p=1), 透视功能失效.
+                        //   v4 测试确认: B558:SS:hit proc='GameBar.exe' idx=9 (持续触发)
+                        //   权衡: 失去 Xbox Game Bar 截图防护 (Win+G), 但恢复透视 (核心需求).
+                        //         玩家更可能用 Steam F12 (已无防护) 或外部工具 (SnippingTool/OBS 仍检测).
+                        wShotTools[9][0] = 0;   // GameBar.exe — 空, 跳过匹配
+                        wShotTools[10][0] = 0;  // GameBarFTServer.exe — 空, 跳过匹配
+                        // ★ BUILD 558 FIX-5: 移除 Steam.exe — CS2 启动器一直在运行, 误触发 TemporarilyRevertPatch
+                        //   原因: Steam.exe 是 CS2 的启动器, 永远在后台运行, 导致截图检测一直触发,
+                        //         补丁被永久撤销 (p=1), 透视功能失效.
+                        //   权衡: 失去 Steam F12 截图防护, 但恢复透视功能 (核心需求).
+                        //         如需防 Steam 截图, 应检测 Steam 截图状态 (非进程存在).
+                        wShotTools[11][0] = 0;  // 空, 跳过匹配
                         STEALTH_WSTR_DECRYPT_TO("NVIDIA Share.exe",       wShotTools[12], 32);
                         STEALTH_WSTR_DECRYPT_TO("ShadowShare.exe",        wShotTools[13], 32);
                         STEALTH_WSTR_DECRYPT_TO("AMDRSSrcExt.exe",        wShotTools[14], 32);
@@ -1234,6 +1317,8 @@ static bool IsScreenshotToolRunning() {
                     }
                     for (int si = 0; si < 15; si++) {
                         if (wShotTools[si][0] && _wcsicmp(name, wShotTools[si]) == 0) {
+                            // ★ BUILD 558 FIX-5: 诊断日志 — 输出匹配的进程名, 确认误触发源
+                            DiagLog("B558:SS:hit proc='%ls' idx=%d\n", name, si);
                             found = true;
                             break;
                         }
@@ -2789,6 +2874,14 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         if (GetTickCount() - lastPatchCheck > 5000) {
             if (!g_cs2Patched) {
                 g_cs2Patched = ApplyCs2Patch();
+                // ★ BUILD 558 FIX-5: 主循环中 ApplyCs2Patch 成功后补启动 DR0 频率统计
+                //   原因: 初始化阶段 ApplyCs2Patch 在 cs2::Memory::Initialize 之前调用 (阶段3 vs 阶段4),
+                //         导致初始化阶段 ApplyCs2Patch 失败 ("mod not loaded"), StartDR0FrequencyStat 未被调用.
+                //         主循环中 cs2::Memory 已初始化, ApplyCs2Patch 成功后需要补启动 DR0 统计.
+                //   幂等: StartDR0FrequencyStat 内部用 InterlockedExchange(&g_dr0StatActive, 1) 防重入
+                if (g_cs2Patched) {
+                    StartDR0FrequencyStat();
+                }
             } else if (!g_patchReverted) {  // 截图工具运行期间不维护补丁
                 MaintainCs2Patch();
             }
