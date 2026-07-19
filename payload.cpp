@@ -185,6 +185,16 @@
 //        安全性: VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch), 无新内存访问模式
 //                降级模式下依赖 SHV_Install patch 兜底 (双重保险), BSOD 风险极低
 //        预期效果: VmxOnWrapper patch 持久有效, EPT 永不构造, 综合 2-5% → 1.5-4%
+// BUILD: 567 (v3.237: 禁用 DR0 频率统计 — 跨进程 #DB 崩溃根因修复)
+//        ★ BUILD 567 v3.237 FIX (DR0 跨进程崩溃 7/20):
+//          - 现象: v3.236 测试 CS2 运行 45 秒后, 按 ESC 切换到菜单时 CS2 崩溃 (0xC0000005)
+//          - 根因: DR0 断点设置在 CS2 线程上 (StartDR0FrequencyStat), CS2 线程执行到 patch 地址
+//                  (client.dll RVA 0xC125D9) 时触发 #DB 异常, #DB 在 CS2 进程内触发,
+//                  loader.exe 的 VEH 无法跨进程捕获 → CS2 进程无 VEH 处理 #DB → CS2 崩溃.
+//          - 修复: 禁用 StartDR0FrequencyStat 调用 (2 处: 初始化阶段 L2895 + 主循环 L3511)
+//          - 安全性: DR0 是 BUILD 557 诊断功能 (统计 patch 执行频率), 非核心功能,
+//                    禁用不影响透视 (ApplyCs2Patch NOP 32c0) 和防检测 (7 层保护).
+//          - 保留: VEH STATUS_SINGLE_STEP 处理仍保留 (防御性, 处理可能的残留 DR0).
 // BUILD: 567 (v3.236: DR0 残留崩溃修复 + VAD 边界放宽)
 //        ★ BUILD 567 v3.236 FIX (DR0 残留 + VAD 边界 7/20):
 //          - 现象 1: v3.235 测试 CS2 运行 60s 后 loader.exe 崩溃 (0xc0000005)
@@ -533,7 +543,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.236 启动摘要 (DR0 残留崩溃修复 + VAD 边界放宽)\n");
+    DiagLog("BUILD 567 v3.237 启动摘要 (禁用 DR0 频率统计 — 跨进程 #DB 崩溃根因修复)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -572,7 +582,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.236 退出摘要\n");
+    DiagLog("BUILD 567 v3.237 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -597,7 +607,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.236 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.237 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
@@ -2888,8 +2898,11 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             // ★ BUILD 557: 补丁成功后启动 DR0 频率统计 (60s 窗口)
             //   目的: 统计 32 c0 (现为 90 90) 执行频率, 为 BUILD 558 DR0+VEH 跳过方案提供决策依据
             //   幂等: StartDR0FrequencyStat 内部用 InterlockedExchange(&g_dr0StatActive, 1) 防重入
+            // ★ BUILD 567 v3.237: 禁用 DR0 频率统计 — DR0 设置在 CS2 线程上,
+            //   #DB 异常在 CS2 进程内触发, loader.exe 的 VEH 无法跨进程捕获,
+            //   导致 CS2 线程执行到 patch 地址时触发 #DB → CS2 崩溃 (0xC0000005).
             if (g_cs2Patched) {
-                StartDR0FrequencyStat();
+                // StartDR0FrequencyStat();  // ★ v3.237: 禁用 (DR0 跨进程崩溃根因)
             }
 
             // ★ BUILD 565: Hook NtReadVirtualMemory 双重保险
@@ -3504,7 +3517,11 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 //         主循环中 cs2::Memory 已初始化, ApplyCs2Patch 成功后需要补启动 DR0 统计.
                 //   幂等: StartDR0FrequencyStat 内部用 InterlockedExchange(&g_dr0StatActive, 1) 防重入
                 if (g_cs2Patched) {
-                    StartDR0FrequencyStat();
+                    // ★ BUILD 567 v3.237: 禁用 DR0 频率统计 — DR0 设置在 CS2 线程上,
+                    //   #DB 异常在 CS2 进程内触发, loader.exe 的 VEH 无法跨进程捕获,
+                    //   导致 CS2 线程执行到 patch 地址时触发 #DB → CS2 崩溃 (0xC0000005).
+                    //   DR0 是 BUILD 557 诊断功能, 非核心功能, 禁用不影响透视/防检测.
+                    // StartDR0FrequencyStat();  // ★ v3.237: 禁用
                     // ★ BUILD 565: 若初始化阶段 NtReadHooker 未安装 (ApplyCs2Patch 失败),
                     //   主循环中重试安装 (5s 间隔, 与 ApplyCs2Patch 同周期)
                     if (!stealth::NtReadHooker::Instance().IsActive() && g_patchAddr && g_clientBase) {
