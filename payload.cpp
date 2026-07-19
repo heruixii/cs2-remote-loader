@@ -185,6 +185,19 @@
 //        安全性: VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch), 无新内存访问模式
 //                降级模式下依赖 SHV_Install patch 兜底 (双重保险), BSOD 风险极低
 //        预期效果: VmxOnWrapper patch 持久有效, EPT 永不构造, 综合 2-5% → 1.5-4%
+// BUILD: 567 (v3.238: 诊断版本 — 添加 EkkoSleep 崩溃位置诊断日志)
+//        ★ BUILD 567 v3.238 DIAG (EkkoSleep 崩溃位置定位 7/20):
+//          - 目的: v3.237 在 patched 日志后 1.3 秒崩溃, 无任何后续日志, 怀疑
+//                  EkkoSleep 内部 EncryptAll/DecryptAll 失败导致代码页保持加密状态.
+//          - 改动: 仅添加诊断日志 (DiagLog + memory_cloak.cpp EkkoDiagLog), 不修改任何逻辑.
+//          - 位置 1: payload.cpp 主循环 NtReadHooker::Install/Maintain 前后 + StealthSleep 前后
+//          - 位置 2: memory_cloak.cpp EkkoSleep 内部 EncryptAll/DecryptAll 前后 + VP 失败时
+//          - 判读: "B238:NR:I+ post" 无后续日志 → NtReadHooker::Install 后崩溃
+//                  "B238:SS:pre" 有 "B238:SS:post" 无 → EkkoSleep 内部崩溃
+//                  "B238:EK:EA+ post" 有 "B238:EK:DA+ pre" 无 → DecryptAll 内部崩溃
+//                  "B238:EK:DA VP FAIL" → VirtualProtect 失败 (根因确认)
+//          - 安全性: EkkoDiagLog 紧邻 EkkoSleep 实现, 落入同一 4KB 页 (已被 exemptPages 豁免)
+//                    诊断日志仅在 EkkoSleep 入口/出口调用, 不在加密窗口内调用.
 // BUILD: 567 (v3.237: 禁用 DR0 频率统计 — 跨进程 #DB 崩溃根因修复)
 //        ★ BUILD 567 v3.237 FIX (DR0 跨进程崩溃 7/20):
 //          - 现象: v3.236 测试 CS2 运行 45 秒后, 按 ESC 切换到菜单时 CS2 崩溃 (0xC0000005)
@@ -543,7 +556,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.237 启动摘要 (禁用 DR0 频率统计 — 跨进程 #DB 崩溃根因修复)\n");
+    DiagLog("BUILD 567 v3.238 启动摘要 (诊断版本 — EkkoSleep 崩溃位置定位)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -582,7 +595,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.237 退出摘要\n");
+    DiagLog("BUILD 567 v3.238 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -607,7 +620,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.237 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.238 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
@@ -3527,8 +3540,14 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     if (!stealth::NtReadHooker::Instance().IsActive() && g_patchAddr && g_clientBase) {
                         HANDLE hCs2ForHook = StealthEngine::Instance().GetProcessHandle();
                         if (hCs2ForHook) {
+                            // ★ BUILD 567 v3.238 DIAG: NtReadHooker::Install 前后诊断
+                            DiagLog("B238:NR:I+ pre addr=0x%llX cb=0x%llX h=%p\n",
+                                (unsigned long long)g_patchAddr,
+                                (unsigned long long)g_clientBase, hCs2ForHook);
                             stealth::NtReadHooker::Instance().Install(
                                 hCs2ForHook, g_clientBase, g_patchAddr);
+                            DiagLog("B238:NR:I+ post active=%d\n",
+                                stealth::NtReadHooker::Instance().IsActive() ? 1 : 0);
                         }
                     }
                 }
@@ -3542,7 +3561,10 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         //   检测 PvpAlive.dll 重载 (基址变化) 或 ntdll 被 PAC 恢复, 自动重新安装 hook.
         //   仅在 hook 已安装且非测试模式时执行.
         if (!g_egTestMode && !g_halfTestMode && stealth::NtReadHooker::Instance().IsActive()) {
+            // ★ BUILD 567 v3.238 DIAG: NtReadHooker::Maintain 前后诊断
+            DiagLog("B238:NR:M+ pre\n");
             stealth::NtReadHooker::Instance().Maintain();
+            DiagLog("B238:NR:M+ post\n");
         }
 
         // ★ BUILD 549: 截图检测 — 5s 间隔 (原 1s)
@@ -3611,9 +3633,17 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             }
         }
         if (!g_egTestMode && !g_dr0StatActive) {
+            // ★ BUILD 567 v3.238 DIAG: StealthSleep (EkkoSleep) 前后诊断
+            //   若 pre 有 post 无 → EkkoSleep 内部崩溃 (EncryptAll/DecryptAll 失败)
+            DiagLog("B238:SS:pre ms=%u dr0=%d eg=%d\n", sleepMs, g_dr0StatActive, g_egTestMode);
             StealthEngine::Instance().StealthSleep(sleepMs);
+            DiagLog("B238:SS:post\n");
         } else {
+            // ★ BUILD 567 v3.238 DIAG: 普通 Sleep 分支 (测试模式/DR0 active)
+            DiagLog("B238:SLP:pre ms=%u (no Ekko dr0=%d eg=%d)\n",
+                sleepMs, g_dr0StatActive, g_egTestMode);
             Sleep(sleepMs);
+            DiagLog("B238:SLP:post\n");
         }
     }
 

