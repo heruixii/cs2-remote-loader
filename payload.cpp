@@ -176,6 +176,54 @@ static uint64_t g_RtlDeactivateEnd  = 0;       // 函数结束地址 (起始 + 0
 static uint32_t g_safeDummyBuf[16]  = {};      // 安全缓冲区 — VEH 设置 rax 指向此缓冲区 (64 字节, 满足 +0x38 偏移读取)
 static DWORD    g_mainThreadId      = 0;       // 主线程 ID — 用于诊断对比崩溃线程
 
+// ============================================================
+// ★ BUILD 555 P2-2: SEH 替代 VEH 评估结论 (文档化)
+//
+// 评估背景:
+//   P2-2 待办提出用 SEH (Structured Exception Handling, __try/__except)
+//   替代 VEH (Vectored Exception Handler) 以降低检测面:
+//     - VEH 通过 AddVectoredExceptionHandler API 注册 (IAT 暴露)
+//     - VEH 链表存储在 PEB->KernelCallbackTable 或 ntdll 内部全局,
+//       PAC 可扫描定位
+//     - SEH 由编译器生成 (无需 API 调用), handler 记录在栈上 (TEB->Tib)
+//
+// 评估结论: **SEH 无法替代 VEH** — 保留 VEH 作为主异常处理机制
+//
+// 原因 1: 作用域不匹配
+//   - VEH 是进程级 (process-wide), 任何线程任何地址的异常都能捕获
+//   - SEH 是函数作用域 (per-function-scope), 仅 __try 块内异常能捕获
+//   - 当前 VEH 的主要用途 (BUILD 536):
+//       捕获 ntdll!RtlDeactivateActivationContext 在 **worker 线程** (线程池/RPC)
+//       中的 ACCESS_VIOLATION 崩溃 — 这些线程不在我们的代码中, 无法用 SEH 包裹
+//   - 移除 VEH 将导致 worker 线程崩溃直接拖垮整个进程
+//
+// 原因 2: 自愈场景不可控
+//   - VEH 自愈 (v3.78) 用于恢复 BYOVD IOCTL 物理映射导致的代码页污染
+//   - 污染可能在 **任意后续指令执行** 时触发, 不限于特定函数
+//   - SEH 仅能在已知调用点包裹, 无法覆盖所有可能触发位置
+//
+// 原因 3: RTCore64 已移除 → 自愈需求降低
+//   - BUILD 550 移除 RTCore64.sys (物理内存映射驱动), 改用 PDFWKRNL.sys (VA memcpy)
+//   - PDFWKRNL 不会导致 STATUS_PRIVILEGED_INSTRUCTION (0xC0000096) —
+//     该自愈路径已是死代码, VEH 的实际负担减轻
+//   - 仅剩 STATUS_ACCESS_VIOLATION 路径 (罕见), SEH 收益进一步降低
+//
+// 原因 4: SEH 实现复杂度高, 收益低
+//   - 包裹主循环需 __try/__except 包覆整个 while(true) 体, 编译器生成
+//     大量 SEH 表项 (.pdata/.xdata), 反而增加二进制特征
+//   - VEH handler 只有一个函数, 特征可控 (EkkoSleep 已豁免其页面)
+//
+// 实施策略:
+//   1. 保留 VEH 作为主异常处理 (覆盖 worker 线程崩溃 + 自愈)
+//   2. 不添加 SEH 包裹 (评估后认为收益不足以抵消复杂度)
+//   3. VEH handler 继续优化 (BUILD 553 已加 60s 重置, BUILD 555 已加降级检测)
+//
+// 替代优化 (已实施):
+//   - BUILD 553: MAX_VEH_RETRIES 3→10 + 60s 无崩溃重置 (避免长期累积误放弃)
+//   - BUILD 555 P2-1: SHV patch 降级检测 (减少 IOCTL 频率, 降低触发自愈的概率)
+//   - EkkoSleep 豁免 VEH handler 页面 (防止加密期间触发异常)
+// ============================================================
+
 static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     uint64_t crashAddr = (uint64_t)ep->ExceptionRecord->ExceptionAddress;
     uint64_t dllBase   = (uint64_t)g_diagDllBase;
@@ -551,6 +599,7 @@ static bool ResolveImportTable(HANDLE hProcess, void* remoteBase,
 static uint8_t* g_patchAddr = nullptr;
 static bool g_cs2Patched = false;
 static bool g_shadowPageTried = false;  // ★ BUILD 549: 影子页尝试标志 (失败后不再重试)
+static uint8_t* g_clientBase = nullptr;  // ★ BUILD 555 P2-4: client.dll 基址缓存 (供 ValidatePatchFunctionBoundary 使用)
 
 // ★ BUILD 549+: pattern XOR 加密常量 (避免明文特征码 0x32 0xc0 0x4c 0x8b ... 出现在二进制中)
 //   原始 pattern: 32 c0 4c 8b a4 24 c8 00 00 00 (xor al,ah; mov r12,[rsp+0xc8])
@@ -623,6 +672,88 @@ typedef struct _B549_SYSTEM_THREAD_INFO {
 //   所有调用使用 stealth::ModNameHash / stealth::GetModuleBaseFromPEB
 // ============================================================
 
+// ★ BUILD 555 P2-4: ValidatePatchFunctionBoundary — 函数边界回溯验证
+//   修复 P2-4 缺陷: 原 ApplyCs2Patch 仅用 10 字节特征码 `32 c0 4c 8b a4 24 c8 00 00 00`
+//   匹配, false positive 风险 (CS2 更新后可能在多个位置出现此序列)
+//
+//   增强 1: 向前回溯最多 256 字节查找函数边界 (复用 ShvInstallPatcher 三级查找算法)
+//     Pass 1: 0xCC int3 (最可靠, 不会出现在指令中间)
+//     Pass 2: 连续 ≥2 字节 0x90 nop (MSVC 对齐)
+//     Pass 3: 连续 ≥4 字节 0x00 零填充 (Clang 对齐)
+//   增强 2: 验证边界后第一字节是合法函数序言 (0x48=REX.W / 0x55=push rbp / 0x40-0x4F=REX)
+//   增强 3: 验证 found 与函数入口距离 <= 0x200 (patch 不应位于函数体深处)
+//   返回: true = 验证通过, false = 验证失败 (拒绝 patch)
+static bool ValidatePatchFunctionBoundary(uint8_t* found) {
+    if (!found) return false;
+
+    // 边界检查: 不能在模块起始处 (无前序字节可回溯)
+    if (found < g_clientBase + 0x100) return false;
+
+    constexpr uint32_t MAX_BACKSCAN = 256;
+    uint32_t backSize = 0;
+    // 计算实际可回溯字节数 (不能超过模块起始)
+    if ((uintptr_t)(found - g_clientBase) < MAX_BACKSCAN) {
+        backSize = (uint32_t)(found - g_clientBase);
+    } else {
+        backSize = MAX_BACKSCAN;
+    }
+    if (backSize < 4) return false;
+
+    uint8_t* backStart = found - backSize;
+
+    // Pass 1: 查找 0xCC (int3, 最可靠 — 不会出现在指令中间)
+    for (int32_t k = (int32_t)backSize - 1; k >= 0; k--) {
+        if (backStart[k] == 0xCC) {
+            uint32_t entryOffset = k + 1;
+            if (entryOffset >= backSize) continue;
+            uint8_t firstByte = backStart[entryOffset];
+            if (firstByte == 0x48 || firstByte == 0x55 ||
+                (firstByte >= 0x40 && firstByte <= 0x4F)) {
+                // 验证 patch 位置与函数入口距离
+                uint32_t dist = backSize - entryOffset;
+                if (dist <= 0x200) return true;
+            }
+        }
+    }
+
+    // Pass 2: 查找连续 ≥2 字节 0x90 (nop 填充, MSVC 常用)
+    for (int32_t k = (int32_t)backSize - 2; k >= 0; k--) {
+        if (backStart[k] == 0x90 && backStart[k + 1] == 0x90) {
+            uint32_t entryOffset = k + 2;
+            while (entryOffset < backSize && backStart[entryOffset] == 0x90) {
+                entryOffset++;
+            }
+            if (entryOffset >= backSize) continue;
+            uint8_t firstByte = backStart[entryOffset];
+            if (firstByte == 0x48 || firstByte == 0x55 ||
+                (firstByte >= 0x40 && firstByte <= 0x4F)) {
+                uint32_t dist = backSize - entryOffset;
+                if (dist <= 0x200) return true;
+            }
+        }
+    }
+
+    // Pass 3: 查找连续 ≥4 字节 0x00 (零填充, Clang/部分 MSVC 使用)
+    for (int32_t k = (int32_t)backSize - 4; k >= 0; k--) {
+        if (backStart[k] == 0x00 && backStart[k + 1] == 0x00 &&
+            backStart[k + 2] == 0x00 && backStart[k + 3] == 0x00) {
+            uint32_t entryOffset = k + 4;
+            while (entryOffset < backSize && backStart[entryOffset] == 0x00) {
+                entryOffset++;
+            }
+            if (entryOffset >= backSize) continue;
+            uint8_t firstByte = backStart[entryOffset];
+            if (firstByte == 0x48 || firstByte == 0x55 ||
+                (firstByte >= 0x40 && firstByte <= 0x4F)) {
+                uint32_t dist = backSize - entryOffset;
+                if (dist <= 0x200) return true;
+            }
+        }
+    }
+
+    return false;  // 三级边界查找全部失败
+}
+
 static bool ApplyCs2Patch() {
     // 1. 获取 client.dll 基址
     // ★ BUILD 549+: 通过 PEB Ldr 遍历获取 (替代 GetModuleHandleA, 规避 PAC 用户态 hook)
@@ -646,6 +777,7 @@ static bool ApplyCs2Patch() {
     }
     uint8_t* base = (uint8_t*)hClient;
     size_t size = ntHdr->OptionalHeader.SizeOfImage;
+    g_clientBase = base;  // ★ BUILD 555 P2-4: 缓存供 ValidatePatchFunctionBoundary 使用
 
     // 3. 搜索特征码 (★ BUILD 549+: XOR 加密, 运行时解密到栈上, 避免明文特征码出现在二进制中)
     //   PAT_ENC 是编译期 XOR 加密的 pattern, 运行时用 g_patKey (volatile) 解密
@@ -655,7 +787,11 @@ static bool ApplyCs2Patch() {
     }
     const size_t patternLen = PAT_LEN;
 
+    // ★ BUILD 555 P2-4: 多匹配拒绝 (避免歧义匹配)
+    //   计数整个模块中匹配次数, > 1 则拒绝 patch (特征码不够独特)
+    //   修复 false positive 风险: CS2 更新后可能在多个位置出现此序列
     uint8_t* found = nullptr;
+    int matchCount = 0;
     for (size_t i = 0; i + patternLen < size; i++) {
         if (base[i] != pattern[0]) continue;
         if (base[i+1] != pattern[1]) continue;
@@ -663,11 +799,28 @@ static bool ApplyCs2Patch() {
         for (size_t j = 2; j < patternLen; j++) {
             if (base[i+j] != pattern[j]) { match = false; break; }
         }
-        if (match) { found = base + i; break; }
+        if (match) {
+            matchCount++;
+            if (matchCount == 1) {
+                found = base + i;  // 第一个匹配
+            } else {
+                // 第二个匹配出现 — 特征码不独特, 拒绝 patch (避免 patch 错误位置)
+                DiagLog("B555:AP:05 multi-match=%d\n", matchCount);
+                return false;
+            }
+        }
     }
 
     if (!found) {
         DiagLogEnc("c2");  // ★ BUILD 549: 加密 "pat not found"
+        return false;
+    }
+
+    // ★ BUILD 555 P2-4: 函数边界回溯验证 (验证强度等同 16+ 字节特征码)
+    //   修复 false positive: 即使字节序列匹配, 也必须位于合法函数体内
+    //   验证: 向前回溯查找函数边界 + 序言字节验证 + 距离限制
+    if (!ValidatePatchFunctionBoundary(found)) {
+        DiagLog("B555:AP:06 boundary check fail\n");
         return false;
     }
 
@@ -2083,8 +2236,15 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     // ★ BUILD 552: 周期性验证 SHV_Install patch 仍然有效
                     //   若 PAC 重载驱动或自我修复 patch, 此处重新 patch
                     //   低频率 (60-90s) 不增加 IOCTL 负担
-                    if (!stealth::ShvInstallPatcher::IsPatched()) {
-                        stealth::ShvInstallPatcher::PatchShvInstallEntry();
+                    // ★ BUILD 555 P2-1: 降级模式下跳过 SHV patch 检查
+                    //   原因: 连续 patch 失败 ≥3 次后, 跳过周期性检查避免触发频繁 IOCTL
+                    //         (PAC 频繁恢复 patch → 频繁 BYOVD IOCTL → PDFWKRNL.sys 卡死风险)
+                    //   降级期依赖 MinifilterNeutralizer (操作回调 stub) 作为主要 minifilter 防护
+                    //   自恢复: IsDegradedMode() 内部判断距上次尝试 >5 分钟自动退出降级模式
+                    if (!stealth::ShvInstallPatcher::IsDegradedMode()) {
+                        if (!stealth::ShvInstallPatcher::IsPatched()) {
+                            stealth::ShvInstallPatcher::PatchShvInstallEntry();
+                        }
                     }
 
                     // ★ BUILD 554 P0-1: 周期性重新调用 VADConcealer

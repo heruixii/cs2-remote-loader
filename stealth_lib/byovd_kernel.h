@@ -214,6 +214,12 @@ public:
     // 检查给定 VA 范围是否与受保护区域重叠
     static bool IsOverlappingProtectedRegion(uintptr_t va, SIZE_T size);
 
+    // ★ BUILD 555 P2-5: IOCTL 冷却期查询 (供 ShadowPageManager::Uninstall 使用)
+    //   返回 true = 当前在冷却期内 (驱动疑似卡死, 应跳过非关键 IOCTL)
+    //   返回 false = IOCTL 通道正常, 可以安全调用
+    //   注: 冷却期由 BUILD 532 overlapped I/O + 2s 超时机制设置 (仅 PDFWKRNL 路径)
+    bool IsIoctlInCooldown() const;
+
 private:
     KernelMemoryAccessor() = default;
 
@@ -464,6 +470,22 @@ public:
 
     // 批量伪装 (对 cleanedBases 中的所有区域)
     static int ConcealAllRegions(DWORD pid, const uintptr_t* bases, int count);
+
+private:
+    // ★ BUILD 555: 动态 EPROCESS 偏移缓存 (修复 P0 硬编码偏移问题)
+    //   原因: BUILD 534 起 VadOffsets::UniqueProcessId=0x440 / ActiveProcessLinks=0x448
+    //         硬编码, Win11 24H2 正确偏移为 0x1D0 / 0x1D8 (见 project_memory.md 约束)
+    //   修复: 运行时扫描 EPROCESS (复用 DKOMProcessHider 算法), 适配所有 Windows 版本
+    static uint32_t s_pidOffset;     // UniqueProcessId 偏移 (运行时解析, 0 = 未解析)
+    static uint32_t s_linksOffset;   // ActiveProcessLinks 偏移 (运行时解析)
+    static uint32_t s_vadRootOffset; // VadRoot 偏移 (运行时解析, 0 = 未解析)
+
+    // 解析 UniqueProcessId / ActiveProcessLinks 偏移 (扫描 System EPROCESS PID=4)
+    // 复用 DKOMProcessHider::EnsureOffsetsResolved 算法
+    static bool EnsureEprocessOffsets(KernelMemoryAccessor& kma, uint64_t ntBase);
+
+    // 解析 VadRoot 偏移 (扫描 EPROCESS 0x400-0x900 范围, 找符合 RTL_BALANCED_NODE 的字段)
+    static bool EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eprocess);
 };
 
 // ============================================================
@@ -568,6 +590,13 @@ public:
     // 返回 true = 已 patch (前 6 字节为 B8 FC FF FF FF C3)
     static bool IsPatched();
 
+    // ★ BUILD 555 P2-1: SHV patch 降级模式查询
+    //   返回 true = 降级模式 (连续 patch 失败 ≥3 次, 应跳过周期性 SHV patch 检查)
+    //   降级原因: PAC 频繁恢复 patch → 频繁 BYOVD IOCTL → 触发 PDFWKRNL.sys 卡死风险
+    //   降级策略: 跳过 SHV patch, 依赖 MinifilterNeutralizer 作为主要防护
+    //   自动恢复: 成功 patch 一次后退出降级模式
+    static bool IsDegradedMode();
+
     // 还原 SHV_Install 原始字节 (仅用于调试/测试, 不应在生产环境调用)
     // 返回 true = 还原成功
     static bool RestoreShvInstallEntry();
@@ -593,6 +622,26 @@ private:
     static uint8_t m_originalBytes[6];
     static bool m_hasOriginalBytes;
     static uint64_t m_patchedAddress;
+
+    // ★ BUILD 555 P2-1: SHV patch 降级检测状态
+    //   m_consecutiveFailures: 连续 patch 失败计数 (成功时重置为 0)
+    //   m_degradedMode: 降级模式标志 (连续失败 ≥ DEGRADED_FAILURE_THRESHOLD 次进入, 成功 patch 后退出)
+    //   m_lastPatchTick: 上次 patch 尝试时间 (用于降级模式下自恢复判定)
+    static uint32_t m_consecutiveFailures;
+    static bool     m_degradedMode;
+    static DWORD    m_lastPatchTick;
+
+    // ★ BUILD 555 P2-1: 降级阈值与自恢复间隔
+    //   连续失败 ≥3 次进入降级模式 (跳过周期性 SHV patch 检查, 依赖 MinifilterNeutralizer)
+    //   降级模式下距上次尝试 >5 分钟自动退出 (允许 PAC 重载后重新 patch)
+    static constexpr uint32_t DEGRADED_FAILURE_THRESHOLD   = 3;
+    static constexpr DWORD    DEGRADED_RECOVERY_INTERVAL_MS = 5 * 60 * 1000;  // 5 分钟
+
+    // ★ BUILD 555 P2-1: 内部状态更新辅助 (供 PatchShvInstallEntry 在各返回点调用)
+    //   RecordPatchFailure: 递增失败计数, 达到阈值时进入降级模式, 更新 m_lastPatchTick
+    //   RecordPatchSuccess: 重置失败计数, 退出降级模式, 更新 m_lastPatchTick
+    static void RecordPatchFailure();
+    static void RecordPatchSuccess();
 };
 
 } // namespace stealth

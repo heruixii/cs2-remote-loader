@@ -1396,9 +1396,19 @@ static bool PdfwIoctlWithTimeout(HANDLE hDevice, DWORD ioctlCode,
     if (hDevice == INVALID_HANDLE_VALUE) return false;
 
     // 冷却期检查 — 驱动疑似卡死时跳过 IOCTL
+    // ★ BUILD 555 P2-verify: 修复 GetTickCount 回绕时的冷却检查 bug
+    //   原实现: now < g_ioctlCooldownUntil (直接无符号比较)
+    //   问题: GetTickCount 接近 UINT32_MAX 时, +10000 回绕到小值,
+    //         now (大) < g_ioctlCooldownUntil (小) → false → 错误地允许 IOCTL
+    //         (与 IsIoctlInCooldown L2499-2506 修复前的 bug 同源)
+    //   修复: 用 (g_ioctlCooldownUntil - now) < 0x7FFFFFFF 判断 "冷却截止时间在未来"
+    //         (无符号回绕安全, GetTickCount DWORD 溢出时仍正确)
     DWORD now = GetTickCount();
-    if (g_ioctlCooldownUntil && now < g_ioctlCooldownUntil) {
-        return false;  // 冷却中, 跳过
+    if (g_ioctlCooldownUntil) {
+        DWORD remaining = g_ioctlCooldownUntil - now;  // 无符号回绕安全
+        if (remaining < 0x7FFFFFFF) {
+            return false;  // 冷却中, 跳过
+        }
     }
 
     // 创建手动重置事件 (overlapped 完成通知)
@@ -2486,12 +2496,30 @@ bool KernelMemoryAccessor::IsOverlappingProtectedRegion(uintptr_t va, SIZE_T siz
     return false;
 }
 
+// ★ BUILD 555 P2-5: IOCTL 冷却期查询 (供 ShadowPageManager::Uninstall 使用)
+//   返回 true = 当前在冷却期内 (驱动疑似卡死, 应跳过非关键 IOCTL)
+//   实现: g_ioctlCooldownUntil 由 BUILD 532 PdfwIoctlWithTimeout 设置 (仅 PDFWKRNL 路径)
+//         RTCore64 路径无超时保护, 始终返回 false (调用方需自己处理同步阻塞)
+//   ★ BUILD 555 P2-verify: 修复无符号算术回绕检查 bug
+//     原实现: (now - g_ioctlCooldownUntil) < 0x7FFFFFFF && now < g_ioctlCooldownUntil
+//     问题: now < g_ioctlCooldownUntil 时, (now - g_ioctlCooldownUntil) 回绕为接近 UINT32_MAX 的大值
+//           导致条件恒为 false, 函数永远不会返回 true
+//     修复: 用 (g_ioctlCooldownUntil - now) < 0x7FFFFFFF 直接判断 "冷却截止时间在未来"
+//           (GetTickCount DWORD 溢出时无符号算术仍正确, 与 VEH 重置逻辑一致)
+bool KernelMemoryAccessor::IsIoctlInCooldown() const {
+    if (!g_overlappedActive) return false;  // 非 overlapped 模式无冷却机制
+    if (g_ioctlCooldownUntil == 0) return false;
+    DWORD now = GetTickCount();
+    // 冷却截止时间在未来 (且在 ~24 天内, 防止 g_ioctlCooldownUntil 残留导致永久冷却)
+    DWORD remaining = g_ioctlCooldownUntil - now;  // 无符号回绕安全
+    return (remaining < 0x7FFFFFFF);
+}
+
 bool KernelMemoryAccessor::IsKernelAddressValid(uint64_t va) {
     // 内核地址范围检查 (Windows x64 规范)
     // 内核空间: 0xFFFF800000000000 ~ 0xFFFFFFFFFFFFFFFF
     if (va < 0xFFFF800000000000ULL) return false;
     if (va > 0xFFFFFFFFFFFFFFFFULL) return false;
-
     // ★ v3.114: IOCTL_VIRTUAL_MEM (0x80002000) 直接读取内核虚拟地址, 无需 VA→PA 转换
     //   移除 PageTableWalker 依赖 (旧代码通过物理内存扫描 PML4, 不兼容内核VA IOCTL)
     //   只要驱动可用且 VA 在内核范围, 即视为有效
@@ -2548,7 +2576,13 @@ uint64_t EACCallbackDisabler::FindObpCallbackArrayHead(KernelMemoryAccessor& kma
 
     // BUILD 458: 分块读取 ObRegisterCallbacks + ObUnRegisterCallbacks 函数体
     // 扩展到 1024 字节, 搜索 LEA/MOV [RIP+rel32] → ntoskrnl .data 段
-    const char* funcNames[] = { "ObRegisterCallbacks", "ObUnRegisterCallbacks" };
+    // ★ BUILD 555 P2-verify: API 名 STEALTH_STR_DECRYPT_TO 加密 (原明文 funcNames[] 进入 .rdata)
+    //   修复: 两个 API 名分别用栈缓冲区解密, 消除 .rdata 明文特征
+    char funcName1[40] = {};
+    char funcName2[40] = {};
+    STEALTH_STR_DECRYPT_TO("ObRegisterCallbacks", funcName1, sizeof(funcName1));
+    STEALTH_STR_DECRYPT_TO("ObUnRegisterCallbacks", funcName2, sizeof(funcName2));
+    const char* funcNames[] = { funcName1, funcName2 };
     uint8_t funcBody[512] = {};
 
     for (const char* funcName : funcNames) {
@@ -2578,7 +2612,10 @@ uint64_t EACCallbackDisabler::FindObpCallbackArrayHead(KernelMemoryAccessor& kma
     }
 
     // 回退: 尝试 ObpCallbackArrayHead 直接导出 (某些 Windows 版本)
-    uint64_t fallback = kma.ResolveExport(ntBase, "ObpCallbackArrayHead");
+    // ★ BUILD 555 P2-verify: STEALTH_STR_DECRYPT_TO 加密 (原明文进入 .rdata)
+    char obpCallbackName[40] = {};
+    STEALTH_STR_DECRYPT_TO("ObpCallbackArrayHead", obpCallbackName, sizeof(obpCallbackName));
+    uint64_t fallback = kma.ResolveExport(ntBase, obpCallbackName);
     if (fallback) s_cachedArrayHead = fallback;  // ★ BUILD 533: 缓存回退结果
     return fallback;
 }
@@ -2735,7 +2772,10 @@ int EACCallbackDisabler::DisableProcessNotifyCallbacks(const char* eacDriverName
     }
 
     // PsSetCreateProcessNotifyRoutine → sigscan 找到 PspCreateProcessNotifyRoutine 数组
-    uint64_t psSetNotify = kma.ResolveExport(ntBase, "PsSetCreateProcessNotifyRoutine");
+    // ★ BUILD 555 P2-verify: STEALTH_STR_DECRYPT_TO 加密 (原明文进入 .rdata)
+    char psCreateProcName[64] = {};
+    STEALTH_STR_DECRYPT_TO("PsSetCreateProcessNotifyRoutine", psCreateProcName, sizeof(psCreateProcName));
+    uint64_t psSetNotify = kma.ResolveExport(ntBase, psCreateProcName);
     if (!psSetNotify) return 0;
 
     // 搜索 lea rcx, [rip+offset] 或 mov rcx, imm64 定位数组
@@ -2806,7 +2846,10 @@ int EACCallbackDisabler::DisableImageNotifyCallbacks(const char* eacDriverName) 
     }
 
     // PsSetLoadImageNotifyRoutine → 找到 PspLoadImageNotifyRoutine 数组
-    uint64_t psSetLoadImg = kma.ResolveExport(ntBase, "PsSetLoadImageNotifyRoutine");
+    // ★ BUILD 555 P2-verify: STEALTH_STR_DECRYPT_TO 加密 (原明文进入 .rdata)
+    char psLoadImgName[64] = {};
+    STEALTH_STR_DECRYPT_TO("PsSetLoadImageNotifyRoutine", psLoadImgName, sizeof(psLoadImgName));
+    uint64_t psSetLoadImg = kma.ResolveExport(ntBase, psLoadImgName);
     if (!psSetLoadImg) return 0;
 
     uint8_t funcBody[128] = {};
@@ -2872,7 +2915,10 @@ int EACCallbackDisabler::DisableThreadNotifyCallbacks(const char* eacDriverName)
     }
 
     // PsSetCreateThreadNotifyRoutine → 找到 PspCreateThreadNotifyRoutine 数组
-    uint64_t psSetThread = kma.ResolveExport(ntBase, "PsSetCreateThreadNotifyRoutine");
+    // ★ BUILD 555 P2-verify: STEALTH_STR_DECRYPT_TO 加密 (原明文进入 .rdata)
+    char psCreateThreadName[64] = {};
+    STEALTH_STR_DECRYPT_TO("PsSetCreateThreadNotifyRoutine", psCreateThreadName, sizeof(psCreateThreadName));
+    uint64_t psSetThread = kma.ResolveExport(ntBase, psCreateThreadName);
     if (!psSetThread) return 0;
 
     // 搜索 lea rcx, [rip+offset] 或 mov rcx, imm64 定位数组 (与 Image/Process 模式相同)
@@ -3148,7 +3194,10 @@ bool DKOMProcessHider::EnsureOffsetsResolved(KernelMemoryAccessor& kma, uint64_t
         return true;
     }
 
-    uint64_t psInitProcVA = kma.ResolveExport(ntBase, "PsInitialSystemProcess");
+    // ★ BUILD 555 P2-verify: STEALTH_STR_DECRYPT_TO 加密 PsInitialSystemProcess (原明文进入 .rdata)
+    char psInitProcName[40] = {};
+    STEALTH_STR_DECRYPT_TO("PsInitialSystemProcess", psInitProcName, sizeof(psInitProcName));
+    uint64_t psInitProcVA = kma.ResolveExport(ntBase, psInitProcName);
     if (!psInitProcVA) {
         ByovdDiag("DKOM.EnsureOffsets: FAIL PsInitialSystemProcess not resolved (ntBase=0x%llX)\n",
             (unsigned long long)ntBase);
@@ -3205,7 +3254,10 @@ uint64_t DKOMProcessHider::FindEPROCESSByPid(KernelMemoryAccessor& kma, DWORD pi
     uint64_t ntBase = kma.GetNtoskrnlBase();
     if (!ntBase) return 0;
 
-    uint64_t psInitProcVA = kma.ResolveExport(ntBase, "PsInitialSystemProcess");
+    // ★ BUILD 555 P2-verify: STEALTH_STR_DECRYPT_TO 加密 PsInitialSystemProcess
+    char psInitProcName2[40] = {};
+    STEALTH_STR_DECRYPT_TO("PsInitialSystemProcess", psInitProcName2, sizeof(psInitProcName2));
+    uint64_t psInitProcVA = kma.ResolveExport(ntBase, psInitProcName2);
     if (!psInitProcVA) return 0;
 
     uint64_t systemEPROCESS = kma.Read<uint64_t>(psInitProcVA);
@@ -3810,7 +3862,10 @@ bool KernelTraceCleaner::ClearMmUnloadedDrivers(uint64_t ntosBase) {
     //     48 8D 0D XX XX XX XX    lea rcx, [MmUnloadedDrivers]
     //     48 8D 15 XX XX XX XX    lea rdx, [MmLastUnloadedDriver]
     //   MmUnloadedDrivers = RIP(下一条指令) + rel32
-    uint64_t ioDeleteDriver = kma.ResolveExport(ntosBase, "IoDeleteDriver");
+    // ★ BUILD 555 P2-verify: STEALTH_STR_DECRYPT_TO 加密 IoDeleteDriver
+    char ioDeleteDriverName[32] = {};
+    STEALTH_STR_DECRYPT_TO("IoDeleteDriver", ioDeleteDriverName, sizeof(ioDeleteDriverName));
+    uint64_t ioDeleteDriver = kma.ResolveExport(ntosBase, ioDeleteDriverName);
     if (!ioDeleteDriver) {
         ByovdDiag("TRACE:MmUnloadedDrivers: IoDeleteDriver not found\n");
         return false;
@@ -4249,34 +4304,129 @@ struct KernFltOpReg {
 // Stub 代码: return 0 (FLT_PREOP_SUCCESS_NO_CALLBACK / FLT_POSTOP_FINISHED_PROCESSING)
 #define STUB_RET0_BYTES {0x33, 0xC0, 0xC3}  // XOR EAX, EAX; RET
 
-// 在 fltmgr.sys 内核镜像中扫描 "return 0" stub
-static uint64_t FindRet0Stub(uint64_t fltmgrBase, uint64_t fltmgrSize) {
-    auto& kma = KernelMemoryAccessor::Instance();
-    const uint8_t stub[] = STUB_RET0_BYTES;
+// ★ BUILD 555 P2-3: 多样化 stub 模式 (修复原单一 stub 易被 PAC 特征码扫描定位的缺陷)
+//   原 FindRet0Stub 只扫描 1 种 stub (33 C0 C3), 所有 minifilter 回调都指向同一地址
+//   → PAC 扫描 fltmgr.sys 找到该 stub 地址, 再扫描 minifilter Operations 数组发现
+//     所有 PreOp/PostOp 都指向同一 stub → 检测到 MinifilterNeutralizer
+//   修复: 扫描 5 种等价 "return 0" 模式, 不同回调轮流使用不同 stub 地址
+//   5 种模式 (语义等价: 返回 0):
+//     Pattern A: 33 C0 C3            (XOR EAX, EAX; RET)         - 3 字节
+//     Pattern B: B8 00 00 00 00 C3   (MOV EAX, 0; RET)           - 6 字节
+//     Pattern C: 2B C0 C3            (SUB EAX, EAX; RET)         - 3 字节
+//     Pattern D: 83 E0 00 C3         (AND EAX, 0; RET)           - 4 字节
+//     Pattern E: 6A 00 58 C3         (PUSH 0; POP RAX; RET)      - 4 字节
 
-    // 扫描 fltmgr.sys 的代码段 (.text, 通常在基址 +0x1000 到 +0x300000)
+// 5 种等价 stub 模式 (运行时构建, 避免明文模式常量被 PAC 扫描)
+static const uint8_t STUB_PATTERNS_RAW[][6] = {
+    {0x33, 0xC0, 0xC3},                       // A: XOR EAX, EAX; RET
+    {0xB8, 0x00, 0x00, 0x00, 0x00, 0xC3},     // B: MOV EAX, 0; RET
+    {0x2B, 0xC0, 0xC3},                       // C: SUB EAX, EAX; RET
+    {0x83, 0xE0, 0x00, 0xC3},                 // D: AND EAX, 0; RET
+    {0x6A, 0x00, 0x58, 0xC3},                 // E: PUSH 0; POP RAX; RET
+};
+static const size_t STUB_PATTERN_LENS[] = {3, 6, 3, 4, 4};
+static constexpr size_t STUB_PATTERN_COUNT = 5;
+static constexpr size_t MAX_STUB_INSTANCES = 16;  // 最多收集 16 个 stub 实例
+
+// ★ BUILD 555 P2-3: FindRet0Stubs — 扫描 fltmgr.sys 找多种 return 0 stub 实例
+//   返回: stub 地址数组 (去重, 最多 maxStubs 个), 实际数量通过 outCount 返回
+//   策略: 轮流扫描 5 种模式, 每种模式找到 1 个实例后切换到下一种, 直到收集够 maxStubs 个
+//         这样 stub 列表中的模式分布均匀, 避免单一模式主导
+static uint64_t FindRet0Stubs(uint64_t fltmgrBase, uint64_t fltmgrSize,
+                               uint64_t* outStubs, size_t maxStubs, size_t* outCount) {
+    auto& kma = KernelMemoryAccessor::Instance();
+    *outCount = 0;
+    if (!outStubs || maxStubs == 0) return 0;
+
     uint64_t scanStart = fltmgrBase + 0x1000;
     uint64_t scanEnd = scanStart + (fltmgrSize > 0x300000 ? 0x300000 : fltmgrSize - 0x1000);
 
-    // ★ BUILD 497: VirtualAlloc 替代 std::vector — 避免 CRT 堆依赖
     uint8_t* chunk = (uint8_t*)VirtualAlloc(nullptr, 0x10000, MEM_COMMIT, PAGE_READWRITE);
     if (!chunk) return 0;
-    for (uint64_t addr = scanStart; addr < scanEnd; addr += 0x10000) {
-        if (!kma.ReadKernelVA(addr, chunk, 0x10000))
-            continue;
-        for (size_t off = 0; off < 0x10000 - 3; off++) {
-            if (chunk[off] == stub[0] && chunk[off+1] == stub[1] && chunk[off+2] == stub[2]) {
+
+    // 标记已收集的 stub 地址 (去重)
+    uint64_t collected[MAX_STUB_INSTANCES] = {};
+    size_t collectedCount = 0;
+
+    // 每种模式是否已找到至少 1 个实例
+    bool patternFound[STUB_PATTERN_COUNT] = {};
+
+    // 多轮扫描: 每轮扫描整个 fltmgr, 找一种新模式或同模式新实例
+    //   直到收集够 maxStubs 个, 或所有模式都至少找到 1 个且总数 >= maxStubs
+    for (size_t round = 0; round < STUB_PATTERN_COUNT * 4 && collectedCount < maxStubs; round++) {
+        size_t targetPatternIdx = round % STUB_PATTERN_COUNT;
+
+        for (uint64_t addr = scanStart; addr < scanEnd && collectedCount < maxStubs; addr += 0x10000) {
+            if (!kma.ReadKernelVA(addr, chunk, 0x10000))
+                continue;
+
+            const uint8_t* pattern = STUB_PATTERNS_RAW[targetPatternIdx];
+            size_t patLen = STUB_PATTERN_LENS[targetPatternIdx];
+
+            for (size_t off = 0; off + patLen <= 0x10000; off++) {
+                bool match = true;
+                for (size_t j = 0; j < patLen; j++) {
+                    if (chunk[off + j] != pattern[j]) { match = false; break; }
+                }
+                if (!match) continue;
+
                 uint64_t stubAddr = addr + off;
-                ByovdDiag("FLT:NTRL: found ret0 stub at flt+0x%llX\n",
+
+                // 去重检查
+                bool dup = false;
+                for (size_t k = 0; k < collectedCount; k++) {
+                    if (collected[k] == stubAddr) { dup = true; break; }
+                }
+                if (dup) continue;
+
+                // 间距检查: 不同 stub 至少相距 16 字节 (避免同一函数内多个 ret 实例)
+                bool tooClose = false;
+                for (size_t k = 0; k < collectedCount; k++) {
+                    uint64_t diff = (stubAddr > collected[k]) ? (stubAddr - collected[k])
+                                                              : (collected[k] - stubAddr);
+                    if (diff < 16) { tooClose = true; break; }
+                }
+                if (tooClose) continue;
+
+                collected[collectedCount++] = stubAddr;
+                patternFound[targetPatternIdx] = true;
+                ByovdDiag("FLT:NTRL: stub[%zu] mode=%zu at flt+0x%llX\n",
+                    collectedCount, targetPatternIdx,
                     (unsigned long long)(stubAddr - fltmgrBase));
-                VirtualFree(chunk, 0, MEM_RELEASE);
-                return stubAddr;
+
+                if (collectedCount >= maxStubs) break;
+
+                // 找到 1 个此模式实例后, 跳出 chunk 扫描, 进入下一轮找其他模式
+                // (这样 stub 列表中模式分布均匀)
+                if (!patternFound[(targetPatternIdx + 1) % STUB_PATTERN_COUNT]) break;
             }
+            if (collectedCount >= maxStubs) break;
         }
     }
+
     VirtualFree(chunk, 0, MEM_RELEASE);
-    ByovdDiag("FLT:NTRL: ret0 stub not found in flt\n");
-    return 0;
+
+    // 输出结果
+    for (size_t i = 0; i < collectedCount && i < maxStubs; i++) {
+        outStubs[i] = collected[i];
+    }
+    *outCount = collectedCount;
+
+    if (collectedCount == 0) {
+        ByovdDiag("FLT:NTRL: no ret0 stubs found in flt\n");
+        return 0;
+    }
+    ByovdDiag("FLT:NTRL: collected %zu diverse stubs\n", collectedCount);
+    return outStubs[0];  // 返回第一个 stub 地址 (兼容旧调用)
+}
+
+// 在 fltmgr.sys 内核镜像中扫描 "return 0" stub
+// ★ BUILD 555 P2-3: 保留向后兼容 (内部转发到 FindRet0Stubs, 只取第一个)
+static uint64_t FindRet0Stub(uint64_t fltmgrBase, uint64_t fltmgrSize) {
+    uint64_t stubs[1] = {};
+    size_t count = 0;
+    FindRet0Stubs(fltmgrBase, fltmgrSize, stubs, 1, &count);
+    return (count > 0) ? stubs[0] : 0;
 }
 
 // BUILD 467: Win11 兼容 — 新增 MOV RXX, imm64 (绝对地址) 模式
@@ -4569,19 +4719,43 @@ static uint64_t ScanDataSectionForFltGlobals(uint64_t fltmgrBase) {
 // BUILD 455/457: 多函数 fallback 查找 FltGlobals + MOV 变体
 // 先 LEA 后 MOV 扫描 RIP-relative 指令 → fltmgr .data 段
 // ★ BUILD 475: sigscan 失败后自动 fallback 到 .data section scan
+// ★ BUILD 555 P2-verify: 11 个 Flt* API 名 STEALTH_STR_DECRYPT_TO 加密 (原明文数组进入 .rdata)
 uint64_t MinifilterNeutralizer::FindFltGlobals(uint64_t fltmgrBase) {
+    // 每个导出名独立栈缓冲区解密, 消除 .rdata 明文特征
+    char fltName1[48] = {};  // FltEnlistFilterForDriverInterface (最长 35 字符 + NUL)
+    char fltName2[40] = {};  // FltGetVolumeFromName
+    char fltName3[40] = {};  // FltGetVolumeFromFileObject
+    char fltName4[32] = {};  // FltRegisterFilter
+    char fltName5[32] = {};  // FltStartFiltering
+    char fltName6[32] = {};  // FltUnregisterFilter
+    char fltName7[40] = {};  // FltGetFileNameInformation
+    char fltName8[40] = {};  // FltQueryInformationFile
+    char fltName9[32] = {};  // FltCreateFile
+    char fltName10[32] = {}; // FltReadFile
+    char fltName11[40] = {}; // FltInitializePushLock
+    STEALTH_STR_DECRYPT_TO("FltEnlistFilterForDriverInterface", fltName1, sizeof(fltName1));
+    STEALTH_STR_DECRYPT_TO("FltGetVolumeFromName",            fltName2, sizeof(fltName2));
+    STEALTH_STR_DECRYPT_TO("FltGetVolumeFromFileObject",      fltName3, sizeof(fltName3));
+    STEALTH_STR_DECRYPT_TO("FltRegisterFilter",                fltName4, sizeof(fltName4));
+    STEALTH_STR_DECRYPT_TO("FltStartFiltering",                fltName5, sizeof(fltName5));
+    STEALTH_STR_DECRYPT_TO("FltUnregisterFilter",              fltName6, sizeof(fltName6));
+    STEALTH_STR_DECRYPT_TO("FltGetFileNameInformation",        fltName7, sizeof(fltName7));
+    STEALTH_STR_DECRYPT_TO("FltQueryInformationFile",          fltName8, sizeof(fltName8));
+    STEALTH_STR_DECRYPT_TO("FltCreateFile",                    fltName9, sizeof(fltName9));
+    STEALTH_STR_DECRYPT_TO("FltReadFile",                      fltName10, sizeof(fltName10));
+    STEALTH_STR_DECRYPT_TO("FltInitializePushLock",            fltName11, sizeof(fltName11));
     const char* exportNames[] = {
-        "FltEnlistFilterForDriverInterface",  // Win10 21H2+ (主路径)
-        "FltGetVolumeFromName",               // 所有版本通用
-        "FltGetVolumeFromFileObject",         // 所有版本通用
-        "FltRegisterFilter",                  // 所有版本通用 (最可靠)
-        "FltStartFiltering",                  // 所有版本通用
-        "FltUnregisterFilter",                // 所有版本通用
-        "FltGetFileNameInformation",          // 所有版本通用
-        "FltQueryInformationFile",           // 所有版本通用
-        "FltCreateFile",                      // 所有版本通用
-        "FltReadFile",                        // 所有版本通用
-        "FltInitializePushLock",             // 所有版本通用
+        fltName1,  // Win10 21H2+ (主路径)
+        fltName2,  // 所有版本通用
+        fltName3,  // 所有版本通用
+        fltName4,  // 所有版本通用 (最可靠)
+        fltName5,  // 所有版本通用
+        fltName6,  // 所有版本通用
+        fltName7,  // 所有版本通用
+        fltName8,  // 所有版本通用
+        fltName9,  // 所有版本通用
+        fltName10, // 所有版本通用
+        fltName11, // 所有版本通用
     };
 
     for (const char* exportName : exportNames) {
@@ -5332,8 +5506,20 @@ bool MinifilterNeutralizer::NeutralizeCallbacks(uint64_t filterAddr) {
     }
 
     // 找到 return-0 stub 地址
-    uint64_t stubAddr = FindRet0Stub(fltmgrBase, 0x400000);
-    if (!stubAddr) return false;
+    // ★ BUILD 555 P2-3: 多样化 stub — 收集多个不同模式的 stub, 让不同回调指向不同地址
+    //   修复原单一 stub 缺陷: 所有 PreOp/PostOp 指向同一地址 → PAC 易扫描检测
+    uint64_t stubAddrs[MAX_STUB_INSTANCES] = {};
+    size_t stubCount = 0;
+    FindRet0Stubs(fltmgrBase, 0x400000, stubAddrs, MAX_STUB_INSTANCES, &stubCount);
+    if (stubCount == 0) return false;
+
+    // ★ BUILD 555 P2-3: 判断回调是否已指向任一 stub (多样化场景下)
+    auto isStubbedToAny = [&](uint64_t addr) -> bool {
+        for (size_t k = 0; k < stubCount; k++) {
+            if (stubAddrs[k] == addr) return true;
+        }
+        return false;
+    };
 
     // Operations 指针偏移 — ★ BUILD 506: 扩展到 0x100-0x400 覆盖 Win11 FLT_FILTER
     uint64_t opsAddr = 0;
@@ -5365,6 +5551,7 @@ bool MinifilterNeutralizer::NeutralizeCallbacks(uint64_t filterAddr) {
     // 遍历 FLT_OPERATION_REGISTRATION 数组 (以 IRP_MJ_OPERATION_END=0x80 终结)
     int replaced = 0;
     int totalCallbacks = 0; // 非 NULL 回调总数
+    int stubRotIdx = 0;  // ★ BUILD 555 P2-3: stub 轮询索引 (每个回调使用不同 stub)
 
     for (int i = 0; i < 64; i++) {  // 最多 64 个操作注册
         KernFltOpReg reg = {};
@@ -5381,28 +5568,38 @@ bool MinifilterNeutralizer::NeutralizeCallbacks(uint64_t filterAddr) {
         bool modified = false;
 
         // 替换 PreOp 回调
-        if (reg.PreOperation != 0 && reg.PreOperation != stubAddr) {
+        if (reg.PreOperation != 0 && !isStubbedToAny(reg.PreOperation)) {
             uint64_t preOpAddr = regAddr + offsetof(KernFltOpReg, PreOperation);
-            if (kma.WriteKernelVA(preOpAddr, &stubAddr, sizeof(stubAddr))) {
-                ByovdDiag("FLT:NTRL: [%d] MJ=0x%02X PreOp 0x%llX→stub\n",
-                    i, (unsigned)reg.MajorFunction, (unsigned long long)reg.PreOperation);
+            // ★ BUILD 555 P2-3: 轮询使用不同 stub (避免所有回调指向同一地址)
+            uint64_t useStub = stubAddrs[stubRotIdx % stubCount];
+            stubRotIdx++;
+            if (kma.WriteKernelVA(preOpAddr, &useStub, sizeof(useStub))) {
+                ByovdDiag("FLT:NTRL: [%d] MJ=0x%02X PreOp 0x%llX→stub%zu\n",
+                    i, (unsigned)reg.MajorFunction,
+                    (unsigned long long)reg.PreOperation,
+                    (size_t)((stubRotIdx - 1) % stubCount));
                 replaced++;
                 modified = true;
             }
-        } else if (reg.PreOperation == stubAddr) {
+        } else if (reg.PreOperation != 0 && isStubbedToAny(reg.PreOperation)) {
             replaced++; // 已经是 stub, 计入成功
         }
 
         // 替换 PostOp 回调 (可能为 NULL, 跳过)
-        if (reg.PostOperation != 0 && reg.PostOperation != stubAddr) {
+        if (reg.PostOperation != 0 && !isStubbedToAny(reg.PostOperation)) {
             uint64_t postOpAddr = regAddr + offsetof(KernFltOpReg, PostOperation);
-            if (kma.WriteKernelVA(postOpAddr, &stubAddr, sizeof(stubAddr))) {
-                ByovdDiag("FLT:NTRL: [%d] MJ=0x%02X PostOp 0x%llX→stub\n",
-                    i, (unsigned)reg.MajorFunction, (unsigned long long)reg.PostOperation);
+            // ★ BUILD 555 P2-3: 轮询使用不同 stub
+            uint64_t useStub = stubAddrs[stubRotIdx % stubCount];
+            stubRotIdx++;
+            if (kma.WriteKernelVA(postOpAddr, &useStub, sizeof(useStub))) {
+                ByovdDiag("FLT:NTRL: [%d] MJ=0x%02X PostOp 0x%llX→stub%zu\n",
+                    i, (unsigned)reg.MajorFunction,
+                    (unsigned long long)reg.PostOperation,
+                    (size_t)((stubRotIdx - 1) % stubCount));
                 replaced++;
                 modified = true;
             }
-        } else if (reg.PostOperation == stubAddr) {
+        } else if (reg.PostOperation != 0 && isStubbedToAny(reg.PostOperation)) {
             replaced++; // 已经是 stub, 计入成功
         }
 
@@ -5950,8 +6147,18 @@ bool MinifilterNeutralizer::IsMessageTransferNeutralized() {
     }
 
     // 检查 Operations 中的回调是否仍指向 stub
-    uint64_t stubAddr = FindRet0Stub(fltmgrBase, 0x400000);
-    if (!stubAddr) return true;
+    // ★ BUILD 555 P2-3: 多样化 stub 验证 — 回调可能指向任一 stub 地址
+    uint64_t stubAddrs[MAX_STUB_INSTANCES] = {};
+    size_t stubCount = 0;
+    FindRet0Stubs(fltmgrBase, 0x400000, stubAddrs, MAX_STUB_INSTANCES, &stubCount);
+    if (stubCount == 0) return true;  // 无法验证, 不报错
+
+    auto isStubAddr = [&](uint64_t addr) -> bool {
+        for (size_t k = 0; k < stubCount; k++) {
+            if (stubAddrs[k] == addr) return true;
+        }
+        return false;
+    };
 
     // ★ BUILD 506: 扩展到 0x100-0x400 覆盖 Win11 FLT_FILTER
     // ★ BUILD 516: 移除 3-MJ 验证 — PDFWKRNL.sys memcpy 不验证地址, 从不可信指针读取会 BSOD
@@ -5974,8 +6181,9 @@ bool MinifilterNeutralizer::IsMessageTransferNeutralized() {
         if (!kma.ReadKernelVA(opsAddr + (uint64_t)(i * sizeof(reg)), &reg, sizeof(reg)))
             break;
         if (reg.MajorFunction == 0x80) break;
-        if ((reg.PreOperation && reg.PreOperation != stubAddr) ||
-            (reg.PostOperation && reg.PostOperation != stubAddr)) {
+        // ★ BUILD 555 P2-3: 验证回调是否指向任一 stub (多样化场景)
+        if ((reg.PreOperation && !isStubAddr(reg.PreOperation)) ||
+            (reg.PostOperation && !isStubAddr(reg.PostOperation))) {
             ByovdDiag("FLT:NTRL:Guard: MJ=0x%02X PreOp=0x%llX PostOp=0x%llX not stub!\n",
                 (unsigned)reg.MajorFunction,
                 (unsigned long long)reg.PreOperation,
@@ -6799,22 +7007,25 @@ void KernelDefense::ReapplyAllCallbacks() {
 //   EPROCESS->VadRoot → AVL 树 (RTL_BALANCED_NODE)
 //   每个 VAD 节点记录一个虚拟地址范围 (StartingVpn..EndingVpn)
 //   VadFlags.PrivateMemory bit: 1 = MEM_PRIVATE, 0 = MEM_MAPPED
+//
+// ★ BUILD 555: UniqueProcessId/ActiveProcessLinks/VadRoot 全部改为运行时动态扫描
+//   修复 P0 缺陷: BUILD 534 起硬编码 0x440/0x448/0x7D8 在 Win11 24H2 上读取错误内存
+//   project_memory.md 约束: "Win11 24H2 EPROCESS offsets must be dynamically scanned
+//                            (UniqueProcessId @0x1D0, ActiveProcessLinks @0x1D8), not hardcoded"
 // ============================================================
 
-// Win10 22H2 / Win11 x64 EPROCESS + VAD 偏移量
+// VAD 节点内部偏移量 (RTL_BALANCED_NODE / _MMVAD_SHORT 内部布局, 跨版本稳定)
 struct VadOffsets {
-    // EPROCESS
-    static constexpr uint32_t UniqueProcessId   = 0x440;
-    static constexpr uint32_t ActiveProcessLinks = 0x448;
-    static constexpr uint32_t VadRoot            = 0x7D8; // 主要候选
-    static constexpr uint32_t VadRootAlt         = 0x658; // Win11 备选
+    // EPROCESS 内部偏移 — 全部运行时动态解析, 不再硬编码
+    // (Win10/11 23H2: UniqueProcessId=0x440, ActiveProcessLinks=0x448, VadRoot=0x7D8)
+    // (Win11 24H2:    UniqueProcessId=0x1D0, ActiveProcessLinks=0x1D8, VadRoot=?)
 
-    // _RTL_BALANCED_NODE (embedded in _MMVAD_SHORT)
+    // _RTL_BALANCED_NODE (embedded in _MMVAD_SHORT) — 跨版本稳定
     static constexpr uint32_t RbnLeft  = 0x00;
     static constexpr uint32_t RbnRight = 0x08;
     static constexpr uint32_t RbnParentEncoded = 0x10;
 
-    // _MMVAD_SHORT (after RTL_BALANCED_NODE at +0x18)
+    // _MMVAD_SHORT (after RTL_BALANCED_NODE at +0x18) — 跨版本稳定
     static constexpr uint32_t VadStartingVpn = 0x18;
     static constexpr uint32_t VadEndingVpn   = 0x20;
     static constexpr uint32_t VadFlags       = 0x30; // u.LongFlags / u.VadFlags union
@@ -6824,17 +7035,140 @@ struct VadOffsets {
     static constexpr uint64_t ProtectionMask    = 0x00F80000ULL; // bits 19-23 (5 bits)
 };
 
-// 获取 cs2.exe 的 EPROCESS 内核地址
-static uint64_t GetEPROCESSByPid(KernelMemoryAccessor& kma, DWORD targetPid, uint64_t ntosBase) {
-    // PsInitialSystemProcess → ActiveProcessLinks → 遍历
-    // 从 ntoskrnl 导出 PsInitialSystemProcess 指针获取 System 进程 EPROCESS
-    // 简化: 硬编码 PsInitialSystemProcess 偏移
-    // 备选: 通过 PsLookupProcessByProcessId 的 sigscan
+// ★ BUILD 555: 静态偏移缓存成员定义 (header 中声明)
+uint32_t VADConcealer::s_pidOffset     = 0;
+uint32_t VADConcealer::s_linksOffset   = 0;
+uint32_t VADConcealer::s_vadRootOffset = 0;
 
-    // 方法: 从 ntoskrnl 数据节定位 PsActiveProcessHead
-    // PsActiveProcessHead 通常是 ntoskrnl 的导出符号
-    // 简化路径: 扫描 ntoskrnl 数据段找 ActiveProcessLinks 循环起点
-    uint64_t psInitAddr = kma.ResolveExport(ntosBase, "PsInitialSystemProcess");
+// ★ BUILD 555: 动态解析 UniqueProcessId / ActiveProcessLinks 偏移
+//   算法复用 DKOMProcessHider::EnsureOffsetsResolved (byovd_kernel.cpp L3144)
+//   扫描 System EPROCESS (PID=4) 0x100-0x800 范围:
+//     1. 找到值为 4 的字段 (UniqueProcessId)
+//     2. 验证其后 8/16 字节是内核地址 (ActiveProcessLinks.Flink/Blink)
+//     3. 二次验证: 通过 Flink 遍历到下一个 EPROCESS, PID 应为合法值
+bool VADConcealer::EnsureEprocessOffsets(KernelMemoryAccessor& kma, uint64_t ntBase) {
+    if (s_pidOffset != 0 && s_linksOffset != 0) return true;  // 已缓存
+
+    // ★ BUILD 555 P2-verify: STEALTH_STR_DECRYPT_TO 加密 PsInitialSystemProcess
+    char psInitProcName3[40] = {};
+    STEALTH_STR_DECRYPT_TO("PsInitialSystemProcess", psInitProcName3, sizeof(psInitProcName3));
+    uint64_t psInitProcVA = kma.ResolveExport(ntBase, psInitProcName3);
+    if (!psInitProcVA) return false;
+
+    uint64_t systemEPROCESS = kma.Read<uint64_t>(psInitProcVA);
+    if (!systemEPROCESS || systemEPROCESS < 0xFFFF800000000000ULL) return false;
+
+    for (uint32_t off = 0x100; off < 0x800; off += 8) {
+        uint64_t val = kma.Read<uint64_t>(systemEPROCESS + off);
+        if (val != 4) continue;  // System PID = 4
+
+        // 验证 off+8 (Flink) 和 off+16 (Blink) 是内核地址
+        uint64_t flink = kma.Read<uint64_t>(systemEPROCESS + off + 8);
+        uint64_t blink = kma.Read<uint64_t>(systemEPROCESS + off + 16);
+        if (flink < 0xFFFF800000000000ULL || blink < 0xFFFF800000000000ULL) continue;
+
+        // 二次验证: 通过 Flink 遍历到下一个 EPROCESS, 读取其 PID
+        uint64_t nextEPROC = flink - (off + 8);
+        uint64_t nextPid = kma.Read<uint64_t>(nextEPROC + off);
+        if (nextPid == 0 || nextPid >= 100000) continue;
+
+        // 验证通过
+        s_pidOffset = off;
+        s_linksOffset = off + 8;
+        return true;
+    }
+    return false;
+}
+
+// ★ BUILD 555: 动态解析 VadRoot 偏移
+//   策略 1: 优先尝试已知候选偏移列表 [0x7D8, 0x658, 0x9D8, 0xA20, 0x6D8, 0x5D8]
+//           (覆盖 Win10 22H2 / Win11 23H2 / Win11 24H2 / Win11 25H2 常见偏移)
+//   策略 2: 候选失败时扫描 EPROCESS 0x400-0x900 范围, 找符合 RTL_BALANCED_NODE 特征:
+//     1. VadRoot 本身是内核地址 (指向 RTL_BALANCED_NODE 结构)
+//     2. RTL_BALANCED_NODE.Left/Right/ParentEncoded 三字段都是 NULL 或内核地址
+//     3. 二次验证: 候选节点 +0x18 (VadStartingVpn) / +0x20 (VadEndingVpn) 合理
+//        (startVpn <= endVpn, 且 startVpn < 0x80000000 用户态 或 >= 0xFFFF800000000000 内核特殊 VAD)
+bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eprocess) {
+    if (s_vadRootOffset != 0) return true;  // 已缓存
+
+    // 指针合法性检查: NULL 或内核地址 (>=0xFFFF800000000000)
+    auto isValidPtr = [](uint64_t p) {
+        return p == 0 || p >= 0xFFFF800000000000ULL;
+    };
+
+    // 验证候选偏移是否为合法 VadRoot (含 Left/Right/ParentEncoded + VadStartingVpn/VadEndingVpn)
+    auto validateVadRoot = [&](uint64_t vadRootCandidate) -> bool {
+        if (!vadRootCandidate || vadRootCandidate < 0xFFFF800000000000ULL) return false;
+
+        uint64_t left   = kma.Read<uint64_t>(vadRootCandidate + VadOffsets::RbnLeft);
+        uint64_t right  = kma.Read<uint64_t>(vadRootCandidate + VadOffsets::RbnRight);
+        uint64_t parent = kma.Read<uint64_t>(vadRootCandidate + VadOffsets::RbnParentEncoded);
+        if (!isValidPtr(left) || !isValidPtr(right) || !isValidPtr(parent)) return false;
+
+        // 至少 1 个非 NULL (完全空的 AVL 节点不太可能是 VadRoot, 但允许)
+        // 二次验证: VadStartingVpn <= VadEndingVpn
+        uint64_t startVpn = kma.Read<uint64_t>(vadRootCandidate + VadOffsets::VadStartingVpn);
+        uint64_t endVpn   = kma.Read<uint64_t>(vadRootCandidate + VadOffsets::VadEndingVpn);
+        if (startVpn > endVpn) return false;
+
+        // ★ BUILD 555 P2-verify: 修正 VPN 范围检查 (原 < 0x100000 过于严格)
+        //   x64 用户态 VA 范围: 0 to 0x0000_7FFF_FFFF_FFFF (128 TB)
+        //   VPN = VA >> 12, 用户态 VPN 范围: 0 to 0x7FFF_FFFF (32 位, ~32 亿页)
+        //   原 < 0x100000 (1M 页 = 4GB) 会误判大部分高地址 VAD 节点 (如 0x00007FF6_xxxx 加载基址)
+        //   新策略: 接受 0 to 0x7FFF_FFFF (用户态) 或 >= 0xFFFF800000000000 (内核特殊 VAD)
+        //   拒绝中间值 (0x80000000 to 0xFFFF7FFFFFFFFFFF, 非法/未定义区域)
+        bool startValid = (startVpn < 0x80000000ULL) || (startVpn >= 0xFFFF800000000000ULL);
+        bool endValid   = (endVpn   < 0x80000000ULL) || (endVpn   >= 0xFFFF800000000000ULL);
+        if (!startValid || !endValid) return false;
+
+        return true;
+    };
+
+    // 策略 1: 优先尝试已知候选偏移
+    static const uint32_t knownCandidates[] = {
+        0x7D8,  // Win10 22H2 / Win11 23H2
+        0x658,  // Win11 备选
+        0x9D8,  // Win11 24H2 候选
+        0xA20,  // Win11 25H2 候选
+        0x6D8,  // Win10 21H2
+        0x5D8,  // Win10 20H2
+    };
+    for (uint32_t off : knownCandidates) {
+        uint64_t candidate = kma.Read<uint64_t>(eprocess + off);
+        if (validateVadRoot(candidate)) {
+            s_vadRootOffset = off;
+            return true;
+        }
+    }
+
+    // 策略 2: 动态扫描 0x400-0x900 范围
+    for (uint32_t off = 0x400; off < 0x900; off += 8) {
+        // 跳过已知已尝试的偏移
+        bool skip = false;
+        for (uint32_t k : knownCandidates) {
+            if (off == k) { skip = true; break; }
+        }
+        if (skip) continue;
+
+        uint64_t candidate = kma.Read<uint64_t>(eprocess + off);
+        if (validateVadRoot(candidate)) {
+            s_vadRootOffset = off;
+            return true;
+        }
+    }
+    return false;
+}
+
+// 获取 cs2.exe 的 EPROCESS 内核地址 (★ BUILD 555: 改用动态偏移)
+//   pidOffset/linksOffset 由调用方 (ConcealRegion) 通过 EnsureEprocessOffsets 解析后传入
+static uint64_t GetEPROCESSByPid(KernelMemoryAccessor& kma, DWORD targetPid, uint64_t ntosBase,
+                                  uint32_t pidOffset, uint32_t linksOffset) {
+    if (!pidOffset || !linksOffset) return 0;
+
+    // ★ BUILD 555 P2-verify: STEALTH_STR_DECRYPT_TO 加密 PsInitialSystemProcess
+    char psInitProcName4[40] = {};
+    STEALTH_STR_DECRYPT_TO("PsInitialSystemProcess", psInitProcName4, sizeof(psInitProcName4));
+    uint64_t psInitAddr = kma.ResolveExport(ntosBase, psInitProcName4);
     if (!psInitAddr) return 0;
 
     uint64_t sysEprocess = kma.Read<uint64_t>(psInitAddr);
@@ -6843,12 +7177,12 @@ static uint64_t GetEPROCESSByPid(KernelMemoryAccessor& kma, DWORD targetPid, uin
     uint64_t current = sysEprocess;
     int maxWalk = 512;
     while (maxWalk-- > 0) {
-        uint64_t pid = kma.Read<uint64_t>(current + VadOffsets::UniqueProcessId);
+        uint64_t pid = kma.Read<uint64_t>(current + pidOffset);
         if (pid == targetPid) return current;
 
-        uint64_t flink = kma.Read<uint64_t>(current + VadOffsets::ActiveProcessLinks);
+        uint64_t flink = kma.Read<uint64_t>(current + linksOffset);
         if (!flink || flink < 0xFFFF800000000000ULL) break;
-        current = flink - VadOffsets::ActiveProcessLinks;
+        current = flink - linksOffset;
     }
     return 0;
 }
@@ -6908,16 +7242,17 @@ bool VADConcealer::ConcealRegion(DWORD pid, uintptr_t regionBase, SIZE_T regionS
     uint64_t ntosBase = kma.GetNtoskrnlBase();
     if (!ntosBase) return false;
 
-    // 获取 cs2.exe 的 EPROCESS
-    uint64_t eprocess = GetEPROCESSByPid(kma, pid, ntosBase);
+    // ★ BUILD 555: 动态解析 EPROCESS 偏移 (替代硬编码 0x440/0x448)
+    if (!EnsureEprocessOffsets(kma, ntosBase)) return false;
+
+    // 获取 cs2.exe 的 EPROCESS (使用动态偏移)
+    uint64_t eprocess = GetEPROCESSByPid(kma, pid, ntosBase, s_pidOffset, s_linksOffset);
     if (!eprocess) return false;
 
-    // 尝试两个可能的 VadRoot 偏移
-    uint64_t vadRoot = 0;
-    for (uint32_t vadOff : {VadOffsets::VadRoot, VadOffsets::VadRootAlt}) {
-        vadRoot = kma.Read<uint64_t>(eprocess + vadOff);
-        if (vadRoot && vadRoot > 0xFFFF800000000000ULL) break;
-    }
+    // ★ BUILD 555: 动态解析 VadRoot 偏移 (替代硬编码 0x7D8/0x658)
+    if (!EnsureVadRootOffset(kma, eprocess)) return false;
+
+    uint64_t vadRoot = kma.Read<uint64_t>(eprocess + s_vadRootOffset);
     if (!vadRoot || vadRoot < 0xFFFF800000000000ULL) return false;
 
     // 遍历 VAD 树, 查找并修改匹配区域
@@ -6943,6 +7278,70 @@ int VADConcealer::ConcealAllRegions(DWORD pid, const uintptr_t* bases, int count
 uint8_t ShvInstallPatcher::m_originalBytes[6] = {};
 bool ShvInstallPatcher::m_hasOriginalBytes = false;
 uint64_t ShvInstallPatcher::m_patchedAddress = 0;
+// ★ BUILD 555 P2-1: 降级检测状态成员定义
+uint32_t ShvInstallPatcher::m_consecutiveFailures = 0;
+bool     ShvInstallPatcher::m_degradedMode = false;
+DWORD    ShvInstallPatcher::m_lastPatchTick = 0;
+
+// ============================================================
+// ★ BUILD 555 P2-1: SHV patch 降级检测实现
+//
+// 设计目标:
+//   - PAC 周期性恢复 SHV_Install patch → payload 周期性重 patch →
+//     每次重 patch 触发 4-6 次 BYOVD IOCTL (ReadKernelVA/WriteKernelVA/读回验证)
+//   - 若 PAC 恢复频率过高 (如 <60s), 累积 IOCTL 频率可能接近 PDFWKRNL.sys
+//     卡死基线 (1400 IOCTL/min), 触发驱动卡死 → 整个 BYOVD 通道失效
+//   - 降级策略: 连续 patch 失败 ≥3 次后, 跳过周期性 SHV patch 检查,
+//     依赖 MinifilterNeutralizer (操作回调 stub) 作为主要 minifilter 防护
+//
+// 失败计数语义:
+//   - "失败" = PatchShvInstallEntry() 返回 false (PAC 未加载/特征码未匹配/写入失败等)
+//   - "成功" = PatchShvInstallEntry() 返回 true (patch 写入并验证通过)
+//   - 已 patched 状态 (IsPatched() == true) 的快速返回不算失败也不算成功
+//     (不更新计数, 避免无意义的状态变化)
+//
+// 自恢复机制:
+//   - 降级模式下若距上次尝试 >5 分钟, IsDegradedMode() 返回 false 允许重试
+//   - 避免 PAC 临时卸载或重启后永远无法重新 patch
+//   - 5 分钟间隔足够长, 不会触发频繁 IOCTL (即使恢复后立即失败也只是 1 次/5min)
+// ============================================================
+
+void ShvInstallPatcher::RecordPatchFailure() {
+    m_lastPatchTick = GetTickCount();
+    m_consecutiveFailures++;
+    if (m_consecutiveFailures >= DEGRADED_FAILURE_THRESHOLD && !m_degradedMode) {
+        m_degradedMode = true;
+        ByovdDiag("BYOVD:ShvPatch: DEGRADED MODE entered (failures=%u)\n",
+            m_consecutiveFailures);
+    }
+}
+
+void ShvInstallPatcher::RecordPatchSuccess() {
+    m_lastPatchTick = GetTickCount();
+    if (m_consecutiveFailures > 0 || m_degradedMode) {
+        ByovdDiag("BYOVD:ShvPatch: recovered from degraded (failures=%u, was_degraded=%d)\n",
+            m_consecutiveFailures, (int)m_degradedMode);
+    }
+    m_consecutiveFailures = 0;
+    m_degradedMode = false;
+}
+
+bool ShvInstallPatcher::IsDegradedMode() {
+    if (!m_degradedMode) return false;
+    // ★ 自恢复: 降级模式下若距上次 patch 尝试 >5 分钟, 退出降级模式允许重试
+    //   避免 PAC 临时卸载/重启 SHV 后永远无法重新 patch
+    //   GetTickCount DWORD 溢出时 (now - lastTick) 无符号算术仍正确 (与 VEH 重置逻辑一致)
+    DWORD now = GetTickCount();
+    DWORD elapsed = now - m_lastPatchTick;
+    if (elapsed > DEGRADED_RECOVERY_INTERVAL_MS) {
+        m_degradedMode = false;
+        m_consecutiveFailures = 0;
+        ByovdDiag("BYOVD:ShvPatch: DEGRADED MODE auto-recover after %ums\n",
+            (unsigned)elapsed);
+        return false;
+    }
+    return true;
+}
 
 // ★ BUILD 553: SIG1 特征码 XOR 加密 (修复 A3 缺陷)
 //   原因: BUILD 552 中 SIG1 = { 0x48, 0xB9, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00 }
@@ -7112,15 +7511,21 @@ uint64_t ShvInstallPatcher::FindShvInstallEntry(uint64_t pacDriverBase, uint32_t
 
 bool ShvInstallPatcher::PatchShvInstallEntry() {
     // 防御性: 若已 patch, 直接返回成功
+    //   ★ BUILD 555 P2-1: 已 patched 状态不更新失败/成功计数
+    //     (IsPatched()=true 时快速返回, 不算新的 patch 尝试, 避免无意义的状态变化)
     if (IsPatched()) {
         ByovdDiag("BYOVD:ShvPatch: already patched @ 0x%llX\n",
             (unsigned long long)m_patchedAddress);
         return true;
     }
 
+    // ★ BUILD 555 P2-1: 在入口记录 m_lastPatchTick (无论成功失败都更新, 用于降级自恢复判定)
+    m_lastPatchTick = GetTickCount();
+
     KernelMemoryAccessor& kma = KernelMemoryAccessor::Instance();
     if (!kma.IsActive()) {
         ByovdDiag("BYOVD:ShvPatch: KMA not active\n");
+        RecordPatchFailure();
         return false;
     }
 
@@ -7132,6 +7537,7 @@ bool ShvInstallPatcher::PatchShvInstallEntry() {
     uint64_t pacBase = kma.GetKernelModuleBase(pacDriverName);
     if (!pacBase) {
         ByovdDiag("BYOVD:ShvPatch: PAC driver not loaded\n");
+        RecordPatchFailure();
         return false;
     }
     ByovdDiag("BYOVD:ShvPatch: PAC driver base = 0x%llX\n", (unsigned long long)pacBase);
@@ -7141,6 +7547,7 @@ bool ShvInstallPatcher::PatchShvInstallEntry() {
     uint32_t e_lfanew = kma.Read<uint32_t>(pacBase + 0x3C);
     if (e_lfanew == 0 || e_lfanew > 0x1000) {
         ByovdDiag("BYOVD:ShvPatch: invalid e_lfanew=0x%X\n", e_lfanew);
+        RecordPatchFailure();
         return false;
     }
     uint64_t ntHeaders = pacBase + e_lfanew;
@@ -7152,6 +7559,7 @@ bool ShvInstallPatcher::PatchShvInstallEntry() {
     uint16_t sizeOfOptionalHeader = kma.Read<uint16_t>(ntHeaders + 0x14);
     if (numSections == 0 || numSections > 64) {
         ByovdDiag("BYOVD:ShvPatch: invalid numSections=%u\n", numSections);
+        RecordPatchFailure();
         return false;
     }
 
@@ -7175,6 +7583,7 @@ bool ShvInstallPatcher::PatchShvInstallEntry() {
     }
     if (!textRVA || !textSize) {
         ByovdDiag("BYOVD:ShvPatch: .text section not found\n");
+        RecordPatchFailure();
         return false;
     }
     ByovdDiag("BYOVD:ShvPatch: .text RVA=0x%X size=0x%X\n", textRVA, textSize);
@@ -7183,6 +7592,7 @@ bool ShvInstallPatcher::PatchShvInstallEntry() {
     uint64_t shvInstallAddr = FindShvInstallEntry(pacBase + textRVA, textSize);
     if (!shvInstallAddr) {
         ByovdDiag("BYOVD:ShvPatch: SHV_Install entry not found via signature scan\n");
+        RecordPatchFailure();
         return false;
     }
     ByovdDiag("BYOVD:ShvPatch: SHV_Install entry @ 0x%llX\n", (unsigned long long)shvInstallAddr);
@@ -7191,6 +7601,7 @@ bool ShvInstallPatcher::PatchShvInstallEntry() {
     if (!kma.ReadKernelVA(shvInstallAddr, m_originalBytes, 6)) {
         ByovdDiag("BYOVD:ShvPatch: failed to read original bytes @ 0x%llX\n",
             (unsigned long long)shvInstallAddr);
+        RecordPatchFailure();
         return false;
     }
     m_hasOriginalBytes = true;
@@ -7203,6 +7614,7 @@ bool ShvInstallPatcher::PatchShvInstallEntry() {
         ByovdDiag("BYOVD:ShvPatch: suspicious original bytes (first=0x%02X), abort\n", first);
         m_hasOriginalBytes = false;
         m_patchedAddress = 0;
+        RecordPatchFailure();
         return false;
     }
 
@@ -7212,6 +7624,7 @@ bool ShvInstallPatcher::PatchShvInstallEntry() {
             (unsigned long long)shvInstallAddr);
         m_hasOriginalBytes = false;
         m_patchedAddress = 0;
+        RecordPatchFailure();
         return false;
     }
 
@@ -7219,18 +7632,22 @@ bool ShvInstallPatcher::PatchShvInstallEntry() {
     uint8_t verify[6] = {};
     if (!kma.ReadKernelVA(shvInstallAddr, verify, 6)) {
         ByovdDiag("BYOVD:ShvPatch: verify read FAILED\n");
+        RecordPatchFailure();
         return false;
     }
     for (int i = 0; i < 6; i++) {
         if (verify[i] != PATCH_BYTES[i]) {
             ByovdDiag("BYOVD:ShvPatch: verify MISMATCH @ byte %d (got 0x%02X, want 0x%02X)\n",
                 i, verify[i], PATCH_BYTES[i]);
+            RecordPatchFailure();
             return false;
         }
     }
 
     ByovdDiag("BYOVD:ShvPatch: SUCCESS — SHV_Install patched @ 0x%llX (mov eax,-4; ret)\n",
         (unsigned long long)shvInstallAddr);
+    // ★ BUILD 555 P2-1: 成功 patch — 重置失败计数, 退出降级模式
+    RecordPatchSuccess();
     return true;
 }
 

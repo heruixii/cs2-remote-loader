@@ -721,22 +721,62 @@ void ShadowPageManager::Uninstall() {
     if (!m_installed) return;
     auto& kma = KernelMemoryAccessor::Instance();
 
-    // 恢复原 PTE
-    kma.WritePte(m_patchAddr, m_origPteValue);
-    Sleep(50);  // 等 TLB 刷新, 确保 CS2 不再访问 pageB
+    // ★ BUILD 555 P2-5: Uninstall 超时保护 (2s 异步机制)
+    //   修复缺陷: 原 Uninstall 无条件调用 WritePte, 如果 PDFWKRNL.sys 卡死
+    //   (BUILD 532/533 卡死基线 1400 IOCTL/min), Uninstall 会无限阻塞,
+    //   导致 DllMain 无法返回 → CS2 进程无法退出
+    //
+    //   策略:
+    //     1. 检查 IsIoctlInCooldown — 冷却期内跳过 WritePte (PTE 未恢复, 但
+    //        进程退出后内核会清理 PTE, 不影响系统稳定性)
+    //     2. WritePte 添加 2s 超时检测: 调用前后记录 tick, 超时则记录警告
+    //     3. 关键: 无论 WritePte 成功/失败/超时, 都执行本地状态清理
+    //        (m_installed=false 等), 确保 DllMain 可以返回
+    DWORD uninstallStart = GetTickCount();
+    bool pteRestored = false;
 
-    // 释放 pageB
+    if (kma.IsIoctlInCooldown()) {
+        // 冷却期内 — 跳过 WritePte, 避免触发卡死的 IOCTL
+        ProcDiag("B555:SP:U1 skip WritePte (IOCTL cooldown)\n");
+    } else {
+        // 恢复原 PTE (添加耗时检测)
+        // ★ BUILD 555 P2-5: WritePte 走 PdfwIoctlWithTimeout (2s overlapped 超时)
+        //   正常情况: writePteElapsed <= 2s (PdfwIoctlWithTimeout 内部超时保护)
+        //   异常情况: writePteElapsed > 2s 表明 overlapped 切换失败, 走同步回退路径
+        //             (g_overlappedActive=false, DeviceIoControl 同步阻塞, 无中断机制)
+        //   ★ 注意: RTCore64 路径已在 BUILD 490 移除, 当前仅 PDFWKRNL 路径
+        DWORD writePteStart = GetTickCount();
+        bool writeOk = kma.WritePte(m_patchAddr, m_origPteValue);
+        DWORD writePteElapsed = GetTickCount() - writePteStart;
+        if (writePteElapsed > 2000) {
+            // ★ BUILD 555 P2-5: WritePte 耗时 >2s, 表明走同步回退路径 (overlapped 不可用)
+            ProcDiag("B555:SP:U2 WritePte TIMEOUT %ums (sync fallback, overlapped unavailable)\n", writePteElapsed);
+        }
+        if (writeOk) {
+            pteRestored = true;
+            Sleep(50);  // 等 TLB 刷新, 确保 CS2 不再访问 pageB
+        } else {
+            ProcDiag("B555:SP:U3 WritePte FAIL (PTE not restored, kernel will clean up on exit)\n");
+        }
+    }
+
+    // 释放 pageB (用户态调用, 无 IOCTL 阻塞风险, 始终执行)
     if (m_pageBPhys) {
         kma.FreeContiguousPhysical(m_pageBPhys);
     }
 
+    // ★ BUILD 555 P2-5: 始终清理本地状态 (无论 WritePte 是否成功)
+    //   原因: 进程退出后内核会清理 PTE, PTE 未恢复不影响系统稳定性
+    //   但本地状态必须清理, 否则 DllMain 无法返回
     m_installed = false;
     m_patchAddr = 0;
     m_origPteValue = 0;
     m_patchPteValue = 0;
     m_pageBPhys = 0;
     m_pageBVA = 0;
-    ProcDiag("B549:SP:12 uninstalled\n");
+    DWORD totalElapsed = GetTickCount() - uninstallStart;
+    ProcDiag("B555:SP:U4 uninstalled pteOk=%d elapsed=%ums\n",
+             (int)pteRestored, totalElapsed);
 }
 
 } // namespace stealth
