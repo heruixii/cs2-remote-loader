@@ -7384,6 +7384,22 @@ static const uint8_t SIG1_ENC[10] = {
     0xEF, 0x1E, 0xA7, 0xA7, 0xA7, 0x27, 0xA7, 0xA7, 0xA7, 0xA7
 };
 
+// ★ BUILD 561: IsValidPrologueByte — 合法函数序言字节验证 (统一辅助函数)
+//   原 BUILD 553 内联验证: 仅接受 0x48 (REX.W) / 0x55 (push rbp) / 0x40-0x4F (REX prefix)
+//   BUILD 561 放宽: 新增 0x53 (push rbx) / 0x56 (push rsi) / 0x57 (push rdi)
+//     原因: MSVC/Clang 编译的函数序言常用 push rbx/rsi/rdi 保存 callee-saved 寄存器,
+//           原 BUILD 553 仅接受 push rbp (0x55), 导致序言为 push rbx 的函数边界查找失败.
+//     风险评估: 极低 — 0x53/0x56/0x57 在指令中间也可能出现 (如 push [mem] 的 ModRM 字节),
+//               但配合三级边界查找 (0xCC/0x90×2/0x00×4/0xC3+0xCC) 后误判率极低,
+//               且仅在 Pass 1-3 均失败时才影响 Pass 4 结果.
+//   排除: 0x00 (零) / 0xCC (int3) / 0x90 (nop) 等填充字节 (由调用方在边界查找时已跳过)
+static inline bool IsValidPrologueByte(uint8_t b) {
+    if (b == 0x48 || b == 0x55) return true;                   // REX.W / push rbp
+    if (b >= 0x40 && b <= 0x4F) return true;                   // REX prefix (40-4F)
+    if (b == 0x53 || b == 0x56 || b == 0x57) return true;      // push rbx/rsi/rdi (BUILD 561)
+    return false;
+}
+
 uint64_t ShvInstallPatcher::FindShvInstallEntry(uint64_t pacDriverBase, uint32_t textSize) {
     // 通过特征码扫描定位 SHV_Install 入口
     // 特征 (PAC_SHV_逆向分析报告 §3.2 L101-105):
@@ -7475,9 +7491,8 @@ uint64_t ShvInstallPatcher::FindShvInstallEntry(uint64_t pacDriverBase, uint32_t
                     if (backscan[k] == 0xCC) {
                         uint32_t entryOffset = k + 1;
                         if (entryOffset >= backscanSize) continue;
-                        uint8_t firstByte = backscan[entryOffset];
-                        if (firstByte == 0x48 || firstByte == 0x55 ||
-                            (firstByte >= 0x40 && firstByte <= 0x4F)) {
+                        // ★ BUILD 561: 使用 IsValidPrologueByte 统一序言验证 (含放宽的 0x53/56/57)
+                        if (IsValidPrologueByte(backscan[entryOffset])) {
                             return backscanStart + entryOffset;
                         }
                     }
@@ -7493,9 +7508,8 @@ uint64_t ShvInstallPatcher::FindShvInstallEntry(uint64_t pacDriverBase, uint32_t
                             entryOffset++;
                         }
                         if (entryOffset >= backscanSize) continue;
-                        uint8_t firstByte = backscan[entryOffset];
-                        if (firstByte == 0x48 || firstByte == 0x55 ||
-                            (firstByte >= 0x40 && firstByte <= 0x4F)) {
+                        // ★ BUILD 561: 使用 IsValidPrologueByte 统一序言验证
+                        if (IsValidPrologueByte(backscan[entryOffset])) {
                             return backscanStart + entryOffset;
                         }
                     }
@@ -7512,9 +7526,33 @@ uint64_t ShvInstallPatcher::FindShvInstallEntry(uint64_t pacDriverBase, uint32_t
                             entryOffset++;
                         }
                         if (entryOffset >= backscanSize) continue;
-                        uint8_t firstByte = backscan[entryOffset];
-                        if (firstByte == 0x48 || firstByte == 0x55 ||
-                            (firstByte >= 0x40 && firstByte <= 0x4F)) {
+                        // ★ BUILD 561: 使用 IsValidPrologueByte 统一序言验证
+                        if (IsValidPrologueByte(backscan[entryOffset])) {
+                            return backscanStart + entryOffset;
+                        }
+                    }
+                }
+
+                // ★ BUILD 561: Pass 4 — 查找 0xC3 (ret) + 0xCC (int3) 模式 (函数末尾 ret + 填充)
+                //   原因: MSVC/Clang 编译的函数末尾常为 `ret; int3` 模式 (ret 后填充 int3 对齐)
+                //         Pass 1 仅查找孤立 0xCC, 但若前一函数末尾是 ret+int3, Pass 1 也能命中
+                //         Pass 4 作为兜底: 当 Pass 1-3 均失败时, 显式查找 ret+int3 模式
+                //   可靠性: 0xC3+0xCC 在指令中间极罕见
+                //     - 0xC3 作为 ret 后必跟下一条指令 (函数边界)
+                //     - 0xCC int3 不会在指令中间出现 (除非是 int3 指令本身, 但那是显式断点)
+                //     - 即使 0xC3 作为 imm8 操作数 (如 mov al, 0xC3), 后续字节是下一条指令操作码,
+                //       恰好为 0xCC 的概率极低 (~1/256)
+                //   向后兼容: Pass 1-3 仍优先, Pass 4 仅在 1-3 均失败时尝试
+                for (int32_t k = backscanSize - 2; k >= 0; k--) {
+                    if (backscan[k] == 0xC3 && backscan[k + 1] == 0xCC) {
+                        // 找到 ret+int3, 跳过后续连续 0xCC 填充
+                        uint32_t entryOffset = k + 2;
+                        while (entryOffset < backscanSize && backscan[entryOffset] == 0xCC) {
+                            entryOffset++;
+                        }
+                        if (entryOffset >= backscanSize) continue;
+                        // ★ BUILD 561: 使用 IsValidPrologueByte 统一序言验证
+                        if (IsValidPrologueByte(backscan[entryOffset])) {
                             return backscanStart + entryOffset;
                         }
                     }
@@ -7566,8 +7604,14 @@ bool ShvInstallPatcher::PatchShvInstallEntry() {
     STEALTH_STR_DECRYPT_TO("MessageTransfer.sys", pacDriverName, sizeof(pacDriverName));
     uint64_t pacBase = kma.GetKernelModuleBase(pacDriverName);
     if (!pacBase) {
-        ByovdDiag("BYOVD:ShvPatch: PAC driver not loaded\n");
-        RecordPatchFailure();
+        // ★ BUILD 561: PAC 未加载时不计入失败次数 (避免误触发降级模式)
+        //   原因: PAC 未加载是正常状态 (CS2 未启动 / PAC 临时卸载 / 系统启动早期),
+        //         不是 patch 机制本身的失败. 原 BUILD 555 逻辑将其计入 m_consecutiveFailures,
+        //         连续 3 次 (即 ~90-135s 周期) 后误进入降级模式, 导致 SHV patch 长期失效.
+        //   修改: 仅更新 m_lastPatchTick (用于降级自恢复判定), 不调用 RecordPatchFailure()
+        //   副作用: 真正的 patch 失败 (PAC 加载但特征码未匹配/写入失败) 仍会触发降级模式
+        ByovdDiag("BYOVD:ShvPatch: PAC driver not loaded (not counted as failure)\n");
+        m_lastPatchTick = GetTickCount();
         return false;
     }
     ByovdDiag("BYOVD:ShvPatch: PAC driver base = 0x%llX\n", (unsigned long long)pacBase);

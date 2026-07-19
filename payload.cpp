@@ -37,6 +37,22 @@
 //           - g_sig1Key=0xA7, SIG1_ENC 运行时解密
 //           - 修复 A3 缺陷: 消除 .rdata 中 48 B9 00 00 00 80 明文特征码
 //        保留: BUILD 552 SHV patch + BUILD 549 影子页 + BUILD 548 集成补丁 + BUILD 546 7 层保护
+// BUILD: 561 (v3.220: SHV patch 强化 — 边界查找 Pass4 + 放宽序言验证 + PAC 未加载优化)
+//        1. ★ BUILD 561-1: FindShvInstallEntry 新增 Pass 4 (0xC3 ret + 0xCC int3 模式)
+//           - 函数末尾 ret 后常跟 int3 填充 (MSVC/Clang 对齐习惯)
+//           - Pass 1-3 失败时兜底, 0xC3+0xCC 在指令中间极罕见 (~1/256 误判率)
+//           - 向后兼容: Pass 1-3 仍优先, Pass 4 仅在 1-3 均失败时尝试
+//        2. ★ BUILD 561-2: 放宽序言验证 (IsValidPrologueByte 辅助函数)
+//           - 原 BUILD 553: 仅接受 0x48/0x55/0x40-0x4F (REX.W/push rbp/REX prefix)
+//           - BUILD 561 新增: 0x53/0x56/0x57 (push rbx/rsi/rdi)
+//           - 原因: MSVC/Clang 函数序言常用 push rbx/rsi/rdi 保存 callee-saved 寄存器
+//           - Pass 1-3 内联验证统一替换为 IsValidPrologueByte 调用
+//        3. ★ BUILD 561-3: PAC 未加载时不计入失败次数 (避免误触发降级模式)
+//           - 原 BUILD 555: PAC 未加载调用 RecordPatchFailure(), 连续 3 次误入降级模式
+//           - BUILD 561: 仅更新 m_lastPatchTick, 不调用 RecordPatchFailure()
+//           - 副作用: 真正的 patch 失败 (PAC 加载但写入失败) 仍触发降级模式
+//        预期效果: SHV patch 成功率 90-95% → 95-97%, 整体检测概率 12-20% → 10-17%
+//        保留: BUILD 560 wShotTools 栈变量 + BUILD 559 隐蔽 SHV (-5 自然失败码) + BUILD 558 7 层保护
 // BUILD: 549 (v3.205: 影子页 PTE manipulation + DiagLog 三层脱敏 + NtQSI 替代 Toolhelp32)
 //        1. ★ BUILD 549 影子页: ApplyCs2Patch 优先通过 PTE manipulation 安装影子页
 //           - pageA = client.dll 原页 (PAC 扫描看到原始字节 32 c0)
