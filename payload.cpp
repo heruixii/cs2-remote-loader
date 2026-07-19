@@ -185,6 +185,16 @@
 //        安全性: VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch), 无新内存访问模式
 //                降级模式下依赖 SHV_Install patch 兜底 (双重保险), BSOD 风险极低
 //        预期效果: VmxOnWrapper patch 持久有效, EPT 永不构造, 综合 2-5% → 1.5-4%
+// BUILD: 567 (v3.232: VadDiag 修复 — ByovdDiag 被 NDEBUG 消除导致 VAD 日志不输出)
+//        ★ BUILD 567 v3.232 FIX (VAD 日志不输出 7/20 01:40):
+//          - 现象: v3.231 运行后 sd.log 只有 B554:VAD:0/1, 没有 B554:EEP/EVR/GEP/CR
+//          - 根因: ByovdDiag 在 Release 模式 (NDEBUG) 下被 #define 为 ((void)0),
+//                  v3.231 添加的 VAD 失败日志全部使用 ByovdDiag, 被预处理器消除
+//          - 修复: 新增 VadDiag 函数 (独立于 ByovdDiag, 不受 NDEBUG 影响)
+//            将所有 B554: 开头的 ByovdDiag 调用改为 VadDiag 调用
+//          - v3.231 白名单修正验证: CS2 运行 62 秒+ (vs v3.230 的 18 秒, v3.229 的 60 秒)
+//            白名单修正成功修复 v3.230 的退化, 但 CS2 仍在 60 秒左右崩溃 (疑似反作弊周期检测)
+//          - v3.232 目标: 通过 VadDiag 输出 VAD 失败详细日志, 定位 VAD 隐藏 0/1 失败原因
 // BUILD: 567 (v3.231: v3.230 白名单错误修正 — 排除系统 PTE + VAD 失败详细日志)
 //        ★ BUILD 567 v3.231 FIX (v3.230 白名单错误修正 7/20 01:30):
 //          - 现象: v3.230 运行后 CS2 透视生效 ~12秒后卡住闪退 (0xC0000005, 比 v3.229 的 60秒更快)
@@ -458,7 +468,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.231 启动摘要 (v3.230 白名单错误修正 — 排除系统 PTE + VAD 失败日志)\n");
+    DiagLog("BUILD 567 v3.232 启动摘要 (VadDiag 修复 — ByovdDiag 被 NDEBUG 消除导致 VAD 日志不输出)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -497,7 +507,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.231 退出摘要\n");
+    DiagLog("BUILD 567 v3.232 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -522,7 +532,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.231 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.232 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",

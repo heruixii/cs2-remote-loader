@@ -163,6 +163,41 @@ static void StateLog(const char* cat, const char* evt, const char* fmt, ...) {
     }
 }
 
+// ★ BUILD 567 v3.231: VadDiag — VAD 诊断日志 (不受 NDEBUG 影响)
+//   原因: ByovdDiag 在 Release 模式下被 #define 为 ((void)0), VAD 失败日志无法输出
+//   方案: 独立日志函数, 直接写 sd.log, 添加时间戳前缀 (与 StateLog 同实现)
+//   用途: VAD 隐藏失败诊断 (B554:EEP/EVR/GEP/CR 系列), 定位 VAD 隐藏 0/1 失败原因
+static void VadDiag(const char* fmt, ...) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char tsBuf[32];
+    snprintf(tsBuf, sizeof(tsBuf), "[%02d:%02d:%02d.%03d] ",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+
+    char buf[640];
+    int tsLen = (int)strlen(tsBuf);
+    memcpy(buf, tsBuf, tsLen);
+
+    va_list args;
+    va_start(args, fmt);
+    int len = vsnprintf(buf + tsLen, sizeof(buf) - tsLen, fmt, args);
+    va_end(args);
+    if (len < 0) return;
+    if (len > (int)(sizeof(buf) - tsLen - 1)) len = (int)(sizeof(buf) - tsLen - 1);
+    len += tsLen;
+
+    wchar_t path[MAX_PATH];
+    GetTempPathW(MAX_PATH, path);
+    wcscat_s(path, L"sd.log");
+    HANDLE h = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD w;
+        WriteFile(h, buf, (DWORD)len, &w, 0);
+        FlushFileBuffers(h);
+        CloseHandle(h);
+    }
+}
+
 // ★ BUILD 567 v3.227: 全局统计计数器 extern 声明 (定义在 payload.cpp)
 //   类型 LogStats 在 byovd_kernel.h 中定义 (共享)
 //   byovd_kernel.cpp 在 PatchVmxOnWrapper/PatchShvInstallEntry 成功/失败时更新
@@ -7651,14 +7686,14 @@ bool VADConcealer::EnsureEprocessOffsets(KernelMemoryAccessor& kma, uint64_t ntB
     STEALTH_STR_DECRYPT_TO("PsInitialSystemProcess", psInitProcName3, sizeof(psInitProcName3));
     uint64_t psInitProcVA = kma.ResolveExport(ntBase, psInitProcName3);
     if (!psInitProcVA) {
-        ByovdDiag("B554:EEP: FAIL PsInitialSystemProcess not resolved (ntBase=0x%llX)\n",
+        VadDiag("B554:EEP: FAIL PsInitialSystemProcess not resolved (ntBase=0x%llX)\n",
                   (unsigned long long)ntBase);
         return false;
     }
 
     uint64_t systemEPROCESS = kma.Read<uint64_t>(psInitProcVA);
     if (!systemEPROCESS || systemEPROCESS < 0xFFFF800000000000ULL) {
-        ByovdDiag("B554:EEP: FAIL systemEPROCESS invalid (psInitVA=0x%llX val=0x%llX)\n",
+        VadDiag("B554:EEP: FAIL systemEPROCESS invalid (psInitVA=0x%llX val=0x%llX)\n",
                   (unsigned long long)psInitProcVA, (unsigned long long)systemEPROCESS);
         return false;
     }
@@ -7673,7 +7708,7 @@ bool VADConcealer::EnsureEprocessOffsets(KernelMemoryAccessor& kma, uint64_t ntB
         uint64_t flink = kma.Read<uint64_t>(systemEPROCESS + off + 8);
         uint64_t blink = kma.Read<uint64_t>(systemEPROCESS + off + 16);
         if (flink < 0xFFFF800000000000ULL || blink < 0xFFFF800000000000ULL) {
-            ByovdDiag("B554:EEP: off=0x%X PID=4 but flink/blink not kernel (flink=0x%llX blink=0x%llX)\n",
+            VadDiag("B554:EEP: off=0x%X PID=4 but flink/blink not kernel (flink=0x%llX blink=0x%llX)\n",
                       off, (unsigned long long)flink, (unsigned long long)blink);
             continue;
         }
@@ -7682,7 +7717,7 @@ bool VADConcealer::EnsureEprocessOffsets(KernelMemoryAccessor& kma, uint64_t ntB
         uint64_t nextEPROC = flink - (off + 8);
         uint64_t nextPid = kma.Read<uint64_t>(nextEPROC + off);
         if (nextPid == 0 || nextPid >= 100000) {
-            ByovdDiag("B554:EEP: off=0x%X PID=4 but nextPid invalid (nextPid=%llu)\n",
+            VadDiag("B554:EEP: off=0x%X PID=4 but nextPid invalid (nextPid=%llu)\n",
                       off, (unsigned long long)nextPid);
             continue;
         }
@@ -7690,11 +7725,11 @@ bool VADConcealer::EnsureEprocessOffsets(KernelMemoryAccessor& kma, uint64_t ntB
         // 验证通过
         s_pidOffset = off;
         s_linksOffset = off + 8;
-        ByovdDiag("B554:EEP: OK pidOffset=0x%X linksOffset=0x%X (pidMatch=%d)\n",
+        VadDiag("B554:EEP: OK pidOffset=0x%X linksOffset=0x%X (pidMatch=%d)\n",
                   off, off + 8, pidMatchCount);
         return true;
     }
-    ByovdDiag("B554:EEP: FAIL no valid PID=4 offset found (pidMatch=%d)\n", pidMatchCount);
+    VadDiag("B554:EEP: FAIL no valid PID=4 offset found (pidMatch=%d)\n", pidMatchCount);
     return false;
 }
 
@@ -7765,11 +7800,11 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
     for (uint32_t off : knownCandidates) {
         uint64_t candidate = kma.Read<uint64_t>(eprocess + off);
         bool valid = validateVadRoot(candidate);
-        ByovdDiag("B554:EVR: try off=0x%X candidate=0x%llX valid=%d\n",
+        VadDiag("B554:EVR: try off=0x%X candidate=0x%llX valid=%d\n",
                   off, (unsigned long long)candidate, (int)valid);
         if (valid) {
             s_vadRootOffset = off;
-            ByovdDiag("B554:EVR: OK via known candidate off=0x%X\n", off);
+            VadDiag("B554:EVR: OK via known candidate off=0x%X\n", off);
             return true;
         }
     }
@@ -7788,17 +7823,17 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
         if (candidate >= 0xFFFF800000000000ULL) {
             scanMatchCount++;
             if (scanMatchCount <= 8) {  // 限制日志量, 只打印前 8 个候选
-                ByovdDiag("B554:EVR: scan off=0x%X candidate=0x%llX\n",
+                VadDiag("B554:EVR: scan off=0x%X candidate=0x%llX\n",
                           off, (unsigned long long)candidate);
             }
         }
         if (validateVadRoot(candidate)) {
             s_vadRootOffset = off;
-            ByovdDiag("B554:EVR: OK via scan off=0x%X (scanMatch=%d)\n", off, scanMatchCount);
+            VadDiag("B554:EVR: OK via scan off=0x%X (scanMatch=%d)\n", off, scanMatchCount);
             return true;
         }
     }
-    ByovdDiag("B554:EVR: FAIL no valid VadRoot offset (scanMatch=%d)\n", scanMatchCount);
+    VadDiag("B554:EVR: FAIL no valid VadRoot offset (scanMatch=%d)\n", scanMatchCount);
     return false;
 }
 
@@ -7813,13 +7848,13 @@ static uint64_t GetEPROCESSByPid(KernelMemoryAccessor& kma, DWORD targetPid, uin
     STEALTH_STR_DECRYPT_TO("PsInitialSystemProcess", psInitProcName4, sizeof(psInitProcName4));
     uint64_t psInitAddr = kma.ResolveExport(ntosBase, psInitProcName4);
     if (!psInitAddr) {
-        ByovdDiag("B554:GEP: FAIL PsInitialSystemProcess not resolved\n");
+        VadDiag("B554:GEP: FAIL PsInitialSystemProcess not resolved\n");
         return 0;
     }
 
     uint64_t sysEprocess = kma.Read<uint64_t>(psInitAddr);
     if (!sysEprocess || sysEprocess < 0xFFFF800000000000ULL) {
-        ByovdDiag("B554:GEP: FAIL sysEprocess invalid (val=0x%llX)\n",
+        VadDiag("B554:GEP: FAIL sysEprocess invalid (val=0x%llX)\n",
                   (unsigned long long)sysEprocess);
         return 0;
     }
@@ -7831,7 +7866,7 @@ static uint64_t GetEPROCESSByPid(KernelMemoryAccessor& kma, DWORD targetPid, uin
         walkCount++;
         uint64_t pid = kma.Read<uint64_t>(current + pidOffset);
         if (pid == targetPid) {
-            ByovdDiag("B554:GEP: OK pid=%u eprocess=0x%llX (walk=%d)\n",
+            VadDiag("B554:GEP: OK pid=%u eprocess=0x%llX (walk=%d)\n",
                       targetPid, (unsigned long long)current, walkCount);
             return current;
         }
@@ -7840,7 +7875,7 @@ static uint64_t GetEPROCESSByPid(KernelMemoryAccessor& kma, DWORD targetPid, uin
         if (!flink || flink < 0xFFFF800000000000ULL) break;
         current = flink - linksOffset;
     }
-    ByovdDiag("B554:GEP: FAIL pid=%u not found (walk=%d)\n", targetPid, walkCount);
+    VadDiag("B554:GEP: FAIL pid=%u not found (walk=%d)\n", targetPid, walkCount);
     return 0;
 }
 
@@ -7912,13 +7947,13 @@ bool VADConcealer::ConcealRegion(DWORD pid, uintptr_t regionBase, SIZE_T regionS
 
     uint64_t ntosBase = kma.GetNtoskrnlBase();
     if (!ntosBase) {
-        ByovdDiag("B554:CR: FAIL ntosBase=0\n");
+        VadDiag("B554:CR: FAIL ntosBase=0\n");
         return false;
     }
 
     // ★ BUILD 555: 动态解析 EPROCESS 偏移 (替代硬编码 0x440/0x448)
     if (!EnsureEprocessOffsets(kma, ntosBase)) {
-        ByovdDiag("B554:CR: FAIL EnsureEprocessOffsets (ntosBase=0x%llX)\n",
+        VadDiag("B554:CR: FAIL EnsureEprocessOffsets (ntosBase=0x%llX)\n",
                   (unsigned long long)ntosBase);
         return false;
     }
@@ -7926,29 +7961,29 @@ bool VADConcealer::ConcealRegion(DWORD pid, uintptr_t regionBase, SIZE_T regionS
     // 获取 cs2.exe 的 EPROCESS (使用动态偏移)
     uint64_t eprocess = GetEPROCESSByPid(kma, pid, ntosBase, s_pidOffset, s_linksOffset);
     if (!eprocess) {
-        ByovdDiag("B554:CR: FAIL GetEPROCESSByPid (pid=%u)\n", pid);
+        VadDiag("B554:CR: FAIL GetEPROCESSByPid (pid=%u)\n", pid);
         return false;
     }
 
     // ★ BUILD 555: 动态解析 VadRoot 偏移 (替代硬编码 0x7D8/0x658)
     if (!EnsureVadRootOffset(kma, eprocess)) {
-        ByovdDiag("B554:CR: FAIL EnsureVadRootOffset (eprocess=0x%llX)\n",
+        VadDiag("B554:CR: FAIL EnsureVadRootOffset (eprocess=0x%llX)\n",
                   (unsigned long long)eprocess);
         return false;
     }
 
     uint64_t vadRoot = kma.Read<uint64_t>(eprocess + s_vadRootOffset);
     if (!vadRoot || vadRoot < 0xFFFF800000000000ULL) {
-        ByovdDiag("B554:CR: FAIL vadRoot invalid (off=0x%X val=0x%llX)\n",
+        VadDiag("B554:CR: FAIL vadRoot invalid (off=0x%X val=0x%llX)\n",
                   s_vadRootOffset, (unsigned long long)vadRoot);
         return false;
     }
 
-    ByovdDiag("B554:CR: enter FindAndModifyVadNode vadRoot=0x%llX target=0x%llX\n",
+    VadDiag("B554:CR: enter FindAndModifyVadNode vadRoot=0x%llX target=0x%llX\n",
               (unsigned long long)vadRoot, (unsigned long long)regionBase);
     // 遍历 VAD 树, 查找并修改匹配区域
     bool ok = FindAndModifyVadNode(kma, vadRoot, regionBase);
-    ByovdDiag("B554:CR: FindAndModifyVadNode result=%d\n", (int)ok);
+    VadDiag("B554:CR: FindAndModifyVadNode result=%d\n", (int)ok);
     return ok;
 }
 
