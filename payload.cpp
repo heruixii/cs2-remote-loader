@@ -91,6 +91,31 @@
 //        预期效果: .data 段长明文窗口消除 (永久 → ~1-10ms 函数执行期间)
 //                 整体检测概率 8-15% → 7-14% (.data 段扫描检测难度提升)
 //        保留: BUILD 562 SIG2 + BUILD 561 Pass4 + BUILD 560 wShotTools 栈变量 + BUILD 559 隐蔽 SHV
+// BUILD: 564 (v3.223: PsLoadedModuleList DKOM 隐藏 — PDFWKRNL.sys 条目摘除)
+//        1. ★ BUILD 564-1: 新增 PsLoadedModuleHider 类 (byovd_kernel.h + byovd_kernel.cpp)
+//           - 目标: 消除 BYOVD 驱动在 ntoskrnl!PsLoadedModuleList 链表中的痕迹
+//           - 原因: PDFWKRNL.sys 加载后 LDR_DATA_TABLE_ENTRY 永久存在于链表
+//                  PAC 内核组件可遍历该链表发现 BYOVD 漏洞驱动
+//        2. ★ BUILD 564-2: LocatePsLoadedModuleList — 扫描 ntoskrnl .data 段定位头节点
+//           - 5 重验证条件: Flink/Blink 内核范围 + DllBase==ntosBase +
+//             BaseDllName.Length==24 + Buffer 内核池 + 内容=="ntoskrnl.exe"
+//           - 任一条件失败跳过, 避免误判其他 LIST_ENTRY
+//           - 1MB 块读取 + 8 字节对齐扫描, 性能可接受 (2-4 次 IOCTL)
+//        3. ★ BUILD 564-3: FindEntryByBaseName — 遍历链表查找目标驱动
+//           - 终止条件: current==listHead / current==0 / 超过 512 次迭代 / 自循环
+//           - 不区分大小写比较 (_wcsicmp)
+//        4. ★ BUILD 564-4: PerformUnlink — DKOM 断链 + SelfLoopHarden
+//           - 复用 DKOMProcessHider::HideProcessByPid 已验证技术 (BUILD 558 FIX)
+//           - 写 prev.Flink=next, next.Blink=prev (断链)
+//           - SelfLoopHarden: current.Flink=&current, current.Blink=&current (防 0x139)
+//           - 失败回滚: 恢复 prev.Flink=&current, next.Blink=&current
+//        5. ★ BUILD 564-5: EnableAll 集成 HideDriver 调用
+//           - 位置: CleanAllTraces 之后, SCM 服务删除之前
+//           - 仅 driverLoaded=true 时调用, 失败不影响其他防御功能
+//        安全性: PDFWKRNL.sys 永不卸载 (不触发 RemoveEntryList) + IOCTL 不依赖链表 +
+//                ReadKernelVA 直接 memcpy + 失败安全 (不修改内核数据)
+//        预期效果: 驱动扫描检测概率 2-4% → 0-1%, 整体检测概率 7-14% → 6-13%
+//        保留: BUILD 563 .data 段修复 + BUILD 562 SIG2 + BUILD 561 Pass4 + BUILD 560 wShotTools 栈变量
 // BUILD: 549 (v3.205: 影子页 PTE manipulation + DiagLog 三层脱敏 + NtQSI 替代 Toolhelp32)
 //        1. ★ BUILD 549 影子页: ApplyCs2Patch 优先通过 PTE manipulation 安装影子页
 //           - pageA = client.dll 原页 (PAC 扫描看到原始字节 32 c0)

@@ -516,6 +516,78 @@ private:
 };
 
 // ============================================================
+// ★ BUILD 564 (v3.223): PsLoadedModuleHider — 从 PsLoadedModuleList
+//   链表摘除指定驱动模块的 LDR_DATA_TABLE_ENTRY, 防止 PAC 内核扫描
+//   发现 BYOVD 驱动 (PDFWKRNL.sys).
+//
+// 技术原理:
+//   - PsLoadedModuleList 是 ntoskrnl.exe 全局 LIST_ENTRY 头节点
+//   - 链表节点为 LDR_DATA_TABLE_ENTRY, 第一个字段是 InLoadOrderLinks
+//   - PDFWKRNL.sys 加载后会插入链表
+//   - DKOM 断链: 写 prev.Flink=next, next.Blink=prev, current.Flink=&current,
+//     current.Blink=&current (SelfLoopHarden 防 0x139 蓝屏)
+//   - 复用 DKOMProcessHider::HideProcessByPid 已验证的 SelfLoopHarden 技术
+//     (7/18-7/19 三次 0x139 param 3 蓝屏根因已修复)
+//
+// LDR_DATA_TABLE_ENTRY 布局 (Win10/11 x64):
+//   +0x00: LIST_ENTRY InLoadOrderLinks       (Flink, Blink 各 8 字节)
+//   +0x10: LIST_ENTRY InMemoryOrderLinks
+//   +0x20: LIST_ENTRY InInitializationOrderLinks
+//   +0x30: PVOID DllBase
+//   +0x38: PVOID EntryPoint
+//   +0x40: ULONG SizeOfImage
+//   +0x48: UNICODE_STRING FullDllName        (Length, MaxLength, Buffer)
+//   +0x58: UNICODE_STRING BaseDllName        (Length, MaxLength, Buffer)
+//   +0x68: ...
+//
+// 安全性:
+//   - PDFWKRNL.sys 永不卸载 (UnloadDriver 仅删 SCM 注册表), 不触发 RemoveEntryList
+//   - IOCTL 通过设备句柄, 不依赖 PsLoadedModuleList
+//   - ReadKernelVA/WriteKernelVA 直接 memcpy, 不查链表
+//   - 失败安全: 任何定位/查找失败都不修改内核数据, 不影响其他防御功能
+//
+// 预期效果: 驱动扫描检测概率 2-4% → 0-1%
+// ============================================================
+class PsLoadedModuleHider {
+public:
+    static PsLoadedModuleHider& Instance() {
+        static PsLoadedModuleHider inst;
+        return inst;
+    }
+
+    // 隐藏指定驱动模块 (按 BaseDllName 匹配, 如 L"PDFWKRNL.sys")
+    // 返回 true 表示成功找到并断链
+    // 失败原因: BYOVD 未激活 / PsLoadedModuleList 定位失败 / 模块未找到 (可能已隐藏)
+    bool HideDriver(const wchar_t* driverBaseName);
+
+private:
+    PsLoadedModuleHider() = default;
+
+    // 定位 PsLoadedModuleList 头节点地址
+    // 策略: 扫描 ntoskrnl .data 段, 找符合以下全部条件的 LIST_ENTRY:
+    //   1. Flink/Blink 都在内核非分页池范围 (>0xFFFF800000000000)
+    //   2. Flink 指向的 entry + 0x30 (DllBase) == ntoskrnl 基址
+    //      (PsLoadedModuleList 第一个 entry 总是 ntoskrnl.exe 自身)
+    //   3. Flink + 0x58 (BaseDllName) 的 UNICODE_STRING.Length == 24
+    //      ("ntoskrnl.exe" = 12 字符 × 2 字节)
+    //   4. Flink + 0x60 (BaseDllName.Buffer) 指向内核池
+    //   5. Buffer 内容 == L"ntoskrnl.exe"
+    // 任一条件失败则跳过候选地址, 避免误判其他 LIST_ENTRY
+    uint64_t LocatePsLoadedModuleList(uint64_t ntosBase);
+
+    // 在链表中按 BaseDllName 查找 LDR_DATA_TABLE_ENTRY 地址
+    // 返回 0 表示未找到 (终止条件: current == listHead 或 current == 0 或超过 512 次迭代)
+    uint64_t FindEntryByBaseName(uint64_t listHead, const wchar_t* baseName);
+
+    // 执行 DKOM 断链 (复用 DKOMProcessHider 模式)
+    // 1. 读 current.Flink/Blink
+    // 2. 写 prev.Flink=next, next.Blink=prev (断链)
+    // 3. SelfLoopHarden: current.Flink=&current, current.Blink=&current (防 0x139)
+    // 失败回滚: 恢复 prev.Flink=&current, next.Blink=&current
+    bool PerformUnlink(uint64_t entryAddr, uint64_t listHead);
+};
+
+// ============================================================
 // ★ v3.126n: Minifilter Neutralizer — 中和 MessageTransfer minifilter
 //
 // 替换 FilterUnload 方案:
