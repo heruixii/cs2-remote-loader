@@ -224,6 +224,21 @@ static DWORD    g_mainThreadId      = 0;       // 主线程 ID — 用于诊断�
 //   - EkkoSleep 豁免 VEH handler 页面 (防止加密期间触发异常)
 // ============================================================
 
+// ★ BUILD 557: DR0 硬件断点频率统计 (诊断测试构建, 60s 窗口)
+//   目的: 统计 32 c0 (现为 90 90) 执行频率, 为 BUILD 558 DR0+VEH 跳过方案提供决策依据
+//   决策矩阵: <100Hz → BUILD 558 采用 DR0+VEH 跳过; >1000Hz → 放弃 DR0 维持 VirtualProtect
+//   线程安全: g_dr0HitCount/g_dr0StatActive/g_dr0StatDone 用 volatile + Interlocked
+//             (VEH 在 CS2 线程上下文触发, 主循环在 loader 线程读写)
+//   位置: 必须定义在 DiagVehHandler 之前 (VEH 内 L257+ 引用这些变量)
+static volatile LONG g_dr0HitCount     = 0;     // 命中计数 (InterlockedIncrement)
+static DWORD         g_dr0FirstHitTid  = 0;     // 首次命中线程 ID (BUILD 558 决策依据)
+static DWORD         g_dr0FirstHitTick = 0;     // 首次命中时刻
+static DWORD         g_dr0StatStartTick= 0;     // 统计开始时刻
+static volatile LONG g_dr0StatActive   = 0;     // 统计激活标志 (VEH 据此判断是否处理 STATUS_SINGLE_STEP)
+static volatile LONG g_dr0StatDone     = 0;     // 统计完成标志 (防重复报告)
+static void*         g_dr0Addr         = nullptr; // DR0 断点地址 (= g_patchAddr)
+static constexpr DWORD DR0_STAT_INTERVAL_MS = 60000; // 60s 频率统计窗口
+
 static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     uint64_t crashAddr = (uint64_t)ep->ExceptionRecord->ExceptionAddress;
     uint64_t dllBase   = (uint64_t)g_diagDllBase;
@@ -246,6 +261,34 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     } else {
         DiagLog("CRASH: code=0x%08X addr=0x%llX off=%llX tid=%u\n",
             code, crashAddr, offset, tid);
+    }
+
+    // ★ BUILD 557: STATUS_SINGLE_STEP (0x80000004) — DR0 硬件断点命中
+    //   必须在 ACCESS_VIOLATION 自愈逻辑之前处理, 否则 DR0 命中会被误判为代码污染
+    //   触发自愈 (memcpy 整个 payload.dll), 导致进程状态混乱.
+    //   DR0 命中时 CPU 触发 #DB, Windows 包装为 STATUS_SINGLE_STEP.
+    //   不修改 RIP — 让 90 90 正常执行 (BUILD 557 纯计数, 不跳过指令).
+    //   Windows 内核 NtContinue 自动设置 EFLAGS.RF, 重试指令不重复触发同一断点.
+    if (code == 0x80000004 && g_dr0StatActive) {
+        uint64_t ea = (uint64_t)ep->ExceptionRecord->ExceptionAddress;
+        if (ea == (uint64_t)g_dr0Addr) {
+            InterlockedIncrement(&g_dr0HitCount);
+            // 首次命中: 记录线程 ID + 时间 (InterlockedCompareExchange 保证只记录一次)
+            if (g_dr0FirstHitTid == 0) {
+                if (InterlockedCompareExchange((volatile LONG*)&g_dr0FirstHitTid,
+                        (LONG)tid, 0) == 0) {
+                    g_dr0FirstHitTick = GetTickCount();
+                    DiagLog("B557:DR0:1st-hit tid=%u tick=%u addr=0x%llX\n",
+                        tid, g_dr0FirstHitTick, (unsigned long long)ea);
+                }
+            }
+            // 清除 DR6: B0 (bit 0) + B1-B3 (bit 1-3) + BS (bit 14)
+            // B0 必须显式清除, 否则下次 DR0 命中检测会失败
+            ep->ContextRecord->Dr6 &= ~0x400FULL;
+            // 不修改 RIP — 让 90 90 正常执行 (BUILD 557 纯计数, 不跳过)
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        // ExceptionAddress 不匹配 — 可能是 TF 单步 (EFLAGS.TF=1), fallthrough
     }
 
     // ★ BUILD 536: 捕获 ntdll!RtlDeactivateActivationContext 内的 ACCESS_VIOLATION 崩溃
@@ -604,6 +647,9 @@ static bool g_cs2Patched = false;
 // ★ BUILD 556: 移除 g_shadowPageTried (影子页方案已废弃, 降级到 VirtualProtect)
 static uint8_t* g_clientBase = nullptr;  // ★ BUILD 555 P2-4: client.dll 基址缓存 (供 ValidatePatchFunctionBoundary 使用)
 
+// ★ BUILD 557: DR0 频率统计变量已移至 L227 (DiagVehHandler 之前), 此处不再重复定义
+//   原因: C++ 文件作用域 static 变量不能前向声明 (无 extern 语法), 必须在使用前定义
+
 // ★ BUILD 549+: pattern XOR 加密常量 (避免明文特征码 0x32 0xc0 0x4c 0x8b ... 出现在二进制中)
 //   原始 pattern: 32 c0 4c 8b a4 24 c8 00 00 00 (xor al,ah; mov r12,[rsp+0xc8])
 //   编译期 XOR 加密, 运行时用 g_patKey 解密
@@ -757,6 +803,38 @@ static bool ValidatePatchFunctionBoundary(uint8_t* found) {
     return false;  // 三级边界查找全部失败
 }
 
+// ============================================================
+// ★ BUILD 557: DR0 硬件断点频率统计 — DR0 设置/清除函数
+//   参考: anti_debug.cpp L268-295 的 CONTEXT_DEBUG_REGISTERS 模式
+//   DR7 位布局 (Intel SDM Vol 3B §17.2.4):
+//     L0 (bit 0)  = 本地启用 DR0
+//     LE (bit 8)  = 本地精确匹配 (推荐设置, 提高断点精度)
+//     RW0 (bit 16-17) = 00 (执行断点)
+//     LEN0 (bit 18-19) = 00 (执行断点忽略此项, IA-32e 模式下 1 字节)
+//   最终 DR7 = 0x101 (L0 + LE)
+//   注意: 线程必须已 SuspendThread 后再调用 SetThreadContext (Windows 文档要求)
+// ============================================================
+static bool SetupDR0Breakpoint(HANDLE hThread, void* addr) {
+    CONTEXT ctx = {};
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (!GetThreadContext(hThread, &ctx)) return false;
+    ctx.Dr0 = reinterpret_cast<DWORD64>(addr);
+    ctx.Dr7 &= ~0x30003ULL;   // 清 bit 0,1,16,17,18,19 (L0/G0/RW0/LEN0)
+    ctx.Dr7 |= 0x101ULL;      // 置 L0 (0x1) + LE (0x100)
+    return SetThreadContext(hThread, &ctx) != 0;
+}
+
+// ★ BUILD 557: ClearDR0Breakpoint — 清除 DR0 断点 (防御性清除所有相关位)
+static bool ClearDR0Breakpoint(HANDLE hThread) {
+    CONTEXT ctx = {};
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (!GetThreadContext(hThread, &ctx)) return false;
+    ctx.Dr0 = 0;
+    ctx.Dr7 &= ~0x3ULL;       // 清 L0 (bit 0) + G0 (bit 1)
+    ctx.Dr7 &= ~0x30000ULL;   // 清 RW0/LEN0 (bit 16-19) 防御性
+    return SetThreadContext(hThread, &ctx) != 0;
+}
+
 static bool ApplyCs2Patch() {
     // 1. 获取 client.dll 基址
     // ★ BUILD 549+: 通过 PEB Ldr 遍历获取 (替代 GetModuleHandleA, 规避 PAC 用户态 hook)
@@ -878,6 +956,138 @@ static void MaintainCs2Patch() {
             DiagLogEnc("p2");  // ★ BUILD 549: 加密 "repatched"
         }
     }
+}
+
+// ============================================================
+// ★ BUILD 557: DR0 频率统计 — 枚举 CS2 线程, 设置/清除 DR0 执行断点
+//   复用: B549_SYSTEM_PROCESS_INFO/B549_SYSTEM_THREAD_INFO 结构 (L624-669)
+//         STEALTH_OPEN_THREAD 宏 (syscall_direct.h, BUILD 556)
+//         SysQuerySystemInformation (class 5 = SystemProcessInformation)
+//   线程安全: g_dr0StatActive 用 InterlockedExchange 保证幂等
+//   注意: DR0 是 per-thread 寄存器, 必须枚举所有 CS2 线程单独设置
+// ============================================================
+
+// ★ BUILD 557: StartDR0FrequencyStat — ApplyCs2Patch 成功后启动 60s 频率统计
+static void StartDR0FrequencyStat() {
+    if (!g_patchAddr) return;
+    if (InterlockedExchange(&g_dr0StatActive, 1)) return;  // 防重入 (已激活)
+
+    g_dr0Addr = g_patchAddr;
+    g_dr0StatStartTick = GetTickCount();
+    g_dr0HitCount = 0;
+    g_dr0FirstHitTid = 0;
+    g_dr0FirstHitTick = 0;
+
+    DWORD selfPid = GetCurrentProcessId();
+    DWORD selfTid = GetCurrentThreadId();
+
+    // NtQuerySystemInformation (class 5 = SystemProcessInformation) 枚举线程
+    BYTE buf[64 * 1024];
+    ULONG retLen = 0;
+    NTSTATUS st = stealth::SysQuerySystemInformation(5, buf, sizeof(buf), &retLen);
+    if (!NT_SUCCESS(st)) {
+        DiagLog("B557:DR0:qsi FAIL 0x%08X\n", (unsigned)st);
+        InterlockedExchange(&g_dr0StatActive, 0);
+        return;
+    }
+
+    int okCount = 0, failCount = 0, threadCount = 0;
+    BYTE* p = buf;
+    while (true) {
+        auto* pi = (B549_SYSTEM_PROCESS_INFO*)p;
+        if (pi->NextEntryOffset == 0) break;
+        p += pi->NextEntryOffset;
+        if ((DWORD)(uintptr_t)pi->UniqueProcessId != selfPid) continue;
+
+        // 找到当前进程, 遍历其线程
+        // SYSTEM_THREAD_INFORMATION 数组紧跟在 SYSTEM_PROCESS_INFORMATION 之后
+        BYTE* threadBase = p + sizeof(B549_SYSTEM_PROCESS_INFO);
+        for (ULONG ti = 0; ti < pi->NumberOfThreads; ti++) {
+            auto* thi = (B549_SYSTEM_THREAD_INFO*)(threadBase + ti * sizeof(B549_SYSTEM_THREAD_INFO));
+            DWORD tid = (DWORD)(uintptr_t)thi->ClientId.UniqueThread;
+            if (tid == selfTid) continue;  // 跳过 loader 主线程 (避免自身被断点干扰)
+            threadCount++;
+
+            HANDLE hThread = nullptr;
+            STEALTH_OPEN_THREAD(hThread, THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, tid);
+            if (!hThread) { failCount++; continue; }
+
+            if (SuspendThread(hThread) == (DWORD)-1) {
+                CloseHandle(hThread);
+                failCount++;
+                continue;
+            }
+
+            bool ok = SetupDR0Breakpoint(hThread, g_dr0Addr);
+            ResumeThread(hThread);
+            CloseHandle(hThread);
+
+            if (ok) okCount++; else failCount++;
+        }
+        break;  // 当前进程只会有一个匹配
+    }
+
+    DiagLog("B557:DR0:start addr=0x%llX ok=%d fail=%d threads=%d\n",
+        (unsigned long long)g_dr0Addr, okCount, failCount, threadCount);
+}
+
+// ★ BUILD 557: ReportDR0Frequency — 60s 后输出频率到 sd.log, 清除所有 DR0
+//   关键顺序: 先 g_dr0StatDone=1, 后清 DR0, 最后 g_dr0StatActive=0
+//   原因: 清除 DR0 期间 VEH 仍可能触发, g_dr0StatActive=1 让 VEH 继续正确处理
+//         (Dr6 清除), 不会 fallthrough 到 ACCESS_VIOLATION 自愈逻辑
+static void ReportDR0Frequency() {
+    if (g_dr0StatDone) return;
+    if (!g_dr0StatActive) return;
+    DWORD elapsed = GetTickCount() - g_dr0StatStartTick;
+    if (elapsed < DR0_STAT_INTERVAL_MS) return;
+
+    InterlockedExchange(&g_dr0StatDone, 1);
+    // g_dr0StatActive 暂保持 1, VEH 继续处理命中直到 DR0 全部清除
+
+    LONG hits = g_dr0HitCount;
+    double freqHz = (elapsed > 0) ? ((double)hits * 1000.0 / (double)elapsed) : 0.0;
+    DiagLog("B557:DR0:report hits=%ld elapsed_ms=%u freq_hz=%.2f 1st_tid=%u\n",
+            hits, elapsed, freqHz, g_dr0FirstHitTid);
+
+    // 枚举所有 CS2 线程, 清除 DR0 (复用 StartDR0FrequencyStat 的枚举模式)
+    DWORD selfPid = GetCurrentProcessId();
+    DWORD selfTid = GetCurrentThreadId();
+    BYTE buf[64 * 1024];
+    ULONG retLen = 0;
+    NTSTATUS st = stealth::SysQuerySystemInformation(5, buf, sizeof(buf), &retLen);
+    if (NT_SUCCESS(st)) {
+        int okCount = 0, failCount = 0;
+        BYTE* p = buf;
+        while (true) {
+            auto* pi = (B549_SYSTEM_PROCESS_INFO*)p;
+            if (pi->NextEntryOffset == 0) break;
+            p += pi->NextEntryOffset;
+            if ((DWORD)(uintptr_t)pi->UniqueProcessId != selfPid) continue;
+
+            BYTE* threadBase = p + sizeof(B549_SYSTEM_PROCESS_INFO);
+            for (ULONG ti = 0; ti < pi->NumberOfThreads; ti++) {
+                auto* thi = (B549_SYSTEM_THREAD_INFO*)(threadBase + ti * sizeof(B549_SYSTEM_THREAD_INFO));
+                DWORD tid = (DWORD)(uintptr_t)thi->ClientId.UniqueThread;
+                if (tid == selfTid) continue;
+
+                HANDLE hThread = nullptr;
+                STEALTH_OPEN_THREAD(hThread, THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, tid);
+                if (!hThread) { failCount++; continue; }
+
+                SuspendThread(hThread);
+                bool ok = ClearDR0Breakpoint(hThread);
+                ResumeThread(hThread);
+                CloseHandle(hThread);
+
+                if (ok) okCount++; else failCount++;
+            }
+            break;
+        }
+        DiagLog("B557:DR0:cleared ok=%d fail=%d (stat done)\n", okCount, failCount);
+    }
+
+    // 全部 DR0 清除后, 关闭 VEH 计数 (StealthSleep 自动恢复)
+    InterlockedExchange(&g_dr0StatActive, 0);
 }
 
 // ★ BUILD 549: 防截图 — 改用 NtQuerySystemInformation syscall (绕过 PAC 用户态 hook)
@@ -1475,15 +1685,27 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         uintptr_t maintainPatchPage   = reinterpret_cast<uintptr_t>(&MaintainCs2Patch) & ~0xFFFULL;
         uintptr_t screenshotCheckPage = reinterpret_cast<uintptr_t>(&IsScreenshotToolRunning) & ~0xFFFULL;
         uintptr_t revertPatchPage     = reinterpret_cast<uintptr_t>(&TemporarilyRevertPatch) & ~0xFFFULL;
+        // ★ BUILD 557: 豁免 DR0 函数所在页 — 防止 EkkoSleep 加密这些函数崩溃
+        //   VEH 在 CS2 线程上高频触发, 会调用 SetupDR0Breakpoint/ClearDR0Breakpoint
+        //   (后者在主循环调用 StartDR0FrequencyStat/ReportDR0Frequency).
+        //   若这些函数所在页被 StealthSleep 加密, 则执行已加密代码 → 崩溃.
+        //   双重保险: BUILD 557 在 60s 统计窗口内已禁用 StealthSleep (变更 8),
+        //   但 60s 窗口外的 StealthSleep 也可能误伤这些函数页, 必须加入豁免.
+        uintptr_t setupDr0Page        = reinterpret_cast<uintptr_t>(&SetupDR0Breakpoint) & ~0xFFFULL;
+        uintptr_t clearDr0Page        = reinterpret_cast<uintptr_t>(&ClearDR0Breakpoint) & ~0xFFFULL;
+        uintptr_t startStatPage       = reinterpret_cast<uintptr_t>(&StartDR0FrequencyStat) & ~0xFFFULL;
+        uintptr_t reportFreqPage      = reinterpret_cast<uintptr_t>(&ReportDR0Frequency) & ~0xFFFULL;
 
         // 收集所有需要豁免的页面 (去重 + 排序)
         // ★ BUILD 544: 数组从 [2] 扩展到 [8] 以容纳 5 个豁免页 (去重后可能更少)
         // ★ BUILD 548: 数组从 [16] 缩减到 [16] 容纳 9 个豁免页 (5 BUILD 544 + 4 BUILD 548)
+        // ★ BUILD 557: 9 → 13 个豁免页 (新增 4 个 DR0 函数页)
         uintptr_t exemptPages[16] = {
             ekkoPage, vehPage, encryptAllPage, decryptAllPage, xorCryptPage,
-            applyPatchPage, maintainPatchPage, screenshotCheckPage, revertPatchPage
+            applyPatchPage, maintainPatchPage, screenshotCheckPage, revertPatchPage,
+            setupDr0Page, clearDr0Page, startStatPage, reportFreqPage
         };
-        int exemptPageCount = 9;
+        int exemptPageCount = 13;
         // 去重 (数组小, 简单 O(n^2))
         for (int i = 0; i < exemptPageCount; i++) {
             for (int j = i + 1; j < exemptPageCount; ) {
@@ -1800,6 +2022,12 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         if (!g_egTestMode && !g_halfTestMode) {
             g_cs2Patched = ApplyCs2Patch();
             DiagLog("B549:I:01 %s\n", g_cs2Patched ? "ok" : "pend");  // ★ BUILD 549: 去特征化
+            // ★ BUILD 557: 补丁成功后启动 DR0 频率统计 (60s 窗口)
+            //   目的: 统计 32 c0 (现为 90 90) 执行频率, 为 BUILD 558 DR0+VEH 跳过方案提供决策依据
+            //   幂等: StartDR0FrequencyStat 内部用 InterlockedExchange(&g_dr0StatActive, 1) 防重入
+            if (g_cs2Patched) {
+                StartDR0FrequencyStat();
+            }
         } else {
             DiagLog("B549:I:02 skip (test)\n");  // ★ BUILD 549: 去特征化
         }
@@ -2341,6 +2569,18 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         static DWORD lastScreenshotCheck = 0;
         static bool g_patchReverted = false;  // ★ BUILD 548: 移到前面, 供 patch 维护分支检查
 
+        // ★ BUILD 557: DR0 频率统计报告 — 每秒检查, 60s 后触发
+        //   ReportDR0Frequency 内部检查 elapsed >= 60s 才真正执行, 提前调用是 no-op
+        //   每秒检查一次避免高频 GetTickCount 调用
+        {
+            static DWORD lastDr0Check = 0;
+            if (g_dr0StatActive && !g_dr0StatDone &&
+                GetTickCount() - lastDr0Check > 1000) {
+                lastDr0Check = GetTickCount();
+                ReportDR0Frequency();
+            }
+        }
+
         // ★ BUILD 553: 补丁维护 — 5s 间隔 (从 BUILD 549 的 500ms 降频, 1% 占空比)
         if (GetTickCount() - lastPatchCheck > 5000) {
             if (!g_cs2Patched) {
@@ -2380,7 +2620,13 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         // ★ BUILD 544: 解除半测试跳过 — EkkoSleep 豁免已修复 (EncryptAll/DecryptAll/XorCrypt 页加入豁免)
         //   保留 g_egTestMode (无 CS2) 跳过 — 测试2 不需要内存加密
         // ★ BUILD 548: 移除 EncryptBasicCode/DecryptBasicCode (basic.exe 已移除)
-        if (!g_egTestMode) {
+        // ★ BUILD 557: DR0 统计窗口内禁用 StealthSleep — 关键安全约束
+        //   原因: EkkoSleep 的 EncryptAll 会 XOR 加密 .data 段 (含统计变量 g_dr0StatActive/
+        //         g_dr0HitCount/g_dr0Addr), VEH 在 CS2 线程上高频触发时读取加密垃圾 →
+        //         g_dr0StatActive 比较失败 → fallthrough 到 ACCESS_VIOLATION 自愈 → 进程崩溃.
+        //   恢复: ReportDR0Frequency 执行后 g_dr0StatActive=0, 自动恢复 StealthSleep.
+        //   双重保险: DR0 函数页已加入 exemptPages (变更 9), 但 .data 段变量无法豁免.
+        if (!g_egTestMode && !g_dr0StatActive) {
             StealthEngine::Instance().StealthSleep(sleepMs);
         } else {
             Sleep(sleepMs);
