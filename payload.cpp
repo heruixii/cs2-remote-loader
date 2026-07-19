@@ -169,6 +169,22 @@
 //                VmxOnWrapper patch 失败不影响 SHV_Install patch (独立失败处理)
 //        预期效果: SHV EPT 检测 2-3% → 0.5-1%, OCR 检测 3-8% → 1-2%, 综合 5-12% → 2-5%
 //        保留: BUILD 565 NtReadVirtualMemory Hook + BUILD 564 DKOM + BUILD 563 .data 修复
+// BUILD: 566 加固 (v3.226: VmxOnWrapper patch 独立降级模式 + 周期性维护 — 持久对抗 PAC 恢复)
+//        5. ★ BUILD 566-5: VmxOnWrapper patch 独立降级模式 (byovd_kernel.h + .cpp)
+//           - 新增 RecordVmxOnPatchFailure / RecordVmxOnPatchSuccess / IsVmxOnDegradedMode
+//           - 新增 m_vmxOnConsecutiveFailures / m_vmxOnDegradedMode / m_vmxOnLastPatchTick
+//           - 与 SHV_Install patch 降级状态完全独立 (互不污染)
+//           - 连续失败 ≥3 次进入降级 (跳过周期性 VmxOnWrapper 检查, 节省 IOCTL)
+//           - 5 分钟自恢复 (与 SHV_Install 降级一致)
+//           - 失败计数语义与 SHV_Install patch 一致 (PAC 未加载也算失败, 自恢复后重试)
+//        6. ★ BUILD 566-6: payload.cpp 主循环周期性 IsVmxOnPatched 验证 (60-90s 间隔)
+//           - 与 IsPatched() 并立, 任一失效即触发 PatchShvInstallEntry 重 patch
+//           - 一次 PatchShvInstallEntry 调用同时维护两者 (避免重复 IOCTL)
+//           - PatchShvInstallEntry 入口先 IsVmxOnPatched 判断, 已 patched 不计成功/失败
+//             (与 SHV_Install patch IsPatched 快速返回语义对称)
+//        安全性: VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch), 无新内存访问模式
+//                降级模式下依赖 SHV_Install patch 兜底 (双重保险), BSOD 风险极低
+//        预期效果: VmxOnWrapper patch 持久有效, EPT 永不构造, 综合 2-5% → 1.5-4%
 // BUILD: 549 (v3.205: 影子页 PTE manipulation + DiagLog 三层脱敏 + NtQSI 替代 Toolhelp32)
 //        1. ★ BUILD 549 影子页: ApplyCs2Patch 优先通过 PTE manipulation 安装影子页
 //           - pageA = client.dll 原页 (PAC 扫描看到原始字节 32 c0)
@@ -2886,10 +2902,27 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     //         (PAC 频繁恢复 patch → 频繁 BYOVD IOCTL → PDFWKRNL.sys 卡死风险)
                     //   降级期依赖 MinifilterNeutralizer (操作回调 stub) 作为主要 minifilter 防护
                     //   自恢复: IsDegradedMode() 内部判断距上次尝试 >5 分钟自动退出降级模式
+                    // ★ BUILD 566 加固 v3.226: 同时验证 VmxOnWrapper patch (独立降级模式)
+                    //   - 与 SHV_Install patch 维护并立 (独立降级状态, 互不污染)
+                    //   - 两者任一需要重 patch, 调用 PatchShvInstallEntry (内部优先 PatchVmxOnWrapper)
+                    //   - 一次 PatchShvInstallEntry 调用同时维护两者 (避免重复 IOCTL)
+                    //   - VmxOnWrapper 降级模式下跳过 (依赖 SHV_Install patch 兜底)
+                    bool needShvRepatch = false;
                     if (!stealth::ShvInstallPatcher::IsDegradedMode()) {
                         if (!stealth::ShvInstallPatcher::IsPatched()) {
-                            stealth::ShvInstallPatcher::PatchShvInstallEntry();
+                            needShvRepatch = true;
                         }
+                    }
+                    bool needVmxOnRepatch = false;
+                    if (!stealth::ShvInstallPatcher::IsVmxOnDegradedMode()) {
+                        if (!stealth::ShvInstallPatcher::IsVmxOnPatched()) {
+                            needVmxOnRepatch = true;
+                        }
+                    }
+                    if (needShvRepatch || needVmxOnRepatch) {
+                        // ★ PatchShvInstallEntry 内部优先 PatchVmxOnWrapper + 后续 SHV_Install patch
+                        //   一次调用同时维护两者, 避免分别调用导致重复 IOCTL
+                        stealth::ShvInstallPatcher::PatchShvInstallEntry();
                     }
 
                     // ★ BUILD 554 P0-1: 周期性重新调用 VADConcealer

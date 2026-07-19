@@ -7735,6 +7735,12 @@ uint8_t ShvInstallPatcher::m_vmxOnOriginalBytes[3] = {};
 bool     ShvInstallPatcher::m_hasVmxOnOriginalBytes = false;
 uint64_t ShvInstallPatcher::m_vmxOnPatchedAddress = 0;
 
+// ★ BUILD 566 加固 v3.226: VmxOnWrapper patch 独立降级模式状态定义
+//   与 SHV_Install patch 降级状态 (m_consecutiveFailures/m_degradedMode/m_lastPatchTick) 完全独立
+uint32_t ShvInstallPatcher::m_vmxOnConsecutiveFailures = 0;
+bool     ShvInstallPatcher::m_vmxOnDegradedMode = false;
+DWORD    ShvInstallPatcher::m_vmxOnLastPatchTick = 0;
+
 // ============================================================
 // ★ BUILD 555 P2-1: SHV patch 降级检测实现
 //
@@ -7789,6 +7795,76 @@ bool ShvInstallPatcher::IsDegradedMode() {
         m_degradedMode = false;
         m_consecutiveFailures = 0;
         ByovdDiag("BYOVD:ShvPatch: DEGRADED MODE auto-recover after %ums\n",
+            (unsigned)elapsed);
+        return false;
+    }
+    return true;
+}
+
+// ============================================================
+// ★ BUILD 566 加固 v3.226: VmxOnWrapper patch 独立降级模式实现
+//
+// 设计目标:
+//   - PAC 周期性恢复 VmxOnWrapper patch (从 31 C0 C3 → 原始字节) →
+//     payload 周期性重 patch → 每次重 patch 触发 3-5 次 BYOVD IOCTL
+//     (ReadKernelVA + WriteKernelVA + 读回验证)
+//   - 若 PAC 恢复频率过高 (如 <60s), 累积 IOCTL 频率可能接近 PDFWKRNL.sys
+//     卡死基线 (1400 IOCTL/min), 触发驱动卡死 → 整个 BYOVD 通道失效
+//   - 降级策略: 连续 patch 失败 ≥3 次后, 跳过周期性 VmxOnWrapper 检查,
+//     依赖 SHV_Install patch (双重保险的另一道) 作为主要 VMX 防护
+//
+// 状态隔离 (与 SHV_Install patch 降级模式完全独立):
+//   - m_vmxOnConsecutiveFailures ≠ m_consecutiveFailures
+//   - m_vmxOnDegradedMode        ≠ m_degradedMode
+//   - m_vmxOnLastPatchTick       ≠ m_lastPatchTick
+//   原因: VmxOnWrapper RVA 失效 (PAC 更新) 不应触发 SHV_Install patch 降级,
+//         反之亦然. 两者独立失败计数, 独立降级, 独立自恢复.
+//
+// 失败计数语义 (与 SHV_Install patch 一致):
+//   - "失败" = PatchVmxOnWrapper() 返回 false (PAC 未加载/RVA 失效/写入失败等)
+//   - "成功" = PatchVmxOnWrapper() 返回 true (patch 写入并验证通过)
+//   - 已 patched 状态 (IsVmxOnPatched() == true) 的快速返回不算失败也不算成功
+//     (不更新计数, 避免无意义的状态变化)
+//   注: PAC 未加载 (pacBase == 0) 也算失败, 与 PatchShvInstallEntry 一致;
+//       降级模式下 5 分钟自恢复后重新尝试, 不影响 PAC 重载后 patch.
+//
+// 自恢复机制 (与 SHV_Install patch 一致):
+//   - 降级模式下若距上次尝试 >5 分钟, IsVmxOnDegradedMode() 返回 false 允许重试
+//   - 避免 PAC 临时卸载或重启后永远无法重新 patch
+//   - GetTickCount DWORD 溢出时 (now - lastTick) 无符号算术仍正确
+// ============================================================
+
+void ShvInstallPatcher::RecordVmxOnPatchFailure() {
+    m_vmxOnLastPatchTick = GetTickCount();
+    m_vmxOnConsecutiveFailures++;
+    if (m_vmxOnConsecutiveFailures >= DEGRADED_FAILURE_THRESHOLD && !m_vmxOnDegradedMode) {
+        m_vmxOnDegradedMode = true;
+        ByovdDiag("BYOVD:VmxOn: DEGRADED MODE entered (failures=%u)\n",
+            m_vmxOnConsecutiveFailures);
+    }
+}
+
+void ShvInstallPatcher::RecordVmxOnPatchSuccess() {
+    m_vmxOnLastPatchTick = GetTickCount();
+    if (m_vmxOnConsecutiveFailures > 0 || m_vmxOnDegradedMode) {
+        ByovdDiag("BYOVD:VmxOn: recovered from degraded (failures=%u, was_degraded=%d)\n",
+            m_vmxOnConsecutiveFailures, (int)m_vmxOnDegradedMode);
+    }
+    m_vmxOnConsecutiveFailures = 0;
+    m_vmxOnDegradedMode = false;
+}
+
+bool ShvInstallPatcher::IsVmxOnDegradedMode() {
+    if (!m_vmxOnDegradedMode) return false;
+    // ★ 自恢复: 降级模式下若距上次 patch 尝试 >5 分钟, 退出降级模式允许重试
+    //   避免 PAC 临时卸载/重启 SHV 后永远无法重新 patch
+    //   GetTickCount DWORD 溢出时 (now - lastTick) 无符号算术仍正确 (与 VEH 重置逻辑一致)
+    DWORD now = GetTickCount();
+    DWORD elapsed = now - m_vmxOnLastPatchTick;
+    if (elapsed > DEGRADED_RECOVERY_INTERVAL_MS) {
+        m_vmxOnDegradedMode = false;
+        m_vmxOnConsecutiveFailures = 0;
+        ByovdDiag("BYOVD:VmxOn: DEGRADED MODE auto-recover after %ums\n",
             (unsigned)elapsed);
         return false;
     }
@@ -8287,8 +8363,36 @@ bool ShvInstallPatcher::PatchShvInstallEntry() {
     //   VmxOnWrapper patch 成功 → VMX 永不启动 → EPT 永不构造 → OCR 无画面源
     //   VmxOnWrapper patch 失败 → 回退到 SHV_Install patch (现有逻辑)
     //   无论 VmxOnWrapper patch 成功与否, 都继续 patch SHV_Install (双重保险)
-    //   VmxOnWrapper patch 失败不计入降级模式 (与 SHV_Install patch 独立)
-    bool vmxOnOk = PatchVmxOnWrapper();
+    // ★ BUILD 566 加固 v3.226: VmxOnWrapper patch 失败/成功计入独立降级计数
+    //   语义与 SHV_Install patch 完全对称:
+    //   - 已 patched (IsVmxOnPatched==true) 快速返回, 不计成功也不计失败 (不更新计数)
+    //     与 SHV_Install patch 入口 IsPatched() 快速返回语义一致 (L8381-8383)
+    //   - 未 patched 调用 PatchVmxOnWrapper, 成功计 success / 失败计 failure
+    //   - 失败 ≥3 次进入 VmxOnWrapper 降级模式 (与 SHV_Install 降级独立)
+    //   - 5 分钟自恢复 (与 SHV_Install 一致)
+    //   IOCTL 开销: 已 patched 时仅 1 次 ReadKernelVA (IsVmxOnPatched), 与 PatchVmxOnWrapper 内部
+    //   IsVmxOnPatched 快速返回的开销相同, 无额外负担.
+    // ★ BUG 修复 (第 3 轮审查): VmxOn 降级模式下必须跳过 PatchVmxOnWrapper, 否则
+    //   needShvRepatch=true 触发 PatchShvInstallEntry 时, PatchVmxOnWrapper 失败会持续
+    //   更新 m_vmxOnLastPatchTick, 导致 5 分钟自恢复永远无法触发.
+    //   降级模式下 vmxOnOk=false (不更新计数), 5 分钟后 IsVmxOnDegradedMode() 自恢复返回 false,
+    //   下次 PatchShvInstallEntry 调用时重新尝试 PatchVmxOnWrapper.
+    bool vmxOnOk;
+    if (IsVmxOnDegradedMode()) {
+        // VmxOn 降级模式: 跳过 PatchVmxOnWrapper (避免失败计数累积 + m_vmxOnLastPatchTick 误更新)
+        // 5 分钟自恢复后 IsVmxOnDegradedMode() 返回 false, 自动恢复 patch 尝试
+        vmxOnOk = false;
+    } else if (IsVmxOnPatched()) {
+        // 已 patched, 快速返回 (不计入降级计数, 避免 m_vmxOnLastPatchTick 被无意义更新)
+        vmxOnOk = true;
+    } else {
+        vmxOnOk = PatchVmxOnWrapper();
+        if (vmxOnOk) {
+            RecordVmxOnPatchSuccess();
+        } else {
+            RecordVmxOnPatchFailure();
+        }
+    }
     ByovdDiag("BYOVD:ShvPatch: VmxOnWrapper patch %s (continuing to SHV_Install patch)\n",
         vmxOnOk ? "SUCCESS" : "FAILED");
 

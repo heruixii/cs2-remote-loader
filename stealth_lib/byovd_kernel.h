@@ -686,6 +686,19 @@ public:
     //   返回 true = 已 patch, false = 未 patch / 状态丢失
     static bool IsVmxOnPatched();
 
+    // ★ BUILD 566 加固 v3.226: VmxOnWrapper patch 独立降级模式 (与 SHV_Install patch 独立)
+    //   目的: PAC 周期性恢复 VmxOnWrapper 字节 → 频繁重 patch → 累积 IOCTL 可能卡死 PDFWKRNL.sys
+    //   策略: 连续 patch 失败 ≥3 次进入独立降级模式 (跳过周期性 VmxOnWrapper 检查)
+    //         依赖 SHV_Install patch (双重保险的另一道) 作为主要 VMX 防护
+    //   自恢复: 降级模式下距上次尝试 >5 分钟, IsVmxOnDegradedMode() 返回 false 允许重试
+    //   失败计数语义 (与 SHV_Install patch 一致):
+    //     - "失败" = PatchVmxOnWrapper() 返回 false (PAC 未加载/RVA 失效/写入失败)
+    //     - "成功" = PatchVmxOnWrapper() 返回 true
+    //     - 已 patched 状态 (IsVmxOnPatched()==true) 快速返回不算失败也不算成功
+    static void RecordVmxOnPatchFailure();
+    static void RecordVmxOnPatchSuccess();
+    static bool IsVmxOnDegradedMode();
+
 private:
     // 通过特征码在 PAC 驱动 .text 段定位 SHV_Install 入口
     // 特征 1: MOV RCX, 0x80000000 (48 B9 00 00 00 80 00 00 00 00) — 2GB 物理内存限制
@@ -791,6 +804,14 @@ private:
     static uint8_t m_vmxOnOriginalBytes[3];
     static bool     m_hasVmxOnOriginalBytes;
     static uint64_t m_vmxOnPatchedAddress;
+
+    // ★ BUILD 566 加固 v3.226: VmxOnWrapper patch 独立降级模式状态
+    //   与 SHV_Install patch 降级状态 (m_consecutiveFailures/m_degradedMode/m_lastPatchTick) 完全独立
+    //   避免互相污染: VmxOnWrapper RVA 失效不会触发 SHV_Install 降级, 反之亦然
+    //   阈值与自恢复间隔复用 DEGRADED_FAILURE_THRESHOLD / DEGRADED_RECOVERY_INTERVAL_MS
+    static uint32_t m_vmxOnConsecutiveFailures;
+    static bool     m_vmxOnDegradedMode;
+    static DWORD    m_vmxOnLastPatchTick;
 
     // ★ BUILD 555 P2-1: 降级阈值与自恢复间隔
     //   连续失败 ≥3 次进入降级模式 (跳过周期性 SHV patch 检查, 依赖 MinifilterNeutralizer)
