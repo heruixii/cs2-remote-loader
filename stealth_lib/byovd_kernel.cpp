@@ -7984,25 +7984,33 @@ static bool FindAndModifyVadNode(KernelMemoryAccessor& kma, uint64_t vadNode, ui
     int maxDepth = 128;
 
     while (vadNode && maxDepth-- > 0) {
-        // ★ BUILD 567 v3.230 FIX (深度防御): 写入前验证 vadNode 确实在分页池
-        //   VAD 节点 (_MMVAD_SHORT) 通过 ExAllocatePoolWithTag(PagedPool,...) 分配, 必在分页池.
-        //   分页池范围: [0xFFFFFC0000000000, 0xFFFFFD0000000000)
-        //   防御: 即使 validateVadRoot 仍有未知缺陷缓存错误偏移, 导致 vadRoot 指向错误地址,
-        //         此检查也能阻止遍历非分页池/内核镜像, 避免写入破坏关键内核结构.
-        //   注: VadRoot 本身 (RTL_BALANCED_NODE 根节点) 也在分页池, 第一次迭代即检查.
-        if (vadNode < 0xFFFFFC0000000000ULL || vadNode >= 0xFFFFFD0000000000ULL) {
+        // ★ BUILD 567 v3.236 FIX-4: 放宽边界到 [0xFFFF8000..., 0xFFFFFD00...) — 与 validateVadRoot 一致
+        //   根因: v3.235 测试 vadRoot=0xFFFFE48DDD3F9FD8 在非分页池扩展区域 (0xFFFF8000-0xFFFFF680),
+        //         被原边界 [0xFFFFFC00, 0xFFFFFD00) 拒绝 → FindAndModifyVadNode result=0 → VAD 隐藏失败.
+        //         vadRoot=0xFFFFE48D... < 0xFFFFF800, 即使放宽到 0xFFFFF800 仍会被拒绝.
+        //   Win11 24H2/25H2 VAD 节点 (_MMVAD_SHORT) 可能分配在非分页池扩展区域 (与 EPROCESS 同区域).
+        //   修复: 下限放宽到 0xFFFF8000 (与 validateVadRoot L7827 一致, 覆盖所有内核池区域),
+        //         上限保持 0xFFFFFD00 (分页池上限, 排除系统 PTE/系统映射/Hypervisor).
+        //   安全性: VAD 节点是有效内核内存 (ExAllocatePoolWithTag 分配), 读取不应导致 0x50 蓝屏.
+        //           validateVadRoot 已验证 VPN 范围 + Left/Right/Parent 指针, 此处仅放宽地址范围检查.
+        //           即使遍历到非 VAD 节点, 后续 ReadKernelVA 读取 VadStartingVpn/VadEndingVpn 会返回
+        //           垃圾值, targetVpn 范围检查失败 → 自然停止遍历 (maxDepth 兜底).
+        if (vadNode < 0xFFFF800000000000ULL || vadNode >= 0xFFFFFD0000000000ULL) {
             return false;
         }
 
         // ★ BUILD 567 v3.230 FIX: 显式检查 ReadKernelVA 返回值 (与 validateVadRoot 一致)
+        // ★ BUILD 567 v3.236 FIX-4: 改用 ReadKernelVAUnsafe — VAD 节点可能在非分页池扩展区域
+        //   (vadRoot=0xFFFFE48D... 在 0xFFFF8000-0xFFFFF680, ReadKernelVA 白名单拒绝)
+        //   ReadKernelVAUnsafe 边界 [0xFFFF8000, 0xFFFFFE00) 覆盖所有内核池区域
         uint64_t startVpn = 0, endVpn = 0;
-        if (!kma.ReadKernelVA(vadNode + VadOffsets::VadStartingVpn, &startVpn, 8)) return false;
-        if (!kma.ReadKernelVA(vadNode + VadOffsets::VadEndingVpn, &endVpn, 8)) return false;
+        if (!kma.ReadKernelVAUnsafe(vadNode + VadOffsets::VadStartingVpn, &startVpn, 8)) return false;
+        if (!kma.ReadKernelVAUnsafe(vadNode + VadOffsets::VadEndingVpn, &endVpn, 8)) return false;
 
         if (targetVpn >= startVpn && targetVpn <= endVpn) {
             // 找到目标 VAD 节点, 修改 PrivateMemory flag
             uint64_t flags = 0;
-            if (!kma.ReadKernelVA(vadNode + VadOffsets::VadFlags, &flags, 8)) return false;
+            if (!kma.ReadKernelVAUnsafe(vadNode + VadOffsets::VadFlags, &flags, 8)) return false;
 
             // 检查 PrivateMemory bit 是否已设置
             if (flags & VadOffsets::PrivateMemoryBit) {
@@ -8013,7 +8021,8 @@ static bool FindAndModifyVadNode(KernelMemoryAccessor& kma, uint64_t vadNode, ui
                 flags &= ~VadOffsets::ProtectionMask;
                 flags |= (5ULL << 19); // Protection = 5 = PAGE_EXECUTE_READ
 
-                kma.Write<uint64_t>(vadNode + VadOffsets::VadFlags, flags);
+                // ★ BUILD 567 v3.236 FIX-4: 改用 WriteUnsafe — VAD 节点可能在非分页池扩展区域
+                kma.WriteUnsafe<uint64_t>(vadNode + VadOffsets::VadFlags, flags);
 
                 // 同时尝试修改 ControlArea → FilePointer 指向已知模块
                 // 这可以进一步降低可疑度, 但需要额外解析
@@ -8026,8 +8035,8 @@ static bool FindAndModifyVadNode(KernelMemoryAccessor& kma, uint64_t vadNode, ui
 
         // AVL 遍历: 根据 VPN 决定走左子树还是右子树
         uint64_t left = 0, right = 0;
-        if (!kma.ReadKernelVA(vadNode + VadOffsets::RbnLeft, &left, 8)) return false;
-        if (!kma.ReadKernelVA(vadNode + VadOffsets::RbnRight, &right, 8)) return false;
+        if (!kma.ReadKernelVAUnsafe(vadNode + VadOffsets::RbnLeft, &left, 8)) return false;
+        if (!kma.ReadKernelVAUnsafe(vadNode + VadOffsets::RbnRight, &right, 8)) return false;
 
         if (targetVpn < startVpn) {
             vadNode = left;

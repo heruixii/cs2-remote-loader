@@ -185,6 +185,24 @@
 //        安全性: VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch), 无新内存访问模式
 //                降级模式下依赖 SHV_Install patch 兜底 (双重保险), BSOD 风险极低
 //        预期效果: VmxOnWrapper patch 持久有效, EPT 永不构造, 综合 2-5% → 1.5-4%
+// BUILD: 567 (v3.236: DR0 残留崩溃修复 + VAD 边界放宽)
+//        ★ BUILD 567 v3.236 FIX (DR0 残留 + VAD 边界 7/20):
+//          - 现象 1: v3.235 测试 CS2 运行 60s 后 loader.exe 崩溃 (0xc0000005)
+//                    根因: 83 个 CS2 线程 DR0 未清除, ReportDR0Frequency 设置 g_dr0StatActive=0,
+//                          主循环恢复 StealthSleep (EkkoSleep), EkkoSleep 加密 .data 段,
+//                          残留 DR0 触发 STATUS_SINGLE_STEP, VEH 读取加密变量崩溃.
+//          - 现象 2: CS2 对局结束退出到主菜单时崩溃 (用户反馈)
+//                    根因: 对局结束大量 CS2 线程退出, 残留 DR0 断点触发, 同上崩溃链.
+//          - 现象 3: VAD 隐藏失败 (FindAndModifyVadNode result=0)
+//                    根因: vadRoot 在非分页池扩展 (0xFFFFE48D...), 被原边界 [0xFFFFFC00, 0xFFFFFD00) 拒绝.
+//          - 修复 1: VEH STATUS_SINGLE_STEP 不依赖 g_dr0StatActive, 直接从 CONTEXT.Dr0 读取断点地址
+//                    (CPU 寄存器不受 EkkoSleep .data 加密影响), 无论 active 与否都清除 DR6 + 继续执行.
+//          - 修复 2: ReportDR0Frequency DR0 清除失败时不恢复 StealthSleep (保持 g_dr0StatActive=1).
+//          - 修复 3: 主循环 10s 周期重试 RetryClearDR0Breakpoints, 全部清除成功时恢复 StealthSleep.
+//          - 修复 4: VAD 边界放宽 [0xFFFFFC00, 0xFFFFFD00) → [0xFFFFF800, 0xFFFFFD00)
+//                    覆盖非分页池扩展区域 (与 EPROCESS 同区域).
+//          - 安全性: 修复 1 是核心防御 (CPU 寄存器不受加密影响), 修复 2/3 是辅助防御 (减少 VEH 触发频率),
+//                    修复 4 仅放宽地址检查, validateVadRoot 已验证 VPN + 指针.
 // BUILD: 567 (v3.235: VAD-DKOM 执行顺序修复 + EPROCESS 缓存 + DKOM WriteUnsafe)
 //        ★ BUILD 567 v3.235 FIX (VAD-DKOM 执行顺序 + DKOM 写入修复 7/20):
 //          - 现象: v3.234 测试 E+G: early DKOM hide: FAILED + B554:GEP: FAIL walk=512
@@ -515,7 +533,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.235 启动摘要 (VAD-DKOM 执行顺序修复 + EPROCESS 缓存 + DKOM WriteUnsafe)\n");
+    DiagLog("BUILD 567 v3.236 启动摘要 (DR0 残留崩溃修复 + VAD 边界放宽)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -554,7 +572,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.235 退出摘要\n");
+    DiagLog("BUILD 567 v3.236 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -579,7 +597,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.235 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.236 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
@@ -737,21 +755,36 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
     //   Windows 内核 NtContinue 自动设置 EFLAGS.RF, 重试指令不重复触发同一断点.
     // ★ BUILD 558 FIX-5 正式版: 移除 v6 诊断日志 (SS# 记录), 回到 v5 稳定状态.
     //   原因: DR0 在 patch 之后启动, 32 c0 已被 NOP, hits 必然为 0, 诊断无意义.
-    if (code == 0x80000004 && g_dr0StatActive) {
-        uint64_t ea = (uint64_t)ep->ExceptionRecord->ExceptionAddress;
-        if (ea == (uint64_t)g_dr0Addr) {
-            InterlockedIncrement(&g_dr0HitCount);
-            // 首次命中: 记录线程 ID + 时间 (InterlockedCompareExchange 保证只记录一次)
-            if (g_dr0FirstHitTid == 0) {
-                if (InterlockedCompareExchange((volatile LONG*)&g_dr0FirstHitTid,
-                        (LONG)tid, 0) == 0) {
-                    g_dr0FirstHitTick = GetTickCount();
-                    DiagLog("B557:DR0:1st-hit tid=%u tick=%u addr=0x%llX\n",
-                        tid, g_dr0FirstHitTick, (unsigned long long)ea);
+    // ★ BUILD 567 v3.236 FIX-1: 不依赖 g_dr0StatActive — 防止 EkkoSleep .data 加密期间
+    //   g_dr0StatActive/g_dr0Addr 被加密成垃圾值导致 VEH 误判 fallthrough → ACCESS_VIOLATION
+    //   自愈 (memcpy 整个 payload.dll) → 进程状态混乱 → 0xc0000005 崩溃.
+    //   根因: v3.235 测试 83 个 CS2 线程 DR0 未清除, ReportDR0Frequency 设置 g_dr0StatActive=0,
+    //         主循环恢复 StealthSleep (EkkoSleep), EkkoSleep 加密 .data 段 (含 g_dr0StatActive/
+    //         g_dr0Addr/g_dr0HitCount), 残留 DR0 触发 STATUS_SINGLE_STEP, VEH 读取加密变量崩溃.
+    //   新逻辑: 直接从 CONTEXT.Dr0 读取断点地址 (CPU 寄存器, 不受 EkkoSleep .data 加密影响),
+    //          dr0 != 0 && ExceptionAddress == dr0 即为 DR0 命中, 清除 DR6 + 继续执行.
+    //   计数仅在 g_dr0StatActive=1 时进行 (EkkoSleep 期间 g_dr0StatActive 可能被加密, 但误计数
+    //          影响小 — 残留 DR0 命中频率本身无意义, 仅用于诊断是否触发).
+    if (code == 0x80000004) {
+        uint64_t ea  = (uint64_t)ep->ExceptionRecord->ExceptionAddress;
+        uint64_t dr0 = ep->ContextRecord->Dr0;  // ★ v3.236: CPU 寄存器, 不受 .data 加密影响
+        if (dr0 != 0 && ea == dr0) {
+            // ★ v3.236: 仅在统计窗口活跃时计数
+            if (g_dr0StatActive) {
+                InterlockedIncrement(&g_dr0HitCount);
+                // 首次命中: 记录线程 ID + 时间 (InterlockedCompareExchange 保证只记录一次)
+                if (g_dr0FirstHitTid == 0) {
+                    if (InterlockedCompareExchange((volatile LONG*)&g_dr0FirstHitTid,
+                            (LONG)tid, 0) == 0) {
+                        g_dr0FirstHitTick = GetTickCount();
+                        DiagLog("B557:DR0:1st-hit tid=%u tick=%u addr=0x%llX\n",
+                            tid, g_dr0FirstHitTick, (unsigned long long)ea);
+                    }
                 }
             }
-            // 清除 DR6: B0 (bit 0) + B1-B3 (bit 1-3) + BS (bit 14)
-            // B0 必须显式清除, 否则下次 DR0 命中检测会失败
+            // ★ v3.236: 无论 active 与否都清除 DR6 — 残留 DR0 触发的 STATUS_SINGLE_STEP 必须处理
+            //   清除 DR6: B0 (bit 0) + B1-B3 (bit 1-3) + BS (bit 14)
+            //   B0 必须显式清除, 否则下次 DR0 命中检测会失败
             ep->ContextRecord->Dr6 &= ~0x400FULL;
             // 不修改 RIP — 让 90 90 正常执行 (BUILD 557 纯计数, 不跳过)
             return EXCEPTION_CONTINUE_EXECUTION;
@@ -1690,13 +1723,88 @@ static void ReportDR0Frequency() {
             break;
         }
         DiagLog("B557:DR0:cleared ok=%d fail=%d (stat done)\n", okCount, failCount);
+        // ★ BUILD 567 v3.236 FIX-2: DR0 清除失败时不恢复 StealthSleep (避免 EkkoSleep 加密 .data
+        //   期间残留 DR0 触发 STATUS_SINGLE_STEP → VEH 崩溃)
+        //   修复 1 已让 VEH 从 CONTEXT.Dr0 读取 (不受 .data 加密影响), 此处仍保留防御:
+        //   避免残留 DR0 频繁触发 VEH (性能 + 日志噪音), 主循环修复 3 会重试清除.
+        if (failCount == 0) {
+            DiagLog("B557:DR0:clear ALL ok=%d — restore StealthSleep\n", okCount);
+            InterlockedExchange(&g_dr0StatActive, 0);
+        } else {
+            DiagLog("B557:DR0:clear PARTIAL ok=%d fail=%d — keep g_dr0StatActive=1 (retry in main loop)\n",
+                okCount, failCount);
+            // 不设置 g_dr0StatActive=0, 保持 StealthSleep 禁用
+            // g_dr0StatDone=1 已设置, 主循环修复 3 检测 g_dr0StatActive && g_dr0StatDone 时重试
+        }
     } else if (buf) {
-        DiagLog("B557:DR0:clear qsi FAIL 0x%08X\n", (unsigned)st);
+        DiagLog("B557:DR0:clear qsi FAIL 0x%08X — keep g_dr0StatActive=1\n", (unsigned)st);
+        // ★ v3.236: QSI 失败也无法清除 DR0, 保持 g_dr0StatActive=1
     }
     if (buf) VirtualFree(buf, 0, MEM_RELEASE);  // ★ BUILD 558 FIX-5: 释放 NtQSI 缓冲区
 
-    // 全部 DR0 清除后, 关闭 VEH 计数 (StealthSleep 自动恢复)
-    InterlockedExchange(&g_dr0StatActive, 0);
+    // ★ BUILD 567 v3.236: 移除末尾无条件 InterlockedExchange(&g_dr0StatActive, 0)
+    //   g_dr0StatActive 的恢复由上方 failCount==0 分支处理 (全部清除成功才恢复)
+}
+
+// ★ BUILD 567 v3.236 FIX-3: DR0 清除重试机制 — 主循环 10s 周期调用
+//   触发条件: g_dr0StatActive=1 && g_dr0StatDone=1 (ReportDR0Frequency 已执行但有残留 DR0)
+//   全部清除成功时恢复 StealthSleep (g_dr0StatActive=0), 否则保持禁用等待下次重试
+//   复用 ReportDR0Frequency 的 NtQSI + 枚举 CS2 线程 + ClearDR0Breakpoint 模式
+static void RetryClearDR0Breakpoints() {
+    DWORD cs2Pid = stealth::StealthEngine::Instance().GetProcessId();
+    ULONG bufSize = 0x100000;  // 1MB 初始
+    BYTE* buf = nullptr;
+    ULONG retLen = 0;
+    NTSTATUS st;
+    int qsiRetries = 5;
+    do {
+        if (buf) VirtualFree(buf, 0, MEM_RELEASE);
+        buf = (BYTE*)VirtualAlloc(nullptr, bufSize, MEM_COMMIT, PAGE_READWRITE);
+        if (!buf) return;  // 分配失败, 等待下次重试
+        st = stealth::SysQuerySystemInformation(5, buf, bufSize, &retLen);
+        if (st == (NTSTATUS)0xC0000004) bufSize *= 2;
+        if (--qsiRetries <= 0 && !NT_SUCCESS(st)) break;
+    } while (st == (NTSTATUS)0xC0000004);
+
+    if (!buf || !NT_SUCCESS(st)) {
+        if (buf) VirtualFree(buf, 0, MEM_RELEASE);
+        return;  // QSI 失败, 等待下次重试
+    }
+
+    int okCount = 0, failCount = 0;
+    BYTE* p = buf;
+    while (true) {
+        auto* pi = (B549_SYSTEM_PROCESS_INFO*)p;
+        if (pi->NextEntryOffset == 0) break;
+        p += pi->NextEntryOffset;
+        if ((DWORD)(uintptr_t)pi->UniqueProcessId != cs2Pid) continue;
+
+        BYTE* threadBase = p + sizeof(B549_SYSTEM_PROCESS_INFO);
+        for (ULONG ti = 0; ti < pi->NumberOfThreads; ti++) {
+            auto* thi = (B549_SYSTEM_THREAD_INFO*)(threadBase + ti * sizeof(B549_SYSTEM_THREAD_INFO));
+            DWORD tid = (DWORD)(uintptr_t)thi->ClientId.UniqueThread;
+
+            HANDLE hThread = nullptr;
+            STEALTH_OPEN_THREAD(hThread, THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, tid);
+            if (!hThread) { failCount++; continue; }
+
+            SuspendThread(hThread);
+            bool ok = ClearDR0Breakpoint(hThread);
+            ResumeThread(hThread);
+            CloseHandle(hThread);
+
+            if (ok) okCount++; else failCount++;
+        }
+        break;
+    }
+    VirtualFree(buf, 0, MEM_RELEASE);
+
+    DiagLog("B557:DR0:retry ok=%d fail=%d\n", okCount, failCount);
+    if (failCount == 0) {
+        DiagLog("B557:DR0:retry ALL ok=%d — restore StealthSleep\n", okCount);
+        InterlockedExchange(&g_dr0StatActive, 0);
+    }
+    // failCount > 0 时保持 g_dr0StatActive=1, 等待下次重试 (10s 后)
 }
 
 // ★ BUILD 549: 防截图 — 改用 NtQuerySystemInformation syscall (绕过 PAC 用户态 hook)
@@ -3369,6 +3477,20 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 GetTickCount() - lastDr0Check > 1000) {
                 lastDr0Check = GetTickCount();
                 ReportDR0Frequency();
+            }
+        }
+
+        // ★ BUILD 567 v3.236 FIX-3: DR0 清除重试机制 — 10 秒周期
+        //   触发条件: g_dr0StatActive=1 && g_dr0StatDone=1
+        //             (ReportDR0Frequency 已执行, 但 failCount > 0 有残留 DR0)
+        //   全部清除成功时恢复 StealthSleep (g_dr0StatActive=0),
+        //   否则保持禁用等待下次重试 (避免 EkkoSleep 加密 .data 期间残留 DR0 触发崩溃)
+        {
+            static DWORD lastDr0Retry = 0;
+            if (g_dr0StatActive && g_dr0StatDone &&
+                GetTickCount() - lastDr0Retry > 10000) {
+                lastDr0Retry = GetTickCount();
+                RetryClearDR0Breakpoints();
             }
         }
 
