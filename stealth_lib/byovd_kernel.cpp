@@ -1629,18 +1629,22 @@ static bool PdfwWriteKernelVA(HANDLE hDevice, uint64_t kernelVA, const void* inB
 bool KernelMemoryAccessor::ReadKernelVA(uint64_t va, void* outBuf, size_t size) {
     if (!m_active) return false;
     if (va < 0xFFFF800000000000ULL) return false;
-    // ★ BUILD 567 v3.229 FIX (蓝屏 0x50 第二次根因 7/20 0:29:21): 白名单方式
-    //   v3.228 黑名单 (只排除系统缓存 0xFFFFE0-0xFFFFF0) 仍被 0xFFFFFD0000000000 (系统 PTE) 触发 0x50.
-    //   内核多个区域含未映射页: 系统缓存/分页池/系统 PTE/系统映射视图/Hypervisor.
-    //   改用白名单只允许以下区域 (所有合法内核数据结构都在这三个区域):
-    //     - PTE 自映射 0xFFFFF68000000000 - 0xFFFFF80000000000 (PTE_BASE, ReadPte/WritePte 使用)
-    //     - 内核镜像  0xFFFFF80000000000 - 0xFFFFFA0000000000 (ntoskrnl/hal/驱动镜像 + .data 段)
-    //     - 非分页池  0xFFFFFA0000000000 - 0xFFFFFC0000000000 (EPROCESS/LDR_DATA_TABLE_ENTRY/回调数组)
-    //   双重保险: 即使调用方未检查, ReadKernelVA 入口拦截.
-    //   安全性: 第 4 轮审查确认所有合法调用方 (ReadPte/ResolveExport/DKOM*/PsLoadedModuleHider)
-    //           读取的地址都在此范围内. PTE 自映射区域 PTE 表本身在非分页池, 始终已映射.
-    if (va < 0xFFFFF68000000000ULL) return false;       // 排除系统缓存 + 分页池(部分) + 系统 PTE(部分)
-    if (va >= 0xFFFFFC0000000000ULL) return false;      // 排除分页池 + 系统 PTE + 系统映射 + Hypervisor
+    // ★ BUILD 567 v3.230 FIX (CS2 闪退根因 7/20): 扩大白名单含分页池
+    //   v3.229 白名单 [0xFFFFF680, 0xFFFFFC00) 排除分页池, 导致致命连锁反应:
+    //     1. VAD 节点 (_MMVAD_SHORT) 在分页池 (ExAllocatePoolWithTag(PagedPool,...))
+    //     2. ReadKernelVA 拒绝分页池 → Read<uint64_t> 返回 0 (无法区分读取失败/值为0)
+    //     3. validateVadRoot 逻辑缺陷: isValidPtr(0)=true, 0>0=false, 0<0x80000000=true
+    //        → 错误偏移被缓存 (如 0x7D8 而非 24H2 实际偏移)
+    //     4. ConcealRegion 读取 EPROCESS+错误偏移 → vadRoot 是错误字段的内核地址
+    //     5. FindAndModifyVadNode 遍历错误"VAD树" → 若 targetVpn 命中 [startVpn,endVpn]
+    //        且 flags&PrivateMemoryBit → 写入 vadRoot+0x30 破坏任意内核结构 → CS2 闪退
+    //   修复: 扩大白名单至 [0xFFFFF680, 0xFFFFFE00), 包含分页池 (VAD 节点所在区域).
+    //   安全性: 分页池页面通常已映射 (池分配器不取消映射空闲页), v3.228 及更早一直如此.
+    //           仍排除系统 PTE (0xFFFFFD0+, v3.228 蓝屏 0x50 根因) + 系统映射 + Hypervisor.
+    //   注: 不使用 PTE 预验证 — ReadPte 公式 PTE_BASE+((va>>12)<<3) 对内核态高地址
+    //       会溢出回绕到用户态 (pteVA < 0x800000000000), ReadKernelVA 拒绝, 无效.
+    if (va < 0xFFFFF68000000000ULL) return false;       // 排除系统缓存 + 系统 PTE(部分)
+    if (va >= 0xFFFFFE0000000000ULL) return false;      // 排除系统 PTE + 系统映射 + Hypervisor
 
     // ★ BUILD 489: 根据驱动类型分发
     if (g_isPdfwKrnl) {
@@ -1653,10 +1657,11 @@ bool KernelMemoryAccessor::ReadKernelVA(uint64_t va, void* outBuf, size_t size) 
 bool KernelMemoryAccessor::WriteKernelVA(uint64_t va, const void* inBuf, size_t size) {
     if (!m_active) return false;
     if (va < 0xFFFF800000000000ULL) return false;
-    // ★ BUILD 567 v3.229 FIX: 白名单 (与 ReadKernelVA 一致, 防御性)
-    //   允许 PTE 自映射 + 内核镜像 + 非分页池
-    if (va < 0xFFFFF68000000000ULL) return false;
-    if (va >= 0xFFFFFC0000000000ULL) return false;
+    // ★ BUILD 567 v3.230 FIX: 扩大白名单含分页池 (与 ReadKernelVA 一致)
+    //   VAD 节点的 VadFlags 字段 (+0x30) 在分页池, VADConcealer 需要写入修改 PrivateMemory.
+    //   v3.229 排除分页池导致 WriteKernelVA 拒绝, 即使读取成功也无法修改 VAD.
+    if (va < 0xFFFFF68000000000ULL) return false;       // 排除系统缓存 + 系统 PTE(部分)
+    if (va >= 0xFFFFFE0000000000ULL) return false;      // 排除系统 PTE + 系统映射 + Hypervisor
 
     // ★ BUILD 489: 根据驱动类型分发
     if (g_isPdfwKrnl) {
@@ -7687,6 +7692,7 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
     if (s_vadRootOffset != 0) return true;  // 已缓存
 
     // 指针合法性检查: NULL 或内核地址 (>=0xFFFF800000000000)
+    // ★ BUILD 567 v3.230 FIX: 仅用于 AVL 节点 Left/Right/Parent (NULL 合法)
     auto isValidPtr = [](uint64_t p) {
         return p == 0 || p >= 0xFFFF800000000000ULL;
     };
@@ -7695,15 +7701,25 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
     auto validateVadRoot = [&](uint64_t vadRootCandidate) -> bool {
         if (!vadRootCandidate || vadRootCandidate < 0xFFFF800000000000ULL) return false;
 
-        uint64_t left   = kma.Read<uint64_t>(vadRootCandidate + VadOffsets::RbnLeft);
-        uint64_t right  = kma.Read<uint64_t>(vadRootCandidate + VadOffsets::RbnRight);
-        uint64_t parent = kma.Read<uint64_t>(vadRootCandidate + VadOffsets::RbnParentEncoded);
+        // ★ BUILD 567 v3.230 FIX: 显式检查 ReadKernelVA 返回值, 避免读取失败被误判为 0
+        //   v3.229 缺陷: Read<uint64_t> 模板无法区分"读取失败"和"值为0"
+        //   当 vadRootCandidate 在分页池 (v3.229 白名单排除) 时, ReadKernelVA 失败返回 0
+        //   isValidPtr(0)=true + 0>0=false + 0<0x80000000=true → 错误验证通过, 缓存错误偏移
+        //   修复: 直接调用 ReadKernelVA 检查返回值, 读取失败立即返回 false
+        uint64_t left = 0, right = 0, parent = 0;
+        if (!kma.ReadKernelVA(vadRootCandidate + VadOffsets::RbnLeft, &left, 8)) return false;
+        if (!kma.ReadKernelVA(vadRootCandidate + VadOffsets::RbnRight, &right, 8)) return false;
+        if (!kma.ReadKernelVA(vadRootCandidate + VadOffsets::RbnParentEncoded, &parent, 8)) return false;
         if (!isValidPtr(left) || !isValidPtr(right) || !isValidPtr(parent)) return false;
 
-        // 至少 1 个非 NULL (完全空的 AVL 节点不太可能是 VadRoot, 但允许)
+        // ★ BUILD 567 v3.230 FIX: 至少一个非 NULL (完全空的节点不太可能是真实 VadRoot)
+        //   深度防御: 真实 VAD 树根节点通常有子节点或父指针, 三字段全 0 极不可能
+        if (!left && !right && !parent) return false;
+
         // 二次验证: VadStartingVpn <= VadEndingVpn
-        uint64_t startVpn = kma.Read<uint64_t>(vadRootCandidate + VadOffsets::VadStartingVpn);
-        uint64_t endVpn   = kma.Read<uint64_t>(vadRootCandidate + VadOffsets::VadEndingVpn);
+        uint64_t startVpn = 0, endVpn = 0;
+        if (!kma.ReadKernelVA(vadRootCandidate + VadOffsets::VadStartingVpn, &startVpn, 8)) return false;
+        if (!kma.ReadKernelVA(vadRootCandidate + VadOffsets::VadEndingVpn, &endVpn, 8)) return false;
         if (startVpn > endVpn) return false;
 
         // ★ BUILD 555 P2-verify: 修正 VPN 范围检查 (原 < 0x100000 过于严格)
@@ -7790,12 +7806,25 @@ static bool FindAndModifyVadNode(KernelMemoryAccessor& kma, uint64_t vadNode, ui
     int maxDepth = 128;
 
     while (vadNode && maxDepth-- > 0) {
-        uint64_t startVpn = kma.Read<uint64_t>(vadNode + VadOffsets::VadStartingVpn);
-        uint64_t endVpn   = kma.Read<uint64_t>(vadNode + VadOffsets::VadEndingVpn);
+        // ★ BUILD 567 v3.230 FIX (深度防御): 写入前验证 vadNode 确实在分页池
+        //   VAD 节点 (_MMVAD_SHORT) 通过 ExAllocatePoolWithTag(PagedPool,...) 分配, 必在分页池.
+        //   分页池范围: [0xFFFFFC0000000000, 0xFFFFFD0000000000)
+        //   防御: 即使 validateVadRoot 仍有未知缺陷缓存错误偏移, 导致 vadRoot 指向错误地址,
+        //         此检查也能阻止遍历非分页池/内核镜像, 避免写入破坏关键内核结构.
+        //   注: VadRoot 本身 (RTL_BALANCED_NODE 根节点) 也在分页池, 第一次迭代即检查.
+        if (vadNode < 0xFFFFFC0000000000ULL || vadNode >= 0xFFFFFD0000000000ULL) {
+            return false;
+        }
+
+        // ★ BUILD 567 v3.230 FIX: 显式检查 ReadKernelVA 返回值 (与 validateVadRoot 一致)
+        uint64_t startVpn = 0, endVpn = 0;
+        if (!kma.ReadKernelVA(vadNode + VadOffsets::VadStartingVpn, &startVpn, 8)) return false;
+        if (!kma.ReadKernelVA(vadNode + VadOffsets::VadEndingVpn, &endVpn, 8)) return false;
 
         if (targetVpn >= startVpn && targetVpn <= endVpn) {
             // 找到目标 VAD 节点, 修改 PrivateMemory flag
-            uint64_t flags = kma.Read<uint64_t>(vadNode + VadOffsets::VadFlags);
+            uint64_t flags = 0;
+            if (!kma.ReadKernelVA(vadNode + VadOffsets::VadFlags, &flags, 8)) return false;
 
             // 检查 PrivateMemory bit 是否已设置
             if (flags & VadOffsets::PrivateMemoryBit) {
@@ -7818,8 +7847,9 @@ static bool FindAndModifyVadNode(KernelMemoryAccessor& kma, uint64_t vadNode, ui
         }
 
         // AVL 遍历: 根据 VPN 决定走左子树还是右子树
-        uint64_t left  = kma.Read<uint64_t>(vadNode + VadOffsets::RbnLeft);
-        uint64_t right = kma.Read<uint64_t>(vadNode + VadOffsets::RbnRight);
+        uint64_t left = 0, right = 0;
+        if (!kma.ReadKernelVA(vadNode + VadOffsets::RbnLeft, &left, 8)) return false;
+        if (!kma.ReadKernelVA(vadNode + VadOffsets::RbnRight, &right, 8)) return false;
 
         if (targetVpn < startVpn) {
             vadNode = left;

@@ -185,6 +185,24 @@
 //        安全性: VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch), 无新内存访问模式
 //                降级模式下依赖 SHV_Install patch 兜底 (双重保险), BSOD 风险极低
 //        预期效果: VmxOnWrapper patch 持久有效, EPT 永不构造, 综合 2-5% → 1.5-4%
+// BUILD: 567 (v3.230: CS2 闪退修复 — 扩大白名单含分页池 + validateVadRoot 缺陷修复)
+//        ★ BUILD 567 v3.230 FIX (CS2 闪退根因 7/20 01:00):
+//          - 现象: v3.229 运行后 CS2 透视生效 ~60秒后卡住闪退 (非蓝屏)
+//          - 用户关键补充: 未安装 PAC, 初始根因 (PAC VAD 扫描) 不成立
+//          - 真实根因 (3 层缺陷叠加):
+//            1) v3.229 白名单 [0xFFFFF680, 0xFFFFFC00) 排除分页池
+//            2) VAD 节点 _MMVAD_SHORT 在分页池 (ExAllocatePoolWithTag(PagedPool))
+//            3) Read<uint64_t> 模板无法区分读取失败/值为0 → validateVadRoot 逻辑缺陷:
+//               isValidPtr(0)=true + 0>0=false + 0<0x80000000=true → 错误偏移被缓存
+//            4) ConcealRegion 读取 EPROCESS+错误偏移 → vadRoot 是错误字段的内核地址
+//            5) FindAndModifyVadNode 遍历错误"VAD树" → 写入破坏任意内核结构 → CS2 闪退
+//          - 3 处修复:
+//            1) ReadKernelVA/WriteKernelVA: 扩大白名单至 [0xFFFFF680, 0xFFFFFE00) 含分页池
+//               仍排除系统 PTE (0xFFFFFD0+, v3.228 蓝屏根因) + 系统映射 + Hypervisor
+//            2) validateVadRoot: 显式检查 ReadKernelVA 返回值 + 至少一个非 NULL (深度防御)
+//            3) FindAndModifyVadNode: 写入前验证 vadNode 确实在分页池 [0xFFFFFC0, 0xFFFFFD0)
+//          - 安全性: 分页池页面通常已映射 (池分配器不取消映射空闲页), v3.228 及更早一直如此.
+//                   不使用 PTE 预验证 — ReadPte 公式对内核态高地址会溢出回绕到用户态, 无效.
 // BUILD: 567 (v3.229: 蓝屏 0x50 二次修复 — 黑名单改白名单)
 //        ★ BUILD 567 v3.229 FIX (蓝屏 0x50 第二次根因 7/20 0:29:21):
 //          - 现象: v3.228 修复后运行 loader.exe 仍蓝屏 BugCheck 0x50
@@ -422,7 +440,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.229 启动摘要 (蓝屏 0x50 二次修复 — 白名单)\n");
+    DiagLog("BUILD 567 v3.230 启动摘要 (CS2 闪退修复 — 扩大白名单含分页池)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -461,7 +479,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.229 退出摘要\n");
+    DiagLog("BUILD 567 v3.230 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -486,7 +504,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.229 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.230 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
