@@ -1629,6 +1629,14 @@ static bool PdfwWriteKernelVA(HANDLE hDevice, uint64_t kernelVA, const void* inB
 bool KernelMemoryAccessor::ReadKernelVA(uint64_t va, void* outBuf, size_t size) {
     if (!m_active) return false;
     if (va < 0xFFFF800000000000ULL) return false;
+    // ★ BUILD 567 v3.228 FIX (蓝屏 0x50 根因 7/19 23:41:29): 排除系统缓存区域
+    //   0xFFFFE00000000000 - 0xFFFFF00000000000 是 Win11 系统缓存区域 (PML4 idx 0x1C0-0x1DF),
+    //   包含文件缓存页 (可能未映射). PDFWKRNL.sys memcpy 不验证地址, 读取未映射页直接 0x50 蓝屏.
+    //   双重保险: 即使调用方未检查, ReadKernelVA 入口拦截.
+    //   安全性: 系统缓存区域不含内核数据结构 (EPROCESS/LDR_DATA_TABLE_ENTRY/回调数组等),
+    //           所有合法内核 R/W 目标都在非分页池 (0xFFFFFA0000000000+) 或内核镜像 (0xFFFFF80000000000+),
+    //           排除系统缓存区域不影响任何合法读取.
+    if (va >= 0xFFFFE00000000000ULL && va < 0xFFFFF00000000000ULL) return false;
 
     // ★ BUILD 489: 根据驱动类型分发
     if (g_isPdfwKrnl) {
@@ -1641,6 +1649,8 @@ bool KernelMemoryAccessor::ReadKernelVA(uint64_t va, void* outBuf, size_t size) 
 bool KernelMemoryAccessor::WriteKernelVA(uint64_t va, const void* inBuf, size_t size) {
     if (!m_active) return false;
     if (va < 0xFFFF800000000000ULL) return false;
+    // ★ BUILD 567 v3.228 FIX: 排除系统缓存区域 (与 ReadKernelVA 一致, 防御性)
+    if (va >= 0xFFFFE00000000000ULL && va < 0xFFFFF00000000000ULL) return false;
 
     // ★ BUILD 489: 根据驱动类型分发
     if (g_isPdfwKrnl) {
@@ -4519,6 +4529,17 @@ uint64_t PsLoadedModuleHider::LocatePsLoadedModuleList(uint64_t ntosBase) {
             // 条件 1: Flink/Blink 都在内核非分页池范围
             if (flink <= 0xFFFF800000000000ULL) continue;
             if (blink <= 0xFFFF800000000000ULL) continue;
+            // ★ BUILD 567 v3.228 FIX (蓝屏 0x50 根因 7/19 23:41:29):
+            //   排除系统缓存区域 0xFFFFE00000000000 - 0xFFFFF00000000000
+            //   根因: .data 段扫描时, 某些 8 字节字段 (文件缓存指针/未初始化值)
+            //         恰好落在系统缓存区域 (PML4 idx 0x1C0-0x1DF), 通过 >= 0xFFFF800000000000 检查,
+            //         但系统缓存区域包含文件缓存页 (可能未映射), PDFWKRNL memcpy 读取触发 0x50 蓝屏.
+            //   崩溃案例: flink=0xFFFFE68000000000 (PML4 idx=0x1CD, 系统缓存区域),
+            //             kma.Read(flink + 0x30) = kma.Read(0xFFFFE68000000030) → 0x50 蓝屏.
+            //   修复: 排除系统缓存区域, LDR_DATA_TABLE_ENTRY 在非分页池 (0xFFFFFA0000000000+),
+            //         不会在此区域, 排除安全.
+            if (flink >= 0xFFFFE00000000000ULL && flink < 0xFFFFF00000000000ULL) continue;
+            if (blink >= 0xFFFFE00000000000ULL && blink < 0xFFFFF00000000000ULL) continue;
             // 排除指向自身的孤立节点 (PsLoadedModuleList 头节点的 Flink 不会指向自身)
             if (flink == dataVA + off + i) continue;
 
@@ -4576,6 +4597,10 @@ uint64_t PsLoadedModuleHider::FindEntryByBaseName(uint64_t listHead, const wchar
     for (int iter = 0; iter < MAX_ITER; iter++) {
         if (current == listHead || current == 0) break;
         if (current <= 0xFFFF800000000000ULL) break;  // 非内核地址, 异常终止
+        // ★ BUILD 567 v3.228 FIX: 排除系统缓存区域 (与 LocatePsLoadedModuleList 一致)
+        //   防御性: 链表本身不应包含系统缓存区域指针, 但若链表损坏, 读取 current+0x58/0x60
+        //         会触发 0x50 蓝屏 (同 LocatePsLoadedModuleList 根因).
+        if (current >= 0xFFFFE00000000000ULL && current < 0xFFFFF00000000000ULL) break;
 
         // 读取 BaseDllName (UNICODE_STRING @ +0x58)
         uint16_t nameLen = kma.Read<uint16_t>(current + LDR_BASE_DLL_NAME_OFF);

@@ -185,6 +185,21 @@
 //        安全性: VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch), 无新内存访问模式
 //                降级模式下依赖 SHV_Install patch 兜底 (双重保险), BSOD 风险极低
 //        预期效果: VmxOnWrapper patch 持久有效, EPT 永不构造, 综合 2-5% → 1.5-4%
+// BUILD: 567 (v3.228: 蓝屏 0x50 修复 — 排除系统缓存区域)
+//        ★ BUILD 567 v3.228 FIX (蓝屏 0x50 根因 7/19 23:41:29):
+//          - 现象: 运行 loader.exe 后蓝屏 BugCheck 0x50 (PAGE_FAULT_IN_NONPAGED_AREA)
+//          - 异常地址: 0xFFFFE68000000030 (PML4 idx=0x1CD, 系统缓存区域)
+//          - 根因公式: flink(0xFFFFE68000000000) + LDR_DLLBASE_OFF(0x30) = 0xFFFFE68000000030
+//          - 根因: LocatePsLoadedModuleList 扫描 ntoskrnl .data 段时, flink 落在系统缓存区域
+//                 (0xFFFFE00000000000-0xFFFFF00000000000), 该区域包含文件缓存页 (可能未映射),
+//                 PDFWKRNL.sys memcpy 不验证地址, 读取未映射页直接 0x50 蓝屏
+//          - 修复: 4 层防御
+//            1) LocatePsLoadedModuleList: flink/blink 排除系统缓存区域
+//            2) FindEntryByBaseName: current 排除系统缓存区域
+//            3) ReadKernelVA: 全局入口排除系统缓存区域 (双重保险)
+//            4) WriteKernelVA: 全局入口排除系统缓存区域 (防御性)
+//          - 安全性: 系统缓存区域不含内核数据结构, 合法内核 R/W 目标都在非分页池
+//                   (0xFFFFFA0000000000+) 或内核镜像 (0xFFFFF80000000000+), 排除安全
 // BUILD: 567 (v3.227: 日志增强 — 封号原因分析支持)
 //        1. ★ BUILD 567-1: 时间戳前缀 (DiagLog/CoreDiag/ByovdDiag)
 //           - 每条日志添加 [HH:MM:SS.mmm] 前缀 (GetLocalTime + snprintf)
@@ -393,7 +408,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.227 启动摘要\n");
+    DiagLog("BUILD 567 v3.228 启动摘要 (蓝屏 0x50 修复)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -432,7 +447,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.227 退出摘要\n");
+    DiagLog("BUILD 567 v3.228 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -457,7 +472,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.227 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.228 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
