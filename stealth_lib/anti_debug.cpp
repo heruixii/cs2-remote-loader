@@ -745,7 +745,9 @@ void AntiDebug::HideAllThreads() {
     DWORD threadIds[256];
     int threadCount = EnumerateAllThreads(threadIds, 256);
     for (int i = 0; i < threadCount; i++) {
-        HANDLE hThread = OpenThread(THREAD_SET_INFORMATION, FALSE, threadIds[i]);
+        // ★ BUILD 556: STEALTH_OPEN_THREAD 替代 OpenThread (消除 kernel32 IAT 导入)
+        HANDLE hThread = nullptr;
+        STEALTH_OPEN_THREAD(hThread, THREAD_SET_INFORMATION, threadIds[i]);
         if (hThread) {
             fn(hThread, 0x11, nullptr, 0); // ThreadHideFromDebugger
             CloseHandle(hThread);

@@ -35,6 +35,15 @@ struct SyscallNumbers {
     DWORD NtDelayExecution;
     DWORD NtContinue;
     DWORD NtWaitForSingleObject;
+    // ★ BUILD 556: P0+P1 syscall 替代 — 新增 4 个 SSN
+    //   NtOpenThread             — 替代 OpenThread (CleanupInjectionTraces)
+    //   NtAdjustPrivilegesToken  — 替代 AdjustTokenPrivileges (EnsureDebugPrivilegeSilent)
+    //   NtOpenProcessToken       — 替代 OpenProcessToken (EnsureDebugPrivilegeSilent / BypassPrivilegeCheck)
+    //   NtQueryInformationToken  — 替代 GetTokenInformation (查询权限)
+    DWORD NtOpenThread;
+    DWORD NtAdjustPrivilegesToken;
+    DWORD NtOpenProcessToken;
+    DWORD NtQueryInformationToken;
 };
 
 // ---- 系统调用解析器 (升级版: Hell's Gate + Halo's Gate) ----
@@ -254,5 +263,83 @@ NTSTATUS SysQueryInformationProcess(
     SyscallMethod method = SyscallMethod::Auto);
 
 NTSTATUS SysClose(HANDLE Handle, SyscallMethod method = SyscallMethod::Auto);
+
+// ============================================================
+// ★ BUILD 556: P0+P1 syscall 替代 — 新增 6 个 Sys* 包装
+//   目标: 消除 IAT 中 WriteProcessMemory/OpenThread/令牌 API 静态导入
+//   实现模式: 与现有 Sys* 一致 (Initialize SSN → DecideMethod →
+//             StackSpoof/Indirect/Tartarus/Direct 四级降级)
+// ============================================================
+
+// ---- SysCreateThreadEx (替代 CreateRemoteThread) ----
+// SSN 已在 Initialize 中提取 (NtCreateThreadEx), 此前未封装
+NTSTATUS SysCreateThreadEx(
+    PHANDLE ThreadHandle, ACCESS_MASK DesiredAccess,
+    PVOID ObjectAttributes, HANDLE ProcessHandle,
+    PVOID StartAddress, PVOID Argument,
+    ULONG CreateFlags, SIZE_T ZeroBits,
+    SIZE_T StackSize, SIZE_T MaximumStackSize,
+    PVOID AttributeList,
+    SyscallMethod method = SyscallMethod::Auto);
+
+// ---- SysFreeVirtualMemory (替代 VirtualFreeEx) ----
+// SSN 已在 Initialize 中提取 (NtFreeVirtualMemory), 此前未封装
+NTSTATUS SysFreeVirtualMemory(
+    HANDLE ProcessHandle, PVOID* BaseAddress,
+    PSIZE_T RegionSize, ULONG FreeType,
+    SyscallMethod method = SyscallMethod::Auto);
+
+// ---- SysOpenThread (替代 OpenThread) ----
+// ★ BUILD 556 新提取 SSN (NtOpenThread)
+//   规避: kernel32!OpenThread 触发 ObRegisterCallbacks 内核回调 (PAC 注册)
+//   替换 payload.cpp L1296 CleanupInjectionTraces 中的 OpenThread 调用
+NTSTATUS SysOpenThread(
+    PHANDLE ThreadHandle, ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes, PCLIENT_ID ClientId,
+    SyscallMethod method = SyscallMethod::Auto);
+
+// ---- SysOpenProcessToken (替代 OpenProcessToken) ----
+// ★ BUILD 556 新提取 SSN (NtOpenProcessToken)
+//   规避: advapi32!OpenProcessToken IAT 静态导入特征
+//   替换 stealth_process.cpp L300/L363 EnsureDebugPrivilegeSilent / BypassPrivilegeCheck
+NTSTATUS SysOpenProcessToken(
+    HANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
+    PHANDLE TokenHandle,
+    SyscallMethod method = SyscallMethod::Auto);
+
+// ---- SysAdjustPrivilegesToken (替代 AdjustTokenPrivileges) ----
+// ★ BUILD 556 新提取 SSN (NtAdjustPrivilegesToken)
+//   规避: advapi32!AdjustTokenPrivileges IAT 静态导入特征
+//   替换 stealth_process.cpp L350 EnsureDebugPrivilegeSilent 提权
+NTSTATUS SysAdjustPrivilegesToken(
+    HANDLE TokenHandle, BOOLEAN DisableAllPrivileges,
+    PVOID NewState, ULONG BufferLength,
+    PVOID PreviousState, PULONG ReturnLength,
+    SyscallMethod method = SyscallMethod::Auto);
+
+// ---- SysQueryInformationToken (替代 GetTokenInformation) ----
+// ★ BUILD 556 新提取 SSN (NtQueryInformationToken)
+//   规避: advapi32!GetTokenInformation IAT 静态导入特征
+//   替换 stealth_process.cpp L313/L326/L366 权限查询
+NTSTATUS SysQueryInformationToken(
+    HANDLE TokenHandle, ULONG TokenInformationClass,
+    PVOID TokenInformation, ULONG TokenInformationLength,
+    PULONG ReturnLength,
+    SyscallMethod method = SyscallMethod::Auto);
+
+// ★ BUILD 556: STEALTH_OPEN_THREAD — OpenThread 的 syscall 替代宏
+//   用法: HANDLE h; STEALTH_OPEN_THREAD(h, THREAD_QUERY_INFORMATION, tid);
+//   规避: kernel32!OpenThread 触发 ObRegisterCallbacks 内核回调 (PAC 注册)
+//   仿照 STEALTH_OPEN_PROCESS (L236-243) 模式
+//   注意: inherit 参数被忽略 (NtOpenThread 不支持句柄继承, 不影响检测规避)
+//   依赖: syscall_direct.h 已 include <winternl.h> (CLIENT_ID, OBJECT_ATTRIBUTES)
+#define STEALTH_OPEN_THREAD(handle_var, access, tid) do { \
+    CLIENT_ID _stealth_cid_556 = {}; \
+    _stealth_cid_556.UniqueThread = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(tid)); \
+    OBJECT_ATTRIBUTES _stealth_oa_556 = {}; \
+    _stealth_oa_556.Length = sizeof(_stealth_oa_556); \
+    handle_var = nullptr; \
+    ::stealth::SysOpenThread(&(handle_var), (access), &_stealth_oa_556, &_stealth_cid_556); \
+} while(0)
 
 } // namespace stealth

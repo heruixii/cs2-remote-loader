@@ -295,22 +295,29 @@ HANDLE StealthProcess::DuplicateHandleFromLowRisk(DWORD pid) {
 }
 
 bool StealthProcess::EnsureDebugPrivilegeSilent() {
-    // 先检查是否已有权限
-    HANDLE hToken;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES, &hToken))
-        return false;
+    // ★ BUILD 556: 全部改用 syscall + 硬编码 SeDebugPrivilege LUID
+    //   消除 4 个 advapi32 API 导入: OpenProcessToken/LookupPrivilegeValueW/
+    //   GetTokenInformation/AdjustTokenPrivileges
+    //   消除 "SeDebugPrivilege" 明文字符串
+    HANDLE hToken = nullptr;
+    NTSTATUS status = stealth::SysOpenProcessToken(
+        GetCurrentProcess(), TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES, &hToken);
+    if (!NT_SUCCESS(status)) return false;
+
+    // ★ BUILD 556: 硬编码 SeDebugPrivilege LUID
+    //   Windows 所有版本中 SeDebugPrivilege 的 LUID 固定为 {LowPart=20, HighPart=0}
+    //   (由系统引导时 LSA 分配的固定值, 不会变动)
+    //   消除 LookupPrivilegeValueW 导入 + "SeDebugPrivilege" 明文字符串
+    LUID seDebugLuid = { 20, 0 };
 
     TOKEN_PRIVILEGES tp = {};
-    LUID luid;
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = seDebugLuid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
 
-    if (!LookupPrivilegeValueW(nullptr, L"SeDebugPrivilege", &luid)) {
-        CloseHandle(hToken);
-        return false;
-    }
-
-    // 检查现有权限
+    // 检查现有权限 (使用 SysQueryInformationToken 替代 GetTokenInformation)
     DWORD size = 0;
-    GetTokenInformation(hToken, TokenPrivileges, nullptr, 0, &size);
+    stealth::SysQueryInformationToken(hToken, TokenPrivileges, nullptr, 0, &size);
     if (size == 0) {
         CloseHandle(hToken);
         return false;
@@ -323,11 +330,12 @@ bool StealthProcess::EnsureDebugPrivilegeSilent() {
     }
 
     bool alreadyHavePrivilege = false;
-    if (GetTokenInformation(hToken, TokenPrivileges, buffer, size, &size)) {
+    if (NT_SUCCESS(stealth::SysQueryInformationToken(
+            hToken, TokenPrivileges, buffer, size, &size))) {
         auto* privileges = reinterpret_cast<TOKEN_PRIVILEGES*>(buffer);
         for (DWORD i = 0; i < privileges->PrivilegeCount; i++) {
-            if (privileges->Privileges[i].Luid.LowPart == luid.LowPart &&
-                privileges->Privileges[i].Luid.HighPart == luid.HighPart &&
+            if (privileges->Privileges[i].Luid.LowPart == seDebugLuid.LowPart &&
+                privileges->Privileges[i].Luid.HighPart == seDebugLuid.HighPart &&
                 (privileges->Privileges[i].Attributes & SE_PRIVILEGE_ENABLED)) {
                 alreadyHavePrivilege = true;
                 break;
@@ -342,28 +350,34 @@ bool StealthProcess::EnsureDebugPrivilegeSilent() {
         return true; // 已有权限, 无需调用 AdjustTokenPrivileges
     }
 
-    // 仅在确实需要时才调用 AdjustTokenPrivileges
-    tp.PrivilegeCount = 1;
-    tp.Privileges[0].Luid = luid;
-    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-
-    BOOL result = AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+    // ★ BUILD 556: SysAdjustPrivilegesToken 替代 AdjustTokenPrivileges
+    //   STATUS_NOT_ALL_ASSIGNED = 0x40000024 (NT_WARNING, NT_SUCCESS 返回 TRUE 但表示部分未分配)
+    //   原版: result != FALSE && GetLastError() != ERROR_NOT_ALL_ASSIGNED
+    //   新版: NT_SUCCESS(status) && status != 0x40000024
+    NTSTATUS adjStatus = stealth::SysAdjustPrivilegesToken(
+        hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
     CloseHandle(hToken);
 
-    return result != FALSE && GetLastError() != ERROR_NOT_ALL_ASSIGNED;
+    const NTSTATUS STATUS_NOT_ALL_ASSIGNED_VAL = ((NTSTATUS)0x40000024L);
+    return NT_SUCCESS(adjStatus) && adjStatus != STATUS_NOT_ALL_ASSIGNED_VAL;
 }
 
 bool StealthProcess::BypassPrivilegeCheck() {
     // 方案: 如果当前进程以管理员运行, 父进程继承的令牌可能已有 SeDebugPrivilege
     // 优先检查继承的令牌而不是调用 AdjustTokenPrivileges
 
+    // ★ BUILD 556: SysOpenProcessToken + SysQueryInformationToken 替代
+    //   advapi32!OpenProcessToken + advapi32!GetTokenInformation
     // 检查是否以管理员运行
     BOOL isElevated = FALSE;
     HANDLE hToken = nullptr;
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+    NTSTATUS status = stealth::SysOpenProcessToken(
+        GetCurrentProcess(), TOKEN_QUERY, &hToken);
+    if (NT_SUCCESS(status)) {
         TOKEN_ELEVATION elevation = {};
         DWORD size = sizeof(elevation);
-        if (GetTokenInformation(hToken, TokenElevation, &elevation, size, &size)) {
+        if (NT_SUCCESS(stealth::SysQueryInformationToken(
+                hToken, TokenElevation, &elevation, size, &size))) {
             isElevated = elevation.TokenIsElevated;
         }
         CloseHandle(hToken);

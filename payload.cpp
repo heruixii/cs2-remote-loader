@@ -560,13 +560,16 @@ static bool ResolveImportTable(HANDLE hProcess, void* remoteBase,
                     buf[i] = entries[blockStart + i].funcAddr;
                 }
                 SIZE_T br = 0;
-                WriteProcessMemory(hProcess, entries[blockStart].remoteAddr, buf, blockBytes, &br);
+                // ★ BUILD 556: SysWriteVirtualMemory 替代 WriteProcessMemory
+                //   消除 kernel32!WriteProcessMemory IAT 静态导入特征
+                stealth::SysWriteVirtualMemory(hProcess, entries[blockStart].remoteAddr, buf, blockBytes, &br);
                 VirtualFree(buf, 0, MEM_RELEASE);
             } else {
                 // 逐个写入 (内存不足时回退)
                 for (DWORD i = blockStart; i <= blockEnd; i++) {
                     SIZE_T br = 0;
-                    WriteProcessMemory(hProcess, entries[i].remoteAddr, &entries[i].funcAddr, sizeof(void*), &br);
+                    // ★ BUILD 556: SysWriteVirtualMemory 替代 WriteProcessMemory
+                    stealth::SysWriteVirtualMemory(hProcess, entries[i].remoteAddr, &entries[i].funcAddr, sizeof(void*), &br);
                 }
             }
         blockStart = blockEnd + 1;
@@ -598,7 +601,7 @@ static bool ResolveImportTable(HANDLE hProcess, void* remoteBase,
 // ============================================================
 static uint8_t* g_patchAddr = nullptr;
 static bool g_cs2Patched = false;
-static bool g_shadowPageTried = false;  // ★ BUILD 549: 影子页尝试标志 (失败后不再重试)
+// ★ BUILD 556: 移除 g_shadowPageTried (影子页方案已废弃, 降级到 VirtualProtect)
 static uint8_t* g_clientBase = nullptr;  // ★ BUILD 555 P2-4: client.dll 基址缓存 (供 ValidatePatchFunctionBoundary 使用)
 
 // ★ BUILD 549+: pattern XOR 加密常量 (避免明文特征码 0x32 0xc0 0x4c 0x8b ... 出现在二进制中)
@@ -824,35 +827,16 @@ static bool ApplyCs2Patch() {
         return false;
     }
 
-    // 4. 检查是否已经补丁过 (通过影子页或 VirtualProtect)
+    // 4. 检查是否已经补丁过 (通过 VirtualProtect)
     if (g_cs2Patched && g_patchAddr == found) {
         return true;  // 已补丁, 无需重复
     }
 
-    // ★ BUILD 549: 5a. 优先尝试影子页方案 (PTE manipulation)
-    //    只尝试一次, 失败后永久回退到 VirtualProtect 路径
-    if (!g_shadowPageTried) {
-        g_shadowPageTried = true;
-        // 获取 CS2 进程句柄 (payload.dll 在 loader2 进程, 需要打开 CS2)
-        // ★ 实际上 ApplyCs2Patch 在 loader2 进程内执行, found 是 loader2 进程视角的 client.dll 地址
-        //   ★★★ 关键修正: payload.dll 是 manual-mapped 到 loader2.exe, 不是 CS2!
-        //   BUILD 548 的 ApplyCs2Patch 搜索的是 loader2.exe 进程内的 client.dll 模块
-        //   这意味着 client.dll 必须在 loader2.exe 进程内 (loader2.exe 加载了 client.dll)
-        //   或者 ApplyCs2Patch 通过 ReadProcessMemory 跨进程读取 CS2 的 client.dll
-        //   ★ 实际上: loader2.exe 通过 AttachToProcess 注入 payload.dll 到 CS2 进程
-        //   所以 payload.dll 运行在 CS2 进程内, GetModuleHandleA("client.dll") 返回 CS2 的 client.dll
-        //   ShadowPageManager.Install 修改的是 CS2 进程的 PTE, 这是正确的
-        HANDLE hCs2 = GetCurrentProcess();  // payload.dll 在 CS2 进程内
-        if (stealth::ShadowPageManager::Instance().Install(hCs2, (uintptr_t)found)) {
-            g_patchAddr = found;
-            g_cs2Patched = true;
-            DiagLogEnc("sp_ok");  // ★ BUILD 549: 加密 "shadow ok"
-            return true;
-        }
-        DiagLogEnc("sp_fail");  // ★ BUILD 549: 加密 "shadow fail fb"
-    }
-
-    // 5b. 回退路径: VirtualProtect 直接修改 .text 段 (BUILD 548 逻辑)
+    // ★ BUILD 556: 移除 ShadowPageManager 影子页方案, 直接走 VirtualProtect 路径
+    //   原因: 影子页 1% 占空比扫描规避 ≈ 0%, 且引入 PTE 痕迹 (向量 a) +
+    //         pageB 物理页暴露 (向量 e) 两个新检测点
+    //   策略: BUILD 556 VirtualProtect 过渡, BUILD 557 测试 DR0 硬件断点方案
+    // 5. VirtualProtect 直接修改 .text 段 (BUILD 548 逻辑)
     DWORD oldProtect = 0;
     if (!VirtualProtect(found, 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
         DiagLog("B549:AP:03 VP fail err=%lu\n", GetLastError());
@@ -874,22 +858,13 @@ static bool ApplyCs2Patch() {
     return true;
 }
 
-// ★ BUILD 549: 补丁持久化保护 — 影子页模式周期切换, 回退模式重写补丁
+// ★ BUILD 549: 补丁持久化保护 — 回退模式重写补丁
 static void MaintainCs2Patch() {
     if (!g_patchAddr) return;
 
-    // ★ BUILD 549: 影子页模式 — 周期性切换 pageA/pageB
-    //   ★ BUILD 553: 周期从 500ms → 5s (降频 10 倍), 占空比从 10% → 1%
-    //     原因: BUILD 552 分析发现 500ms 周期导致 240 IOCTL/min, 违反 PDFWKRNL.sys
-    //           10s cooldown 约束, 可能触发驱动卡死 (参考 BUILD 532/533 卡死基线)
-    //   5s 周期, 50ms pageA (1% 占空比), 让 PAC 扫描命中原始字节
-    if (stealth::ShadowPageManager::Instance().IsInstalled()) {
-        stealth::ShadowPageManager::Instance().RevealOriginal();  // 切到 pageA
-        Sleep(50);  // 等 TLB 刷新 + PAC 扫描窗口
-        stealth::ShadowPageManager::Instance().ReapplyPatch();    // 切回 pageB
-        return;
-    }
-
+    // ★ BUILD 556: 移除 ShadowPageManager 影子页周期切换, 直接走 VirtualProtect 重写路径
+    //   原因: 影子页 1% 占空比扫描规避 ≈ 0%, PTE 痕迹 + pageB 物理页暴露风险
+    //   策略: BUILD 556 VirtualProtect 过渡, BUILD 557 测试 DR0 硬件断点方案
     // ★ BUILD 549+: 回退模式 — 检查补丁是否被 PAC 恢复, 重写
     //   用 XOR 比较避免明文 0x32 0xc0 出现在二进制中 (g_patKey 是 volatile 防止常量传播)
     if ((uint8_t)(g_patchAddr[0] ^ g_patKey) == PAT_ENC[0] &&
@@ -1293,7 +1268,11 @@ static void CleanupInjectionTraces() {
                             DWORD tid = sti->ClientId.UniqueThread
                                       ? (DWORD)(uintptr_t)sti->ClientId.UniqueThread : 0;
 
-                            HANDLE hTh = OpenThread(THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT, FALSE, tid);
+                            HANDLE hTh = nullptr;
+                            // ★ BUILD 556: STEALTH_OPEN_THREAD 替代 OpenThread
+                            //   消除 kernel32!OpenThread IAT 静态导入特征
+                            //   规避: OpenThread 触发 ObRegisterCallbacks 内核回调 (PAC 注册)
+                            STEALTH_OPEN_THREAD(hTh, THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT, tid);
                             if (hTh) {
                                 // 查询 Win32StartAddress (class 9)
                                 PVOID startAddr = nullptr;
@@ -2197,8 +2176,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 DWORD cs2ExitCode = STILL_ACTIVE;
                 if (GetExitCodeProcess(hCs2, &cs2ExitCode) && cs2ExitCode != STILL_ACTIVE) {
                     DiagLog("B550:EX:tgt-exit=%u safe-exit\n", cs2ExitCode);  // ★ BUILD 550: 脱敏 (原含 CS2)
-                    // ★ BUILD 549: 先卸载影子页 (恢复原 PTE + 释放 pageB), 必须在 DisableAll 卸载驱动前
-                    stealth::ShadowPageManager::Instance().Uninstall();
+                    // ★ BUILD 556: 移除 ShadowPageManager::Uninstall (影子页方案已废弃)
+                    //   VirtualProtect patch 无需卸载 (CS2 退出时自动释放)
                     stealth::KernelDefense::DisableAll();  // 包含 UnhideProcess
                     StealthEngine::Instance().Shutdown();
                     return 0;
@@ -2226,10 +2205,13 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         {
             static DWORD lastPacCheck = 0;
             DWORD nowTick = GetTickCount();
-            static DWORD pacCheckInterval = RandomJitter(60000, 30000);  // ★ BUILD 534: 60-90s
+            // ★ BUILD 556: SHV 周期 60-90s → 30-45s
+            //   原因: 加快 SHV patch 恢复响应, 缩短 PAC 重载驱动后的 EPT 监控窗口
+            //   IOCTL 负担评估: 5 分钟内 ~210 IOCTL (原 ~105 IOCTL), 仍在 PDFWKRNL.sys 安全范围
+            static DWORD pacCheckInterval = RandomJitter(30000, 15000);  // ★ BUILD 556: 30-45s
             if (nowTick - lastPacCheck >= pacCheckInterval) {
                 lastPacCheck = nowTick;
-                pacCheckInterval = RandomJitter(60000, 30000);  // ★ BUILD 534: 60-90s 随机
+                pacCheckInterval = RandomJitter(30000, 15000);  // ★ BUILD 556: 30-45s 随机
                 if (stealth::KernelMemoryAccessor::Instance().IsActive()) {
                     stealth::KernelDefense::ReapplyAllCallbacks();
 
@@ -2373,22 +2355,14 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         if (GetTickCount() - lastScreenshotCheck > 5000) {
             bool toolRunning = IsScreenshotToolRunning();
             if (toolRunning && !g_patchReverted && g_cs2Patched) {
-                // ★ BUILD 549: 影子页模式 — 永久切到 pageA (截图期间)
-                if (stealth::ShadowPageManager::Instance().IsInstalled()) {
-                    stealth::ShadowPageManager::Instance().RevealOriginal();
-                    Sleep(50);  // 等 TLB 刷新
-                } else {
-                    TemporarilyRevertPatch();  // 回退模式
-                }
+                // ★ BUILD 556: 移除影子页 RevealOriginal, 直接走 TemporarilyRevertPatch 回退路径
+                //   原因: 影子页方案已废弃, 降级到 VirtualProtect
+                TemporarilyRevertPatch();  // VirtualProtect 模式: 临时恢复原始字节
                 g_patchReverted = true;
             } else if (!toolRunning && g_patchReverted) {
-                // ★ BUILD 549: 恢复补丁
-                if (stealth::ShadowPageManager::Instance().IsInstalled()) {
-                    stealth::ShadowPageManager::Instance().ReapplyPatch();
-                    Sleep(50);
-                    g_patchReverted = false;
-                } else if (ApplyCs2Patch()) {
-                    // 回退模式: 检查返回值 — 失败则保持 g_patchReverted=true, 下次循环重试
+                // ★ BUILD 556: 移除影子页 ReapplyPatch, 直接走 ApplyCs2Patch 回退路径
+                //   恢复补丁: 检查返回值 — 失败则保持 g_patchReverted=true, 下次循环重试
+                if (ApplyCs2Patch()) {
                     g_patchReverted = false;
                 }
             }
@@ -2414,8 +2388,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     }
 
     // ★ BUILD 548: basic.exe 已移除, 不需要 TerminateBasicESP
-    // ★ BUILD 549: 卸载影子页 (恢复原 PTE + 释放 pageB), 必须在 DisableAll 卸载驱动前
-    stealth::ShadowPageManager::Instance().Uninstall();
+    // ★ BUILD 556: 移除 ShadowPageManager::Uninstall (影子页方案已废弃)
+    //   VirtualProtect patch 无需卸载 (进程退出时自动释放)
     stealth::KernelDefense::DisableAll();
     StealthEngine::Instance().Shutdown();
     return 0;

@@ -13,6 +13,8 @@
 #include "module_resolver.h"  // GetModuleBaseFromPEB + ModNameHash
 // ★ BUILD 551: STEALTH_GET_PROC_ADDRESS_NOREF 宏 (NtSetSecurityObject 加密解析)
 #include "string_obfuscator.h"
+// ★ BUILD 556: SysOpenProcessToken + SysQueryInformationToken (令牌 API syscall 替代)
+#include "syscall_direct.h"
 
 namespace stealth {
 
@@ -45,10 +47,13 @@ bool HandleACLGuard::LockHandle(HANDLE hProcess) {
     NTSTATUS status = 0;
 
     // 1. 获取当前进程的 SID (安全标识符)
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken))
+    // ★ BUILD 556: SysOpenProcessToken 替代 OpenProcessToken (消除 advapi32 IAT 导入)
+    NTSTATUS tokenStatus = stealth::SysOpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken);
+    if (!NT_SUCCESS(tokenStatus))
         return false;
 
-    GetTokenInformation(hToken, TokenUser, nullptr, 0, &tokenUserSize);
+    // ★ BUILD 556: SysQueryInformationToken 替代 GetTokenInformation
+    stealth::SysQueryInformationToken(hToken, TokenUser, nullptr, 0, &tokenUserSize);
     if (tokenUserSize == 0) {
         CloseHandle(hToken);
         return false;
@@ -61,7 +66,8 @@ bool HandleACLGuard::LockHandle(HANDLE hProcess) {
         return false;
     }
     pTokenUser = reinterpret_cast<PTOKEN_USER>(tokenUserBuf);
-    if (!GetTokenInformation(hToken, TokenUser, pTokenUser, tokenUserSize, &tokenUserSize)) {
+    // ★ BUILD 556: SysQueryInformationToken 替代 GetTokenInformation
+    if (!NT_SUCCESS(stealth::SysQueryInformationToken(hToken, TokenUser, pTokenUser, tokenUserSize, &tokenUserSize))) {
         goto cleanup;
     }
     CloseHandle(hToken);
