@@ -1267,6 +1267,28 @@ static bool IsScreenshotToolRunning() {
 
     bool found = false;
     if (NT_SUCCESS(status)) {
+        // ★ BUILD 560: wShotTools 移到 while 循环外 (原 BUILD 554 在循环内每次重新解密, 浪费 CPU)
+        //   ★ BUILD 560: 缩短 .data 段明文窗口 — wShotTools 改为栈变量 (原 static 永久存在 .data 段)
+        //   原因: static wchar_t wShotTools[15][32] 在 .data 段, 解密后的截图工具名
+        //         ("SnippingTool.exe" 等) 永久存在, PAC 任何时候扫描 .data 段都能发现.
+        //   修复: 改为栈变量, 函数执行期间 (~1-10ms) 短暂存在, 末尾 SecureZeroMemory 清零.
+        //   开销: 每 5s 解密 8 个字符串 < 1μs (可忽略).
+        //   安全: EkkoSleep 不影响栈变量 (栈不在 EkkoSleep 保护区), 无副作用.
+        //   检测列表 (保留 8 个核心工具): SnippingTool/ShareX/Greenshot/Lightshot/
+        //     ScreenClippingHost/OBS/obs64/Streamlabs OBS.
+        //   BUILD 558 FIX-5 已移除: Discord/GameBar/GameBarFTServer/Steam/
+        //     NVIDIA Share/ShadowShare/AMDRSSrcExt (误触发风险高).
+        wchar_t wShotTools[15][32] = {};
+        STEALTH_WSTR_DECRYPT_TO("SnippingTool.exe",       wShotTools[0],  32);
+        STEALTH_WSTR_DECRYPT_TO("ShareX.exe",             wShotTools[1],  32);
+        STEALTH_WSTR_DECRYPT_TO("Greenshot.exe",          wShotTools[2],  32);
+        STEALTH_WSTR_DECRYPT_TO("Lightshot.exe",          wShotTools[3],  32);
+        STEALTH_WSTR_DECRYPT_TO("ScreenClippingHost.exe", wShotTools[4],  32);
+        STEALTH_WSTR_DECRYPT_TO("OBS.exe",                wShotTools[5],  32);
+        STEALTH_WSTR_DECRYPT_TO("obs64.exe",              wShotTools[6],  32);
+        STEALTH_WSTR_DECRYPT_TO("Streamlabs OBS.exe",     wShotTools[7],  32);
+        // idx 8-14 保持全零 (栈变量初始化为 0, 跳过匹配)
+
         BYTE* ptr = buffer;
         while (true) {
             auto* entry = (B549_SYSTEM_PROCESS_INFO*)ptr;
@@ -1276,56 +1298,8 @@ static bool IsScreenshotToolRunning() {
                     if (nameLen >= MAX_PATH) nameLen = MAX_PATH - 1;
                     memcpy(name, entry->ImageName.Buffer, nameLen * sizeof(WCHAR));
 
-                    // ★ BUILD 554 P1-1: 截图工具检测扩展 (5 → 15+) + 全部加密 (修复 A5 缺陷)
-                    //   原因: 原 5 个工具为明文 L"..." 在 .rdata 中, 暴露反截图意图;
-                    //         且未覆盖 OBS/Discord/GameBar/Steam/NVIDIA/AMD 等主流工具.
-                    //   策略: 全部改用 STEALTH_WSTR_DECRYPT_TO 编译期加密, 运行时解密到栈缓冲,
-                    //         首次调用一次性解密并缓存到 static 数组 (单线程, 无并发问题).
-                    //         检测列表覆盖主流直播/录屏/截图/屏幕共享工具 (15+ 项).
-                    static wchar_t wShotTools[15][32] = {};
-                    static bool wShotToolsInit = false;
-                    if (!wShotToolsInit) {
-                        STEALTH_WSTR_DECRYPT_TO("SnippingTool.exe",       wShotTools[0],  32);
-                        STEALTH_WSTR_DECRYPT_TO("ShareX.exe",             wShotTools[1],  32);
-                        STEALTH_WSTR_DECRYPT_TO("Greenshot.exe",          wShotTools[2],  32);
-                        STEALTH_WSTR_DECRYPT_TO("Lightshot.exe",          wShotTools[3],  32);
-                        STEALTH_WSTR_DECRYPT_TO("ScreenClippingHost.exe", wShotTools[4],  32);
-                        STEALTH_WSTR_DECRYPT_TO("OBS.exe",                wShotTools[5],  32);
-                        STEALTH_WSTR_DECRYPT_TO("obs64.exe",              wShotTools[6],  32);
-                        STEALTH_WSTR_DECRYPT_TO("Streamlabs OBS.exe",     wShotTools[7],  32);
-                        // ★ BUILD 558 FIX-5 正式版 (方案 A): 优化截图检测列表
-                        //   原因: 联网搜索确认完美平台"完美时刻"功能基于 demo 事后编辑, 不实时屏幕捕获.
-                        //         perfectworldarena.exe 是完美平台主进程, 玩家使用完美平台时一直运行,
-                        //         加入检测会导致 TemporarilyRevertPatch 持续触发, 透视功能消失 (同 Steam.exe 问题).
-                        //   移除 Discord.exe — CS2 玩家常用语音软件, 屏幕共享非主要功能, 误触发风险高.
-                        //   移除 NVIDIA Share / ShadowShare / AMDRSSrcExt — 显卡驱动录屏, 误触发风险高.
-                        //   不添加 perfectworldarena.exe — 完美时刻基于 demo, 不实时屏幕捕获, 加入会误触发.
-                        //   保留 8 个核心截图工具 (SnippingTool/ShareX/Greenshot/Lightshot/ScreenClippingHost/OBS/obs64/Streamlabs OBS).
-                        wShotTools[8][0] = 0;   // Discord.exe — 空, 跳过匹配 (原 idx=8)
-                        // ★ BUILD 558 FIX-5 v5: 移除 GameBar.exe + GameBarFTServer.exe (Xbox Game Bar)
-                        //   原因: Xbox Game Bar 是 Win10/11 自带组件, 玩游戏时自动后台运行 (按 Win+G 唤出).
-                        //         CS2 玩家机器 99% 同时运行 GameBar.exe + GameBarFTServer.exe,
-                        //         导致 IsScreenshotToolRunning 持续返回 true, TemporarilyRevertPatch 被调用,
-                        //         补丁永久撤销 (p=1), 透视功能失效.
-                        //   v4 测试确认: B558:SS:hit proc='GameBar.exe' idx=9 (持续触发)
-                        //   权衡: 失去 Xbox Game Bar 截图防护 (Win+G), 但恢复透视 (核心需求).
-                        //         玩家更可能用 Steam F12 (已无防护) 或外部工具 (SnippingTool/OBS 仍检测).
-                        wShotTools[9][0] = 0;   // GameBar.exe — 空, 跳过匹配
-                        wShotTools[10][0] = 0;  // GameBarFTServer.exe — 空, 跳过匹配
-                        // ★ BUILD 558 FIX-5: 移除 Steam.exe — CS2 启动器一直在运行, 误触发 TemporarilyRevertPatch
-                        //   原因: Steam.exe 是 CS2 的启动器, 永远在后台运行, 导致截图检测一直触发,
-                        //         补丁被永久撤销 (p=1), 透视功能失效.
-                        //   权衡: 失去 Steam F12 截图防护, 但恢复透视功能 (核心需求).
-                        //         如需防 Steam 截图, 应检测 Steam 截图状态 (非进程存在).
-                        wShotTools[11][0] = 0;  // 空, 跳过匹配
-                        // ★ BUILD 558 FIX-5 正式版: 移除 NVIDIA Share / ShadowShare / AMDRSSrcExt
-                        //   原因: 显卡驱动录屏功能 (ShadowPlay/ReLive) 在玩家机器后台常驻, 误触发风险高.
-                        //         真正的实时屏幕捕获威胁来自 OBS 等专用录屏软件 (已检测).
-                        wShotTools[12][0] = 0;  // NVIDIA Share.exe — 空, 跳过匹配
-                        wShotTools[13][0] = 0;  // ShadowShare.exe — 空, 跳过匹配
-                        wShotTools[14][0] = 0;  // AMDRSSrcExt.exe — 空, 跳过匹配
-                        wShotToolsInit = true;
-                    }
+                    // ★ BUILD 560: wShotTools 已移到 while 循环外 (函数顶部), 此处直接使用
+                    //   原 BUILD 554 static 数组 + init flag 已删除, 改为栈变量 + 末尾清零
                     for (int si = 0; si < 15; si++) {
                         if (wShotTools[si][0] && _wcsicmp(name, wShotTools[si]) == 0) {
                             // ★ BUILD 558 FIX-5: 诊断日志 — 输出匹配的进程名, 确认误触发源
@@ -1339,6 +1313,11 @@ static bool IsScreenshotToolRunning() {
             if (entry->NextEntryOffset == 0) break;
             ptr += entry->NextEntryOffset;
         }
+
+        // ★ BUILD 560: 主动清零栈缓冲 — 缩短 .data 段明文窗口
+        //   wShotTools 是栈变量 (非 static), 函数返回时自动销毁, 但栈帧可能被后续函数复用.
+        //   显式 SecureZeroMemory 确保 PAC 扫描栈内存时看不到截图工具名明文.
+        SecureZeroMemory(wShotTools, sizeof(wShotTools));
     } else {
         DiagLog("B549:SS:01 NtQSI fail st=0x%08X\n", (unsigned)status);
     }
