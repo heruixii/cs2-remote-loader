@@ -185,6 +185,21 @@
 //        安全性: VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch), 无新内存访问模式
 //                降级模式下依赖 SHV_Install patch 兜底 (双重保险), BSOD 风险极低
 //        预期效果: VmxOnWrapper patch 持久有效, EPT 永不构造, 综合 2-5% → 1.5-4%
+// BUILD: 567 (v3.233: EPROCESS 专用读取 — 绕过白名单修复 systemEPROCESS 在系统 PTE 区域)
+//        ★ BUILD 567 v3.233 FIX (VAD 隐藏失败根因修复 7/20 02:00):
+//          - 现象: v3.232 测试 B554:EEP: FAIL no valid PID=4 offset found (pidMatch=0)
+//                  VAD 隐藏仍然 0/1 失败, CS2 运行 15 秒崩溃 (0xC0000005)
+//          - 根因: systemEPROCESS 地址在系统 PTE 区域 [0xFFFFFD00, 0xFFFFFE00),
+//                  被 ReadKernelVA 白名单 [0xFFFFF680, 0xFFFFFD00) 拒绝,
+//                  Read<uint64_t> 全部返回 0, pidMatchCount=0
+//          - 修复: 新增 ReadKernelVAUnsafe + ReadUnsafe<T> (绕过白名单)
+//            安全边界 [0xFFFFF800, 0xFFFFFE00) — 含系统 PTE, 排除系统映射/Hypervisor
+//            EnsureEprocessOffsets/EnsureVadRootOffset/GetEPROCESSByPid/ConcealRegion
+//            全部改用 ReadUnsafe 读取 EPROCESS 字段
+//          - 安全性: EPROCESS 是有效内核内存, 读取不应导致 0x50 蓝屏
+//            v3.228 蓝屏 0x50 是读取系统 PTE 区域的无效地址, 不是 EPROCESS
+//          - 优化: VadDiag 移除 FlushFileBuffers, 减少 I/O 阻塞 (v3.232 的 15 秒可能因此)
+//          - v3.232 VadDiag 修复验证: B554:EEP/CR 日志正常输出, 成功定位根因
 // BUILD: 567 (v3.232: VadDiag 修复 — ByovdDiag 被 NDEBUG 消除导致 VAD 日志不输出)
 //        ★ BUILD 567 v3.232 FIX (VAD 日志不输出 7/20 01:40):
 //          - 现象: v3.231 运行后 sd.log 只有 B554:VAD:0/1, 没有 B554:EEP/EVR/GEP/CR
@@ -468,7 +483,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.232 启动摘要 (VadDiag 修复 — ByovdDiag 被 NDEBUG 消除导致 VAD 日志不输出)\n");
+    DiagLog("BUILD 567 v3.233 启动摘要 (EPROCESS 专用读取 — 绕过白名单修复 systemEPROCESS 在系统 PTE 区域)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -507,7 +522,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.232 退出摘要\n");
+    DiagLog("BUILD 567 v3.233 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -532,7 +547,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.232 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.233 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",

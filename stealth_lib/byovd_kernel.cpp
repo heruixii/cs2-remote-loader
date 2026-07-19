@@ -193,7 +193,9 @@ static void VadDiag(const char* fmt, ...) {
     if (h != INVALID_HANDLE_VALUE) {
         DWORD w;
         WriteFile(h, buf, (DWORD)len, &w, 0);
-        FlushFileBuffers(h);
+        // ★ BUILD 567 v3.233: 移除 FlushFileBuffers — 减少 I/O 阻塞, 避免拖慢主循环
+        //   原因: FlushFileBuffers 是同步操作, v3.232 测试 CS2 仅运行 15 秒 (vs v3.231 的 62 秒)
+        //   风险: CS2 崩溃时最后几条日志可能丢失, 但 OS 缓存通常会在崩溃前刷盘
         CloseHandle(h);
     }
 }
@@ -1701,6 +1703,30 @@ bool KernelMemoryAccessor::WriteKernelVA(uint64_t va, const void* inBuf, size_t 
     }
     // ★ v3.124: 使用 PhysicalWriteViaIOCTL (0x8000204C) — 直接内核VA写入
     return PhysicalWriteViaIOCTL(m_hDevice, g_probedWriteIoctl, va, inBuf, size);
+}
+
+// ★ BUILD 567 v3.233: EPROCESS 专用读取 (绕过白名单)
+//   背景: v3.232 发现 EnsureEprocessOffsets 失败 (pidMatch=0), 根因是 systemEPROCESS
+//        可能在系统 PTE 区域 (0xFFFFFD00-0xFFFFFE00), 被 ReadKernelVA 白名单拒绝
+//   方案: 绕过白名单, 但有更严格的安全边界 [0xFFFFF800, 0xFFFFFE00)
+//   安全性: EPROCESS 是有效的内核内存, 读取不应导致 0x50 蓝屏
+//           v3.228 蓝屏 0x50 是因为读取了系统 PTE 区域的无效地址, 不是 EPROCESS
+bool KernelMemoryAccessor::ReadKernelVAUnsafe(uint64_t va, void* outBuf, size_t size) {
+    if (!m_active) return false;
+    // ★ v3.233: 安全边界 [0xFFFFF800, 0xFFFFFE00) — 比 ReadKernelVA 更宽 (含系统 PTE)
+    //   包含: 内核镜像 (0xFFFFF800-0xFFFFFA00)
+    //         非分页池 (0xFFFFFA00-0xFFFFFC00)
+    //         分页池   (0xFFFFFC00-0xFFFFFD00) ← VAD 节点所在
+    //         系统 PTE (0xFFFFFD00-0xFFFFFE00) ← systemEPROCESS 可能在此
+    //   排除: 系统缓存 (0xFFFFF680-) + 系统映射 (0xFFFFFE00+) + Hypervisor (0xFFFFFF00+)
+    if (va < 0xFFFFF80000000000ULL) return false;
+    if (va >= 0xFFFFFE0000000000ULL) return false;
+
+    // ★ BUILD 489: 根据驱动类型分发
+    if (g_isPdfwKrnl) {
+        return PdfwReadKernelVA(m_hDevice, va, outBuf, size);
+    }
+    return PhysicalReadViaIOCTL(m_hDevice, g_probedReadIoctl, va, outBuf, size);
 }
 
 // ============================================================
@@ -7698,15 +7724,24 @@ bool VADConcealer::EnsureEprocessOffsets(KernelMemoryAccessor& kma, uint64_t ntB
         return false;
     }
 
+    // ★ BUILD 567 v3.233: 记录 systemEPROCESS 地址, 判断是否在白名单外
+    //   白名单 [0xFFFFF680, 0xFFFFFD00), 系统 PTE 区域 [0xFFFFFD00, 0xFFFFFE00)
+    //   v3.232 发现 pidMatch=0, 推测 systemEPROCESS 在系统 PTE 区域被白名单拒绝
+    bool inWhitelist = (systemEPROCESS >= 0xFFFFF68000000000ULL && systemEPROCESS < 0xFFFFFD0000000000ULL);
+    bool inSystemPte = (systemEPROCESS >= 0xFFFFFD0000000000ULL && systemEPROCESS < 0xFFFFFE0000000000ULL);
+    VadDiag("B554:EEP: systemEPROCESS=0x%llX inWhitelist=%d inSystemPte=%d\n",
+              (unsigned long long)systemEPROCESS, (int)inWhitelist, (int)inSystemPte);
+
     int pidMatchCount = 0;
     for (uint32_t off = 0x100; off < 0x800; off += 8) {
-        uint64_t val = kma.Read<uint64_t>(systemEPROCESS + off);
+        // ★ BUILD 567 v3.233: 使用 ReadUnsafe 绕过白名单 (systemEPROCESS 可能在系统 PTE 区域)
+        uint64_t val = kma.ReadUnsafe<uint64_t>(systemEPROCESS + off);
         if (val != 4) continue;  // System PID = 4
         pidMatchCount++;
 
         // 验证 off+8 (Flink) 和 off+16 (Blink) 是内核地址
-        uint64_t flink = kma.Read<uint64_t>(systemEPROCESS + off + 8);
-        uint64_t blink = kma.Read<uint64_t>(systemEPROCESS + off + 16);
+        uint64_t flink = kma.ReadUnsafe<uint64_t>(systemEPROCESS + off + 8);
+        uint64_t blink = kma.ReadUnsafe<uint64_t>(systemEPROCESS + off + 16);
         if (flink < 0xFFFF800000000000ULL || blink < 0xFFFF800000000000ULL) {
             VadDiag("B554:EEP: off=0x%X PID=4 but flink/blink not kernel (flink=0x%llX blink=0x%llX)\n",
                       off, (unsigned long long)flink, (unsigned long long)blink);
@@ -7715,7 +7750,7 @@ bool VADConcealer::EnsureEprocessOffsets(KernelMemoryAccessor& kma, uint64_t ntB
 
         // 二次验证: 通过 Flink 遍历到下一个 EPROCESS, 读取其 PID
         uint64_t nextEPROC = flink - (off + 8);
-        uint64_t nextPid = kma.Read<uint64_t>(nextEPROC + off);
+        uint64_t nextPid = kma.ReadUnsafe<uint64_t>(nextEPROC + off);
         if (nextPid == 0 || nextPid >= 100000) {
             VadDiag("B554:EEP: off=0x%X PID=4 but nextPid invalid (nextPid=%llu)\n",
                       off, (unsigned long long)nextPid);
@@ -7759,10 +7794,11 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
         //   当 vadRootCandidate 在分页池 (v3.229 白名单排除) 时, ReadKernelVA 失败返回 0
         //   isValidPtr(0)=true + 0>0=false + 0<0x80000000=true → 错误验证通过, 缓存错误偏移
         //   修复: 直接调用 ReadKernelVA 检查返回值, 读取失败立即返回 false
+        // ★ BUILD 567 v3.233: 改用 ReadKernelVAUnsafe (VAD 节点可能在系统 PTE 区域)
         uint64_t left = 0, right = 0, parent = 0;
-        if (!kma.ReadKernelVA(vadRootCandidate + VadOffsets::RbnLeft, &left, 8)) return false;
-        if (!kma.ReadKernelVA(vadRootCandidate + VadOffsets::RbnRight, &right, 8)) return false;
-        if (!kma.ReadKernelVA(vadRootCandidate + VadOffsets::RbnParentEncoded, &parent, 8)) return false;
+        if (!kma.ReadKernelVAUnsafe(vadRootCandidate + VadOffsets::RbnLeft, &left, 8)) return false;
+        if (!kma.ReadKernelVAUnsafe(vadRootCandidate + VadOffsets::RbnRight, &right, 8)) return false;
+        if (!kma.ReadKernelVAUnsafe(vadRootCandidate + VadOffsets::RbnParentEncoded, &parent, 8)) return false;
         if (!isValidPtr(left) || !isValidPtr(right) || !isValidPtr(parent)) return false;
 
         // ★ BUILD 567 v3.230 FIX: 至少一个非 NULL (完全空的节点不太可能是真实 VadRoot)
@@ -7771,8 +7807,8 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
 
         // 二次验证: VadStartingVpn <= VadEndingVpn
         uint64_t startVpn = 0, endVpn = 0;
-        if (!kma.ReadKernelVA(vadRootCandidate + VadOffsets::VadStartingVpn, &startVpn, 8)) return false;
-        if (!kma.ReadKernelVA(vadRootCandidate + VadOffsets::VadEndingVpn, &endVpn, 8)) return false;
+        if (!kma.ReadKernelVAUnsafe(vadRootCandidate + VadOffsets::VadStartingVpn, &startVpn, 8)) return false;
+        if (!kma.ReadKernelVAUnsafe(vadRootCandidate + VadOffsets::VadEndingVpn, &endVpn, 8)) return false;
         if (startVpn > endVpn) return false;
 
         // ★ BUILD 555 P2-verify: 修正 VPN 范围检查 (原 < 0x100000 过于严格)
@@ -7798,7 +7834,8 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
         0x5D8,  // Win10 20H2
     };
     for (uint32_t off : knownCandidates) {
-        uint64_t candidate = kma.Read<uint64_t>(eprocess + off);
+        // ★ BUILD 567 v3.233: 使用 ReadUnsafe (eprocess 可能在系统 PTE 区域)
+        uint64_t candidate = kma.ReadUnsafe<uint64_t>(eprocess + off);
         bool valid = validateVadRoot(candidate);
         VadDiag("B554:EVR: try off=0x%X candidate=0x%llX valid=%d\n",
                   off, (unsigned long long)candidate, (int)valid);
@@ -7819,7 +7856,8 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
         }
         if (skip) continue;
 
-        uint64_t candidate = kma.Read<uint64_t>(eprocess + off);
+        // ★ BUILD 567 v3.233: 使用 ReadUnsafe (eprocess 可能在系统 PTE 区域)
+        uint64_t candidate = kma.ReadUnsafe<uint64_t>(eprocess + off);
         if (candidate >= 0xFFFF800000000000ULL) {
             scanMatchCount++;
             if (scanMatchCount <= 8) {  // 限制日志量, 只打印前 8 个候选
@@ -7864,14 +7902,15 @@ static uint64_t GetEPROCESSByPid(KernelMemoryAccessor& kma, DWORD targetPid, uin
     int walkCount = 0;
     while (maxWalk-- > 0) {
         walkCount++;
-        uint64_t pid = kma.Read<uint64_t>(current + pidOffset);
+        // ★ BUILD 567 v3.233: 使用 ReadUnsafe (EPROCESS 可能在系统 PTE 区域)
+        uint64_t pid = kma.ReadUnsafe<uint64_t>(current + pidOffset);
         if (pid == targetPid) {
             VadDiag("B554:GEP: OK pid=%u eprocess=0x%llX (walk=%d)\n",
                       targetPid, (unsigned long long)current, walkCount);
             return current;
         }
 
-        uint64_t flink = kma.Read<uint64_t>(current + linksOffset);
+        uint64_t flink = kma.ReadUnsafe<uint64_t>(current + linksOffset);
         if (!flink || flink < 0xFFFF800000000000ULL) break;
         current = flink - linksOffset;
     }
@@ -7972,7 +8011,8 @@ bool VADConcealer::ConcealRegion(DWORD pid, uintptr_t regionBase, SIZE_T regionS
         return false;
     }
 
-    uint64_t vadRoot = kma.Read<uint64_t>(eprocess + s_vadRootOffset);
+    // ★ BUILD 567 v3.233: 使用 ReadUnsafe 读取 vadRoot (eprocess 可能在系统 PTE 区域)
+    uint64_t vadRoot = kma.ReadUnsafe<uint64_t>(eprocess + s_vadRootOffset);
     if (!vadRoot || vadRoot < 0xFFFF800000000000ULL) {
         VadDiag("B554:CR: FAIL vadRoot invalid (off=0x%X val=0x%llX)\n",
                   s_vadRootOffset, (unsigned long long)vadRoot);

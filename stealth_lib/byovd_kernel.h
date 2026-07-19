@@ -156,11 +156,25 @@ public:
     // 写入内核虚拟地址
     bool WriteKernelVA(uint64_t va, const void* inBuf, size_t size);
 
+    // ★ BUILD 567 v3.233: EPROCESS 专用读取 (绕过白名单)
+    //   安全边界: [0xFFFFF800, 0xFFFFFE00) — 包含内核镜像/非分页池/分页池/系统PTE
+    //   用途: EnsureEprocessOffsets 读取 systemEPROCESS (可能分配在系统 PTE 区域)
+    //   安全性: EPROCESS 是有效内核内存, 读取不应导致 0x50; v3.228 蓝屏是读取无效地址
+    bool ReadKernelVAUnsafe(uint64_t va, void* outBuf, size_t size);
+
     // 模板化便捷方法
     template<typename T>
     T Read(uint64_t va) {
         T value{};
         ReadKernelVA(va, &value, sizeof(T));
+        return value;
+    }
+
+    // ★ BUILD 567 v3.233: EPROCESS 专用读取模板 (绕过白名单)
+    template<typename T>
+    T ReadUnsafe(uint64_t va) {
+        T value{};
+        ReadKernelVAUnsafe(va, &value, sizeof(T));
         return value;
     }
 
