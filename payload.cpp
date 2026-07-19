@@ -185,6 +185,22 @@
 //        安全性: VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch), 无新内存访问模式
 //                降级模式下依赖 SHV_Install patch 兜底 (双重保险), BSOD 风险极低
 //        预期效果: VmxOnWrapper patch 持久有效, EPT 永不构造, 综合 2-5% → 1.5-4%
+// BUILD: 567 (v3.234: 安全边界扩大 — 覆盖非分页池扩展/PFN 数据库)
+//        ★ BUILD 567 v3.234 FIX (VAD 隐藏失败根因二次修复 7/20 02:10):
+//          - 现象: v3.233 测试 B554:EEP: systemEPROCESS=0xFFFF928F9F6DC040 inWhitelist=0 inSystemPte=0
+//                  systemEPROCESS 既不在白名单 [0xFFFFF680, 0xFFFFFD00), 也不在系统 PTE [0xFFFFFD00, 0xFFFFFE00)
+//                  v3.233 ReadKernelVAUnsafe 边界 [0xFFFFF800, 0xFFFFFE00) 仍然拒绝 (低于下限)
+//                  CS2 运行 17 秒后崩溃 (0xC0000005, 与 v3.232 的 15 秒接近)
+//          - 根因: Win11 24H2/25H2 EPROCESS 分配在非分页池扩展区域 (0xFFFF8000-0xFFFFF680)
+//                  v3.233 假设 systemEPROCESS 在系统 PTE 区域是错误的
+//                  实际 systemEPROCESS=0xFFFF928F9F6DC040 在 0xFFFF8000-0xFFFFF680 范围内
+//          - 修复: 扩大 ReadKernelVAUnsafe 安全边界到 [0xFFFF8000, 0xFFFFFE00)
+//            覆盖所有 EPROCESS 可能分配区域: 非分页池扩展/PFN/系统缓存/PTE 自映射/内核镜像/非分页池/分页池/系统 PTE
+//            仅排除系统映射 (0xFFFFFE00+) + Hypervisor (0xFFFFFF00+)
+//          - 安全性: EPROCESS 是有效内核内存, 读取不应导致 0x50 蓝屏
+//            v3.228 蓝屏 0x50 是读取系统 PTE 区域的无效地址, 不是 EPROCESS
+//            EPROCESS 由内核分配器 (ExAllocatePoolWithTag) 分配, 永远在有效内核池区域
+//          - v3.233 VadDiag 验证: systemEPROCESS 地址成功记录, 确认在非分页池扩展区域
 // BUILD: 567 (v3.233: EPROCESS 专用读取 — 绕过白名单修复 systemEPROCESS 在系统 PTE 区域)
 //        ★ BUILD 567 v3.233 FIX (VAD 隐藏失败根因修复 7/20 02:00):
 //          - 现象: v3.232 测试 B554:EEP: FAIL no valid PID=4 offset found (pidMatch=0)
@@ -483,7 +499,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.233 启动摘要 (EPROCESS 专用读取 — 绕过白名单修复 systemEPROCESS 在系统 PTE 区域)\n");
+    DiagLog("BUILD 567 v3.234 启动摘要 (安全边界扩大 — 覆盖非分页池扩展/PFN 数据库)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -522,7 +538,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.233 退出摘要\n");
+    DiagLog("BUILD 567 v3.234 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -547,7 +563,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.233 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.234 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",

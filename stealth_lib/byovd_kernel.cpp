@@ -1711,15 +1711,22 @@ bool KernelMemoryAccessor::WriteKernelVA(uint64_t va, const void* inBuf, size_t 
 //   方案: 绕过白名单, 但有更严格的安全边界 [0xFFFFF800, 0xFFFFFE00)
 //   安全性: EPROCESS 是有效的内核内存, 读取不应导致 0x50 蓝屏
 //           v3.228 蓝屏 0x50 是因为读取了系统 PTE 区域的无效地址, 不是 EPROCESS
+// ★ BUILD 567 v3.234 FIX (7/20 02:10): 扩大安全边界到 [0xFFFF8000, 0xFFFFFE00)
+//   v3.233 测试发现 systemEPROCESS=0xFFFF928F9F6DC040 在非分页池扩展区域 (0xFFFF8000-0xFFFFF680)
+//   Win11 24H2/25H2 EPROCESS 分配在非分页池扩展, 非 v3.233 假设的系统 PTE 区域
+//   扩大边界包含非分页池扩展/PFN 数据库, 覆盖所有可能的 EPROCESS 分配区域
 bool KernelMemoryAccessor::ReadKernelVAUnsafe(uint64_t va, void* outBuf, size_t size) {
     if (!m_active) return false;
-    // ★ v3.233: 安全边界 [0xFFFFF800, 0xFFFFFE00) — 比 ReadKernelVA 更宽 (含系统 PTE)
-    //   包含: 内核镜像 (0xFFFFF800-0xFFFFFA00)
-    //         非分页池 (0xFFFFFA00-0xFFFFFC00)
-    //         分页池   (0xFFFFFC00-0xFFFFFD00) ← VAD 节点所在
-    //         系统 PTE (0xFFFFFD00-0xFFFFFE00) ← systemEPROCESS 可能在此
-    //   排除: 系统缓存 (0xFFFFF680-) + 系统映射 (0xFFFFFE00+) + Hypervisor (0xFFFFFF00+)
-    if (va < 0xFFFFF80000000000ULL) return false;
+    // ★ v3.234: 安全边界 [0xFFFF8000, 0xFFFFFE00) — 覆盖所有 EPROCESS 可能分配区域
+    //   包含: 非分页池扩展/PFN (0xFFFF8000-0xFFFFF680) ← Win11 24H2/25H2 EPROCESS 所在
+    //         系统缓存         (0xFFFFF680-0xFFFFF800)
+    //         PTE 自映射        (0xFFFFF800-0xFFFFFA00) — 注: 此处注释有误, 实际 PTE 自映射在 0xFFFFF680
+    //         内核镜像          (0xFFFFF800-0xFFFFFA00)
+    //         非分页池          (0xFFFFFA00-0xFFFFFC00)
+    //         分页池            (0xFFFFFC00-0xFFFFFD00) ← VAD 节点所在
+    //         系统 PTE          (0xFFFFFD00-0xFFFFFE00)
+    //   排除: 系统映射 (0xFFFFFE00+) + Hypervisor (0xFFFFFF00+)
+    if (va < 0xFFFF800000000000ULL) return false;
     if (va >= 0xFFFFFE0000000000ULL) return false;
 
     // ★ BUILD 489: 根据驱动类型分发
