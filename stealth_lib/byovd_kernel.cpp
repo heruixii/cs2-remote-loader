@@ -48,13 +48,46 @@
     #define ByovdDiag(fmt, ...) ((void)0)
 #else
     // Debug 模式 — 保留日志输出 (写 %TEMP%\sd.log)
+// ★ BUILD 567 v3.227: 时间戳格式化 (与 payload.cpp DiagLog_FormatTimestamp 同实现)
+static void ByovdDiag_FormatTimestamp(char* buf, size_t bufSize) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    snprintf(buf, bufSize, "[%02d:%02d:%02d.%03d] ",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+}
+
+// ★ BUILD 567 v3.227: 日志轮转 (调用前文件句柄必须已关闭)
+static void ByovdDiag_RotateIfNeeded(const wchar_t* path) {
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fad)) return;
+    ULARGE_INTEGER fileSize;
+    fileSize.LowPart  = fad.nFileSizeLow;
+    fileSize.HighPart = fad.nFileSizeHigh;
+    if (fileSize.QuadPart < (10ULL * 1024 * 1024)) return;
+    wchar_t path1[MAX_PATH], path2[MAX_PATH];
+    wcscpy_s(path1, MAX_PATH, path);  wcscat_s(path1, MAX_PATH, L".1");
+    wcscpy_s(path2, MAX_PATH, path);  wcscat_s(path2, MAX_PATH, L".2");
+    MoveFileExW(path1, path2, MOVEFILE_REPLACE_EXISTING);
+    MoveFileExW(path, path1, MOVEFILE_REPLACE_EXISTING);
+}
+
 static void ByovdDiag(const char* fmt, ...) {
-    char buf[512];
+    char tsBuf[32];
+    ByovdDiag_FormatTimestamp(tsBuf, sizeof(tsBuf));
+    int tsLen = (int)strlen(tsBuf);
+
+    char buf[576];  // ★ BUILD 567: 512 → 576 (容纳时间戳)
+    memcpy(buf, tsBuf, tsLen);
     va_list args;
     va_start(args, fmt);
-    int len = vsnprintf(buf, sizeof(buf), fmt, args);
+    int len = vsnprintf(buf + tsLen, sizeof(buf) - tsLen, fmt, args);
     va_end(args);
     if (len < 0) return;
+    // ★ BUILD 567 BUG 修复 (第 1 轮审查): vsnprintf 返回期望长度, 可能 > 缓冲区剩余空间
+    //   未限制会导致 WriteFile 越界读取 buf 后面的内存
+    if (len > (int)(sizeof(buf) - tsLen - 1)) len = (int)(sizeof(buf) - tsLen - 1);
+    len += tsLen;
+
     wchar_t path[MAX_PATH];
     GetTempPathW(MAX_PATH, path);
     wcscat_s(path, L"sd.log");  // ★ BUILD 549: 文件名脱敏 (与 payload.cpp 一致)
@@ -65,8 +98,75 @@ static void ByovdDiag(const char* fmt, ...) {
         FlushFileBuffers(h);  // ★ v3.38: 强制落盘
         CloseHandle(h);
     }
+    // ★ BUILD 567 v3.227: 日志轮转检查
+    ByovdDiag_RotateIfNeeded(path);
 }
 #endif  // NDEBUG
+
+// ★ BUILD 567 v3.227: StateLog — 状态变化日志 (独立于 ByovdDiag, 不被 NDEBUG 消除)
+//   原因: 状态变化时间线是封号分析的关键, 必须在 release 模式下也输出
+//   实现: 直接写 sd.log (与 DiagLog 同路径), 添加时间戳前缀 + 10MB 轮转
+//   格式: "[HH:MM:SS.mmm] STATE:CAT:EVENT detail\n"
+//   注: 与 payload.cpp DiagLogState 宏输出格式一致, 便于日志分析
+static void StateLog(const char* cat, const char* evt, const char* fmt, ...) {
+    // 时间戳前缀
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char tsBuf[32];
+    snprintf(tsBuf, sizeof(tsBuf), "[%02d:%02d:%02d.%03d] ",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+
+    char buf[640];
+    int prefixLen = snprintf(buf, sizeof(buf), "%sSTATE:%s:%s ", tsBuf, cat, evt);
+    if (prefixLen < 0 || prefixLen >= (int)sizeof(buf)) return;
+
+    va_list args;
+    va_start(args, fmt);
+    // -1 留给末尾 \n
+    int len = vsnprintf(buf + prefixLen, sizeof(buf) - prefixLen - 1, fmt, args);
+    va_end(args);
+    if (len < 0) return;
+    // ★ BUILD 567 BUG 修复 (第 1 轮审查): vsnprintf 返回期望长度, 可能 > 缓冲区剩余空间
+    //   vsnprintf 实际可写入字符数 = sizeof(buf) - prefixLen - 2 (留 1 给 \n, 1 给 null)
+    //   未限制会导致 buf[len]='\n' 写越界 + WriteFile 越界读取
+    if (len > (int)(sizeof(buf) - prefixLen - 2)) len = (int)(sizeof(buf) - prefixLen - 2);
+    len += prefixLen;
+    // 添加换行 (确保不超过缓冲区)
+    if (len < (int)sizeof(buf) - 1) {
+        buf[len] = '\n';
+        len++;
+    }
+
+    wchar_t path[MAX_PATH];
+    GetTempPathW(MAX_PATH, path);
+    wcscat_s(path, L"sd.log");
+    HANDLE h = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD w;
+        WriteFile(h, buf, (DWORD)len, &w, 0);
+        FlushFileBuffers(h);
+        CloseHandle(h);
+    }
+    // 日志轮转检查 (与 DiagLog_RotateIfNeeded 同实现, 独立避免依赖 ByovdDiag 辅助函数)
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (GetFileAttributesExW(path, GetFileExInfoStandard, &fad)) {
+        ULARGE_INTEGER fileSize;
+        fileSize.LowPart  = fad.nFileSizeLow;
+        fileSize.HighPart = fad.nFileSizeHigh;
+        if (fileSize.QuadPart >= (10ULL * 1024 * 1024)) {
+            wchar_t path1[MAX_PATH], path2[MAX_PATH];
+            wcscpy_s(path1, MAX_PATH, path);  wcscat_s(path1, MAX_PATH, L".1");
+            wcscpy_s(path2, MAX_PATH, path);  wcscat_s(path2, MAX_PATH, L".2");
+            MoveFileExW(path1, path2, MOVEFILE_REPLACE_EXISTING);
+            MoveFileExW(path, path1, MOVEFILE_REPLACE_EXISTING);
+        }
+    }
+}
+
+// ★ BUILD 567 v3.227: 全局统计计数器 extern 声明 (定义在 payload.cpp)
+//   类型 LogStats 在 byovd_kernel.h 中定义 (共享)
+//   byovd_kernel.cpp 在 PatchVmxOnWrapper/PatchShvInstallEntry 成功/失败时更新
+extern LogStats g_logStats;
 
 // BYOVD 驱动嵌入支持: 将 RTCore64.sys 编译进 payload
 //   python scripts/embed_driver.py RTCore64.sys → rtcore64_embed.h
@@ -7767,10 +7867,16 @@ DWORD    ShvInstallPatcher::m_vmxOnLastPatchTick = 0;
 void ShvInstallPatcher::RecordPatchFailure() {
     m_lastPatchTick = GetTickCount();
     m_consecutiveFailures++;
+    // ★ BUILD 567 v3.227: 失败计数 + 状态日志
+    g_logStats.shvPatchFailure++;
+    StateLog("SHV", "FAILED", "consecutive=%u tick=%u",
+        (unsigned)m_consecutiveFailures, (unsigned)GetTickCount());
     if (m_consecutiveFailures >= DEGRADED_FAILURE_THRESHOLD && !m_degradedMode) {
         m_degradedMode = true;
+        g_logStats.degradedEnter++;  // ★ BUILD 567: 降级模式触发计数
         ByovdDiag("BYOVD:ShvPatch: DEGRADED MODE entered (failures=%u)\n",
             m_consecutiveFailures);
+        StateLog("SHV", "DEGRADED_ENTER", "failures=%u", (unsigned)m_consecutiveFailures);
     }
 }
 
@@ -7779,6 +7885,9 @@ void ShvInstallPatcher::RecordPatchSuccess() {
     if (m_consecutiveFailures > 0 || m_degradedMode) {
         ByovdDiag("BYOVD:ShvPatch: recovered from degraded (failures=%u, was_degraded=%d)\n",
             m_consecutiveFailures, (int)m_degradedMode);
+        // ★ BUILD 567 v3.227: 降级恢复状态日志
+        StateLog("SHV", "DEGRADED_RECOVER", "failures=%u was_degraded=%d",
+            (unsigned)m_consecutiveFailures, (int)m_degradedMode);
     }
     m_consecutiveFailures = 0;
     m_degradedMode = false;
@@ -7796,6 +7905,8 @@ bool ShvInstallPatcher::IsDegradedMode() {
         m_consecutiveFailures = 0;
         ByovdDiag("BYOVD:ShvPatch: DEGRADED MODE auto-recover after %ums\n",
             (unsigned)elapsed);
+        // ★ BUILD 567 v3.227: 自恢复状态日志
+        StateLog("SHV", "DEGRADED_RECOVER", "auto after %ums", (unsigned)elapsed);
         return false;
     }
     return true;
@@ -7837,10 +7948,16 @@ bool ShvInstallPatcher::IsDegradedMode() {
 void ShvInstallPatcher::RecordVmxOnPatchFailure() {
     m_vmxOnLastPatchTick = GetTickCount();
     m_vmxOnConsecutiveFailures++;
+    // ★ BUILD 567 v3.227: 失败计数 + 状态日志
+    g_logStats.vmxOnPatchFailure++;
+    StateLog("VMXON", "FAILED", "consecutive=%u tick=%u",
+        (unsigned)m_vmxOnConsecutiveFailures, (unsigned)GetTickCount());
     if (m_vmxOnConsecutiveFailures >= DEGRADED_FAILURE_THRESHOLD && !m_vmxOnDegradedMode) {
         m_vmxOnDegradedMode = true;
+        g_logStats.degradedEnter++;  // ★ BUILD 567: 降级模式触发计数
         ByovdDiag("BYOVD:VmxOn: DEGRADED MODE entered (failures=%u)\n",
             m_vmxOnConsecutiveFailures);
+        StateLog("VMXON", "DEGRADED_ENTER", "failures=%u", (unsigned)m_vmxOnConsecutiveFailures);
     }
 }
 
@@ -7849,6 +7966,9 @@ void ShvInstallPatcher::RecordVmxOnPatchSuccess() {
     if (m_vmxOnConsecutiveFailures > 0 || m_vmxOnDegradedMode) {
         ByovdDiag("BYOVD:VmxOn: recovered from degraded (failures=%u, was_degraded=%d)\n",
             m_vmxOnConsecutiveFailures, (int)m_vmxOnDegradedMode);
+        // ★ BUILD 567 v3.227: 降级恢复状态日志
+        StateLog("VMXON", "DEGRADED_RECOVER", "failures=%u was_degraded=%d",
+            (unsigned)m_vmxOnConsecutiveFailures, (int)m_vmxOnDegradedMode);
     }
     m_vmxOnConsecutiveFailures = 0;
     m_vmxOnDegradedMode = false;
@@ -7866,6 +7986,8 @@ bool ShvInstallPatcher::IsVmxOnDegradedMode() {
         m_vmxOnConsecutiveFailures = 0;
         ByovdDiag("BYOVD:VmxOn: DEGRADED MODE auto-recover after %ums\n",
             (unsigned)elapsed);
+        // ★ BUILD 567 v3.227: 自恢复状态日志
+        StateLog("VMXON", "DEGRADED_RECOVER", "auto after %ums", (unsigned)elapsed);
         return false;
     }
     return true;
@@ -8287,6 +8409,9 @@ bool ShvInstallPatcher::PatchVmxOnWrapper() {
     ByovdDiag("BYOVD:VmxOn: VmxOnWrapper @ 0x%llX\n", (unsigned long long)vmxOnAddr);
 
     // 3. 读取原始 3 字节
+    // ★ BUILD 567 v3.227: 记录是否为重 patch (m_vmxOnPatchedAddress 之前是否非零)
+    //   用于区分 STATE:VMXON:PATCHED (首次) vs STATE:VMXON:REPATCHED (PAC 恢复后重 patch)
+    bool wasPatchedBefore = (m_vmxOnPatchedAddress != 0);
     if (!kma.ReadKernelVA(vmxOnAddr, m_vmxOnOriginalBytes, 3)) {
         ByovdDiag("BYOVD:VmxOn: failed to read original bytes @ 0x%llX\n",
             (unsigned long long)vmxOnAddr);
@@ -8340,6 +8465,12 @@ bool ShvInstallPatcher::PatchVmxOnWrapper() {
 
     ByovdDiag("BYOVD:VmxOn: SUCCESS — VmxOnWrapper patched @ 0x%llX (xor eax,eax; ret — VMX 永不启动)\n",
         (unsigned long long)vmxOnAddr);
+    // ★ BUILD 567 v3.227: 状态变化日志 + 计数器更新
+    //   首次 patch: STATE:VMXON:PATCHED, 重 patch: STATE:VMXON:REPATCHED
+    g_logStats.vmxOnPatchSuccess++;
+    if (wasPatchedBefore) g_logStats.vmxOnRepatch++;
+    StateLog("VMXON", wasPatchedBefore ? "REPATCHED" : "PATCHED",
+        "addr=0x%llx tick=%u", (unsigned long long)vmxOnAddr, (unsigned)GetTickCount());
     return true;
 }
 
@@ -8492,6 +8623,9 @@ bool ShvInstallPatcher::PatchShvInstallEntry() {
     ByovdDiag("BYOVD:ShvPatch: SHV_Install entry @ 0x%llX\n", (unsigned long long)shvInstallAddr);
 
     // 4. 读取原始 6 字节 (用于 Restore)
+    // ★ BUILD 567 v3.227: 记录是否为重 patch (m_patchedAddress 之前是否非零)
+    //   用于区分 STATE:SHV:PATCHED (首次) vs STATE:SHV:REPATCHED (PAC 恢复后重 patch)
+    bool wasShvPatchedBefore = (m_patchedAddress != 0);
     if (!kma.ReadKernelVA(shvInstallAddr, m_originalBytes, 6)) {
         ByovdDiag("BYOVD:ShvPatch: failed to read original bytes @ 0x%llX\n",
             (unsigned long long)shvInstallAddr);
@@ -8542,6 +8676,12 @@ bool ShvInstallPatcher::PatchShvInstallEntry() {
         (unsigned long long)shvInstallAddr);
     // ★ BUILD 555 P2-1: 成功 patch — 重置失败计数, 退出降级模式
     RecordPatchSuccess();
+    // ★ BUILD 567 v3.227: 状态变化日志 + 计数器更新
+    //   首次 patch: STATE:SHV:PATCHED, 重 patch: STATE:SHV:REPATCHED
+    g_logStats.shvPatchSuccess++;
+    if (wasShvPatchedBefore) g_logStats.shvRepatch++;
+    StateLog("SHV", wasShvPatchedBefore ? "REPATCHED" : "PATCHED",
+        "addr=0x%llx tick=%u", (unsigned long long)shvInstallAddr, (unsigned)GetTickCount());
     return true;
 }
 

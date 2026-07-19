@@ -16,16 +16,51 @@
 //           "ReopenProcessHandle:"/"FindWindowW" 等明文格式字符串, 在 .rdata 中暴露
 //           "OpenProcessStealth" 是字符串扫描残留 0x4BF09 的根因
 //     策略: NDEBUG 时宏化为 ((void)0), 字符串不进入 .rdata
+//   ★ BUILD 567 v3.227: 时间戳前缀 + 10MB 日志轮转 (与 payload.cpp DiagLog 同步)
+//     注: 辅助函数在 NDEBUG 时也会被宏消除 (随 CoreDiag 一起)
 #ifdef NDEBUG
     #define CoreDiag(fmt, ...) ((void)0)
 #else
+// ★ BUILD 567 v3.227: 时间戳格式化 (与 payload.cpp DiagLog_FormatTimestamp 同实现)
+static void CoreDiag_FormatTimestamp(char* buf, size_t bufSize) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    snprintf(buf, bufSize, "[%02d:%02d:%02d.%03d] ",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+}
+
+// ★ BUILD 567 v3.227: 日志轮转 (调用前文件句柄必须已关闭)
+static void CoreDiag_RotateIfNeeded(const wchar_t* path) {
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fad)) return;
+    ULARGE_INTEGER fileSize;
+    fileSize.LowPart  = fad.nFileSizeLow;
+    fileSize.HighPart = fad.nFileSizeHigh;
+    if (fileSize.QuadPart < (10ULL * 1024 * 1024)) return;
+    wchar_t path1[MAX_PATH], path2[MAX_PATH];
+    wcscpy_s(path1, MAX_PATH, path);  wcscat_s(path1, MAX_PATH, L".1");
+    wcscpy_s(path2, MAX_PATH, path);  wcscat_s(path2, MAX_PATH, L".2");
+    MoveFileExW(path1, path2, MOVEFILE_REPLACE_EXISTING);
+    MoveFileExW(path, path1, MOVEFILE_REPLACE_EXISTING);
+}
+
 static void CoreDiag(const char* fmt, ...) {
-    char buf[256];
+    char tsBuf[32];
+    CoreDiag_FormatTimestamp(tsBuf, sizeof(tsBuf));
+    int tsLen = (int)strlen(tsBuf);
+
+    char buf[320];  // ★ BUILD 567: 256 → 320 (容纳时间戳)
+    memcpy(buf, tsBuf, tsLen);
     va_list args;
     va_start(args, fmt);
-    int len = vsnprintf(buf, sizeof(buf), fmt, args);
+    int len = vsnprintf(buf + tsLen, sizeof(buf) - tsLen, fmt, args);
     va_end(args);
     if (len < 0) return;
+    // ★ BUILD 567 BUG 修复 (第 1 轮审查): vsnprintf 返回期望长度, 可能 > 缓冲区剩余空间
+    //   未限制会导致 WriteFile 越界读取 buf 后面的内存
+    if (len > (int)(sizeof(buf) - tsLen - 1)) len = (int)(sizeof(buf) - tsLen - 1);
+    len += tsLen;
+
     wchar_t path[MAX_PATH];
     GetTempPathW(MAX_PATH, path);
     wcscat_s(path, L"sd.log");  // ★ BUILD 550: 文件名脱敏 (原 stealth_diag.log)
@@ -36,6 +71,8 @@ static void CoreDiag(const char* fmt, ...) {
         FlushFileBuffers(h);  // ★ v3.38: 强制落盘
         CloseHandle(h);
     }
+    // ★ BUILD 567 v3.227: 日志轮转检查
+    CoreDiag_RotateIfNeeded(path);
 }
 #endif  // NDEBUG
 

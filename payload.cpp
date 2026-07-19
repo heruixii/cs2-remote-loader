@@ -185,6 +185,31 @@
 //        安全性: VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch), 无新内存访问模式
 //                降级模式下依赖 SHV_Install patch 兜底 (双重保险), BSOD 风险极低
 //        预期效果: VmxOnWrapper patch 持久有效, EPT 永不构造, 综合 2-5% → 1.5-4%
+// BUILD: 567 (v3.227: 日志增强 — 封号原因分析支持)
+//        1. ★ BUILD 567-1: 时间戳前缀 (DiagLog/CoreDiag/ByovdDiag)
+//           - 每条日志添加 [HH:MM:SS.mmm] 前缀 (GetLocalTime + snprintf)
+//           - 缓冲区扩大: DiagLog 512→640, CoreDiag 256→320, ByovdDiag 512→576
+//        2. ★ BUILD 567-2: 日志轮转 (10MB 阈值, 保留 2 备份 sd.log.1/sd.log.2)
+//           - DiagLog/CoreDiag/ByovdDiag 写入后检查 GetFileAttributesEx 文件大小
+//           - 超过 10MB: MoveFileEx sd.log.1→sd.log.2, sd.log→sd.log.1
+//           - 总占用 ≤ 30MB, 避免长时间运行日志过大
+//        3. ★ BUILD 567-3: DiagLogState 宏 + StateLog 函数 (状态变化时间线)
+//           - payload.cpp DiagLogState 宏: STATE:CAT:EVENT detail 格式
+//           - byovd_kernel.cpp StateLog 函数 (独立于 ByovdDiag, 不被 NDEBUG 消除)
+//           - 类别: VMXON/SHV/VEH/CB/SYS
+//           - 事件: PATCHED/REPATCHED/FAILED/DEGRADED_ENTER/DEGRADED_RECOVER/SELFHEAL/REAPPLIED
+//        4. ★ BUILD 567-4: g_logStats 全局统计计数器 (LogStats 结构体, 跨编译单元共享)
+//           - vmxOnPatchSuccess/Failure/Repatch + shvPatchSuccess/Failure/Repatch
+//           - vehSelfheal + degradedEnter + cbReapply
+//           - 更新点: byovd_kernel.cpp Record*/Patch* 函数 + payload.cpp VEH/主循环
+//        5. ★ BUILD 567-5: 启动摘要 (LogStartSummary) — 系统信息 + BUILD 版本
+//           - Windows 版本 (RtlGetVersion) + SystemTick + HVCI 状态 + HostPID
+//        6. ★ BUILD 567-6: 退出摘要 (LogExitSummary) — 运行时长 + 关键事件统计
+//           - 两个 return 0 之前调用 (CS2 退出 / 正常退出)
+//        7. ★ BUILD 567-7: 周期摘要 (LogPeriodicSummary) — 主循环每 5 分钟一次
+//           - 内部检查 lastSummaryTick, 未到 5 分钟直接返回 false, 无性能影响
+//        安全性: 仅日志增强, 无新内核内存访问, 无新 IOCTL, BSOD 风险为零
+//        预期效果: 封号后通过 sd.log 精确分析 (时间戳 + 状态时间线 + 统计摘要)
 // BUILD: 549 (v3.205: 影子页 PTE manipulation + DiagLog 三层脱敏 + NtQSI 替代 Toolhelp32)
 //        1. ★ BUILD 549 影子页: ApplyCs2Patch 优先通过 PTE manipulation 安装影子页
 //           - pageA = client.dll 原页 (PAC 扫描看到原始字节 32 c0)
@@ -244,16 +269,59 @@ static DWORD RandomJitter(DWORD baseMs, DWORD rangeMs) {
 //   原代码: #ifdef NDEBUG #define DiagLog(fmt, ...) ((void)0)
 //   诊断版: 改为 #if 0, DiagLog 总是启用, 写入 sd.log
 //   恢复方法: 诊断完成后将下面 #if 0 改回 #ifdef NDEBUG
+// ★ BUILD 567 v3.227: 日志增强 — 时间戳前缀 + 10MB 日志轮转
+//   时间戳格式: [HH:MM:SS.mmm] (13 字节, 精确到毫秒)
+//   日志轮转: 超过 10MB 时 sd.log → sd.log.1 → sd.log.2 (保留 2 备份, 总 ≤30MB)
+//   目的: 封号后通过精确时间戳定位崩溃时刻, 通过状态变化时间线分析根因
 #if 0  // ★ BUILD 557 DIAG (原 #ifdef NDEBUG)
     #define DiagLog(fmt, ...) ((void)0)
 #else
+// ★ BUILD 567 v3.227: 时间戳格式化辅助函数
+//   输出: "[HH:MM:SS.mmm] " (13 字符 + null)
+static void DiagLog_FormatTimestamp(char* buf, size_t bufSize) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    snprintf(buf, bufSize, "[%02d:%02d:%02d.%03d] ",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+}
+
+// ★ BUILD 567 v3.227: 日志轮转检查 (调用前文件句柄必须已关闭)
+//   使用 GetFileAttributesEx 获取文件大小, 避免句柄管理复杂化
+//   超过 10MB 时: sd.log.1 → sd.log.2 (覆盖), sd.log → sd.log.1
+static void DiagLog_RotateIfNeeded(const wchar_t* path) {
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fad)) return;
+    ULARGE_INTEGER fileSize;
+    fileSize.LowPart  = fad.nFileSizeLow;
+    fileSize.HighPart = fad.nFileSizeHigh;
+    if (fileSize.QuadPart < (10ULL * 1024 * 1024)) return;  // < 10MB, 无需轮转
+    wchar_t path1[MAX_PATH], path2[MAX_PATH];
+    wcscpy_s(path1, MAX_PATH, path);  wcscat_s(path1, MAX_PATH, L".1");
+    wcscpy_s(path2, MAX_PATH, path);  wcscat_s(path2, MAX_PATH, L".2");
+    // sd.log.1 → sd.log.2 (覆盖旧 sd.log.2, 失败忽略 — 备份丢失但日志继续)
+    MoveFileExW(path1, path2, MOVEFILE_REPLACE_EXISTING);
+    // sd.log → sd.log.1 (覆盖旧 sd.log.1, 失败忽略)
+    MoveFileExW(path, path1, MOVEFILE_REPLACE_EXISTING);
+}
+
 static void DiagLog(const char* fmt, ...) {
-    char buf[512];
+    // ★ BUILD 567: 时间戳前缀
+    char tsBuf[32];
+    DiagLog_FormatTimestamp(tsBuf, sizeof(tsBuf));
+    int tsLen = (int)strlen(tsBuf);
+
+    char buf[640];  // ★ BUILD 567: 512 → 640 (容纳时间戳 + 长内容)
+    memcpy(buf, tsBuf, tsLen);
     va_list args;
     va_start(args, fmt);
-    int len = vsnprintf(buf, sizeof(buf), fmt, args);
+    int len = vsnprintf(buf + tsLen, sizeof(buf) - tsLen, fmt, args);
     va_end(args);
-    if (len < 0) len = 0; // vsnprintf error fallback
+    if (len < 0) len = 0;  // vsnprintf error fallback
+    // ★ BUG 修复 (第 1 轮审查): vsnprintf 返回期望长度, 可能 > 缓冲区剩余空间
+    //   限制到实际写入长度, 防止 WriteFile 越界读取
+    if (len > (int)(sizeof(buf) - tsLen - 1)) len = (int)(sizeof(buf) - tsLen - 1);
+    len += tsLen;  // 总长度 = 时间戳 + 内容
+
     wchar_t path[MAX_PATH];
     GetTempPathW(MAX_PATH, path);
     wcscat_s(path, L"sd.log");  // ★ BUILD 549: 文件名脱敏 (原 stealth_diag.log)
@@ -262,8 +330,10 @@ static void DiagLog(const char* fmt, ...) {
         DWORD w;
         WriteFile(h, buf, (DWORD)len, &w, 0);
         FlushFileBuffers(h);  // ★ v3.38: 强制落盘, 防止崩溃时缓存丢失
-        CloseHandle(h);
+        CloseHandle(h);  // 立即关闭, 简化轮转逻辑
     }
+    // ★ BUILD 567 v3.227: 日志轮转检查 (句柄已关闭, 使用 GetFileAttributesEx 获取大小)
+    DiagLog_RotateIfNeeded(path);
 }
 #endif  // NDEBUG
 
@@ -287,6 +357,117 @@ static void DiagLog(const char* fmt, ...) {
     snprintf(_buf, sizeof(_buf), "%s\n", _s); \
     DiagLog("%s", _buf); \
 } while(0)
+
+// ★ BUILD 567 v3.227: DiagLogState — 状态变化时间线日志宏
+//   格式: "STATE:CAT:EVENT detail\n" (由 DiagLog 添加时间戳前缀)
+//   类别 (CAT): VMXON / SHV / VEH / CB / SYS
+//   事件 (EVENT): PATCHED / REPATCHED / FAILED / DEGRADED_ENTER / DEGRADED_RECOVER / SELFHEAL / FATAL / REAPPLIED
+//   示例输出: "[23:45:12.345] STATE:VMXON:REPATCHED addr=0x... tick=12345"
+//   用途: 封号后通过 STATE: 行精确追踪 patch 状态变化时间线
+//   注: cat 和 evt 应为字符串字面量 (编译期确定), detail 使用 printf 格式 (不带 \n, 宏自动添加)
+//        调用示例: DiagLogState("VMXON", "PATCHED", "addr=0x%llx", addr);
+//   ★ BUILD 567 BUG 修复 (第 4 轮审查 — 编译错误): 分离 fmt 和可变参数
+//     原宏 __VA_ARGS__ 参与字符串拼接, 但调用时 __VA_ARGS__ = "fmt", arg 导致语法错误
+//     修复: fmt 单独作为字符串拼接, ##__VA_ARGS__ 作为可变参数
+#define DiagLogState(cat, evt, fmt, ...) \
+    DiagLog("STATE:%s:%s " fmt "\n", cat, evt, ##__VA_ARGS__)
+
+// ★ BUILD 567 v3.227: 全局统计计数器 (单线程 CheatMainLoop 访问, 无需同步)
+//   用途: 启动摘要 / 退出摘要 / 周期摘要 输出运行统计
+//   更新点: byovd_kernel.cpp PatchVmxOnWrapper/PatchShvInstallEntry 成功/失败时
+//           payload.cpp 主循环回调重应用 / VEH 自愈时
+//   注: 类型 LogStats 定义在 byovd_kernel.h (跨编译单元共享)
+//        g_logStats 非 static — byovd_kernel.cpp 通过 extern 引用 (payload.dll 内部符号, 不导出)
+LogStats g_logStats = {};
+
+// ============================================================
+// ★ BUILD 567 v3.227: 日志摘要函数 (启动/退出/周期)
+//   用途: 封号原因分析 — 通过摘要快速了解运行状态 + 关键事件统计
+//   注: 所有函数调用 DiagLog (自动添加时间戳前缀)
+// ============================================================
+
+// ★ BUILD 567 v3.227: 启动摘要 — 记录系统信息 + BUILD 版本
+//   调用位置: CheatMainLoop 入口 (DeleteFileW 之后)
+static void LogStartSummary() {
+    g_logStats.startTick = GetTickCount();
+    g_logStats.lastSummaryTick = g_logStats.startTick;
+
+    DiagLog("============================================\n");
+    DiagLog("BUILD 567 v3.227 启动摘要\n");
+
+    // Windows 版本 (RtlGetVersion, 不被 deprecated)
+    OSVERSIONINFOEXW osvi = {};
+    osvi.dwOSVersionInfoSize = sizeof(osvi);
+    typedef LONG (NTAPI* fnRtlGetVersion)(PRTL_OSVERSIONINFOW);
+    HMODULE ntdllMod = (HMODULE)stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll"));
+    auto fn = (fnRtlGetVersion)STEALTH_GET_PROC_ADDRESS_NOREF(ntdllMod, "RtlGetVersion");
+    if (fn) {
+        fn((PRTL_OSVERSIONINFOW)&osvi);
+        DiagLog("Windows: %u.%u.%u\n",
+            osvi.dwMajorVersion, osvi.dwMinorVersion, osvi.dwBuildNumber);
+    } else {
+        DiagLog("Windows: RtlGetVersion unavailable\n");
+    }
+
+    // 系统启动时长 (TickCount)
+    DiagLog("SystemTick: %u ms\n", (unsigned)GetTickCount());
+
+    // HVCI 状态 (如果 KernelMemoryAccessor 可用)
+    DiagLog("HVCI: %s\n",
+        stealth::KernelMemoryAccessor::IsHVCIEnabled() ? "enabled" : "disabled");
+
+    // 当前进程 PID (loader2.exe / CS2)
+    DiagLog("HostPID: %u\n", (unsigned)GetCurrentProcessId());
+
+    DiagLog("============================================\n");
+}
+
+// ★ BUILD 567 v3.227: 退出摘要 — 运行时长 + 关键事件统计
+//   调用位置: CheatMainLoop 两个 return 0 之前 (CS2 退出 / 正常退出)
+static void LogExitSummary() {
+    DWORD now = GetTickCount();
+    DWORD elapsed = now - g_logStats.startTick;
+    DWORD elapsedSec = elapsed / 1000;
+    DWORD minutes = elapsedSec / 60;
+    DWORD seconds = elapsedSec % 60;
+
+    DiagLog("============================================\n");
+    DiagLog("BUILD 567 v3.227 退出摘要\n");
+    DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
+    DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
+        g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
+    DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
+        g_logStats.shvPatchSuccess, g_logStats.shvPatchFailure, g_logStats.shvRepatch);
+    DiagLog("VEH 自愈: %u 次\n", g_logStats.vehSelfheal);
+    DiagLog("降级模式: %u 次\n", g_logStats.degradedEnter);
+    DiagLog("回调重应用: %u 次\n", g_logStats.cbReapply);
+    DiagLog("============================================\n");
+}
+
+// ★ BUILD 567 v3.227: 周期摘要 — 主循环每 5 分钟输出一次
+//   调用位置: 主循环内, 与 diagInterval 同步检查
+//   返回: true = 已输出摘要 (用于避免重复调用)
+static bool LogPeriodicSummary() {
+    DWORD now = GetTickCount();
+    // 5 分钟 = 300000ms (与 DEGRADED_RECOVERY_INTERVAL_MS 同量级)
+    if (now - g_logStats.lastSummaryTick < 300000) return false;
+    g_logStats.lastSummaryTick = now;
+
+    DWORD elapsed = now - g_logStats.startTick;
+    DWORD elapsedSec = elapsed / 1000;
+
+    DiagLog("============================================\n");
+    DiagLog("BUILD 567 v3.227 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
+        g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
+    DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
+        g_logStats.shvPatchSuccess, g_logStats.shvPatchFailure, g_logStats.shvRepatch);
+    DiagLog("VEH 自愈: %u 次\n", g_logStats.vehSelfheal);
+    DiagLog("降级模式: %u 次\n", g_logStats.degradedEnter);
+    DiagLog("回调重应用: %u 次\n", g_logStats.cbReapply);
+    DiagLog("============================================\n");
+    return true;
+}
 
 // 崩溃捕获 — 帮助定位 Init 期间的 crash
 static HMODULE g_diagDllBase;
@@ -530,6 +711,10 @@ static LONG CALLBACK DiagVehHandler(PEXCEPTION_POINTERS ep) {
             (unsigned long long)g_backupBuf,
             (unsigned long long)g_backupCodeBase,
             isPrivInstr ? "PRIV_INSTR" : "ACCESS_VIOL");
+        // ★ BUILD 567 v3.227: VEH 自愈计数 + 状态日志
+        g_logStats.vehSelfheal++;
+        DiagLogState("VEH", "SELFHEAL", "count=%u cause=%s",
+            (unsigned)g_vehCrashCount, isPrivInstr ? "PRIV_INSTR" : "ACCESS_VIOL");
 
         // ★ v3.70/v3.78: 逐页恢复, 保存/恢复原始保护
         //   v3.70: 跳过 VEH 处理器自身所在页面 (未被污染, 保护不变)
@@ -1905,6 +2090,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     GetTempPathW(MAX_PATH, logPath);
     wcscat_s(logPath, L"sd.log");  // ★ BUILD 549: 文件名脱敏 (原 stealth_diag.log)
     DeleteFileW(logPath);
+    // ★ BUILD 567 v3.227: 启动摘要 (系统信息 + BUILD 版本, 封号分析用)
+    LogStartSummary();
     DiagLogEnc("d1");  // ★ BUILD 549: 加密 "diag start b549"
     DiagLog("BEFORE Init...\n");
 
@@ -2832,6 +3019,10 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     while (true) {
         frameCount++;
 
+        // ★ BUILD 567 v3.227: 周期性统计摘要 (每 5 分钟输出一次, 封号分析用)
+        //   内部检查 lastSummaryTick, 未到 5 分钟直接返回 false, 无性能影响
+        LogPeriodicSummary();
+
         // ★ BUILD 540: CS2 退出检测安全网 — 防止 TerminateProcess 路径 0x139 蓝屏
         //   根因: DKOM 永久断链后, 进程被 TerminateProcess(任务管理器) 终止时
         //   PspExitProcess 的 RemoveEntryList 调试检查失败 → BugCheck 0x139 参数 3
@@ -2857,6 +3048,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     if (stealth::NtReadHooker::Instance().IsActive()) {
                         stealth::NtReadHooker::Instance().Uninstall();
                     }
+                    // ★ BUILD 567 v3.227: 退出摘要 (CS2 退出路径)
+                    LogExitSummary();
                     stealth::KernelDefense::DisableAll();  // 包含 UnhideProcess
                     StealthEngine::Instance().Shutdown();
                     return 0;
@@ -2893,6 +3086,9 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 pacCheckInterval = RandomJitter(30000, 15000);  // ★ BUILD 556: 30-45s 随机
                 if (stealth::KernelMemoryAccessor::Instance().IsActive()) {
                     stealth::KernelDefense::ReapplyAllCallbacks();
+                    // ★ BUILD 567 v3.227: 回调重应用计数 + 状态日志
+                    g_logStats.cbReapply++;
+                    DiagLogState("CB", "REAPPLIED", "tick=%u", (unsigned)GetTickCount());
 
                     // ★ BUILD 552: 周期性验证 SHV_Install patch 仍然有效
                     //   若 PAC 重载驱动或自我修复 patch, 此处重新 patch
@@ -3158,6 +3354,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     // ★ BUILD 548: basic.exe 已移除, 不需要 TerminateBasicESP
     // ★ BUILD 556: 移除 ShadowPageManager::Uninstall (影子页方案已废弃)
     //   VirtualProtect patch 无需卸载 (进程退出时自动释放)
+    // ★ BUILD 567 v3.227: 退出摘要 (主循环正常退出路径)
+    LogExitSummary();
     stealth::KernelDefense::DisableAll();
     StealthEngine::Instance().Shutdown();
     return 0;

@@ -18,6 +18,27 @@
 #include <cstdint>
 // ★ BUILD 496: 移除 <string> <functional> <vector> <memory> — CRT 堆未初始化
 
+// ============================================================
+// ★ BUILD 567 v3.227: 全局日志统计计数器 (跨编译单元共享)
+//   定义在 payload.cpp, byovd_kernel.cpp 通过 extern 引用更新
+//   用途: 启动/退出/周期摘要 输出运行统计 (封号原因分析)
+//   注: 单线程 CheatMainLoop 访问, 无需同步
+// ============================================================
+struct LogStats {
+    DWORD     startTick;           // 启动 tick (DllMain 入口)
+    DWORD     lastSummaryTick;     // 上次摘要输出 tick (5 分钟周期)
+    uint32_t  vmxOnPatchSuccess;   // VmxOn patch 成功次数 (首次 + 重 patch)
+    uint32_t  vmxOnPatchFailure;   // VmxOn patch 失败次数
+    uint32_t  vmxOnRepatch;        // VmxOn 重 patch 次数 (PAC 恢复后)
+    uint32_t  shvPatchSuccess;     // SHV patch 成功次数
+    uint32_t  shvPatchFailure;     // SHV patch 失败次数
+    uint32_t  shvRepatch;          // SHV 重 patch 次数
+    uint32_t  vehSelfheal;         // VEH 自愈触发次数
+    uint32_t  degradedEnter;       // 降级模式触发次数 (VmxOn + SHV 合计)
+    uint32_t  cbReapply;           // 内核回调重应用次数
+};
+extern LogStats g_logStats;
+
 namespace stealth {
 
 // ============================================================
