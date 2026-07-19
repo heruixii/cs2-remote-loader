@@ -16,6 +16,8 @@
 #include "byovd_kernel.h"
 #include "module_resolver.h"  // ★ BUILD 550: GetModuleBaseFromPEB 替代 GetModuleHandleW
 #include "string_obfuscator.h"  // ★ BUILD 550: STEALTH_STR_DECRYPT_TO / STEALTH_WSTR_DECRYPT_TO
+// ★ BUILD 565: StealthMemory + StealthProcess (跨进程 R/W + 模块枚举) for NtReadHooker
+#include "stealth_process.h"
 #include <winreg.h>
 #include <winternl.h>
 #include <winsvc.h>
@@ -8283,6 +8285,668 @@ bool ShvInstallPatcher::RestoreShvInstallEntry() {
     m_hasOriginalBytes = false;
     m_patchedAddress = 0;
     return true;
+}
+
+// ============================================================
+// ★ BUILD 565 v3.224: NtReadHooker 实现
+//   Hook NtReadVirtualMemory 双重保险 (B: IAT hook PvpAlive + A: inline hook ntdll)
+//   过滤逻辑: post-read patching — 仅过滤 patch 区域 [clientBase+0xC125D9, +0xC125DB)
+// ============================================================
+
+uintptr_t NtReadHooker::FindPvpAliveBase(HANDLE cs2Process) {
+    if (!cs2Process) return 0;
+
+    // 跨进程枚举 CS2 模块 (NtQueryInformationProcess + PEB.Ldr)
+    stealth::StealthProcess::ModuleInfo modules[256];
+    int modCount = stealth::StealthProcess::GetProcessModules(cs2Process, modules, 256);
+    if (modCount <= 0) return 0;
+
+    // 解密 "PvpAlive.dll" 用于比较 (避免明文进入 .rdata)
+    wchar_t pvpAliveW[32] = {};
+    STEALTH_WSTR_DECRYPT_TO("PvpAlive.dll", pvpAliveW, (int)(sizeof(pvpAliveW) / sizeof(wchar_t)));
+
+    uintptr_t result = 0;
+    for (int i = 0; i < modCount; i++) {
+        if (_wcsicmp(modules[i].name, pvpAliveW) == 0) {
+            result = modules[i].baseAddress;
+            break;
+        }
+    }
+
+    SecureZeroMemory(pvpAliveW, sizeof(pvpAliveW));
+    return result;
+}
+
+uintptr_t NtReadHooker::FindNtReadInIAT(HANDLE cs2Process, uintptr_t pvpAliveBase,
+                                         uintptr_t* out_originalNtRead) {
+    if (!cs2Process || !pvpAliveBase || !out_originalNtRead) return 0;
+    *out_originalNtRead = 0;
+
+    // 读 DOS 头
+    IMAGE_DOS_HEADER dosHdr = {};
+    if (!stealth::StealthMemory::Read(cs2Process, pvpAliveBase, &dosHdr, sizeof(dosHdr)))
+        return 0;
+    if (dosHdr.e_magic != IMAGE_DOS_SIGNATURE) return 0;
+
+    // 读 NT 头 (PE32+)
+    IMAGE_NT_HEADERS64 ntHdr = {};
+    if (!stealth::StealthMemory::Read(cs2Process, pvpAliveBase + dosHdr.e_lfanew,
+                                       &ntHdr, sizeof(ntHdr)))
+        return 0;
+    if (ntHdr.Signature != IMAGE_NT_SIGNATURE) return 0;
+
+    // Import Directory
+    IMAGE_DATA_DIRECTORY importDir =
+        ntHdr.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!importDir.VirtualAddress || !importDir.Size) return 0;
+
+    uintptr_t importDescAddr = pvpAliveBase + importDir.VirtualAddress;
+
+    // 解密 "ntdll.dll" / "NtReadVirtualMemory" 用于比较
+    char ntdllA[32] = {};
+    char ntReadA[64] = {};
+    STEALTH_STR_DECRYPT_TO("ntdll.dll", ntdllA, (int)sizeof(ntdllA));
+    STEALTH_STR_DECRYPT_TO("NtReadVirtualMemory", ntReadA, (int)sizeof(ntReadA));
+
+    uintptr_t iatEntryAddr = 0;
+
+    // 遍历 IMPORT_DESCRIPTOR 数组 (每个 20 字节, 以全零终止)
+    for (DWORD idx = 0; idx < 4096; idx++) {
+        IMAGE_IMPORT_DESCRIPTOR desc = {};
+        uintptr_t curAddr = importDescAddr + idx * sizeof(IMAGE_IMPORT_DESCRIPTOR);
+        if (!stealth::StealthMemory::Read(cs2Process, curAddr, &desc, sizeof(desc)))
+            break;
+        if (!desc.Name && !desc.FirstThunk) break;  // 终止符
+
+        // 读取 DLL 名
+        char dllName[64] = {};
+        if (desc.Name) {
+            stealth::StealthMemory::Read(cs2Process, pvpAliveBase + desc.Name,
+                                          dllName, sizeof(dllName) - 1);
+        }
+        if (_stricmp(dllName, ntdllA) != 0) continue;
+
+        // INT (OriginalFirstThunk) 用于读函数名, IAT (FirstThunk) 是实际地址
+        uintptr_t intAddr = desc.OriginalFirstThunk
+                            ? pvpAliveBase + desc.OriginalFirstThunk
+                            : pvpAliveBase + desc.FirstThunk;
+        uintptr_t iatAddr = pvpAliveBase + desc.FirstThunk;
+
+        for (DWORD thunkIdx = 0; thunkIdx < 65536; thunkIdx++) {
+            uint64_t intEntry = 0;
+            if (!stealth::StealthMemory::Read(cs2Process,
+                                               intAddr + thunkIdx * sizeof(uint64_t),
+                                               &intEntry, sizeof(intEntry)))
+                break;
+            if (!intEntry) break;  // 终止
+
+            // 按序号导入跳过
+            if (intEntry & 0x8000000000000000ULL) continue;
+
+            // 读取函数名 (IMAGE_IMPORT_BY_NAME: 2 字节 hint + 名字)
+            char funcName[128] = {};
+            stealth::StealthMemory::Read(cs2Process,
+                                          pvpAliveBase + (intEntry & 0x7FFFFFFFFFFFFFFFULL),
+                                          funcName, sizeof(funcName) - 1);
+            // 跳过 2 字节 hint
+            char* funcNameStr = funcName + 2;
+            if (_stricmp(funcNameStr, ntReadA) == 0) {
+                iatEntryAddr = iatAddr + thunkIdx * sizeof(uint64_t);
+                // 读取 IAT 当前值 (= ntdll!NtReadVirtualMemory 实际地址)
+                uint64_t iatValue = 0;
+                stealth::StealthMemory::Read(cs2Process, iatEntryAddr,
+                                              &iatValue, sizeof(iatValue));
+                *out_originalNtRead = (uintptr_t)iatValue;
+                break;
+            }
+        }
+        if (iatEntryAddr) break;
+    }
+
+    SecureZeroMemory(ntdllA, sizeof(ntdllA));
+    SecureZeroMemory(ntReadA, sizeof(ntReadA));
+    return iatEntryAddr;
+}
+
+bool NtReadHooker::GenerateFilterShellcode(uint8_t* outBuf, size_t* outSize,
+                                            uintptr_t originalNtRead,
+                                            uintptr_t patchAddr) {
+    if (!outBuf || !outSize) return false;
+
+    // ★ BUILD 565: 过滤函数 shellcode (PIC, 104 字节)
+    //   调用原 NtReadVirtualMemory, 若成功且读取范围与 patch 区域重叠,
+    //   在 Buffer 中恢复 32 c0 (原始字节), 返回原 status.
+    //   内嵌常量: originalNtRead @ 偏移 0x16, patchAddr @ 偏移 0x35
+    static const uint8_t kTemplate[] = {
+        // [0x00] push rbp; mov rbp, rsp; sub rsp, 0x40
+        0x55, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x40,
+        // [0x08] mov [rbp-0x08], rdx  (BaseAddress)
+        0x48, 0x89, 0x55, 0xF8,
+        // [0x0C] mov [rbp-0x10], r8   (Buffer)
+        0x4C, 0x89, 0x45, 0xF0,
+        // [0x10] mov [rbp-0x18], r9   (NumberOfBytesToRead)
+        0x4C, 0x89, 0x4D, 0xE8,
+        // [0x14] mov rax, originalNtRead (10 字节, 常量在 +2 = 0x16)
+        0x48, 0xB8, 0,0,0,0,0,0,0,0,
+        // [0x1E] call rax
+        0xFF, 0xD0,
+        // [0x20] mov [rbp-0x20], eax  (status)
+        0x89, 0x45, 0xE0,
+        // [0x23] test eax, eax
+        0x85, 0xC0,
+        // [0x25] jne .return (+0x38 → 0x5F)
+        0x75, 0x38,
+        // [0x27] mov rdx, [rbp-0x08]  (BaseAddress)
+        0x48, 0x8B, 0x55, 0xF8,
+        // [0x2B] mov r9, [rbp-0x18]   (NumberOfBytesToRead)
+        0x4C, 0x8B, 0x4D, 0xE8,
+        // [0x2F] lea r9, [rdx + r9]   (readEnd = BaseAddress + NumberOfBytesToRead)
+        //   ★ BUILD 565 FIX-1: REX 字节 0x4C → 0x4E (REX.X=1 才能让 index=r9)
+        //   原错误: 4C 8D 0C 0A = lea r9, [rdx + rdx] (index=rdx, 计算 2*BaseAddress)
+        //   修复后: 4E 8D 0C 0A = lea r9, [rdx + r9]  (index=r9,  计算 BaseAddress + NumberOfBytesToRead)
+        0x4E, 0x8D, 0x0C, 0x0A,
+        // [0x33] mov rax, patchAddr (10 字节, 常量在 +2 = 0x35)
+        0x48, 0xB8, 0,0,0,0,0,0,0,0,
+        // [0x3D] lea rcx, [rax + 2]   (patchEnd)
+        0x48, 0x8D, 0x48, 0x02,
+        // [0x41] cmp rdx, rcx         (BaseAddress vs patchEnd)
+        0x48, 0x39, 0xCA,
+        // [0x44] jae .return (+0x19 → 0x5F)
+        0x73, 0x19,
+        // [0x46] cmp rax, r9          (patchAddr vs readEnd)
+        0x4C, 0x39, 0xC8,
+        // [0x49] jae .return (+0x14 → 0x5F)
+        0x73, 0x14,
+        // [0x4B] mov rdx, [rbp-0x08]  (BaseAddress)
+        0x48, 0x8B, 0x55, 0xF8,
+        // [0x4F] sub rax, rdx         (offset = patchAddr - BaseAddress)
+        0x48, 0x29, 0xD0,
+        // [0x52] mov r8, [rbp-0x10]   (Buffer)
+        0x4C, 0x8B, 0x45, 0xF0,
+        // [0x56] add r8, rax          (Buffer + offset)
+        //   ★ BUILD 565 FIX-2: REX 字节 0x4C → 0x49 (REX.R=0 + REX.B=1 才能让目标=r8, 源=rax)
+        //   原错误: 4C 01 C0 = add rax, r8 (目标 rax, 源 r8; 但后续 mov [r8] 用 r8 原值 Buffer, 写错位置)
+        //   修复后: 49 01 C0 = add r8, rax (目标 r8 = Buffer + offset, 源 rax = offset)
+        0x49, 0x01, 0xC0,
+        // [0x59] mov word ptr [r8], 0xC032  (32 c0 小端)
+        0x66, 0x41, 0xC7, 0x00, 0x32, 0xC0,
+        // [0x5F] .return: mov eax, [rbp-0x20]  (status)
+        0x8B, 0x45, 0xE0,
+        // [0x62] add rsp, 0x40
+        0x48, 0x83, 0xC4, 0x40,
+        // [0x66] pop rbp
+        0x5D,
+        // [0x67] ret
+        0xC3,
+    };
+    constexpr size_t kTemplateSize = sizeof(kTemplate);  // 104 字节
+    static_assert(sizeof(kTemplate) == 104, "B565: filter shellcode size mismatch");
+
+    if (*outSize < kTemplateSize) return false;
+
+    memcpy(outBuf, kTemplate, kTemplateSize);
+
+    // 填充内嵌常量 (8 字节小端)
+    *reinterpret_cast<uintptr_t*>(outBuf + 0x16) = originalNtRead;
+    *reinterpret_cast<uintptr_t*>(outBuf + 0x35) = patchAddr;
+
+    *outSize = kTemplateSize;
+    return true;
+}
+
+bool NtReadHooker::InstallIATHook(HANDLE cs2Process, uintptr_t iatEntryAddr,
+                                   uintptr_t originalNtRead,
+                                   uintptr_t clientBase, uintptr_t patchAddr) {
+    if (!cs2Process || !iatEntryAddr || !originalNtRead) return false;
+
+    // 1. 生成过滤函数 shellcode
+    uint8_t shellcode[256] = {};
+    size_t shellcodeSize = sizeof(shellcode);
+    if (!GenerateFilterShellcode(shellcode, &shellcodeSize, originalNtRead, patchAddr)) {
+        ByovdDiag("B565:IAT: GenerateFilterShellcode FAILED\n");
+        return false;
+    }
+
+    // 2. 在 CS2 进程分配可执行内存 (PAGE_EXECUTE_READWRITE)
+    //    注意: VirtualAllocEx 已在 kernel32 IAT 中 (loader.exe 也用), 不引入新特征
+    LPVOID pAlloc = VirtualAllocEx(cs2Process, nullptr, shellcodeSize,
+                                    MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!pAlloc) {
+        ByovdDiag("B565:IAT: VirtualAllocEx FAILED err=%u\n", GetLastError());
+        return false;
+    }
+    uintptr_t filterAddr = (uintptr_t)pAlloc;
+
+    // 3. 写入 shellcode
+    if (!stealth::StealthMemory::Write(cs2Process, filterAddr, shellcode, shellcodeSize)) {
+        ByovdDiag("B565:IAT: Write shellcode FAILED\n");
+        VirtualFreeEx(cs2Process, pAlloc, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // 4. 读取 IAT 原始值 (保存用于 Uninstall)
+    uintptr_t iatOriginalValue = 0;
+    if (!stealth::StealthMemory::Read(cs2Process, iatEntryAddr,
+                                       &iatOriginalValue, sizeof(iatOriginalValue))) {
+        ByovdDiag("B565:IAT: Read IAT original FAILED\n");
+        VirtualFreeEx(cs2Process, pAlloc, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // 5. 临时改 IAT 页保护为 PAGE_READWRITE
+    DWORD oldProtect = 0;
+    if (!stealth::StealthMemory::Protect(cs2Process, iatEntryAddr, sizeof(uintptr_t),
+                                          PAGE_READWRITE, &oldProtect)) {
+        ByovdDiag("B565:IAT: Protect(RW) FAILED err=%u\n", GetLastError());
+        VirtualFreeEx(cs2Process, pAlloc, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // 6. 修改 IAT 条目指向过滤函数
+    bool writeOk = stealth::StealthMemory::Write(cs2Process, iatEntryAddr,
+                                                  &filterAddr, sizeof(filterAddr));
+
+    // 7. 恢复 IAT 页保护 (无论 writeOk 与否都恢复)
+    DWORD restoreProtect = 0;
+    stealth::StealthMemory::Protect(cs2Process, iatEntryAddr, sizeof(uintptr_t),
+                                     oldProtect, &restoreProtect);
+
+    if (!writeOk) {
+        ByovdDiag("B565:IAT: Write IAT new value FAILED\n");
+        VirtualFreeEx(cs2Process, pAlloc, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // 8. 记录状态
+    m_iatHookActive = true;
+    m_iatEntryAddr = iatEntryAddr;
+    m_originalNtRead = originalNtRead;
+    m_iatOriginalValue = iatOriginalValue;
+    m_filterFuncAddr = filterAddr;
+    m_filterFuncSize = shellcodeSize;
+    (void)clientBase;  // clientBase 不在 IAT hook 状态中保留 (Maintain 不需要)
+
+    ByovdDiag("B565:IAT: hook installed iatEntry=0x%llX origNtRead=0x%llX filter=0x%llX\n",
+              (unsigned long long)iatEntryAddr,
+              (unsigned long long)originalNtRead,
+              (unsigned long long)filterAddr);
+    return true;
+}
+
+uintptr_t NtReadHooker::FindNtdllNtRead(HANDLE cs2Process) {
+    if (!cs2Process) return 0;
+
+    // 1. 跨进程枚举 CS2 模块找 ntdll.dll 基址
+    stealth::StealthProcess::ModuleInfo modules[256];
+    int modCount = stealth::StealthProcess::GetProcessModules(cs2Process, modules, 256);
+    if (modCount <= 0) return 0;
+
+    uintptr_t ntdllBase = 0;
+    wchar_t ntdllW[16] = {};
+    STEALTH_WSTR_DECRYPT_TO("ntdll.dll", ntdllW, (int)(sizeof(ntdllW) / sizeof(wchar_t)));
+    for (int i = 0; i < modCount; i++) {
+        if (_wcsicmp(modules[i].name, ntdllW) == 0) {
+            ntdllBase = modules[i].baseAddress;
+            break;
+        }
+    }
+    SecureZeroMemory(ntdllW, sizeof(ntdllW));
+    if (!ntdllBase) return 0;
+
+    // 2. 读 ntdll PE 头, 解析导出表
+    IMAGE_DOS_HEADER dosHdr = {};
+    if (!stealth::StealthMemory::Read(cs2Process, ntdllBase, &dosHdr, sizeof(dosHdr)))
+        return 0;
+    if (dosHdr.e_magic != IMAGE_DOS_SIGNATURE) return 0;
+
+    IMAGE_NT_HEADERS64 ntHdr = {};
+    if (!stealth::StealthMemory::Read(cs2Process, ntdllBase + dosHdr.e_lfanew,
+                                       &ntHdr, sizeof(ntHdr)))
+        return 0;
+    if (ntHdr.Signature != IMAGE_NT_SIGNATURE) return 0;
+
+    IMAGE_DATA_DIRECTORY exportDir =
+        ntHdr.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!exportDir.VirtualAddress) return 0;
+
+    // 3. 读 EXPORT_DIRECTORY
+    IMAGE_EXPORT_DIRECTORY expDir = {};
+    if (!stealth::StealthMemory::Read(cs2Process, ntdllBase + exportDir.VirtualAddress,
+                                       &expDir, sizeof(expDir)))
+        return 0;
+
+    // 4. 遍历名称指针数组, 查找 "NtReadVirtualMemory"
+    char ntReadA[64] = {};
+    STEALTH_STR_DECRYPT_TO("NtReadVirtualMemory", ntReadA, (int)sizeof(ntReadA));
+
+    uintptr_t result = 0;
+    uintptr_t nameRvas   = ntdllBase + expDir.AddressOfNames;
+    uintptr_t ordinalRvas = ntdllBase + expDir.AddressOfNameOrdinals;
+    uintptr_t funcRvas   = ntdllBase + expDir.AddressOfFunctions;
+
+    for (DWORD i = 0; i < expDir.NumberOfNames; i++) {
+        DWORD nameRva = 0;
+        if (!stealth::StealthMemory::Read(cs2Process,
+                                           nameRvas + i * sizeof(DWORD),
+                                           &nameRva, sizeof(nameRva)))
+            break;
+        if (!nameRva) continue;
+
+        char funcName[128] = {};
+        stealth::StealthMemory::Read(cs2Process, ntdllBase + nameRva,
+                                      funcName, sizeof(funcName) - 1);
+
+        if (_stricmp(funcName, ntReadA) == 0) {
+            WORD ordinal = 0;
+            stealth::StealthMemory::Read(cs2Process,
+                                          ordinalRvas + i * sizeof(WORD),
+                                          &ordinal, sizeof(ordinal));
+            DWORD funcRva = 0;
+            stealth::StealthMemory::Read(cs2Process,
+                                          funcRvas + ordinal * sizeof(DWORD),
+                                          &funcRva, sizeof(funcRva));
+            if (funcRva) {
+                result = ntdllBase + funcRva;
+            }
+            break;
+        }
+    }
+
+    SecureZeroMemory(ntReadA, sizeof(ntReadA));
+    return result;
+}
+
+bool NtReadHooker::InstallInlineHook(HANDLE cs2Process, uintptr_t ntReadAddr,
+                                      uintptr_t clientBase, uintptr_t patchAddr) {
+    if (!cs2Process || !ntReadAddr) return false;
+    (void)clientBase;  // clientBase 在 inline hook 中不直接使用 (patch 已编码在 shellcode)
+
+    // ★ BUILD 565: 方案 A 使用 trampoline 模式
+    //   ntdll!NtReadVirtualMemory 前 12 字节被覆盖为 jmp filterFunc
+    //   trampoline = 原 12 字节 + jmp [rip+0] + 8 字节目标 (ntReadAddr + 12)
+    //   过滤函数调用 trampoline, trampoline 执行原 12 字节然后跳回 ntReadAddr + 12
+    //   注意: 12 字节足够覆盖 ntdll syscall stub 前 4 条指令
+    //         (mov r10, rcx; mov eax, SSN; test ...; jne ...; syscall; ret)
+
+    // 1.1 读原 12 字节
+    uint8_t origBytes[16] = {};
+    if (!stealth::StealthMemory::Read(cs2Process, ntReadAddr, origBytes, 12)) {
+        ByovdDiag("B565:Inline: Read original 12 bytes FAILED\n");
+        return false;
+    }
+
+    // 1.2 生成过滤函数 shellcode (originalNtRead = trampoline, 稍后修正)
+    uint8_t shellcode[256] = {};
+    size_t shellcodeSize = sizeof(shellcode);
+    if (!GenerateFilterShellcode(shellcode, &shellcodeSize, 0, patchAddr)) {
+        ByovdDiag("B565:Inline: GenerateFilterShellcode FAILED\n");
+        return false;
+    }
+
+    // 1.3 生成 trampoline: 原 12 字节 + jmp [rip+0] + 8 字节目标地址
+    //   jmp [rip+0] = FF 25 00 00 00 00 (6 字节)
+    //   + 8 字节目标 = ntReadAddr + 12
+    //   总大小 = 12 + 6 + 8 = 26 字节
+    uint8_t trampoline[32] = {};
+    memcpy(trampoline, origBytes, 12);
+    trampoline[12] = 0xFF;  // jmp [rip+0]
+    trampoline[13] = 0x25;
+    trampoline[14] = 0x00;
+    trampoline[15] = 0x00;
+    trampoline[16] = 0x00;
+    trampoline[17] = 0x00;
+    uintptr_t jmpTarget = ntReadAddr + 12;
+    memcpy(trampoline + 18, &jmpTarget, sizeof(jmpTarget));
+    constexpr size_t trampolineSize = 26;
+
+    // 2. 分配可执行内存 (shellcode + trampoline)
+    SIZE_T allocSize = shellcodeSize + trampolineSize + 16;
+    LPVOID pAlloc = VirtualAllocEx(cs2Process, nullptr, allocSize,
+                                    MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!pAlloc) {
+        ByovdDiag("B565:Inline: VirtualAllocEx FAILED err=%u\n", GetLastError());
+        return false;
+    }
+    uintptr_t allocBase = (uintptr_t)pAlloc;
+    uintptr_t filterAddr = allocBase;
+    uintptr_t trampolineAddr = allocBase + shellcodeSize;
+
+    // 3. 修正 shellcode 中的 originalNtRead = trampolineAddr
+    *reinterpret_cast<uintptr_t*>(shellcode + 0x16) = trampolineAddr;
+
+    // 4. 写入 shellcode 和 trampoline
+    if (!stealth::StealthMemory::Write(cs2Process, filterAddr, shellcode, shellcodeSize)) {
+        ByovdDiag("B565:Inline: Write shellcode FAILED\n");
+        VirtualFreeEx(cs2Process, pAlloc, 0, MEM_RELEASE);
+        return false;
+    }
+    if (!stealth::StealthMemory::Write(cs2Process, trampolineAddr, trampoline, trampolineSize)) {
+        ByovdDiag("B565:Inline: Write trampoline FAILED\n");
+        VirtualFreeEx(cs2Process, pAlloc, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // 5. 改 ntdll 页保护为 RWX
+    DWORD oldProtect = 0;
+    if (!stealth::StealthMemory::Protect(cs2Process, ntReadAddr, 12,
+                                          PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        ByovdDiag("B565:Inline: Protect(RWX) FAILED err=%u\n", GetLastError());
+        VirtualFreeEx(cs2Process, pAlloc, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // 6. 写入 jmp 到过滤函数 (12 字节: 48 B8 <8字节地址> FF E0 = mov rax,imm64; jmp rax)
+    uint8_t jmpBuf[12] = {};
+    jmpBuf[0] = 0x48;  // REX.W
+    jmpBuf[1] = 0xB8;  // mov rax, imm64
+    memcpy(jmpBuf + 2, &filterAddr, sizeof(filterAddr));
+    jmpBuf[10] = 0xFF;  // jmp rax
+    jmpBuf[11] = 0xE0;
+
+    bool writeOk = stealth::StealthMemory::Write(cs2Process, ntReadAddr, jmpBuf, sizeof(jmpBuf));
+
+    // 7. 恢复 ntdll 页保护
+    DWORD restoreProtect = 0;
+    stealth::StealthMemory::Protect(cs2Process, ntReadAddr, 12,
+                                     oldProtect, &restoreProtect);
+
+    if (!writeOk) {
+        ByovdDiag("B565:Inline: Write jmp FAILED\n");
+        VirtualFreeEx(cs2Process, pAlloc, 0, MEM_RELEASE);
+        return false;
+    }
+
+    // 8. 记录状态
+    m_inlineHookActive = true;
+    m_ntdllNtReadAddr = ntReadAddr;
+    memcpy(m_ntdllOriginalBytes, origBytes, 12);
+    m_inlineFilterFuncAddr = allocBase;
+    m_inlineFilterFuncSize = allocSize;
+    m_originalNtRead = ntReadAddr;
+
+    ByovdDiag("B565:Inline: hook installed ntRead=0x%llX filter=0x%llX tramp=0x%llX\n",
+              (unsigned long long)ntReadAddr,
+              (unsigned long long)filterAddr,
+              (unsigned long long)trampolineAddr);
+    return true;
+}
+
+bool NtReadHooker::Install(HANDLE cs2Process, uintptr_t clientBase, uintptr_t patchAddr) {
+    if (!cs2Process || !clientBase || !patchAddr) return false;
+    if (m_active) return true;
+
+    m_cs2Process = cs2Process;
+    m_clientBase = clientBase;
+    m_patchAddr = patchAddr;
+
+    ByovdDiag("B565:Install: cs2Proc=0x%p clientBase=0x%llX patchAddr=0x%llX\n",
+              cs2Process, (unsigned long long)clientBase, (unsigned long long)patchAddr);
+
+    // 方案 B: IAT hook PvpAlive.dll (优先)
+    uintptr_t pvpBase = FindPvpAliveBase(cs2Process);
+    if (pvpBase) {
+        ByovdDiag("B565:Install: PvpAlive.dll found @ 0x%llX\n",
+                  (unsigned long long)pvpBase);
+        uintptr_t originalNtRead = 0;
+        uintptr_t iatEntry = FindNtReadInIAT(cs2Process, pvpBase, &originalNtRead);
+        if (iatEntry && originalNtRead) {
+            if (InstallIATHook(cs2Process, iatEntry, originalNtRead, clientBase, patchAddr)) {
+                m_active = true;
+                m_pvpAliveBase = pvpBase;
+                ByovdDiag("B565:Install: IAT hook (B) success, skip inline (A)\n");
+                return true;
+            }
+            ByovdDiag("B565:Install: IAT hook (B) failed, fallback to inline (A)\n");
+        } else {
+            ByovdDiag("B565:Install: NtRead not in PvpAlive IAT (entry=0x%llX orig=0x%llX), fallback to A\n",
+                      (unsigned long long)iatEntry, (unsigned long long)originalNtRead);
+        }
+    } else {
+        ByovdDiag("B565:Install: PvpAlive.dll not loaded, fallback to inline (A)\n");
+    }
+
+    // 方案 A: inline hook ntdll!NtReadVirtualMemory (兜底)
+    uintptr_t ntReadAddr = FindNtdllNtRead(cs2Process);
+    if (!ntReadAddr) {
+        ByovdDiag("B565:Install: FindNtdllNtRead FAILED\n");
+        return false;
+    }
+    if (InstallInlineHook(cs2Process, ntReadAddr, clientBase, patchAddr)) {
+        m_active = true;
+        ByovdDiag("B565:Install: inline hook (A) success\n");
+        return true;
+    }
+
+    ByovdDiag("B565:Install: both B and A failed\n");
+    return false;
+}
+
+void NtReadHooker::Uninstall() {
+    if (!m_active) return;
+
+    // 方案 B: 恢复 IAT
+    if (m_iatHookActive && m_cs2Process && m_iatEntryAddr) {
+        DWORD oldProtect = 0;
+        if (stealth::StealthMemory::Protect(m_cs2Process, m_iatEntryAddr, sizeof(uintptr_t),
+                                              PAGE_READWRITE, &oldProtect)) {
+            uintptr_t origValue = m_iatOriginalValue;
+            stealth::StealthMemory::Write(m_cs2Process, m_iatEntryAddr,
+                                           &origValue, sizeof(origValue));
+            DWORD restoreProtect = 0;
+            stealth::StealthMemory::Protect(m_cs2Process, m_iatEntryAddr, sizeof(uintptr_t),
+                                             oldProtect, &restoreProtect);
+        }
+        if (m_filterFuncAddr) {
+            VirtualFreeEx(m_cs2Process, (LPVOID)m_filterFuncAddr, 0, MEM_RELEASE);
+        }
+        m_iatHookActive = false;
+        ByovdDiag("B565:Uninstall: IAT hook restored\n");
+    }
+
+    // 方案 A: 恢复 ntdll
+    if (m_inlineHookActive && m_cs2Process && m_ntdllNtReadAddr) {
+        DWORD oldProtect = 0;
+        if (stealth::StealthMemory::Protect(m_cs2Process, m_ntdllNtReadAddr, 12,
+                                              PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            stealth::StealthMemory::Write(m_cs2Process, m_ntdllNtReadAddr,
+                                           m_ntdllOriginalBytes, 12);
+            DWORD restoreProtect = 0;
+            stealth::StealthMemory::Protect(m_cs2Process, m_ntdllNtReadAddr, 12,
+                                             oldProtect, &restoreProtect);
+        }
+        if (m_inlineFilterFuncAddr) {
+            VirtualFreeEx(m_cs2Process, (LPVOID)m_inlineFilterFuncAddr, 0, MEM_RELEASE);
+        }
+        m_inlineHookActive = false;
+        ByovdDiag("B565:Uninstall: inline hook restored\n");
+    }
+
+    m_active = false;
+    m_iatEntryAddr = 0;
+    m_iatOriginalValue = 0;
+    m_originalNtRead = 0;
+    m_filterFuncAddr = 0;
+    m_filterFuncSize = 0;
+    m_pvpAliveBase = 0;
+    m_ntdllNtReadAddr = 0;
+    m_inlineFilterFuncAddr = 0;
+    m_inlineFilterFuncSize = 0;
+    memset(m_ntdllOriginalBytes, 0, sizeof(m_ntdllOriginalBytes));
+}
+
+bool NtReadHooker::Maintain() {
+    if (!m_active || !m_cs2Process) return false;
+
+    // 方案 B: 检测 PvpAlive.dll 是否重载 (基址变化)
+    if (m_iatHookActive) {
+        uintptr_t curPvpBase = FindPvpAliveBase(m_cs2Process);
+        if (curPvpBase != m_pvpAliveBase) {
+            ByovdDiag("B565:Maintain: PvpAlive base changed 0x%llX → 0x%llX, rehooking\n",
+                      (unsigned long long)m_pvpAliveBase, (unsigned long long)curPvpBase);
+            // 释放旧 filter 函数内存 (不恢复 IAT — PvpAlive 已卸载, IAT 已无效)
+            if (m_filterFuncAddr) {
+                VirtualFreeEx(m_cs2Process, (LPVOID)m_filterFuncAddr, 0, MEM_RELEASE);
+                m_filterFuncAddr = 0;
+            }
+            m_iatHookActive = false;
+
+            // 重新安装 (B 优先, A 兜底)
+            if (curPvpBase) {
+                uintptr_t originalNtRead = 0;
+                uintptr_t iatEntry = FindNtReadInIAT(m_cs2Process, curPvpBase, &originalNtRead);
+                if (iatEntry && originalNtRead &&
+                    InstallIATHook(m_cs2Process, iatEntry, originalNtRead,
+                                    m_clientBase, m_patchAddr)) {
+                    m_pvpAliveBase = curPvpBase;
+                    ByovdDiag("B565:Maintain: IAT hook reinstalled\n");
+                    return true;
+                }
+            }
+            // B 失败, 尝试 A
+            ByovdDiag("B565:Maintain: IAT rehook failed, try inline (A)\n");
+            uintptr_t ntReadAddr = FindNtdllNtRead(m_cs2Process);
+            if (ntReadAddr && InstallInlineHook(m_cs2Process, ntReadAddr,
+                                                 m_clientBase, m_patchAddr)) {
+                ByovdDiag("B565:Maintain: inline hook (A) installed as fallback\n");
+                return true;
+            }
+            m_active = false;
+            return false;
+        }
+    }
+
+    // 方案 A: 检测 ntdll 是否被 PAC 恢复 (前 12 字节是否还是我们的 jmp)
+    if (m_inlineHookActive && m_ntdllNtReadAddr) {
+        uint8_t curBytes[12] = {};
+        if (stealth::StealthMemory::Read(m_cs2Process, m_ntdllNtReadAddr, curBytes, 12)) {
+            uint8_t expectedJmp[12] = {};
+            expectedJmp[0] = 0x48;
+            expectedJmp[1] = 0xB8;
+            memcpy(expectedJmp + 2, &m_inlineFilterFuncAddr, sizeof(m_inlineFilterFuncAddr));
+            expectedJmp[10] = 0xFF;
+            expectedJmp[11] = 0xE0;
+
+            if (memcmp(curBytes, expectedJmp, 12) != 0) {
+                ByovdDiag("B565:Maintain: ntdll hook lost, rehooking\n");
+                // 释放旧 trampoline + filter
+                if (m_inlineFilterFuncAddr) {
+                    VirtualFreeEx(m_cs2Process, (LPVOID)m_inlineFilterFuncAddr, 0, MEM_RELEASE);
+                    m_inlineFilterFuncAddr = 0;
+                }
+                m_inlineHookActive = false;
+
+                if (InstallInlineHook(m_cs2Process, m_ntdllNtReadAddr,
+                                       m_clientBase, m_patchAddr)) {
+                    ByovdDiag("B565:Maintain: inline hook reinstalled\n");
+                    return true;
+                }
+                m_active = false;
+                return false;
+            }
+        }
+    }
+
+    return true;  // hook 仍活跃
 }
 
 } // namespace stealth

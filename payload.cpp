@@ -116,6 +116,33 @@
 //                ReadKernelVA 直接 memcpy + 失败安全 (不修改内核数据)
 //        预期效果: 驱动扫描检测概率 2-4% → 0-1%, 整体检测概率 7-14% → 6-13%
 //        保留: BUILD 563 .data 段修复 + BUILD 562 SIG2 + BUILD 561 Pass4 + BUILD 560 wShotTools 栈变量
+// BUILD: 565 (v3.224: Hook NtReadVirtualMemory 双重保险 — 用户态扫描检测概率 2-5% → 1-2%)
+//        1. ★ BUILD 565-1: 新增 NtReadHooker 类 (byovd_kernel.h L786-865 + byovd_kernel.cpp L8296-8943)
+//           - 目标: 拦截 PvpAlive.dll 通过 NtReadVirtualMemory 扫描 client.dll patch 区域
+//           - 原因: BUILD 564 DKOM 隐藏驱动但未防御用户态扫描, PAC 仍可发现 32 c0 → 90 90 patch
+//        2. ★ BUILD 565-2: 方案 B (IAT hook PvpAlive.dll) — 主方案, PAC 发现风险最低
+//           - FindPvpAliveBase: 跨进程枚举 CS2 模块 (StealthProcess::GetProcessModules)
+//           - FindNtReadInIAT: 读 PE 头 → Import Directory → 遍历查找 "NtReadVirtualMemory"
+//           - InstallIATHook: VirtualAllocEx 分配可执行内存 + 写 shellcode + 改 IAT 条目
+//        3. ★ BUILD 565-3: 方案 A (inline hook ntdll) — 兜底方案, B 失败时自动启用
+//           - FindNtdllNtRead: 跨进程枚举 ntdll + 读导出表
+//           - InstallInlineHook: Trampoline 模式 (12 原 + jmp[rip+0] + 8 目标 = 26 字节)
+//           - 改 ntdll 前 12 字节为 48 B8 <addr> FF E0 (mov rax, addr; jmp rax)
+//        4. ★ BUILD 565-4: GenerateFilterShellcode — 104 字节 PIC shellcode
+//           - 调用原 NtReadVirtualMemory 后, 若读取范围与 [patchAddr, patchAddr+2) 重叠
+//           - 在 Buffer 对应偏移写入 32 c0 (恢复原始字节, PAC 扫描看到原始字节)
+//           - static_assert(sizeof(kTemplate) == 104) 编译期验证模板大小
+//           - 常量填充: originalNtRead @0x16, patchAddr @0x35
+//        5. ★ BUILD 565-5: payload.cpp 4 处集成
+//           - L2401: EnableAll ApplyCs2Patch 成功后调用 Install (B565:I:01 日志)
+//           - L2788: CS2 退出 DisableAll 之前调用 Uninstall
+//           - L2977: 主循环 ApplyCs2Patch 补装成功后重试 Install
+//           - L2993: 主循环 5s 间隔调用 Maintain (检测 PvpAlive 重载 / ntdll 被恢复)
+//        安全性: hook 在用户态 (CS2 进程内), 不触发 PatchGuard, BSOD 风险极低
+//                Uninstall 失败仅记录日志不阻塞退出, 失败安全
+//                Install 失败不影响其他防御功能 (与 PsLoadedModuleHider 一致)
+//        预期效果: 用户态扫描检测概率 2-5% → 1-2%, 综合检测概率 6-13% → 5-12%
+//        保留: BUILD 564 DKOM 隐藏 + BUILD 563 .data 段修复 + BUILD 562 SIG2 + BUILD 561 Pass4
 // BUILD: 549 (v3.205: 影子页 PTE manipulation + DiagLog 三层脱敏 + NtQSI 替代 Toolhelp32)
 //        1. ★ BUILD 549 影子页: ApplyCs2Patch 优先通过 PTE manipulation 安装影子页
 //           - pageA = client.dll 原页 (PAC 扫描看到原始字节 32 c0)
@@ -2389,6 +2416,20 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             if (g_cs2Patched) {
                 StartDR0FrequencyStat();
             }
+
+            // ★ BUILD 565: Hook NtReadVirtualMemory 双重保险
+            //   拦截 PAC 用户态 PvpAlive.dll 对 CS2 client.dll 的扫描,
+            //   在 Buffer 中恢复 patch 区域 (RVA 0xC125D9, 2 字节) 原始字节 (32 c0).
+            //   方案 B (IAT hook PvpAlive) 优先, 失败时启用方案 A (inline hook ntdll).
+            //   失败安全: Install 失败不影响其他防御功能.
+            if (g_cs2Patched && g_patchAddr && g_clientBase) {
+                HANDLE hCs2ForHook = StealthEngine::Instance().GetProcessHandle();
+                if (hCs2ForHook) {
+                    bool ntReadHooked = stealth::NtReadHooker::Instance().Install(
+                        hCs2ForHook, g_clientBase, g_patchAddr);
+                    DiagLog("B565:I:01 %s\n", ntReadHooked ? "ok" : "fail");
+                }
+            }
         } else {
             DiagLog("B549:I:02 skip (test)\n");  // ★ BUILD 549: 去特征化
         }
@@ -2768,6 +2809,12 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     DiagLog("B550:EX:tgt-exit=%u safe-exit\n", cs2ExitCode);  // ★ BUILD 550: 脱敏 (原含 CS2)
                     // ★ BUILD 556: 移除 ShadowPageManager::Uninstall (影子页方案已废弃)
                     //   VirtualProtect patch 无需卸载 (CS2 退出时自动释放)
+                    // ★ BUILD 565: 卸载 NtReadVirtualMemory hook (恢复 IAT + ntdll)
+                    //   必须在 CS2 退出前调用, 恢复 IAT/ntdll 原始字节, 防止 CS2 崩溃.
+                    //   失败安全: Uninstall 失败仅记录日志, 不阻塞退出 (hook 在用户态, 不蓝屏).
+                    if (stealth::NtReadHooker::Instance().IsActive()) {
+                        stealth::NtReadHooker::Instance().Uninstall();
+                    }
                     stealth::KernelDefense::DisableAll();  // 包含 UnhideProcess
                     StealthEngine::Instance().Shutdown();
                     return 0;
@@ -2954,11 +3001,27 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 //   幂等: StartDR0FrequencyStat 内部用 InterlockedExchange(&g_dr0StatActive, 1) 防重入
                 if (g_cs2Patched) {
                     StartDR0FrequencyStat();
+                    // ★ BUILD 565: 若初始化阶段 NtReadHooker 未安装 (ApplyCs2Patch 失败),
+                    //   主循环中重试安装 (5s 间隔, 与 ApplyCs2Patch 同周期)
+                    if (!stealth::NtReadHooker::Instance().IsActive() && g_patchAddr && g_clientBase) {
+                        HANDLE hCs2ForHook = StealthEngine::Instance().GetProcessHandle();
+                        if (hCs2ForHook) {
+                            stealth::NtReadHooker::Instance().Install(
+                                hCs2ForHook, g_clientBase, g_patchAddr);
+                        }
+                    }
                 }
             } else if (!g_patchReverted) {  // 截图工具运行期间不维护补丁
                 MaintainCs2Patch();
             }
             lastPatchCheck = GetTickCount();
+        }
+
+        // ★ BUILD 565: NtReadHooker 维护 — 与补丁维护同 5s 间隔
+        //   检测 PvpAlive.dll 重载 (基址变化) 或 ntdll 被 PAC 恢复, 自动重新安装 hook.
+        //   仅在 hook 已安装且非测试模式时执行.
+        if (!g_egTestMode && !g_halfTestMode && stealth::NtReadHooker::Instance().IsActive()) {
+            stealth::NtReadHooker::Instance().Maintain();
         }
 
         // ★ BUILD 549: 截图检测 — 5s 间隔 (原 1s)

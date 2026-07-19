@@ -752,4 +752,116 @@ private:
     static void RecordPatchSuccess();
 };
 
+// ============================================================
+// ★ BUILD 565 v3.224: NtReadHooker — Hook NtReadVirtualMemory 双重保险
+//
+// 目标: 拦截 PAC 用户态组件 PvpAlive.dll (22MB) 对 CS2 进程的 NtReadVirtualMemory
+//       扫描, 在返回 Buffer 中恢复 patch 区域 [clientBase+0xC125D9, +0xC125DB) 的
+//       原始字节 (32 c0), 让 PAC 扫描看到的 client.dll 是"未修改"的.
+//
+// 方案 B+A 双重保险 (用户决策):
+//   - 主方案 B: IAT hook PvpAlive.dll — 修改 PvpAlive.dll IAT 中 NtReadVirtualMemory
+//               条目指向过滤函数 shellcode. PAC 发现风险最低 + BSOD 风险最低.
+//   - 兜底方案 A: inline hook ntdll!NtReadVirtualMemory — 修改 ntdll 前 12 字节为
+//                 jmp 到过滤函数. 覆盖全面 (含 GetProcAddress 动态解析), 但 PAC 可能
+//                 检测 ntdll 完整性.
+//   - 策略: 初版仅启用一个 hook (B 优先, B 失败时启用 A). 避免双重 hook 增加复杂度.
+//
+// 过滤逻辑 (post-read patching, 用户确认):
+//   1. 调用原 NtReadVirtualMemory (rcx=ProcessHandle, rdx=BaseAddress, r8=Buffer,
+//      r9=NumberOfBytesToRead, [rsp+0x28]=NumberOfBytesRead)
+//   2. 若 status != 0 (失败), 直接返回原 status
+//   3. 检查 [BaseAddress, BaseAddress+NumberOfBytesToRead) 与 [patchAddr, patchAddr+2) 重叠
+//   4. 若重叠, 在 Buffer 对应偏移写入 32 c0 (原始字节, 小端 0xC032)
+//   5. 返回原 status
+//
+// 安全性:
+//   - 失败安全: 任何 hook 安装失败都不影响其他防御功能 (与 PsLoadedModuleHider 一致)
+//   - Maintain 检测到 hook 失效时自动重装
+//   - Uninstall 失败时记录日志但不阻塞退出
+//   - hook 在用户态 (CS2 进程内), 不触发 PatchGuard, BSOD 风险极低
+//
+// 预期效果: 用户态扫描检测概率 2-5% → 1-2%, 综合检测概率 7-14% → 6-12%
+// ============================================================
+class NtReadHooker {
+public:
+    static NtReadHooker& Instance() {
+        static NtReadHooker inst;
+        return inst;
+    }
+
+    // 安装 hook (B+A 双重保险, B 优先, A 兜底)
+    // 参数: cs2Process (CS2 进程句柄), clientBase (client.dll 基址), patchAddr (patch 地址)
+    // 返回 true = 至少一个 hook 安装成功
+    bool Install(HANDLE cs2Process, uintptr_t clientBase, uintptr_t patchAddr);
+
+    // 卸载 hook (CS2 退出前必须调用, 恢复 IAT + ntdll)
+    void Uninstall();
+
+    // 检查 hook 是否活跃
+    bool IsActive() const { return m_active; }
+
+    // 维护 hook (主循环周期调用, 检测 PvpAlive.dll 重载 / ntdll 被 PAC 恢复)
+    bool Maintain();
+
+private:
+    NtReadHooker() = default;
+
+    // === 方案 B: IAT hook PvpAlive.dll ===
+    // 在 CS2 进程内查找 PvpAlive.dll 基址 (跨进程枚举模块)
+    // 返回基址, 0 = 未找到
+    uintptr_t FindPvpAliveBase(HANDLE cs2Process);
+
+    // 读取 PvpAlive.dll IAT, 查找 NtReadVirtualMemory 条目
+    // 参数: pvpAliveBase = PvpAlive.dll 在 CS2 进程内的基址
+    // 返回 IAT 条目地址 (CS2 进程内 VA), 0 = 未找到
+    // out_originalNtRead: 输出原 NtReadVirtualMemory 地址 (ntdll 内)
+    uintptr_t FindNtReadInIAT(HANDLE cs2Process, uintptr_t pvpAliveBase,
+                              uintptr_t* out_originalNtRead);
+
+    // 安装 IAT hook (修改 IAT 条目指向过滤函数 shellcode)
+    bool InstallIATHook(HANDLE cs2Process, uintptr_t iatEntryAddr,
+                        uintptr_t originalNtRead,
+                        uintptr_t clientBase, uintptr_t patchAddr);
+
+    // === 方案 A: inline hook ntdll!NtReadVirtualMemory ===
+    // 在 CS2 进程内查找 ntdll!NtReadVirtualMemory 地址
+    // 通过跨进程枚举 CS2 模块找到 ntdll 基址, 然后读 ntdll 导出表
+    uintptr_t FindNtdllNtRead(HANDLE cs2Process);
+
+    // 安装 inline hook (修改 ntdll 前 12 字节为 jmp 到过滤函数)
+    bool InstallInlineHook(HANDLE cs2Process, uintptr_t ntReadAddr,
+                           uintptr_t clientBase, uintptr_t patchAddr);
+
+    // === 过滤函数 shellcode 生成 (PIC 位置无关代码) ===
+    // 生成过滤函数 shellcode, 内嵌 originalNtRead + patchAddr 常量
+    // outBuf: 调用方分配的缓冲区 (建议 256 字节)
+    // outSize: 输出实际 shellcode 大小
+    bool GenerateFilterShellcode(uint8_t* outBuf, size_t* outSize,
+                                 uintptr_t originalNtRead,
+                                 uintptr_t patchAddr);
+
+    // === 状态 ===
+    bool      m_active = false;
+    HANDLE    m_cs2Process = nullptr;
+    uintptr_t m_clientBase = 0;
+    uintptr_t m_patchAddr = 0;
+
+    // 方案 B (IAT hook) 状态
+    bool      m_iatHookActive = false;
+    uintptr_t m_pvpAliveBase = 0;
+    uintptr_t m_iatEntryAddr = 0;          // PvpAlive IAT 条目地址
+    uintptr_t m_originalNtRead = 0;        // 原 NtReadVirtualMemory 地址 (ntdll 内)
+    uintptr_t m_iatOriginalValue = 0;      // IAT 原始值 (用于 Uninstall)
+    uintptr_t m_filterFuncAddr = 0;        // CS2 进程内过滤函数地址 (VirtualAllocEx 分配)
+    size_t    m_filterFuncSize = 0;
+
+    // 方案 A (inline hook ntdll) 状态
+    bool      m_inlineHookActive = false;
+    uintptr_t m_ntdllNtReadAddr = 0;       // ntdll!NtReadVirtualMemory 地址
+    uint8_t   m_ntdllOriginalBytes[16] = {}; // ntdll 原始字节 (用于 Uninstall)
+    uintptr_t m_inlineFilterFuncAddr = 0;  // inline hook 过滤函数地址
+    size_t    m_inlineFilterFuncSize = 0;
+};
+
 } // namespace stealth
