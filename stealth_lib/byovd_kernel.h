@@ -931,6 +931,19 @@ public:
     // 维护 hook (主循环周期调用, 检测 PvpAlive.dll 重载 / ntdll 被 PAC 恢复)
     bool Maintain();
 
+    // ★ BUILD 567 v3.257 DIAG: 公共 getter — 供 payload.cpp DiagLog 输出内部状态
+    //   原因: ByovdDiag 在 release 模式 (NDEBUG) 下被宏消除, NtReadHooker::Maintain
+    //         内部的 ByovdDiag 调用不输出日志. 调查 CS2 对局加载崩溃需要这些状态.
+    //   方案: 暴露 getter, payload.cpp 用 DiagLog (release 模式仍启用) 输出.
+    bool      IsIATHookActive()     const { return m_iatHookActive; }
+    bool      IsInlineHookActive()  const { return m_inlineHookActive; }
+    uintptr_t GetPvpAliveBase()     const { return m_pvpAliveBase; }
+    uintptr_t GetFilterFuncAddr()   const { return m_filterFuncAddr; }
+    uintptr_t GetNtdllNtReadAddr()  const { return m_ntdllNtReadAddr; }
+    uintptr_t GetInlineFilterFunc() const { return m_inlineFilterFuncAddr; }
+    uintptr_t GetIatEntryAddr()     const { return m_iatEntryAddr; }
+    uintptr_t GetOriginalNtRead()   const { return m_originalNtRead; }
+
 private:
     NtReadHooker() = default;
 

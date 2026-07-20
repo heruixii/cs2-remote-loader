@@ -787,7 +787,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.256 启动摘要 (限制 codeSize 只覆盖 .text 段 — 修复 .rdata 加密崩溃)\n");
+    DiagLog("BUILD 567 v3.257 启动摘要 (诊断 CS2 对局加载崩溃 — 主循环心跳 + NtReadHooker 状态)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -826,7 +826,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.256 退出摘要\n");
+    DiagLog("BUILD 567 v3.257 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -851,7 +851,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.256 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.257 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
@@ -1788,11 +1788,20 @@ static void MaintainCs2Patch() {
     //   用 XOR 比较避免明文 0x32 0xc0 出现在二进制中 (g_patKey 是 volatile 防止常量传播)
     // ★ BUILD 558 FIX-4: 跨程读取 patch 地址的 2 字节
     uint8_t curBytes[2] = {};
-    if (!stealth::StealthMemory::Read(hProcess, patchAddr, curBytes, 2)) return;
+    if (!stealth::StealthMemory::Read(hProcess, patchAddr, curBytes, 2)) {
+        // ★ BUILD 567 v3.257 DIAG: 记录读取失败
+        DiagLog("B558:MP:read fail addr=0x%llX\n", (unsigned long long)patchAddr);
+        return;
+    }
+
+    // ★ BUILD 567 v3.257 DIAG: 记录当前 patch 字节 (用 XOR 加密避免明文)
+    DiagLog("B558:MP:cur b0=0x%02X b1=0x%02X (patAddr=0x%llX)\n",
+        curBytes[0], curBytes[1], (unsigned long long)patchAddr);
 
     if ((uint8_t)(curBytes[0] ^ g_patKey) == PAT_ENC[0] &&
         (uint8_t)(curBytes[1] ^ g_patKey) == PAT_ENC[1]) {
         // patch 被 PAC 恢复为原始字节 (32 c0), 重新写入 (90 90)
+        DiagLog("B558:MP:repatch (restored to orig)\n");
         DWORD oldProtect = 0;
         if (stealth::StealthMemory::Protect(hProcess, patchAddr, 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
             uint8_t patchBytes[2] = { 0x90, 0x90 };
@@ -3919,6 +3928,39 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             DiagLog("B238:NR:M+ pre\n");
             stealth::NtReadHooker::Instance().Maintain();
             DiagLog("B238:NR:M+ post\n");
+        }
+
+        // ★ BUILD 567 v3.257 DIAG: 主循环心跳 — 5s 间隔
+        //   目的: 调查 CS2 对局加载崩溃 (主菜单正常, 进入对局加载界面崩溃 0xC0000005)
+        //   日志含: frameCount, CS2 是否活跃, hook 内部状态 (IAT/inline/PvpAlive/filter),
+        //   patch 状态 (g_cs2Patched/g_patchReverted/g_patchAddr)
+        //   判读: 崩溃前最后一条 B257:HB 显示崩溃时刻主循环状态;
+        //         若 PvpAlive 基址=0 → CS2 卸载 PvpAlive.dll (对局加载触发);
+        //         若 filterFunc=0 → hook 未安装或被清理;
+        //         若 inlineHook=1 → 走 inline hook 路径 (shellcode 在 CS2 进程内执行)
+        {
+            static DWORD lastHeartbeat = 0;
+            if (GetTickCount() - lastHeartbeat > 5000) {
+                lastHeartbeat = GetTickCount();
+                bool cs2Alive = false;
+                HANDLE hCs2 = StealthEngine::Instance().GetProcessHandle();
+                if (hCs2) {
+                    DWORD ec = STILL_ACTIVE;
+                    if (GetExitCodeProcess(hCs2, &ec) && ec == STILL_ACTIVE) cs2Alive = true;
+                }
+                auto& nrh = stealth::NtReadHooker::Instance();
+                DiagLog("B257:HB:fc=%d cs2=%d act=%d iat=%d inl=%d pvp=0x%llX ff=0x%llX nf=0x%llX pat=%d rev=%d pa=0x%llX\n",
+                    frameCount, cs2Alive ? 1 : 0,
+                    nrh.IsActive() ? 1 : 0,
+                    nrh.IsIATHookActive() ? 1 : 0,
+                    nrh.IsInlineHookActive() ? 1 : 0,
+                    (unsigned long long)nrh.GetPvpAliveBase(),
+                    (unsigned long long)nrh.GetFilterFuncAddr(),
+                    (unsigned long long)nrh.GetInlineFilterFunc(),
+                    g_cs2Patched ? 1 : 0,
+                    g_patchReverted ? 1 : 0,
+                    (unsigned long long)g_patchAddr);
+            }
         }
 
         // ★ BUILD 549: 截图检测 — 5s 间隔 (原 1s)
