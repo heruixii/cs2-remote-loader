@@ -851,7 +851,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.264 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.265 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",

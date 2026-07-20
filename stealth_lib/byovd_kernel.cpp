@@ -7884,6 +7884,16 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
             return false;
         }
 
+        // ★ BUILD 567 v3.265 FIX: 如果 L=0 且 R=0, 则 sVpn 或 eVpn 必须非零
+        //   v3.264 测试 Win11 24H2: off=0xD88 误报 L=0 R=0 P=非空 sVpn=0 eVpn=0
+        //   真实 VadRoot 是 AVL 树根节点, 通常有子节点 (loader.exe 有多个 VAD 节点)
+        //   例外: 叶子节点 (L=R=0) 的 sVpn/eVpn 应该非零 (真实 VAD 范围)
+        //   修复: L=0 且 R=0 且 sVpn=0 且 eVpn=0 → 误报, 拒绝
+        if (!left && !right && !startVpn && !endVpn) {
+            VadDiag("B554:EVR:VR off=0x%X FAIL L=R=sVpn=eVpn=0 (likely not VadRoot)\n", off);
+            return false;
+        }
+
         // ★ BUILD 555 P2-verify: 修正 VPN 范围检查 (原 < 0x100000 过于严格)
         //   x64 用户态 VA 范围: 0 to 0x0000_7FFF_FFFF_FFFF (128 TB)
         //   VPN = VA >> 12, 用户态 VPN 范围: 0 to 0x7FFF_FFFF (32 位, ~32 亿页)
@@ -7957,7 +7967,7 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
             return true;
         }
     }
-    VadDiag("B554:EVR: FAIL no valid VadRoot offset (scanMatch=%d range=0x400-0x1000)\n", scanMatchCount);
+    VadDiag("B554:EVR: FAIL no valid VadRoot offset (scanMatch=%d range=0x400-0x1800)\n", scanMatchCount);
     return false;
 }
 
