@@ -8031,8 +8031,13 @@ static bool FindAndModifyVadNode(KernelMemoryAccessor& kma, uint64_t vadNode, ui
 
     uint64_t targetVpn = targetVa >> 12;
     int maxDepth = 128;
+    int traverseCount = 0;  // ★ BUILD 567 v3.264 DIAG: 遍历计数
+
+    VadDiag("B554:FMVN:enter vadRoot=0x%llX targetVa=0x%llX targetVpn=0x%llX\n",
+        (unsigned long long)vadNode, (unsigned long long)targetVa, (unsigned long long)targetVpn);
 
     while (vadNode && maxDepth-- > 0) {
+        traverseCount++;
         // ★ BUILD 567 v3.236 FIX-4: 放宽边界到 [0xFFFF8000..., 0xFFFFFD00...) — 与 validateVadRoot 一致
         //   根因: v3.235 测试 vadRoot=0xFFFFE48DDD3F9FD8 在非分页池扩展区域 (0xFFFF8000-0xFFFFF680),
         //         被原边界 [0xFFFFFC00, 0xFFFFFD00) 拒绝 → FindAndModifyVadNode result=0 → VAD 隐藏失败.
@@ -8045,6 +8050,8 @@ static bool FindAndModifyVadNode(KernelMemoryAccessor& kma, uint64_t vadNode, ui
         //           即使遍历到非 VAD 节点, 后续 ReadKernelVA 读取 VadStartingVpn/VadEndingVpn 会返回
         //           垃圾值, targetVpn 范围检查失败 → 自然停止遍历 (maxDepth 兜底).
         if (vadNode < 0xFFFF800000000000ULL || vadNode >= 0xFFFFFD0000000000ULL) {
+            VadDiag("B554:FMVN:FAIL addr range vadNode=0x%llX (traverse=%d)\n",
+                (unsigned long long)vadNode, traverseCount);
             return false;
         }
 
@@ -8053,13 +8060,34 @@ static bool FindAndModifyVadNode(KernelMemoryAccessor& kma, uint64_t vadNode, ui
         //   (vadRoot=0xFFFFE48D... 在 0xFFFF8000-0xFFFFF680, ReadKernelVA 白名单拒绝)
         //   ReadKernelVAUnsafe 边界 [0xFFFF8000, 0xFFFFFE00) 覆盖所有内核池区域
         uint64_t startVpn = 0, endVpn = 0;
-        if (!kma.ReadKernelVAUnsafe(vadNode + VadOffsets::VadStartingVpn, &startVpn, 8)) return false;
-        if (!kma.ReadKernelVAUnsafe(vadNode + VadOffsets::VadEndingVpn, &endVpn, 8)) return false;
+        if (!kma.ReadKernelVAUnsafe(vadNode + VadOffsets::VadStartingVpn, &startVpn, 8)) {
+            VadDiag("B554:FMVN:FAIL read startVpn vadNode=0x%llX (traverse=%d)\n",
+                (unsigned long long)vadNode, traverseCount);
+            return false;
+        }
+        if (!kma.ReadKernelVAUnsafe(vadNode + VadOffsets::VadEndingVpn, &endVpn, 8)) {
+            VadDiag("B554:FMVN:FAIL read endVpn vadNode=0x%llX (traverse=%d)\n",
+                (unsigned long long)vadNode, traverseCount);
+            return false;
+        }
+
+        // ★ BUILD 567 v3.264 DIAG: 遍历日志 (前 8 次)
+        if (traverseCount <= 8) {
+            VadDiag("B554:FMVN:trav=%d node=0x%llX sVpn=0x%llX eVpn=0x%llX\n",
+                traverseCount, (unsigned long long)vadNode,
+                (unsigned long long)startVpn, (unsigned long long)endVpn);
+        }
 
         if (targetVpn >= startVpn && targetVpn <= endVpn) {
             // 找到目标 VAD 节点, 修改 PrivateMemory flag
             uint64_t flags = 0;
-            if (!kma.ReadKernelVAUnsafe(vadNode + VadOffsets::VadFlags, &flags, 8)) return false;
+            if (!kma.ReadKernelVAUnsafe(vadNode + VadOffsets::VadFlags, &flags, 8)) {
+                VadDiag("B554:FMVN:FAIL read flags (traverse=%d)\n", traverseCount);
+                return false;
+            }
+
+            VadDiag("B554:FMVN:FOUND node=0x%llX flags=0x%llX (traverse=%d)\n",
+                (unsigned long long)vadNode, (unsigned long long)flags, traverseCount);
 
             // 检查 PrivateMemory bit 是否已设置
             if (flags & VadOffsets::PrivateMemoryBit) {
@@ -8073,19 +8101,24 @@ static bool FindAndModifyVadNode(KernelMemoryAccessor& kma, uint64_t vadNode, ui
                 // ★ BUILD 567 v3.236 FIX-4: 改用 WriteUnsafe — VAD 节点可能在非分页池扩展区域
                 kma.WriteUnsafe<uint64_t>(vadNode + VadOffsets::VadFlags, flags);
 
-                // 同时尝试修改 ControlArea → FilePointer 指向已知模块
-                // 这可以进一步降低可疑度, 但需要额外解析
-                // 跳过: 仅修改 PrivateMemory + Protection 已经够用
-
+                VadDiag("B554:FMVN:MODIFIED node=0x%llX newFlags=0x%llX\n",
+                    (unsigned long long)vadNode, (unsigned long long)flags);
                 return true;
             }
+            VadDiag("B554:FMVN:already MAPPED (traverse=%d)\n", traverseCount);
             return false; // 已经是 MAPPED
         }
 
         // AVL 遍历: 根据 VPN 决定走左子树还是右子树
         uint64_t left = 0, right = 0;
-        if (!kma.ReadKernelVAUnsafe(vadNode + VadOffsets::RbnLeft, &left, 8)) return false;
-        if (!kma.ReadKernelVAUnsafe(vadNode + VadOffsets::RbnRight, &right, 8)) return false;
+        if (!kma.ReadKernelVAUnsafe(vadNode + VadOffsets::RbnLeft, &left, 8)) {
+            VadDiag("B554:FMVN:FAIL read left (traverse=%d)\n", traverseCount);
+            return false;
+        }
+        if (!kma.ReadKernelVAUnsafe(vadNode + VadOffsets::RbnRight, &right, 8)) {
+            VadDiag("B554:FMVN:FAIL read right (traverse=%d)\n", traverseCount);
+            return false;
+        }
 
         if (targetVpn < startVpn) {
             vadNode = left;
@@ -8093,6 +8126,7 @@ static bool FindAndModifyVadNode(KernelMemoryAccessor& kma, uint64_t vadNode, ui
             vadNode = right;
         }
     }
+    VadDiag("B554:FMVN:FAIL maxDepth reached (traverse=%d)\n", traverseCount);
     return false;
 }
 
