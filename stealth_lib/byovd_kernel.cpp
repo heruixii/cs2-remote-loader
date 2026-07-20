@@ -3773,66 +3773,32 @@ bool DKOMProcessHider::UnhideProcessByPid(DWORD pid) {
 
     uint64_t currentLinksVA = entry->eprocess + m_linksOffset;
 
-    // 读取 prev->Flink 和 next->Blink 的当前值, 检查链表是否被修改
-    // ★ BUILD 567 v3.235: 使用 ReadUnsafe (prev/next EPROCESS 可能在非分页池扩展区域)
-    uint64_t prevFlinkNow = kma.ReadUnsafe<uint64_t>(entry->blinkBackup);     // prev->Flink 当前值
-    uint64_t nextBlinkNow = kma.ReadUnsafe<uint64_t>(entry->flinkBackup + 8); // next->Blink 当前值
+    // ★ BUILD 567 v3.277 FIX: 永远用 self-loop, 不碰邻居进程 — 避免 0x50 蓝屏
+    //   v3.276 测试: 关闭 CS2 蓝屏 0x50 in SysDrv_34C7.sys (BYOVD driver)
+    //   根因: listIntact 分支写入 prev/next 邻居 EPROCESS, 如果邻居进程已退出,
+    //         EPROCESS 被释放 → driver 写入已释放内核内存 → 0x50
+    //   修复: 永远用 self-loop (只写 current 自己的 EPROCESS, 保证有效)
+    //   安全性: loader.exe 退出时 PspExitProcess 调用 RemoveEntryList,
+    //           self-loop (Flink=Blink=&current) 时 RemoveEntryList 是 no-op:
+    //             Flink->Blink = Blink → current->Blink = &current (no-op)
+    //             Blink->Flink = Flink → current->Flink = &current (no-op)
+    //           不碰邻居进程, 不会 0x139 也不会 0x50.
+    //   副作用: loader.exe 不重新加入 ActiveProcessLinks (保持隐藏状态直到退出),
+    //           但 CS2 已退出, 无需被枚举.
+    // ★ BUILD 567 v3.235: 使用 WriteUnsafe (EPROCESS 可能在非分页池扩展区域)
+    bool w1 = kma.WriteUnsafe(currentLinksVA,     currentLinksVA);  // current->Flink = &current (self-loop)
+    bool w2 = kma.WriteUnsafe(currentLinksVA + 8, currentLinksVA);  // current->Blink = &current (self-loop)
 
-    bool listIntact = (prevFlinkNow == entry->flinkBackup && nextBlinkNow == entry->blinkBackup);
+    ByovdDiag("DKOM.UnhideByPid: self-loop (v3.277 always) w1(Flink)=%d w2(Blink)=%d "
+              "(pid=%u EPROC=0x%llX currentLinks=0x%llX)\n",
+        w1?1:0, w2?1:0, pid,
+        (unsigned long long)entry->eprocess, (unsigned long long)currentLinksVA);
 
-    if (listIntact) {
-        // 链表未被修改 — 使用原逻辑恢复 (正确将 current 重新链入)
-        // ★ BUILD 558 FIX: 必须同时恢复 current.Flink/Blink
-        //   原因: HideProcessByPid 现在对所有进程调用 SelfLoopHarden,
-        //         current.Flink/Blink 被改为 &current (自循环).
-        //         若只写 prev.Flink/next.Blink, 链表会变成:
-        //           prev → current → (current.Flink=&current 自循环) → 死循环
-        //         必须恢复 current.Flink=next, current.Blink=prev 才能完整链入.
-        //   兼容性: 若 SelfLoopHarden 未被调用 (旧版), w3/w4 写入与原值相同, 无副作用.
-        // ★ BUILD 567 v3.235: 使用 WriteUnsafe (EPROCESS 可能在非分页池扩展区域)
-        bool w1 = kma.WriteUnsafe(entry->blinkBackup, currentLinksVA);       // prev.Flink = &current.ActiveProcessLinks
-        bool w2 = kma.WriteUnsafe(entry->flinkBackup + 8, currentLinksVA);   // next.Blink = &current.ActiveProcessLinks
-        bool w3 = kma.WriteUnsafe(currentLinksVA, entry->flinkBackup);       // current.Flink = next (恢复原始值)
-        bool w4 = kma.WriteUnsafe(currentLinksVA + 8, entry->blinkBackup);   // current.Blink = prev (恢复原始值)
-
-        ByovdDiag("DKOM.UnhideByPid: list intact — w1(prev.Flink)=%d w2(next.Blink)=%d "
-                  "w3(cur.Flink)=%d w4(cur.Blink)=%d "
-                  "(pid=%u EPROC=0x%llX linksOffset=0x%X currentLinks=0x%llX)\n",
-            w1?1:0, w2?1:0, w3?1:0, w4?1:0,
-            pid, (unsigned long long)entry->eprocess, m_linksOffset,
-            (unsigned long long)currentLinksVA);
-
-        entry->hidden = false;
-        entry->eprocess = 0;
-        entry->flinkBackup = 0;
-        entry->blinkBackup = 0;
-        return (w1 && w2 && w3 && w4);
-    } else {
-        // 链表被修改 — 有新进程 C 插入到 prev 和 next 之间
-        // 使用"自循环"回退: current->Flink=&current, current->Blink=&current
-        // 不修改 prev/next, 避免破坏新插入进程 C 的链表项
-        // 注意: 若 PerformUnlink 后调用了 SelfLoopHarden, current 已经是自循环状态,
-        //       此处再次写入幂等 (无副作用)
-        ByovdDiag("DKOM.UnhideByPid: LIST MODIFIED (new process inserted) — using self-loop "
-                  "(pid=%u prevFlink=0x%llX expect=0x%llX, nextBlink=0x%llX expect=0x%llX, EPROC=0x%llX)\n",
-            pid,
-            (unsigned long long)prevFlinkNow, (unsigned long long)entry->flinkBackup,
-            (unsigned long long)nextBlinkNow, (unsigned long long)entry->blinkBackup,
-            (unsigned long long)entry->eprocess);
-
-        // ★ BUILD 567 v3.235: 使用 WriteUnsafe (EPROCESS 可能在非分页池扩展区域)
-        bool w1 = kma.WriteUnsafe(currentLinksVA,     currentLinksVA);  // current->Flink = &current (self-loop)
-        bool w2 = kma.WriteUnsafe(currentLinksVA + 8, currentLinksVA);  // current->Blink = &current (self-loop)
-
-        ByovdDiag("DKOM.UnhideByPid: self-loop w1(Flink)=%d w2(Blink)=%d (pid=%u currentLinks=0x%llX)\n",
-            w1?1:0, w2?1:0, pid, (unsigned long long)currentLinksVA);
-
-        entry->hidden = false;
-        entry->eprocess = 0;
-        entry->flinkBackup = 0;
-        entry->blinkBackup = 0;
-        return (w1 && w2);
-    }
+    entry->hidden = false;
+    entry->eprocess = 0;
+    entry->flinkBackup = 0;
+    entry->blinkBackup = 0;
+    return (w1 && w2);
 }
 
 // ============================================================
