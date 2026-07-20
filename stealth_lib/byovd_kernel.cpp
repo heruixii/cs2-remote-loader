@@ -7951,19 +7951,27 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
         }
 
         // ★ BUILD 555 P2-verify: 修正 VPN 范围检查 (原 < 0x100000 过于严格)
-        //   x64 用户态 VA 范围: 0 to 0x0000_7FFF_FFFF_FFFF (128 TB)
-        //   VPN = VA >> 12, 用户态 VPN 范围: 0 to 0x7FFF_FFFF (32 位, ~32 亿页)
+        //   x64 用户态 VA 范围: 0 to 0x0000_7FFF_FFFF_FFFF (128 TB, 48 位)
+        //   VPN = VA >> 12, 用户态 VPN 范围: 0 to 0x7FFF_FFFF_FFFF (40 位, ~128TB 页)
         //   原 < 0x100000 (1M 页 = 4GB) 会误判大部分高地址 VAD 节点 (如 0x00007FF6_xxxx 加载基址)
-        //   新策略: 接受 0 to 0x7FFF_FFFF (用户态) 或 >= 0xFFFF800000000000 (内核特殊 VAD)
-        //   拒绝中间值 (0x80000000 to 0xFFFF7FFFFFFFFFFF, 非法/未定义区域)
-        // ★ BUILD 567 v3.263 FIX: 收紧 endVpn 验证 — 只接受用户态 VPN (< 0x80000000)
+        //   新策略: 接受 0 to 0x7FFFFFFFFFFF (用户态) 或 >= 0xFFFF800000000000 (内核特殊 VAD)
+        //   拒绝中间值 (0x800000000000 to 0xFFFF7FFFFFFFFFFF, 非法/未定义区域)
+        // ★ BUILD 567 v3.263 FIX: 收紧 endVpn 验证 — 只接受用户态 VPN (< 0x800000000000)
         //   v3.262 测试发现 off=0xAA8 误报: eVpn=0xFFFFF8018E7BAE30 (内核地址) 通过验证
         //   原因: VAD 是用户态内存映射, endVpn 应该是用户态 VPN, 不应是内核地址
-        //   修复: endVpn 只接受 < 0x80000000 (用户态), 不接受内核特殊 VAD
+        //   修复: endVpn 只接受 < 0x800000000000 (用户态), 不接受内核特殊 VAD
         //   startVpn 保持原逻辑 (允许内核特殊 VAD, 兼容系统进程)
         // ★ BUILD 567 v3.272: 现在 VPN 值正确 (4字节+VpnHigh), 此检查才真正生效
-        bool startValid = (startVpn < 0x80000000ULL) || (startVpn >= 0xFFFF800000000000ULL);
-        bool endValid   = (endVpn < 0x80000000ULL);  // ★ v3.263: 收紧, 只接受用户态
+        // ★ BUILD 567 v3.275 FIX: VPN 阈值从 32 位 (0x80000000) 改为 40 位 (0x800000000000)
+        //   v3.274 测试发现 off=0x558 被误拒: start=0x7FF461DC0 end=0x7FF561DDF
+        //   根因: (VpnHigh << 32) | VpnLow 合并后是 40 位值 (如 0x7FF461DC0)
+        //         但阈值 0x80000000 是 32 位 (2GB), 0x7FF461DC0 > 0x80000000 → 误拒
+        //   修复: 阈值改为 0x800000000000 (40 位, 对应 48 位用户态 VA 上限 0x7FFFFFFFFFFF)
+        //         用户态 VPN 范围: 0 to 0x7FFFFFFFFFFF (40 位)
+        //         内核特殊 VAD: >= 0xFFFF800000000000 (48 位内核 VA >> 12)
+        static constexpr uint64_t USER_VPN_MAX = 0x800000000000ULL;  // 40 位用户态 VPN 上限
+        bool startValid = (startVpn < USER_VPN_MAX) || (startVpn >= 0xFFFF800000000000ULL);
+        bool endValid   = (endVpn < USER_VPN_MAX);  // ★ v3.263: 收紧, 只接受用户态
         if (!startValid || !endValid) {
             VadDiag("B554:EVR:VR off=0x%X FAIL vpn valid start=0x%llX(%d) end=0x%llX(%d)\n",
                 off, (unsigned long long)startVpn, (int)startValid,
