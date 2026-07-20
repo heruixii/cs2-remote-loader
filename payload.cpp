@@ -185,6 +185,23 @@
 //        安全性: VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch), 无新内存访问模式
 //                降级模式下依赖 SHV_Install patch 兜底 (双重保险), BSOD 风险极低
 //        预期效果: VmxOnWrapper patch 持久有效, EPT 永不构造, 综合 2-5% → 1.5-4%
+// BUILD: 567 (v3.250: D1 细分为 4 个 4KB 页级子块诊断)
+//        ★ BUILD 567 v3.250 DIAG (D1 [208KB, 224KB) 崩溃页定位 7/20):
+//          - 背景: v3.249 确认 D0 完整完成 (D0done 出现), 崩溃在 D1 [208KB, 224KB)
+//                  (EA r3 D0/E0/E1/E2/E3/D0done 出现, D1 出现但未完成)
+//                  D1 范围 [dllBase+0x60000, dllBase+0x64000) 完全在 .rdata 段内
+//          - 诊断: D1 进一步细分为 4 个 4KB 页:
+//                  EA r3 F0 → 页 0 [208KB, 212KB) = [dllBase+0x60000, dllBase+0x61000) — .rdata 段
+//                  EA r3 F1 → 页 1 [212KB, 216KB) = [dllBase+0x61000, dllBase+0x62000) — .rdata 段
+//                  EA r3 F2 → 页 2 [216KB, 220KB) = [dllBase+0x62000, dllBase+0x63000) — .rdata 段
+//                  EA r3 F3 → 页 3 [220KB, 224KB) = [dllBase+0x63000, dllBase+0x64000) — .rdata 段
+//                  EA r3 D1done → D1 完成
+//          - 判读:
+//                  F0 出现, F1 未出现 → 崩溃在页 0 ([0x60000, 0x61000))
+//                  F1 出现, F2 未出现 → 崩溃在页 1 ([0x61000, 0x62000))
+//                  F2 出现, F3 未出现 → 崩溃在页 2 ([0x62000, 0x63000))
+//                  F3 出现, D1done 未出现 → 崩溃在页 3 ([0x63000, 0x64000))
+//                  D1done 出现 → D1 完成 (崩溃在 D2 或之后)
 // BUILD: 567 (v3.249: D0 细分为 4 个 4KB 页级子块诊断)
 //        ★ BUILD 567 v3.249 DIAG (D0 [192KB, 208KB) 崩溃页定位 7/20):
 //          - 背景: v3.248 确认崩溃在 XorCrypt 处理块 3 子块 0 [192KB, 208KB) 时
@@ -731,7 +748,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.249 启动摘要 (D0 细分为 4 个 4KB 页级子块诊断)\n");
+    DiagLog("BUILD 567 v3.250 启动摘要 (D1 细分为 4 个 4KB 页级子块诊断)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -770,7 +787,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.249 退出摘要\n");
+    DiagLog("BUILD 567 v3.250 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -795,7 +812,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.249 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.250 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",

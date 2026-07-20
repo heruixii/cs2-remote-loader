@@ -294,6 +294,7 @@ void SleepObfuscator::EncryptAll() {
                             else if (subIdx == 3) EK_RAW_LOG("EA r3 D3\n");
                             else EK_RAW_LOG("EA r3 DX\n");
                             // ★ v3.249: D0 内部页级诊断
+                            // ★ v3.250: D1 内部页级诊断 (D0 完整完成, 崩溃在 D1)
                             if (subIdx == 0) {
                                 SIZE_T pageProc = 0;
                                 int pageIdx = 0;
@@ -310,6 +311,29 @@ void SleepObfuscator::EncryptAll() {
                                     pageIdx++;
                                 }
                                 EK_RAW_LOG("EA r3 D0done\n");
+                            } else if (subIdx == 1) {
+                                // ★ v3.250: D1 内部页级诊断
+                                //   v3.249 测试: D0 完整完成 (D0done 出现), 崩溃在 D1 [208KB, 224KB)
+                                //   D1 范围 [dllBase+0x60000, dllBase+0x64000) 完全在 .rdata 段内
+                                //   F0 = [0x60000, 0x61000) — .rdata 段
+                                //   F1 = [0x61000, 0x62000) — .rdata 段
+                                //   F2 = [0x62000, 0x63000) — .rdata 段
+                                //   F3 = [0x63000, 0x64000) — .rdata 段
+                                SIZE_T pageProc = 0;
+                                int pageIdx = 0;
+                                while (pageProc < sub) {
+                                    SIZE_T page = sub - pageProc;
+                                    if (page > 0x1000) page = 0x1000; // 4KB
+                                    if (pageIdx == 0) EK_RAW_LOG("EA r3 F0\n");
+                                    else if (pageIdx == 1) EK_RAW_LOG("EA r3 F1\n");
+                                    else if (pageIdx == 2) EK_RAW_LOG("EA r3 F2\n");
+                                    else if (pageIdx == 3) EK_RAW_LOG("EA r3 F3\n");
+                                    else EK_RAW_LOG("EA r3 FX\n");
+                                    XorCrypt((BYTE*)region.addr + processed + subProc + pageProc, page, region.xorKey);
+                                    pageProc += page;
+                                    pageIdx++;
+                                }
+                                EK_RAW_LOG("EA r3 D1done\n");
                             } else {
                                 XorCrypt((BYTE*)region.addr + processed + subProc, sub, region.xorKey);
                             }
@@ -383,6 +407,23 @@ void SleepObfuscator::EncryptAll() {
                                     pageIdx++;
                                 }
                                 EK_RAW_LOG("EA r3 D0done\n");
+                            } else if (subIdx == 1) {
+                                // ★ v3.250: D1 内部页级诊断 (对称 isCode 分支)
+                                SIZE_T pageProc = 0;
+                                int pageIdx = 0;
+                                while (pageProc < sub) {
+                                    SIZE_T page = sub - pageProc;
+                                    if (page > 0x1000) page = 0x1000; // 4KB
+                                    if (pageIdx == 0) EK_RAW_LOG("EA r3 F0\n");
+                                    else if (pageIdx == 1) EK_RAW_LOG("EA r3 F1\n");
+                                    else if (pageIdx == 2) EK_RAW_LOG("EA r3 F2\n");
+                                    else if (pageIdx == 3) EK_RAW_LOG("EA r3 F3\n");
+                                    else EK_RAW_LOG("EA r3 FX\n");
+                                    XorCrypt((BYTE*)region.addr + processed + subProc + pageProc, page, region.xorKey);
+                                    pageProc += page;
+                                    pageIdx++;
+                                }
+                                EK_RAW_LOG("EA r3 D1done\n");
                             } else {
                                 XorCrypt((BYTE*)region.addr + processed + subProc, sub, region.xorKey);
                             }
