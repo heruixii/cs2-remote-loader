@@ -185,6 +185,19 @@
 //        安全性: VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch), 无新内存访问模式
 //                降级模式下依赖 SHV_Install patch 兜底 (双重保险), BSOD 风险极低
 //        预期效果: VmxOnWrapper patch 持久有效, EPT 永不构造, 综合 2-5% → 1.5-4%
+// BUILD: 567 (v3.253: import thunk 扫描精确匹配 — rel32 目标验证 .idata 段)
+//        ★ BUILD 567 v3.253 FIX (import thunk 扫描漏匹配修复 7/20):
+//          - 背景: v3.252 豁免 import thunk 所在页, 但扫描模式 `FF 25 xx xx xx xx 90 90`
+//                  只匹配 188 个有 2 nop 填充的 thunk, 漏掉 9 个 "other" 类型
+//                  (后面跟 ret/int3/其他指令, 不是 90 90).
+//          - 症状: v3.252 测试仍崩溃在 B238:EK:EA+ pre 之后 (EncryptAll 内部),
+//                  B567:252 日志显示 188 thunks, 30 exempt pages.
+//          - 实际统计: 197 个 thunk 指向 .idata, 分布在 12 个唯一页.
+//          - 修复: 扫描模式从 `FF 25 xx xx xx xx 90 90` 改为 `FF 25 xx xx xx xx` +
+//                  rel32 目标地址验证 (target 在 [idataPageStart, idataPageEnd) 范围内).
+//                  精确匹配所有 import thunk, 无误报.
+//          - 代价: ~12 页 (48KB) 不加密 (相对 .text 364KB 约 13%), 但消除崩溃根因.
+//          - 预期: B567:253 日志显示 197 thunks, ~35 exempt pages, EA done/DA done 出现.
 // BUILD: 567 (v3.252: 豁免所有 import thunk 所在页 — EkkoSleep 崩溃真正根因修复)
 //        ★ BUILD 567 v3.252 FIX (EkkoSleep 崩溃真正根因修复 7/20):
 //          - 根因: v3.250/v3.251 崩溃在 E0 页 [0x5C000, 0x5D000) 内,
@@ -764,7 +777,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.252 启动摘要 (豁免所有 import thunk 所在页 — EkkoSleep 崩溃真正根因修复)\n");
+    DiagLog("BUILD 567 v3.253 启动摘要 (import thunk 扫描精确匹配 — rel32 目标验证 .idata 段)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -803,7 +816,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.252 退出摘要\n");
+    DiagLog("BUILD 567 v3.253 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -828,7 +841,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.252 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.253 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
@@ -2794,36 +2807,48 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         }
         // ★ BUILD 567 v3.252 FIX: 豁免所有 import thunk 所在页 (EkkoSleep 崩溃根因修复)
         //   根因: EkkoSleep EncryptAll 加密 .text 段时, 加密了 import thunk
-        //         (FF 25 xx xx xx xx 90 90 = jmp [rip+offset]; nop; nop),
+        //         (FF 25 xx xx xx xx = jmp [rip+rel32] → IAT 条目),
         //         EK_RAW_LOG 宏 / VirtualProtect / FlushInstructionCache 等调用
         //         通过 import thunk 跳转到 IAT, import thunk 代码被加密后
         //         → CPU 执行加密字节 → 0xc0000005 崩溃.
-        //   验证: v3.249 D0 完整完成 (E0/E1/E2/E3 全加密, import thunk 不在 E0 页),
+        //   验证: v3.249 D0 完整完成 (import thunk 不在 E0 页),
         //         v3.250 .text 段变大后 import thunk 移到 E0 页 → E0 出现 E1 未出现,
         //         证实 import thunk 位置是根因 (v3.251 栈上构造 sd.log 修复无效).
-        //   修复: 扫描整个 DLL 镜像找到所有 import thunk (FF 25 xx xx xx xx 90 90),
+        //   修复: 扫描整个 DLL 镜像找到所有 import thunk (FF 25 xx xx xx xx),
+        //         验证 rel32 目标地址在 .idata 段范围内 (精确匹配, 无误报),
         //         将其所在页添加到 exemptPages (去重).
-        //   代价: ~15 页 (60KB) 不加密 (相对 .text 384KB 约 15%), 但消除崩溃根因.
+        //   ★ BUILD 567 v3.253 FIX: 扫描模式从 `FF 25 xx xx xx xx 90 90` 改为
+        //     `FF 25 xx xx xx xx` + rel32 目标验证. 原因: v3.252 只匹配 90 90 填充的
+        //     thunk (188 个), 漏掉 9 个 "other" 类型 (后面跟 ret/int3/其他指令),
+        //     这些漏掉的 thunk 所在页未豁免 → EkkoSleep 调用对应函数仍崩溃.
+        //     实际统计: 197 个 thunk 指向 .idata, 分布在 12 个唯一页.
+        //   代价: ~12 页 (48KB) 不加密 (相对 .text 364KB 约 13%), 但消除崩溃根因.
         {
             uintptr_t scanStart = (uintptr_t)dllBase + 0x1000;
             uintptr_t scanEnd = (uintptr_t)dllBase + dllSize;
             int thunkCount = 0;
-            for (uintptr_t p = scanStart; p + 8 <= scanEnd; p++) {
+            for (uintptr_t p = scanStart; p + 6 <= scanEnd; p++) {
                 uint8_t* b = reinterpret_cast<uint8_t*>(p);
-                if (b[0] == 0xFF && b[1] == 0x25 && b[6] == 0x90 && b[7] == 0x90) {
-                    uintptr_t thunkPage = p & ~0xFFFULL;
-                    bool found = false;
-                    for (int i = 0; i < exemptPageCount; i++) {
-                        if (exemptPages[i] == thunkPage) { found = true; break; }
-                    }
-                    if (!found && exemptPageCount < 126) {
-                        exemptPages[exemptPageCount++] = thunkPage;
-                    }
-                    thunkCount++;
-                    p += 7;  // 跳过这个 thunk (8 字节, p++ 再 +7 = +8)
+                if (b[0] != 0xFF || b[1] != 0x25) continue;
+                // 读取 rel32 (有符号小端)
+                int32_t rel32 = (int32_t)((uint32_t)b[2] | ((uint32_t)b[3] << 8) |
+                                          ((uint32_t)b[4] << 16) | ((uint32_t)b[5] << 24));
+                // 计算 rip-relative 目标地址 (jmp [rip+rel32], RIP 指向下一条指令 = p+6)
+                uintptr_t target = p + 6 + (int64_t)rel32;
+                // 验证目标在 .idata 段范围内 (精确匹配 import thunk, 排除普通 FF 25 指令)
+                if (target < idataPageStart || target >= idataPageEnd) continue;
+                uintptr_t thunkPage = p & ~0xFFFULL;
+                bool found = false;
+                for (int i = 0; i < exemptPageCount; i++) {
+                    if (exemptPages[i] == thunkPage) { found = true; break; }
                 }
+                if (!found && exemptPageCount < 126) {
+                    exemptPages[exemptPageCount++] = thunkPage;
+                }
+                thunkCount++;
+                p += 5;  // 跳过这个 thunk (6 字节, p++ 再 +5 = +6)
             }
-            DiagLog("B567:252:import thunk scan: %d thunks, %d exempt pages\n",
+            DiagLog("B567:253:import thunk scan: %d thunks, %d exempt pages\n",
                 thunkCount, exemptPageCount);
         }
         // 去重 (数组小, 简单 O(n^2))
