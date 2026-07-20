@@ -787,7 +787,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.281 启动摘要 (CS2 退出蓝屏 0x3B 修复 — DisableAll 跳过 RegDeleteTreeW + DeleteFileW, driver 保持加载)\n");
+    DiagLog("BUILD 567 v3.282 启动摘要 (CS2 退出蓝屏 0x3B 修复 — DisableAll 前 Sleep 2 秒等待 CS2 异步清理完成)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -3713,6 +3713,21 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     //   诊断: 退出摘要信息从 DisableAll 内部 StateLog 获取 (DISABLE_ALL_ENTER/UNHIDE_ALL_DONE/KMA_SHUTDOWN_DONE)
                     //   注: LogExitSummary 的统计信息 (VmxOn/SHV/VEH 等) 不再在 CS2 退出路径打印,
                     //       但主循环正常退出路径 (L4096) 仍会打印.
+                    // ★ BUILD 567 v3.282 FIX: CS2 退出蓝屏 0x3B 修复 — DisableAll 前 Sleep 等待 CS2 异步清理完成
+                    //   v3.281 测试: CLEANUP_SKIPPED 打印后, TerminateProcess 调用本身蓝屏 0x3B
+                    //   v3.280 测试: KMA_SHUTDOWN_DONE 后, RegDeleteTreeW/DeleteFileW 蓝屏 0x3B
+                    //   v3.277/v3.278 测试: DisableAll 完成后, LogExitSummary DiagLog 蓝屏 0x3B/0x50
+                    //   模式: 每次蓝屏都在 driver 关闭/卸载后的下一个 syscall
+                    //   根因: CS2 退出后, Windows 内核异步清理 CS2 资源 (PspExitProcess/句柄清理/内存释放),
+                    //         这个清理过程可能触发 BYOVD driver 注册的内核回调, 回调访问 CS2 已释放 EPROCESS.
+                    //         driver 句柄关闭后 (kma.Shutdown), driver 回调仍可能被触发 (driver 仍加载),
+                    //         任何 syscall 都可能在这个时间窗口内触发回调 → 0x3B/0x50.
+                    //   修复: DisableAll 前 Sleep 2 秒, 让 CS2 退出异步清理完成, 避开蓝屏时间窗口.
+                    //         Sleep 是用户态 API (不进入内核回调路径), 安全.
+                    //   顺序: Sleep(2000) → DisableAll (UnhideAll + kma.Shutdown) → TerminateProcess
+                    //   注: Sleep 2 秒是经验值, CS2 退出异步清理通常在 1-2 秒内完成.
+                    DiagLog("B582:EXIT:Sleep 2000ms (wait CS2 async cleanup)\n");
+                    Sleep(2000);  // ★ v3.282: 等待 CS2 退出异步清理完成
                     stealth::KernelDefense::DisableAll();  // ★ v3.279: 直接 DisableAll (UnhideAll + kma.Shutdown)
                     // ★ v3.279: 直接 TerminateProcess, 跳过 LogExitSummary / NtReadHooker::Uninstall / StealthEngine::Shutdown
                     //   原因: CS2 退出期间任何 syscall 都可能触发 0x50; 最小化 syscall 数量
