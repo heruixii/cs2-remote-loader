@@ -7967,7 +7967,7 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
             return true;
         }
     }
-    VadDiag("B554:EVR: FAIL no valid VadRoot offset (scanMatch=%d range=0x400-0x1800)\n", scanMatchCount);
+    VadDiag("B554:EVR: FAIL no valid VadRoot offset (scanMatch=%d range=0x400-0x1000)\n", scanMatchCount);
     return false;
 }
 
