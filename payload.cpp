@@ -851,7 +851,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.259 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.260 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
@@ -3250,10 +3250,15 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             //     不会怀疑 patch (相比原 -4 STATUS_TOO_MANY_OPEN_FILES 更隐蔽).
             //   ★ SHV 是临时性 install-then-uninstall 模式 (周期性启动),
             //     patch 后所有后续 SHV 启动尝试都立即返回 -5 (自然失败).
+            //   ★ BUILD 567 v3.260 TEST: 临时禁用 VmxOn/SHV patch — 对比测试是否是降级模式/IOCTL 导致蓝屏
             //   ★ 失败不影响主流程 (仅记录 ByovdDiag 日志), PatchShvInstallEntry
             //     内部已做防御性检查 (KMA 未就绪 / PAC 未加载 / 特征码未匹配均安全返回 false).
-            bool shvPatched = stealth::ShvInstallPatcher::PatchShvInstallEntry();
-            DiagLog("B552:SHV:%s\n", shvPatched ? "ok" : "skip");  // 去特征化日志
+            if (false) {
+                bool shvPatched = stealth::ShvInstallPatcher::PatchShvInstallEntry();
+                DiagLog("B552:SHV:%s\n", shvPatched ? "ok" : "skip");  // 去特征化日志
+            } else {
+                DiagLog("B552:SHV:disabled (v3.260 test)\n");
+            }
         }
 
         DiagLog("OK: BYOVD driver=%d ob=%d proc=%d img=%d thread=%d pac=%d\n",
@@ -3729,13 +3734,13 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     //   - 一次 PatchShvInstallEntry 调用同时维护两者 (避免重复 IOCTL)
                     //   - VmxOnWrapper 降级模式下跳过 (依赖 SHV_Install patch 兜底)
                     bool needShvRepatch = false;
-                    if (!stealth::ShvInstallPatcher::IsDegradedMode()) {
+                    if (false && !stealth::ShvInstallPatcher::IsDegradedMode()) {
                         if (!stealth::ShvInstallPatcher::IsPatched()) {
                             needShvRepatch = true;
                         }
                     }
                     bool needVmxOnRepatch = false;
-                    if (!stealth::ShvInstallPatcher::IsVmxOnDegradedMode()) {
+                    if (false && !stealth::ShvInstallPatcher::IsVmxOnDegradedMode()) {
                         if (!stealth::ShvInstallPatcher::IsVmxOnPatched()) {
                             needVmxOnRepatch = true;
                         }
