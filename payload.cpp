@@ -787,7 +787,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.273 启动摘要 (VAD 修复 — Parent 低2位 Balance 解码 + v3.272 双重解引用/VadFlags/VPN 修复)\n");
+    DiagLog("BUILD 567 v3.274 启动摘要 (CS2 退出蓝屏修复 — safe-exit 清理顺序调整: DisableAll 优先)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -826,7 +826,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.271 退出摘要\n");
+    DiagLog("BUILD 567 v3.274 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -3687,8 +3687,21 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 DWORD cs2ExitCode = STILL_ACTIVE;
                 if (GetExitCodeProcess(hCs2, &cs2ExitCode) && cs2ExitCode != STILL_ACTIVE) {
                     DiagLog("B550:EX:tgt-exit=%u safe-exit\n", cs2ExitCode);  // ★ BUILD 550: 脱敏 (原含 CS2)
+                    // ★ BUILD 567 v3.274 FIX: CS2 退出蓝屏修复 — 调整 safe-exit 清理顺序
+                    //   根因: v3.273 测试发现关闭 CS2 瞬间蓝屏. 日志显示 LogExitSummary 第一行打印后
+                    //         第二行未打印就蓝屏, DisableAll 还没来得及执行.
+                    //   分析: CS2 退出时 BYOVD driver 仍然 active (driver 句柄未关闭),
+                    //         CS2 退出的内核操作 (PspExitProcess) 与 driver 冲突 → 蓝屏.
+                    //   修复: 把 DisableAll 移到最前面, 尽快关闭 driver + 恢复 DKOM + 恢复回调.
+                    //         顺序: DisableAll (关闭 driver) → NtReadHooker::Uninstall → LogExitSummary → Shutdown
+                    //   安全性: DisableAll 内部顺序 UnhideAll (需 driver) → RestoreAll → kma.Shutdown (关闭 driver),
+                    //           UnhideAll 在 kma.Shutdown 之前, 能正常使用 driver.
+                    //           NtReadHooker::Uninstall 是用户态操作 (恢复 IAT/ntdll), 不需要 driver.
+                    //           LogExitSummary 是 DiagLog, 不需要 driver.
+                    //           Shutdown 恢复 .text + ETW/AMSI + EncryptAll + 关闭 CS2 句柄, 不需要 driver.
                     // ★ BUILD 556: 移除 ShadowPageManager::Uninstall (影子页方案已废弃)
                     //   VirtualProtect patch 无需卸载 (CS2 退出时自动释放)
+                    stealth::KernelDefense::DisableAll();  // ★ v3.274: 移到最前面 (包含 UnhideProcess + kma.Shutdown)
                     // ★ BUILD 565: 卸载 NtReadVirtualMemory hook (恢复 IAT + ntdll)
                     //   必须在 CS2 退出前调用, 恢复 IAT/ntdll 原始字节, 防止 CS2 崩溃.
                     //   失败安全: Uninstall 失败仅记录日志, 不阻塞退出 (hook 在用户态, 不蓝屏).
@@ -3697,7 +3710,6 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     }
                     // ★ BUILD 567 v3.227: 退出摘要 (CS2 退出路径)
                     LogExitSummary();
-                    stealth::KernelDefense::DisableAll();  // 包含 UnhideProcess
                     StealthEngine::Instance().Shutdown();
                     return 0;
                 }
