@@ -826,7 +826,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.263 退出摘要\n");
+    DiagLog("BUILD 567 v3.267 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -3774,8 +3774,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     //   原因: PAC 可能通过周期性内核修复恢复 VAD 标志 (MEM_MAPPED → MEM_PRIVATE),
                     //         使 payload.dll 注入区域重新暴露给 VAD 扫描.
                     //   策略: 每 60-90s 与 ReapplyAllCallbacks 同周期重新隐藏, 保持深度防御.
-                    // ★ BUILD 567 v3.266 FIX: 永久禁用 VAD 隐藏 (同初始化阶段)
-                    if (false) {
+                    // ★ BUILD 567 v3.267 FIX: 重新启用 VAD 隐藏 (同初始化阶段)
+                    {
                         DWORD cs2Pid = GetCurrentProcessId();
                         uintptr_t bases[1] = { (uintptr_t)g_diagDllBase };
                         stealth::VADConcealer::ConcealAllRegions(cs2Pid, bases, 1);

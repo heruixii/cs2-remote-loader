@@ -7921,10 +7921,14 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
     };
 
     // 策略 1: 优先尝试已知候选偏移
+    // ★ BUILD 567 v3.267 FIX: 添加 Win11 24H2 VadRoot=0x558 (vergiliusproject.com 确认)
+    //   Win11 24H2 EPROCESS 结构重新组织: VadRoot 从 0x7D8 移到 0x558
+    //   这解释了 v3.262~v3.265 找不到正确 VadRoot 的原因 (0x558 不在候选列表)
     static const uint32_t knownCandidates[] = {
-        0x7D8,  // Win10 22H2 / Win11 23H2
+        0x558,  // ★ Win11 24H2 (Build 26100) — vergiliusproject.com 确认
+        0x7D8,  // Win10 22H2 / Win11 22H2/23H2
         0x658,  // Win11 备选
-        0x9D8,  // Win11 24H2 候选
+        0x9D8,  // Win11 备选
         0xA20,  // Win11 25H2 候选
         0x6D8,  // Win10 21H2
         0x5D8,  // Win10 20H2
