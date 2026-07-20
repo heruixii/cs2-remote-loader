@@ -266,18 +266,39 @@ void SleepObfuscator::EncryptAll() {
             }
             if (diagR3) {
                 // ★ v3.247: 分块 XorCrypt, 每块 64KB, 定位崩溃块
+                // ★ v3.248: 块 3 细分为 4 个 16KB 子块, 精确定位崩溃的 16KB 块
+                //   v3.247 测试: EA r3 C3 出现, EA r3 C4 未出现 → 崩溃在块 3 [192KB, 256KB)
                 SIZE_T processed = 0;
                 int chunkIdx = 0;
                 while (processed < region.size) {
                     SIZE_T chunk = region.size - processed;
                     if (chunk > 0x10000) chunk = 0x10000; // 64KB
-                    if (chunkIdx == 0) EK_RAW_LOG("EA r3 C0\n");
-                    else if (chunkIdx == 1) EK_RAW_LOG("EA r3 C1\n");
-                    else if (chunkIdx == 2) EK_RAW_LOG("EA r3 C2\n");
-                    else if (chunkIdx == 3) EK_RAW_LOG("EA r3 C3\n");
-                    else if (chunkIdx == 4) EK_RAW_LOG("EA r3 C4\n");
-                    else EK_RAW_LOG("EA r3 CX\n");
-                    XorCrypt((BYTE*)region.addr + processed, chunk, region.xorKey);
+                    if (chunkIdx == 3) {
+                        // ★ v3.248: 块 3 细分为 4 个 16KB 子块
+                        EK_RAW_LOG("EA r3 C3\n");
+                        SIZE_T subProc = 0;
+                        int subIdx = 0;
+                        while (subProc < chunk) {
+                            SIZE_T sub = chunk - subProc;
+                            if (sub > 0x4000) sub = 0x4000; // 16KB
+                            if (subIdx == 0) EK_RAW_LOG("EA r3 D0\n");
+                            else if (subIdx == 1) EK_RAW_LOG("EA r3 D1\n");
+                            else if (subIdx == 2) EK_RAW_LOG("EA r3 D2\n");
+                            else if (subIdx == 3) EK_RAW_LOG("EA r3 D3\n");
+                            else EK_RAW_LOG("EA r3 DX\n");
+                            XorCrypt((BYTE*)region.addr + processed + subProc, sub, region.xorKey);
+                            subProc += sub;
+                            subIdx++;
+                        }
+                        EK_RAW_LOG("EA r3 C3done\n");
+                    } else {
+                        if (chunkIdx == 0) EK_RAW_LOG("EA r3 C0\n");
+                        else if (chunkIdx == 1) EK_RAW_LOG("EA r3 C1\n");
+                        else if (chunkIdx == 2) EK_RAW_LOG("EA r3 C2\n");
+                        else if (chunkIdx == 4) EK_RAW_LOG("EA r3 C4\n");
+                        else EK_RAW_LOG("EA r3 CX\n");
+                        XorCrypt((BYTE*)region.addr + processed, chunk, region.xorKey);
+                    }
                     processed += chunk;
                     chunkIdx++;
                 }
@@ -300,18 +321,38 @@ void SleepObfuscator::EncryptAll() {
             }
             if (diagR3) {
                 // ★ v3.247: 分块 XorCrypt, 每块 64KB, 定位崩溃块
+                // ★ v3.248: 块 3 细分为 4 个 16KB 子块, 精确定位崩溃的 16KB 块
                 SIZE_T processed = 0;
                 int chunkIdx = 0;
                 while (processed < region.size) {
                     SIZE_T chunk = region.size - processed;
                     if (chunk > 0x10000) chunk = 0x10000; // 64KB
-                    if (chunkIdx == 0) EK_RAW_LOG("EA r3 C0\n");
-                    else if (chunkIdx == 1) EK_RAW_LOG("EA r3 C1\n");
-                    else if (chunkIdx == 2) EK_RAW_LOG("EA r3 C2\n");
-                    else if (chunkIdx == 3) EK_RAW_LOG("EA r3 C3\n");
-                    else if (chunkIdx == 4) EK_RAW_LOG("EA r3 C4\n");
-                    else EK_RAW_LOG("EA r3 CX\n");
-                    XorCrypt((BYTE*)region.addr + processed, chunk, region.xorKey);
+                    if (chunkIdx == 3) {
+                        // ★ v3.248: 块 3 细分为 4 个 16KB 子块
+                        EK_RAW_LOG("EA r3 C3\n");
+                        SIZE_T subProc = 0;
+                        int subIdx = 0;
+                        while (subProc < chunk) {
+                            SIZE_T sub = chunk - subProc;
+                            if (sub > 0x4000) sub = 0x4000; // 16KB
+                            if (subIdx == 0) EK_RAW_LOG("EA r3 D0\n");
+                            else if (subIdx == 1) EK_RAW_LOG("EA r3 D1\n");
+                            else if (subIdx == 2) EK_RAW_LOG("EA r3 D2\n");
+                            else if (subIdx == 3) EK_RAW_LOG("EA r3 D3\n");
+                            else EK_RAW_LOG("EA r3 DX\n");
+                            XorCrypt((BYTE*)region.addr + processed + subProc, sub, region.xorKey);
+                            subProc += sub;
+                            subIdx++;
+                        }
+                        EK_RAW_LOG("EA r3 C3done\n");
+                    } else {
+                        if (chunkIdx == 0) EK_RAW_LOG("EA r3 C0\n");
+                        else if (chunkIdx == 1) EK_RAW_LOG("EA r3 C1\n");
+                        else if (chunkIdx == 2) EK_RAW_LOG("EA r3 C2\n");
+                        else if (chunkIdx == 4) EK_RAW_LOG("EA r3 C4\n");
+                        else EK_RAW_LOG("EA r3 CX\n");
+                        XorCrypt((BYTE*)region.addr + processed, chunk, region.xorKey);
+                    }
                     processed += chunk;
                     chunkIdx++;
                 }
