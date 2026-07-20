@@ -787,7 +787,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.258 启动摘要 (修复 NtReadHooker shellcode 缓冲区溢出 — CS2 对局加载崩溃根因)\n");
+    DiagLog("BUILD 567 v3.259 启动摘要 (对比测试 — 临时禁用 NtReadHooker 验证是否是崩溃根因)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -826,7 +826,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.258 退出摘要\n");
+    DiagLog("BUILD 567 v3.259 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -851,7 +851,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.258 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.259 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
@@ -3286,7 +3286,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             //   在 Buffer 中恢复 patch 区域 (RVA 0xC125D9, 2 字节) 原始字节 (32 c0).
             //   方案 B (IAT hook PvpAlive) 优先, 失败时启用方案 A (inline hook ntdll).
             //   失败安全: Install 失败不影响其他防御功能.
-            if (g_cs2Patched && g_patchAddr && g_clientBase) {
+            // ★ BUILD 567 v3.259 TEST: 临时禁用 NtReadHooker — 对比测试是否是 NtReadHooker 导致 CS2 崩溃
+            if (false && g_cs2Patched && g_patchAddr && g_clientBase) {
                 HANDLE hCs2ForHook = StealthEngine::Instance().GetProcessHandle();
                 if (hCs2ForHook) {
                     bool ntReadHooked = stealth::NtReadHooker::Instance().Install(
@@ -3900,7 +3901,10 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     // StartDR0FrequencyStat();  // ★ v3.237: 禁用
                     // ★ BUILD 565: 若初始化阶段 NtReadHooker 未安装 (ApplyCs2Patch 失败),
                     //   主循环中重试安装 (5s 间隔, 与 ApplyCs2Patch 同周期)
-                    if (!stealth::NtReadHooker::Instance().IsActive() && g_patchAddr && g_clientBase) {
+                    // ★ BUILD 567 v3.259 TEST: 临时禁用 NtReadHooker — 对比测试是否是 NtReadHooker 导致 CS2 崩溃
+                    //   若禁用后 CS2 不崩溃 → NtReadHooker 是崩溃根因 (inline hook 被 CS2 自检检测)
+                    //   若禁用后 CS2 仍崩溃 → ApplyCs2Patch 是崩溃根因 (patch 被 CS2 自检检测)
+                    if (false && !stealth::NtReadHooker::Instance().IsActive() && g_patchAddr && g_clientBase) {
                         HANDLE hCs2ForHook = StealthEngine::Instance().GetProcessHandle();
                         if (hCs2ForHook) {
                             // ★ BUILD 567 v3.238 DIAG: NtReadHooker::Install 前后诊断
