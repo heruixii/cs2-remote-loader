@@ -787,7 +787,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.278 启动摘要 (CS2 退出蓝屏 0x3B 修复 — LogExitSummary 移到 DisableAll 前 + TerminateProcess 立即终止)\n");
+    DiagLog("BUILD 567 v3.279 启动摘要 (CS2 退出蓝屏 0x50 修复 — 跳过 LogExitSummary, 直接 DisableAll + TerminateProcess)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -3701,23 +3701,21 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     //           Shutdown 恢复 .text + ETW/AMSI + EncryptAll + 关闭 CS2 句柄, 不需要 driver.
                     // ★ BUILD 556: 移除 ShadowPageManager::Uninstall (影子页方案已废弃)
                     //   VirtualProtect patch 无需卸载 (CS2 退出时自动释放)
-                    // ★ BUILD 567 v3.278 FIX: CS2 退出蓝屏 0x3B (SYSTEM_SERVICE_EXCEPTION) 修复
-                    //   v3.277 测试: KMA_SHUTDOWN_DONE 后蓝屏 0x3B, 日志只到 LogExitSummary 的 "============"
-                    //   根因: driver 卸载后, driver 注册的内核回调可能仍指向已释放的 driver 内存,
-                    //         后续任何 syscall (DiagLog 的 CreateFileW/WriteFile, NtReadHooker::Uninstall
-                    //         的 VirtualProtectEx/WriteProcessMemory) 触发这些回调 → 0x3B
-                    //   修复: LogExitSummary 移到 DisableAll 之前 (driver 还活着, syscall 安全),
-                    //         DisableAll 完成后直接 TerminateProcess, 不执行任何后续 syscall
-                    //   顺序: LogExitSummary (driver active) → DisableAll (卸载 driver + 恢复 DKOM)
-                    //         → TerminateProcess (立即终止, 不触发 DllMain/全局析构/后续 syscall)
-                    //   安全性: LogExitSummary 在 driver active 时打印, syscall 安全;
-                    //           DisableAll 完成 UnhideAll (DKOM 恢复) + kma.Shutdown (driver 卸载);
-                    //           TerminateProcess 不执行后续代码, OS 自动清理句柄/内存;
-                    //           NtReadHooker::Uninstall / StealthEngine::Shutdown 被跳过 (CS2 已退出, 无意义).
-                    LogExitSummary();  // ★ v3.278: 移到 DisableAll 之前 (driver active, syscall 安全)
-                    stealth::KernelDefense::DisableAll();  // ★ v3.274: 包含 UnhideProcess + kma.Shutdown
-                    // ★ v3.278: 直接 TerminateProcess, 跳过 NtReadHooker::Uninstall / StealthEngine::Shutdown
-                    //   原因: driver 卸载后后续 syscall 可能触发 0x3B; CS2 已退出, 用户态清理无意义
+                    // ★ BUILD 567 v3.279 FIX: CS2 退出蓝屏 0x50 修复 — 跳过 LogExitSummary, 直接 DisableAll + TerminateProcess
+                    //   v3.278 测试: LogExitSummary 的 "============" 打印后, "BUILD 567 v3.278 退出摘要" 蓝屏 0x50
+                    //   v3.277 测试: KMA_SHUTDOWN_DONE 后, LogExitSummary 的 "============" 打印后, "BUILD 567 v3.277 退出摘要" 蓝屏 0x50
+                    //   两次蓝屏位置完全相同 (LogExitSummary L828 之后, L829 之前)
+                    //   根因: CS2 退出后, Windows 内核异步清理 CS2 资源 (PspExitProcess/句柄清理/内存释放),
+                    //         可能触发 BYOVD driver (PDFWKRNL.sys) 注册的内核回调, 回调访问 CS2 已释放 EPROCESS → 0x50
+                    //         LogExitSummary 的 7 次 DiagLog syscall 增加了触发蓝屏的时间窗口
+                    //   修复: 跳过 LogExitSummary, 直接 DisableAll + TerminateProcess, 最小化 syscall 数量
+                    //   顺序: DisableAll (UnhideAll + kma.Shutdown, 尽快完成内核清理) → TerminateProcess (立即终止)
+                    //   诊断: 退出摘要信息从 DisableAll 内部 StateLog 获取 (DISABLE_ALL_ENTER/UNHIDE_ALL_DONE/KMA_SHUTDOWN_DONE)
+                    //   注: LogExitSummary 的统计信息 (VmxOn/SHV/VEH 等) 不再在 CS2 退出路径打印,
+                    //       但主循环正常退出路径 (L4096) 仍会打印.
+                    stealth::KernelDefense::DisableAll();  // ★ v3.279: 直接 DisableAll (UnhideAll + kma.Shutdown)
+                    // ★ v3.279: 直接 TerminateProcess, 跳过 LogExitSummary / NtReadHooker::Uninstall / StealthEngine::Shutdown
+                    //   原因: CS2 退出期间任何 syscall 都可能触发 0x50; 最小化 syscall 数量
                     TerminateProcess(GetCurrentProcess(), 0);  // 立即终止, 不会执行到这里之后
                     return 0;  // 不会执行, 仅为编译器满意
                 }
