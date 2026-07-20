@@ -7823,7 +7823,8 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
     };
 
     // 验证候选偏移是否为合法 VadRoot (含 Left/Right/ParentEncoded + VadStartingVpn/VadEndingVpn)
-    auto validateVadRoot = [&](uint64_t vadRootCandidate) -> bool {
+    // ★ BUILD 567 v3.262 DIAG: 添加详细诊断日志, 记录每个失败原因
+    auto validateVadRoot = [&](uint64_t vadRootCandidate, uint32_t off = 0) -> bool {
         if (!vadRootCandidate || vadRootCandidate < 0xFFFF800000000000ULL) return false;
 
         // ★ BUILD 567 v3.230 FIX: 显式检查 ReadKernelVA 返回值, 避免读取失败被误判为 0
@@ -7833,20 +7834,46 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
         //   修复: 直接调用 ReadKernelVA 检查返回值, 读取失败立即返回 false
         // ★ BUILD 567 v3.233: 改用 ReadKernelVAUnsafe (VAD 节点可能在系统 PTE 区域)
         uint64_t left = 0, right = 0, parent = 0;
-        if (!kma.ReadKernelVAUnsafe(vadRootCandidate + VadOffsets::RbnLeft, &left, 8)) return false;
-        if (!kma.ReadKernelVAUnsafe(vadRootCandidate + VadOffsets::RbnRight, &right, 8)) return false;
-        if (!kma.ReadKernelVAUnsafe(vadRootCandidate + VadOffsets::RbnParentEncoded, &parent, 8)) return false;
-        if (!isValidPtr(left) || !isValidPtr(right) || !isValidPtr(parent)) return false;
+        if (!kma.ReadKernelVAUnsafe(vadRootCandidate + VadOffsets::RbnLeft, &left, 8)) {
+            VadDiag("B554:EVR:VR off=0x%X FAIL read left (cand=0x%llX)\n", off, (unsigned long long)vadRootCandidate);
+            return false;
+        }
+        if (!kma.ReadKernelVAUnsafe(vadRootCandidate + VadOffsets::RbnRight, &right, 8)) {
+            VadDiag("B554:EVR:VR off=0x%X FAIL read right (cand=0x%llX)\n", off, (unsigned long long)vadRootCandidate);
+            return false;
+        }
+        if (!kma.ReadKernelVAUnsafe(vadRootCandidate + VadOffsets::RbnParentEncoded, &parent, 8)) {
+            VadDiag("B554:EVR:VR off=0x%X FAIL read parent (cand=0x%llX)\n", off, (unsigned long long)vadRootCandidate);
+            return false;
+        }
+        if (!isValidPtr(left) || !isValidPtr(right) || !isValidPtr(parent)) {
+            VadDiag("B554:EVR:VR off=0x%X FAIL ptr check L=0x%llX R=0x%llX P=0x%llX\n",
+                off, (unsigned long long)left, (unsigned long long)right, (unsigned long long)parent);
+            return false;
+        }
 
         // ★ BUILD 567 v3.230 FIX: 至少一个非 NULL (完全空的节点不太可能是真实 VadRoot)
         //   深度防御: 真实 VAD 树根节点通常有子节点或父指针, 三字段全 0 极不可能
-        if (!left && !right && !parent) return false;
+        if (!left && !right && !parent) {
+            VadDiag("B554:EVR:VR off=0x%X FAIL all NULL\n", off);
+            return false;
+        }
 
         // 二次验证: VadStartingVpn <= VadEndingVpn
         uint64_t startVpn = 0, endVpn = 0;
-        if (!kma.ReadKernelVAUnsafe(vadRootCandidate + VadOffsets::VadStartingVpn, &startVpn, 8)) return false;
-        if (!kma.ReadKernelVAUnsafe(vadRootCandidate + VadOffsets::VadEndingVpn, &endVpn, 8)) return false;
-        if (startVpn > endVpn) return false;
+        if (!kma.ReadKernelVAUnsafe(vadRootCandidate + VadOffsets::VadStartingVpn, &startVpn, 8)) {
+            VadDiag("B554:EVR:VR off=0x%X FAIL read startVpn\n", off);
+            return false;
+        }
+        if (!kma.ReadKernelVAUnsafe(vadRootCandidate + VadOffsets::VadEndingVpn, &endVpn, 8)) {
+            VadDiag("B554:EVR:VR off=0x%X FAIL read endVpn\n", off);
+            return false;
+        }
+        if (startVpn > endVpn) {
+            VadDiag("B554:EVR:VR off=0x%X FAIL vpn range start=0x%llX > end=0x%llX\n",
+                off, (unsigned long long)startVpn, (unsigned long long)endVpn);
+            return false;
+        }
 
         // ★ BUILD 555 P2-verify: 修正 VPN 范围检查 (原 < 0x100000 过于严格)
         //   x64 用户态 VA 范围: 0 to 0x0000_7FFF_FFFF_FFFF (128 TB)
@@ -7856,8 +7883,16 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
         //   拒绝中间值 (0x80000000 to 0xFFFF7FFFFFFFFFFF, 非法/未定义区域)
         bool startValid = (startVpn < 0x80000000ULL) || (startVpn >= 0xFFFF800000000000ULL);
         bool endValid   = (endVpn   < 0x80000000ULL) || (endVpn   >= 0xFFFF800000000000ULL);
-        if (!startValid || !endValid) return false;
+        if (!startValid || !endValid) {
+            VadDiag("B554:EVR:VR off=0x%X FAIL vpn valid start=0x%llX(%d) end=0x%llX(%d)\n",
+                off, (unsigned long long)startVpn, (int)startValid,
+                (unsigned long long)endVpn, (int)endValid);
+            return false;
+        }
 
+        VadDiag("B554:EVR:VR off=0x%X OK L=0x%llX R=0x%llX P=0x%llX sVpn=0x%llX eVpn=0x%llX\n",
+            off, (unsigned long long)left, (unsigned long long)right, (unsigned long long)parent,
+            (unsigned long long)startVpn, (unsigned long long)endVpn);
         return true;
     };
 
@@ -7873,7 +7908,7 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
     for (uint32_t off : knownCandidates) {
         // ★ BUILD 567 v3.233: 使用 ReadUnsafe (eprocess 可能在系统 PTE 区域)
         uint64_t candidate = kma.ReadUnsafe<uint64_t>(eprocess + off);
-        bool valid = validateVadRoot(candidate);
+        bool valid = validateVadRoot(candidate, off);
         VadDiag("B554:EVR: try off=0x%X candidate=0x%llX valid=%d\n",
                   off, (unsigned long long)candidate, (int)valid);
         if (valid) {
@@ -7883,9 +7918,9 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
         }
     }
 
-    // 策略 2: 动态扫描 0x400-0x900 范围
+    // 策略 2: 动态扫描 0x400-0x1000 范围 (★ BUILD 567 v3.262: 扩大范围 0x900→0x1000)
     int scanMatchCount = 0;
-    for (uint32_t off = 0x400; off < 0x900; off += 8) {
+    for (uint32_t off = 0x400; off < 0x1000; off += 8) {
         // 跳过已知已尝试的偏移
         bool skip = false;
         for (uint32_t k : knownCandidates) {
@@ -7902,13 +7937,13 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
                           off, (unsigned long long)candidate);
             }
         }
-        if (validateVadRoot(candidate)) {
+        if (validateVadRoot(candidate, off)) {
             s_vadRootOffset = off;
             VadDiag("B554:EVR: OK via scan off=0x%X (scanMatch=%d)\n", off, scanMatchCount);
             return true;
         }
     }
-    VadDiag("B554:EVR: FAIL no valid VadRoot offset (scanMatch=%d)\n", scanMatchCount);
+    VadDiag("B554:EVR: FAIL no valid VadRoot offset (scanMatch=%d range=0x400-0x1000)\n", scanMatchCount);
     return false;
 }
 
