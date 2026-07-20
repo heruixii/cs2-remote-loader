@@ -251,6 +251,9 @@ void SleepObfuscator::EncryptAll() {
         // ★ BUILD 567 v3.246 DIAG: 对 region 3 添加精细诊断 (已知崩溃位置)
         //   v3.245 测试: EA r3 出现, EA r4 未出现 → 崩溃在处理 region 3 时
         //   本版添加 VP1/XC/VP2/FIC/end 精细诊断, 精确定位崩溃步骤
+        // ★ BUILD 567 v3.247 DIAG: v3.246 确认崩溃在 XorCrypt 内部 (EA r3 XC 出现, EA r3 VP2 未出现)
+        //   region 3 = 299KB, 分块 XorCrypt 每块 64KB, 精确定位崩溃块
+        //   判读: EA r3 C0-C4 表示正在处理块 0-4, EA r3 XCdone 表示 XorCrypt 完成
         bool diagR3 = (ri == 3);
 
         if (region.isCode) {
@@ -261,8 +264,27 @@ void SleepObfuscator::EncryptAll() {
                 else EK_RAW_LOG("EA VP fail\n");
                 continue;
             }
-            if (diagR3) EK_RAW_LOG("EA r3 XC\n");
-            XorCrypt(region.addr, region.size, region.xorKey);
+            if (diagR3) {
+                // ★ v3.247: 分块 XorCrypt, 每块 64KB, 定位崩溃块
+                SIZE_T processed = 0;
+                int chunkIdx = 0;
+                while (processed < region.size) {
+                    SIZE_T chunk = region.size - processed;
+                    if (chunk > 0x10000) chunk = 0x10000; // 64KB
+                    if (chunkIdx == 0) EK_RAW_LOG("EA r3 C0\n");
+                    else if (chunkIdx == 1) EK_RAW_LOG("EA r3 C1\n");
+                    else if (chunkIdx == 2) EK_RAW_LOG("EA r3 C2\n");
+                    else if (chunkIdx == 3) EK_RAW_LOG("EA r3 C3\n");
+                    else if (chunkIdx == 4) EK_RAW_LOG("EA r3 C4\n");
+                    else EK_RAW_LOG("EA r3 CX\n");
+                    XorCrypt((BYTE*)region.addr + processed, chunk, region.xorKey);
+                    processed += chunk;
+                    chunkIdx++;
+                }
+                EK_RAW_LOG("EA r3 XCdone\n");
+            } else {
+                XorCrypt(region.addr, region.size, region.xorKey);
+            }
             if (diagR3) EK_RAW_LOG("EA r3 VP2\n");
             VirtualProtect(region.addr, region.size, oldProtect, &oldProtect);
             if (diagR3) EK_RAW_LOG("EA r3 FIC\n");
@@ -276,8 +298,27 @@ void SleepObfuscator::EncryptAll() {
                 else EK_RAW_LOG("EA VP fail\n");
                 continue;
             }
-            if (diagR3) EK_RAW_LOG("EA r3 XC\n");
-            XorCrypt(region.addr, region.size, region.xorKey);
+            if (diagR3) {
+                // ★ v3.247: 分块 XorCrypt, 每块 64KB, 定位崩溃块
+                SIZE_T processed = 0;
+                int chunkIdx = 0;
+                while (processed < region.size) {
+                    SIZE_T chunk = region.size - processed;
+                    if (chunk > 0x10000) chunk = 0x10000; // 64KB
+                    if (chunkIdx == 0) EK_RAW_LOG("EA r3 C0\n");
+                    else if (chunkIdx == 1) EK_RAW_LOG("EA r3 C1\n");
+                    else if (chunkIdx == 2) EK_RAW_LOG("EA r3 C2\n");
+                    else if (chunkIdx == 3) EK_RAW_LOG("EA r3 C3\n");
+                    else if (chunkIdx == 4) EK_RAW_LOG("EA r3 C4\n");
+                    else EK_RAW_LOG("EA r3 CX\n");
+                    XorCrypt((BYTE*)region.addr + processed, chunk, region.xorKey);
+                    processed += chunk;
+                    chunkIdx++;
+                }
+                EK_RAW_LOG("EA r3 XCdone\n");
+            } else {
+                XorCrypt(region.addr, region.size, region.xorKey);
+            }
             if (diagR3) EK_RAW_LOG("EA r3 VP2\n");
             VirtualProtect(region.addr, region.size, oldProtect, &oldProtect);
         }
