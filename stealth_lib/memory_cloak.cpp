@@ -340,6 +340,30 @@ ekko_sleep_entry:
             diagInEkko, markerInEkko);
     }
 
+    // ★ BUILD 567 v3.243 DIAG: SleepObfuscator 对象 (this) 地址诊断
+    //   根因假设: m_regions[64] 数组 (~1.5KB) 在 .bss 段, 若所在页未被豁免,
+    //             EncryptAll 处理覆盖 .bss 的 region 时会加密 m_regions 本身 → 崩溃
+    //   判读: objInEkko=1/encA=1/decA=1 → 对象在已豁免页 (排除根因)
+    //         全 0 → 对象在未豁免页 → 根因确认 → v3.243 已在 payload.cpp 添加 sleepObjPage 豁免
+    //   安全性: 此日志在 EncryptAll 之前调用, 代码页未加密, 安全
+    {
+        uintptr_t thisAddr = reinterpret_cast<uintptr_t>(this);
+        uintptr_t mregsAddr = reinterpret_cast<uintptr_t>(m_regions);
+        uintptr_t ekkoPage = GetSelfPage();
+        uintptr_t encAPage = GetEncryptAllPage();
+        uintptr_t decAPage = GetDecryptAllPage();
+        uintptr_t thisPage = thisAddr & ~0xFFFULL;
+        int objInEkko = (thisPage == ekkoPage) ? 1 : 0;
+        int objInEncA = (thisPage == encAPage) ? 1 : 0;
+        int objInDecA = (thisPage == decAPage) ? 1 : 0;
+        EkkoDiagLog("B243:EK:this this=0x%llX m_regions=0x%llX m_regionCount=%d thisPage=0x%llX objInEkko=%d objInEncA=%d objInDecA=%d\n",
+            (unsigned long long)thisAddr,
+            (unsigned long long)mregsAddr,
+            m_regionCount,
+            (unsigned long long)thisPage,
+            objInEkko, objInEncA, objInDecA);
+    }
+
     // ★ BUILD 567 v3.238 DIAG: EkkoSleep 入口日志
     //   若 "EA+ pre" 有 "EA+ post" 无 → EncryptAll 内部崩溃
     //   若 "DA+ pre" 有 "DA+ post" 无 → DecryptAll 内部崩溃

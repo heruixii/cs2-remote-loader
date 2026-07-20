@@ -185,6 +185,25 @@
 //        安全性: VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch), 无新内存访问模式
 //                降级模式下依赖 SHV_Install patch 兜底 (双重保险), BSOD 风险极低
 //        预期效果: VmxOnWrapper patch 持久有效, EPT 永不构造, 综合 2-5% → 1.5-4%
+// BUILD: 567 (v3.243: 豁免 SleepObfuscator 对象所在页 — 真正根因修复)
+//        ★ BUILD 567 v3.243 FIX (EncryptAll 加密自身 m_regions 数组 7/20):
+//          - 根因: v3.242 移除加密窗口日志后仍崩溃, 重新分析根因.
+//                  EncryptAll 保护范围 [dllBase+0x1000, dllBase+dllSize) 覆盖整个 DLL 镜像
+//                  (包括 .text/.rdata/.data/.bss), 不仅仅是 .text 段.
+//                  SleepObfuscator 单例对象 (Instance() 返回 static 局部变量) 在 .bss 段,
+//                  含 m_regions[MAX_REGIONS=64] 数组 (~1.5KB). 若该对象所在页未被豁免:
+//                    1. EncryptAll 遍历 m_regions, 处理覆盖 .bss 的 region 时 XorCrypt 加密该 region
+//                    2. 该 region 范围包含 m_regions 数组本身 → m_regions 被加密
+//                    3. 下次循环访问 m_regions[ri+1] 时读取加密垃圾 → VirtualProtect 用错误 addr → 崩溃
+//          - 修复: payload.cpp exemptPages 添加 sleepObjPage + sleepObjPage+0x1000 (防跨页),
+//                  exemptPageCount 20 → 22. 同时 B550:EK:protected 日志添加 sleepObj@ 字段.
+//          - 诊断: memory_cloak.cpp EkkoSleep 入口添加 B243:EK:this 日志, 输出 this/m_regions
+//                  地址 + objInEkko/objInEncA/objInDecA 标志 (验证对象是否在豁免页).
+//          - 判读: 若 "B238:EK:DA+ post" 出现 → 根因确认, v3.243 修复成功
+//                  若 "B238:EK:DA+ post" 未出现 → 仍有其他被加密的关键数据, 需进一步分析
+//          - 安全性: 多豁免 2*4KB=8KB (相对 520KB 仅 1.5%), 不影响加密效果.
+//          - 副作用: SleepObfuscator 对象 (m_regions/m_regionCount/m_masterKey) 在 EkkoSleep 期间
+//                    不被加密 (保持明文), 但这些数据不含敏感特征, 风险可接受.
 // BUILD: 567 (v3.242: 移除加密窗口内的 EkkoDiagLog 调用 — 真正根因修复)
 //        ★ BUILD 567 v3.242 FIX (EkkoSleep 加密窗口 CRT 崩溃 7/20):
 //          - 根因: v3.241 B241:EK:self 诊断确认 EkkoSleep 入口在 ekkoPage+0x1000 (已豁免),
@@ -604,7 +623,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.242 启动摘要 (移除加密窗口内的 EkkoDiagLog 调用 — 真正根因修复)\n");
+    DiagLog("BUILD 567 v3.243 启动摘要 (豁免 SleepObfuscator 对象所在页 — 真正根因修复)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -643,7 +662,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.242 退出摘要\n");
+    DiagLog("BUILD 567 v3.243 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -668,7 +687,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.242 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.243 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
@@ -2604,6 +2623,16 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         //   修复: 对 EncryptAll/DecryptAll/XorCrypt 额外豁免"入口页+0x1000"(下一页),
         //         防止函数跨页时尾部所在页被加密. 代价: 多 3*4KB=12KB 不加密 (相对 .text 344KB 仅 3.5%)
         //   注: 即使函数不跨页, 多豁免一页也是安全的 (仅减少少量加密范围, 不影响功能)
+        // ★ BUILD 567 v3.243 FIX: 豁免 SleepObfuscator 对象所在页面 (真正根因修复)
+        //   根因: SleepObfuscator 单例对象 (含 m_regions[64] 约 1.5KB) 在 .bss 段,
+        //         EncryptAll 保护范围 [dllBase+0x1000, dllBase+dllSize) 覆盖整个 DLL 镜像 (含 .bss).
+        //         若 m_regions 所在页未被豁免, EncryptAll 处理覆盖 .bss 的 region 时
+        //         会 XorCrypt 加密 m_regions 数组本身 → 下次循环读取 m_regions[ri+1] 时
+        //         addr/size/xorKey 都是加密垃圾 → VirtualProtect 用错误 addr → 崩溃!
+        //   修复: 豁免 SleepObfuscator::Instance() 对象所在页 + 下一页 (防跨页, 对象 ~1.5KB)
+        //   代价: 多 2*4KB=8KB 不加密 (相对 520KB 仅 1.5%)
+        uintptr_t sleepObjAddr = (uintptr_t)&SleepObfuscator::Instance();
+        uintptr_t sleepObjPage = sleepObjAddr & ~0xFFFULL;
         uintptr_t exemptPages[48] = {
             ekkoPage, ekkoPage + 0x1000, ekkoPage + 0x2000,  // ★ BUILD 567 v3.241 FIX: EkkoSleep 跨页保护 (扩展到 3 页)
             vehPage,
@@ -2612,9 +2641,10 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             xorCryptPage,   xorCryptPage   + 0x1000,        // ★ FIX-3: XorCrypt 跨页保护
             applyPatchPage, maintainPatchPage, screenshotCheckPage, revertPatchPage,
             setupDr0Page, clearDr0Page, startStatPage, reportFreqPage,
-            diagLogPage, unhideAllPage
+            diagLogPage, unhideAllPage,
+            sleepObjPage, sleepObjPage + 0x1000  // ★ BUILD 567 v3.243 FIX: SleepObfuscator 对象跨页保护
         };
-        int exemptPageCount = 20;  // ★ v3.241: 19 → 20 (添加 ekkoPage + 0x2000)
+        int exemptPageCount = 22;  // ★ v3.243: 20 → 22 (添加 sleepObjPage + sleepObjPage+0x1000)
         // 追加 .idata 段所有页 (IAT 所在, 必须全部豁免)
         for (uintptr_t p = idataPageStart; p < idataPageEnd && exemptPageCount < 30; p += 0x1000) {
             exemptPages[exemptPageCount++] = p;
@@ -2662,9 +2692,10 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
 
         // ★ BUILD 567 v3.239 DIAG: 添加 ek+1@ (ekkoPage+0x1000) 显示下一页地址
         //   若 diagLog 地址 ∈ [ek+1, ek+1+0x1000) → EkkoDiagLog 在未被豁免的下一页 → 根因确认
+        // ★ BUILD 567 v3.243 DIAG: 添加 sleepObj@ 字段 — 确认 SleepObfuscator 对象地址在豁免页
         DiagLog("B550:EK:protected %llu bytes (exempt %d pages, ek@0x%llX ek+1@0x%llX veh@0x%llX "
                 "encA@0x%llX decA@0x%llX xorC@0x%llX ap@0x%llX mp@0x%llX "
-                "sc@0x%llX rp@0x%llX dl@0x%llX uh@0x%llX idata[0x%llX-0x%llX))\n",  // ★ BUILD 558 FIX: 追加 dl(DiagLog)/uh(UnhideAll)/idata
+                "sc@0x%llX rp@0x%llX dl@0x%llX uh@0x%llX sleepObj@0x%llX idata[0x%llX-0x%llX))\n",
             (unsigned long long)totalProtected, exemptPageCount,
             (unsigned long long)ekkoPage, (unsigned long long)(ekkoPage + 0x1000),
             (unsigned long long)vehPage,
@@ -2673,6 +2704,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             (unsigned long long)applyPatchPage, (unsigned long long)maintainPatchPage,
             (unsigned long long)screenshotCheckPage, (unsigned long long)revertPatchPage,
             (unsigned long long)diagLogPage, (unsigned long long)unhideAllPage,
+            (unsigned long long)sleepObjAddr,
             (unsigned long long)idataPageStart, (unsigned long long)idataPageEnd);
     }
 
