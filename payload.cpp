@@ -787,7 +787,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.255 启动摘要 (EncryptAll 入口诊断 — 确认崩溃位置)\n");
+    DiagLog("BUILD 567 v3.256 启动摘要 (限制 codeSize 只覆盖 .text 段 — 修复 .rdata 加密崩溃)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -826,7 +826,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.255 退出摘要\n");
+    DiagLog("BUILD 567 v3.256 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -851,7 +851,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.255 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.256 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
@@ -2660,9 +2660,50 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     //   防止 EkkoSleep 加密期间触发异常 → CPU 执行已加密代码 → 双重错误
     // ============================================================
     {
+        // ★ BUILD 567 v3.256 FIX: 限制 codeSize 只覆盖 .text 段, 不覆盖 .rdata/.data 段
+        //   根因: v3.255 诊断显示第 11 个 region 的 XorCrypt 崩溃 + 日志乱码.
+        //         原 codeSize = dllSize - 0x1000 覆盖整个 DLL 镜像 (含 .rdata 段),
+        //         XorCrypt 加密 .rdata 段中的 EK_RAW_LOG 字符串常量 → 下次 EK_RAW_LOG
+        //         调用时 msg 参数指向被加密的字符串 → WriteFile 写入加密垃圾 → 日志乱码.
+        //   修复: 从 PE 段表解析 .text 段 VirtualSize, PE 头被擦除时硬编码回退值 (0x59da0).
+        //         只加密 .text 段 (代码), 不加密 .rdata/.data 段 (数据).
+        //   代价: 减少加密范围 (~64KB .rdata + 3KB .data), 但 .text 段 (~366KB) 仍被加密,
+        //         防代码扫描能力不变. 反作弊内存扫描主要扫描 .text 段找特征码.
         uintptr_t codeBase = (uintptr_t)dllBase + 0x1000;
-        SIZE_T codeSize = (dllSize > 0x1000) ? (dllSize - 0x1000) : dllSize;
-        uintptr_t codeEnd = codeBase + codeSize;
+        SIZE_T codeSize = 0;
+        uintptr_t codeEnd = codeBase;
+        {
+            auto* image = reinterpret_cast<BYTE*>(dllBase);
+            auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(image);
+            bool textParsed = false;
+            if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+                auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image + dos->e_lfanew);
+                if (nt->Signature == IMAGE_NT_SIGNATURE) {
+                    auto* sec = IMAGE_FIRST_SECTION(nt);
+                    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+                        if (memcmp(sec[i].Name, ".text", 5) == 0) {
+                            codeSize = sec[i].Misc.VirtualSize;
+                            codeEnd = codeBase + codeSize;
+                            textParsed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!textParsed) {
+                // ★ PE 头被 ManualMap 擦除 (前 0x400 字节) → 硬编码回退
+                //   当前 payload.dll: .text @RVA 0x1000, VirtualSize=0x59e60 (objdump -h 验证)
+                //   注意: 重新编译后需用 objdump -h payload.dll 验证 .text 段大小, 更新此处
+                //   安全约束: 硬编码值必须 < 0x5b000 (.data 段 VA), 否则会加密 .data 段
+                codeSize = 0x59e60;
+                codeEnd = codeBase + codeSize;
+                DiagLog("B567:256:.text fallback hardcoded size=0x%llX (PE header erased)\n",
+                    (unsigned long long)codeSize);
+            } else {
+                DiagLog("B567:256:.text parsed size=0x%llX\n",
+                    (unsigned long long)codeSize);
+            }
+        }
 
         uintptr_t ekkoPage = SleepObfuscator::GetSelfPage();
         uintptr_t vehPage  = reinterpret_cast<uintptr_t>(DiagVehHandler) & ~0xFFFULL;
