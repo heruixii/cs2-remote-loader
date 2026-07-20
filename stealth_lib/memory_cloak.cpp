@@ -172,6 +172,12 @@ void SleepObfuscator::RegisterProtectedCode(void* addr, SIZE_T size) {
 //         宏代码在 EkkoSleep/EncryptAll/DecryptAll 内部展开, 这些函数所在页已豁免, 不被加密.
 //         不调用任何 CRT 函数, 字符串长度用 sizeof(msg)-1 编译期常量.
 //   v3.245: 宏定义移到 EncryptAll 之前, 因为 v3.245 在 EncryptAll/DecryptAll 内部使用.
+//   ★ BUILD 567 v3.251 FIX: L"sd.log" 改为栈上构造!
+//     根因: v3.250 确认 sd.log 字符串在 .rdata 段 RVA 0x5FC18/0x61804/0x62158/0x62CD8,
+//           EkkoSleep EncryptAll 加密 .rdata 段时加密了 sd.log 字符串,
+//           下一次 EK_RAW_LOG 调用时 while(_ekSuf[_ekI]) 读取被加密的 sd.log,
+//           加密后字节无 0 终止符 → 循环不终止 → 越界读取 → 访问违规崩溃.
+//     修复: L"sd.log" 改为栈上 wchar_t 数组逐字节构造, 不读取 .rdata 段.
 //   判读: 根据最后出现的日志判断崩溃位置:
 //         EA start → EncryptAll 入口
 //         EA skip → 跳过覆盖关键页的 region
@@ -188,7 +194,10 @@ void SleepObfuscator::RegisterProtectedCode(void* addr, SIZE_T size) {
     wchar_t _ekPath[MAX_PATH]; \
     GetTempPathW(MAX_PATH, _ekPath); \
     size_t _ekPL = 0; while (_ekPath[_ekPL]) _ekPL++; \
-    const wchar_t* _ekSuf = L"sd.log"; \
+    /* ★ v3.251 FIX: 栈上构造 "sd.log" 避免读取 .rdata 段 (EkkoSleep 加密 .rdata → 崩溃) */ \
+    wchar_t _ekSuf[7]; \
+    _ekSuf[0] = L's'; _ekSuf[1] = L'd'; _ekSuf[2] = L'.'; \
+    _ekSuf[3] = L'l'; _ekSuf[4] = L'o'; _ekSuf[5] = L'g'; _ekSuf[6] = 0; \
     size_t _ekI = 0; while (_ekSuf[_ekI]) { _ekPath[_ekPL+_ekI] = _ekSuf[_ekI]; _ekI++; } \
     _ekPath[_ekPL+_ekI] = 0; \
     HANDLE _ekH = CreateFileW(_ekPath, FILE_APPEND_DATA, FILE_SHARE_READ, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0); \

@@ -185,6 +185,17 @@
 //        安全性: VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch), 无新内存访问模式
 //                降级模式下依赖 SHV_Install patch 兜底 (双重保险), BSOD 风险极低
 //        预期效果: VmxOnWrapper patch 持久有效, EPT 永不构造, 综合 2-5% → 1.5-4%
+// BUILD: 567 (v3.251: EK_RAW_LOG 宏 L"sd.log" 改为栈上构造修复)
+//        ★ BUILD 567 v3.251 FIX (EkkoSleep 崩溃根因修复 7/20):
+//          - 根因: v3.250 确认 sd.log 字符串在 .rdata 段 RVA 0x5FC18/0x61804/0x62158/0x62CD8,
+//                  EkkoSleep EncryptAll 加密 .rdata 段时加密了 sd.log 字符串,
+//                  下一次 EK_RAW_LOG 调用时 while(_ekSuf[_ekI]) 读取被加密的 sd.log,
+//                  加密后字节无 0 终止符 → 循环不终止 → 越界读取 → 访问违规崩溃.
+//          - 修复: EK_RAW_LOG 宏中 L"sd.log" 改为栈上 wchar_t 数组逐字节构造,
+//                  不读取 .rdata 段, 避免加密后字符串损坏.
+//          - 验证: v3.249 D0 完整完成 (D0done 出现) + v3.250 D0 内 E0 出现 E1 未出现,
+//                  不一致结果说明崩溃位置随 .rdata 布局变化, 证实字符串常量位置是根因.
+//          - 预期: EA done 出现, DA done 出现, EkkoSleep 正常返回, 不再崩溃.
 // BUILD: 567 (v3.250: D1 细分为 4 个 4KB 页级子块诊断)
 //        ★ BUILD 567 v3.250 DIAG (D1 [208KB, 224KB) 崩溃页定位 7/20):
 //          - 背景: v3.249 确认 D0 完整完成 (D0done 出现), 崩溃在 D1 [208KB, 224KB)
@@ -748,7 +759,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.250 启动摘要 (D1 细分为 4 个 4KB 页级子块诊断)\n");
+    DiagLog("BUILD 567 v3.251 启动摘要 (EK_RAW_LOG 宏 L\"sd.log\" 改为栈上构造修复)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -787,7 +798,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.250 退出摘要\n");
+    DiagLog("BUILD 567 v3.251 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -812,7 +823,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.250 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.251 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
