@@ -7859,6 +7859,15 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
             return false;
         }
 
+        // ★ BUILD 567 v3.263 FIX: Left 和 Right 不能都非 NULL 且相等 (AVL 树节点不应指向同一地址)
+        //   v3.262 测试发现 off=0xAA8 误报: L=R=0xFFFFCD045294CB28, 导致 FindAndModifyVadNode 死循环
+        //   真实 AVL 节点: Left/Right 指向不同子节点, 或都是 NULL (叶子节点)
+        //   误报模式: Left=Right=同一非 NULL 地址 (可能是其他字段的值被误读为指针)
+        if (left && right && left == right) {
+            VadDiag("B554:EVR:VR off=0x%X FAIL L==R (same addr 0x%llX)\n", off, (unsigned long long)left);
+            return false;
+        }
+
         // 二次验证: VadStartingVpn <= VadEndingVpn
         uint64_t startVpn = 0, endVpn = 0;
         if (!kma.ReadKernelVAUnsafe(vadRootCandidate + VadOffsets::VadStartingVpn, &startVpn, 8)) {
@@ -7881,8 +7890,13 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
         //   原 < 0x100000 (1M 页 = 4GB) 会误判大部分高地址 VAD 节点 (如 0x00007FF6_xxxx 加载基址)
         //   新策略: 接受 0 to 0x7FFF_FFFF (用户态) 或 >= 0xFFFF800000000000 (内核特殊 VAD)
         //   拒绝中间值 (0x80000000 to 0xFFFF7FFFFFFFFFFF, 非法/未定义区域)
+        // ★ BUILD 567 v3.263 FIX: 收紧 endVpn 验证 — 只接受用户态 VPN (< 0x80000000)
+        //   v3.262 测试发现 off=0xAA8 误报: eVpn=0xFFFFF8018E7BAE30 (内核地址) 通过验证
+        //   原因: VAD 是用户态内存映射, endVpn 应该是用户态 VPN, 不应是内核地址
+        //   修复: endVpn 只接受 < 0x80000000 (用户态), 不接受内核特殊 VAD
+        //   startVpn 保持原逻辑 (允许内核特殊 VAD, 兼容系统进程)
         bool startValid = (startVpn < 0x80000000ULL) || (startVpn >= 0xFFFF800000000000ULL);
-        bool endValid   = (endVpn   < 0x80000000ULL) || (endVpn   >= 0xFFFF800000000000ULL);
+        bool endValid   = (endVpn < 0x80000000ULL);  // ★ v3.263: 收紧, 只接受用户态
         if (!startValid || !endValid) {
             VadDiag("B554:EVR:VR off=0x%X FAIL vpn valid start=0x%llX(%d) end=0x%llX(%d)\n",
                 off, (unsigned long long)startVpn, (int)startValid,
