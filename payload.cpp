@@ -787,7 +787,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.277 启动摘要 (CS2 退出蓝屏 0x50 修复 — UnhideAll 永远用 self-loop, 不碰邻居 EPROCESS)\n");
+    DiagLog("BUILD 567 v3.278 启动摘要 (CS2 退出蓝屏 0x3B 修复 — LogExitSummary 移到 DisableAll 前 + TerminateProcess 立即终止)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -826,7 +826,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.277 退出摘要\n");
+    DiagLog("BUILD 567 v3.278 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -3701,17 +3701,25 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     //           Shutdown 恢复 .text + ETW/AMSI + EncryptAll + 关闭 CS2 句柄, 不需要 driver.
                     // ★ BUILD 556: 移除 ShadowPageManager::Uninstall (影子页方案已废弃)
                     //   VirtualProtect patch 无需卸载 (CS2 退出时自动释放)
-                    stealth::KernelDefense::DisableAll();  // ★ v3.274: 移到最前面 (包含 UnhideProcess + kma.Shutdown)
-                    // ★ BUILD 565: 卸载 NtReadVirtualMemory hook (恢复 IAT + ntdll)
-                    //   必须在 CS2 退出前调用, 恢复 IAT/ntdll 原始字节, 防止 CS2 崩溃.
-                    //   失败安全: Uninstall 失败仅记录日志, 不阻塞退出 (hook 在用户态, 不蓝屏).
-                    if (stealth::NtReadHooker::Instance().IsActive()) {
-                        stealth::NtReadHooker::Instance().Uninstall();
-                    }
-                    // ★ BUILD 567 v3.227: 退出摘要 (CS2 退出路径)
-                    LogExitSummary();
-                    StealthEngine::Instance().Shutdown();
-                    return 0;
+                    // ★ BUILD 567 v3.278 FIX: CS2 退出蓝屏 0x3B (SYSTEM_SERVICE_EXCEPTION) 修复
+                    //   v3.277 测试: KMA_SHUTDOWN_DONE 后蓝屏 0x3B, 日志只到 LogExitSummary 的 "============"
+                    //   根因: driver 卸载后, driver 注册的内核回调可能仍指向已释放的 driver 内存,
+                    //         后续任何 syscall (DiagLog 的 CreateFileW/WriteFile, NtReadHooker::Uninstall
+                    //         的 VirtualProtectEx/WriteProcessMemory) 触发这些回调 → 0x3B
+                    //   修复: LogExitSummary 移到 DisableAll 之前 (driver 还活着, syscall 安全),
+                    //         DisableAll 完成后直接 TerminateProcess, 不执行任何后续 syscall
+                    //   顺序: LogExitSummary (driver active) → DisableAll (卸载 driver + 恢复 DKOM)
+                    //         → TerminateProcess (立即终止, 不触发 DllMain/全局析构/后续 syscall)
+                    //   安全性: LogExitSummary 在 driver active 时打印, syscall 安全;
+                    //           DisableAll 完成 UnhideAll (DKOM 恢复) + kma.Shutdown (driver 卸载);
+                    //           TerminateProcess 不执行后续代码, OS 自动清理句柄/内存;
+                    //           NtReadHooker::Uninstall / StealthEngine::Shutdown 被跳过 (CS2 已退出, 无意义).
+                    LogExitSummary();  // ★ v3.278: 移到 DisableAll 之前 (driver active, syscall 安全)
+                    stealth::KernelDefense::DisableAll();  // ★ v3.274: 包含 UnhideProcess + kma.Shutdown
+                    // ★ v3.278: 直接 TerminateProcess, 跳过 NtReadHooker::Uninstall / StealthEngine::Shutdown
+                    //   原因: driver 卸载后后续 syscall 可能触发 0x3B; CS2 已退出, 用户态清理无意义
+                    TerminateProcess(GetCurrentProcess(), 0);  // 立即终止, 不会执行到这里之后
+                    return 0;  // 不会执行, 仅为编译器满意
                 }
             }
         }
