@@ -826,7 +826,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.259 退出摘要\n");
+    DiagLog("BUILD 567 v3.261 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -851,7 +851,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.260 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.261 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
@@ -3250,14 +3250,19 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             //     不会怀疑 patch (相比原 -4 STATUS_TOO_MANY_OPEN_FILES 更隐蔽).
             //   ★ SHV 是临时性 install-then-uninstall 模式 (周期性启动),
             //     patch 后所有后续 SHV 启动尝试都立即返回 -5 (自然失败).
-            //   ★ BUILD 567 v3.260 TEST: 临时禁用 VmxOn/SHV patch — 对比测试是否是降级模式/IOCTL 导致蓝屏
+            //   ★ BUILD 567 v3.261 FIX: 永久条件化 — PAC 未安装时跳过 VmxOn/SHV patch
+            //     原因: v3.259/v3.260 测试确认 VmxOn/SHV patch 在 PAC 未安装情况下
+            //           仍尝试 patch → 连续失败 3 次进入降级模式 → 频繁 IOCTL 导致
+            //           PDFWKRNL.sys 不稳定 → 蓝屏.
+            //     修复: 检查 kernelResult.pacStatus, 仅在 PAC 已安装时执行 patch.
+            //     注: PatchShvInstallEntry 内部已做防御性检查, 此为外层快速跳过.
             //   ★ 失败不影响主流程 (仅记录 ByovdDiag 日志), PatchShvInstallEntry
             //     内部已做防御性检查 (KMA 未就绪 / PAC 未加载 / 特征码未匹配均安全返回 false).
-            if (false) {
+            if (kernelResult.pacStatus != stealth::KernelDefense::PacStatus::NotInstalled) {
                 bool shvPatched = stealth::ShvInstallPatcher::PatchShvInstallEntry();
                 DiagLog("B552:SHV:%s\n", shvPatched ? "ok" : "skip");  // 去特征化日志
             } else {
-                DiagLog("B552:SHV:disabled (v3.260 test)\n");
+                DiagLog("B552:SHV:skip (PAC not installed)\n");
             }
         }
 
@@ -3291,7 +3296,11 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             //   在 Buffer 中恢复 patch 区域 (RVA 0xC125D9, 2 字节) 原始字节 (32 c0).
             //   方案 B (IAT hook PvpAlive) 优先, 失败时启用方案 A (inline hook ntdll).
             //   失败安全: Install 失败不影响其他防御功能.
-            // ★ BUILD 567 v3.259 TEST: 临时禁用 NtReadHooker — 对比测试是否是 NtReadHooker 导致 CS2 崩溃
+            // ★ BUILD 567 v3.261 FIX: NtReadHooker 永久禁用 — inline hook ntdll 被 CS2 自检检测
+            //   v3.259 测试确认: NtReadHooker (inline hook ntdll!NtReadVirtualMemory) 是
+            //   CS2 对局加载崩溃根因. CS2 对局加载时自检 ntdll 完整性, 检测到 inline hook 后自杀.
+            //   修复方案: 永久禁用 NtReadHooker, 依赖 patch 自身隐蔽性 (patch 仅 2 字节 90 90).
+            //   未来若需恢复: 改用 IAT hook PvpAlive.dll (需检测 PvpAlive.dll 加载).
             if (false && g_cs2Patched && g_patchAddr && g_clientBase) {
                 HANDLE hCs2ForHook = StealthEngine::Instance().GetProcessHandle();
                 if (hCs2ForHook) {
@@ -3733,6 +3742,10 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     //   - 两者任一需要重 patch, 调用 PatchShvInstallEntry (内部优先 PatchVmxOnWrapper)
                     //   - 一次 PatchShvInstallEntry 调用同时维护两者 (避免重复 IOCTL)
                     //   - VmxOnWrapper 降级模式下跳过 (依赖 SHV_Install patch 兜底)
+                    // ★ BUILD 567 v3.261 FIX: 主循环 VmxOn/SHV 重 patch 永久禁用
+                    //   原因: v3.260 测试确认 VmxOn/SHV patch 是蓝屏根因.
+                    //   初始化阶段已条件化 (PAC 未安装时跳过), 主循环不再重 patch.
+                    //   若 PAC 后续加载, ReapplyAllCallbacks 会摘除回调, VmxOn/SHV 不再触发.
                     bool needShvRepatch = false;
                     if (false && !stealth::ShvInstallPatcher::IsDegradedMode()) {
                         if (!stealth::ShvInstallPatcher::IsPatched()) {
@@ -3906,9 +3919,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     // StartDR0FrequencyStat();  // ★ v3.237: 禁用
                     // ★ BUILD 565: 若初始化阶段 NtReadHooker 未安装 (ApplyCs2Patch 失败),
                     //   主循环中重试安装 (5s 间隔, 与 ApplyCs2Patch 同周期)
-                    // ★ BUILD 567 v3.259 TEST: 临时禁用 NtReadHooker — 对比测试是否是 NtReadHooker 导致 CS2 崩溃
-                    //   若禁用后 CS2 不崩溃 → NtReadHooker 是崩溃根因 (inline hook 被 CS2 自检检测)
-                    //   若禁用后 CS2 仍崩溃 → ApplyCs2Patch 是崩溃根因 (patch 被 CS2 自检检测)
+                    // ★ BUILD 567 v3.261 FIX: NtReadHooker 主循环重试永久禁用 (同初始化阶段)
+                    //   v3.259 测试确认 NtReadHooker 是 CS2 崩溃根因, 永久禁用.
                     if (false && !stealth::NtReadHooker::Instance().IsActive() && g_patchAddr && g_clientBase) {
                         HANDLE hCs2ForHook = StealthEngine::Instance().GetProcessHandle();
                         if (hCs2ForHook) {
