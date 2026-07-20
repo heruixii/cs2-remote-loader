@@ -292,6 +292,33 @@ void SleepObfuscator::EkkoSleep(DWORD milliseconds) {
     // Ekko 技术: 使用 WaitableTimer 替代 Sleep
     // 在计时器触发前加密内存, 触发后解密
 
+    // ★ BUILD 567 v3.239 DIAG: 地址诊断 — 确认 EkkoDiagLog/EkkoSleep 是否在 ekkoPage 中
+    //   ekkoPage = GetSelfPage() = EkkoSleepPageMarker 的页 (已豁免)
+    //   v3.238 崩溃现象: "B238:EK:EA+ pre" 有日志, "B238:EK:EA+ post" 无日志
+    //   根因假设: EkkoDiagLog 不在 ekkoPage 中, 被 EncryptAll 加密 → 调用时执行加密代码 → 崩溃
+    //   验证逻辑:
+    //     diagInEkko=1 → EkkoDiagLog 在豁免页 → 根因假设错误, 需重新分析
+    //     diagInEkko=0 → EkkoDiagLog 不在豁免页 → 根因确认 → v3.240 修复
+    //   安全性: 此日志在 EncryptAll 之前调用, 代码页未加密, 安全
+    {
+        uintptr_t ekkoPage = GetSelfPage();
+        uintptr_t diagLogAddr = reinterpret_cast<uintptr_t>(&EkkoDiagLog);
+        uintptr_t markerAddr = reinterpret_cast<uintptr_t>(&EkkoSleepPageMarker);
+        uintptr_t encAPage = GetEncryptAllPage();
+        uintptr_t decAPage = GetDecryptAllPage();
+        uintptr_t xorCPage = GetXorCryptPage();
+        int diagInEkko = (diagLogAddr >= ekkoPage && diagLogAddr < ekkoPage + 0x1000) ? 1 : 0;
+        int markerInEkko = (markerAddr >= ekkoPage && markerAddr < ekkoPage + 0x1000) ? 1 : 0;
+        EkkoDiagLog("B239:EK:addr ekkoPage=0x%llX diagLog=0x%llX marker=0x%llX encA=0x%llX decA=0x%llX xorC=0x%llX diagInEkko=%d markerInEkko=%d\n",
+            (unsigned long long)ekkoPage,
+            (unsigned long long)diagLogAddr,
+            (unsigned long long)markerAddr,
+            (unsigned long long)encAPage,
+            (unsigned long long)decAPage,
+            (unsigned long long)xorCPage,
+            diagInEkko, markerInEkko);
+    }
+
     // ★ BUILD 567 v3.238 DIAG: EkkoSleep 入口日志
     //   若 "EA+ pre" 有 "EA+ post" 无 → EncryptAll 内部崩溃
     //   若 "DA+ pre" 有 "DA+ post" 无 → DecryptAll 内部崩溃

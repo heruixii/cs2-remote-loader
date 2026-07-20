@@ -185,6 +185,16 @@
 //        安全性: VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch), 无新内存访问模式
 //                降级模式下依赖 SHV_Install patch 兜底 (双重保险), BSOD 风险极低
 //        预期效果: VmxOnWrapper patch 持久有效, EPT 永不构造, 综合 2-5% → 1.5-4%
+// BUILD: 567 (v3.239: 验证版本 — 添加 EkkoDiagLog/EkkoSleep 地址诊断日志)
+//        ★ BUILD 567 v3.239 DIAG (EkkoDiagLog 页面归属验证 7/20):
+//          - 目的: v3.238 确认崩溃位置在 EncryptAll 之后 ("B238:EK:EA+ pre" 有, "post" 无),
+//                  根因假设: EkkoDiagLog 不在 ekkoPage (0x1D5DECB5000) 中, 被 EncryptAll 加密.
+//          - 改动: 仅添加地址诊断日志, 不修改任何逻辑.
+//          - 位置 1: memory_cloak.cpp EkkoSleep 入口 — 输出 ekkoPage/diagLog/marker/encA/decA/xorC 地址
+//          - 位置 2: payload.cpp B550:EK:protected 日志 — 添加 ek+1@ (ekkoPage+0x1000) 显示下一页
+//          - 判读: diagInEkko=0 → EkkoDiagLog 不在豁免页 → 根因确认 → v3.240 修复
+//                  diagInEkko=1 → EkkoDiagLog 在豁免页 → 根因假设错误, 需重新分析
+//          - 安全性: 地址诊断日志在 EncryptAll 之前调用, 代码页未加密, 安全.
 // BUILD: 567 (v3.238: 诊断版本 — 添加 EkkoSleep 崩溃位置诊断日志)
 //        ★ BUILD 567 v3.238 DIAG (EkkoSleep 崩溃位置定位 7/20):
 //          - 目的: v3.237 在 patched 日志后 1.3 秒崩溃, 无任何后续日志, 怀疑
@@ -556,7 +566,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.238 启动摘要 (诊断版本 — EkkoSleep 崩溃位置定位)\n");
+    DiagLog("BUILD 567 v3.239 启动摘要 (验证版本 — EkkoDiagLog 页面归属验证)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -595,7 +605,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.238 退出摘要\n");
+    DiagLog("BUILD 567 v3.239 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -620,7 +630,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.238 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.239 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
@@ -2611,11 +2621,14 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             totalProtected += segSz;
         }
 
-        DiagLog("B550:EK:protected %llu bytes (exempt %d pages, ek@0x%llX veh@0x%llX "
+        // ★ BUILD 567 v3.239 DIAG: 添加 ek+1@ (ekkoPage+0x1000) 显示下一页地址
+        //   若 diagLog 地址 ∈ [ek+1, ek+1+0x1000) → EkkoDiagLog 在未被豁免的下一页 → 根因确认
+        DiagLog("B550:EK:protected %llu bytes (exempt %d pages, ek@0x%llX ek+1@0x%llX veh@0x%llX "
                 "encA@0x%llX decA@0x%llX xorC@0x%llX ap@0x%llX mp@0x%llX "
                 "sc@0x%llX rp@0x%llX dl@0x%llX uh@0x%llX idata[0x%llX-0x%llX))\n",  // ★ BUILD 558 FIX: 追加 dl(DiagLog)/uh(UnhideAll)/idata
             (unsigned long long)totalProtected, exemptPageCount,
-            (unsigned long long)ekkoPage, (unsigned long long)vehPage,
+            (unsigned long long)ekkoPage, (unsigned long long)(ekkoPage + 0x1000),
+            (unsigned long long)vehPage,
             (unsigned long long)encryptAllPage, (unsigned long long)decryptAllPage,
             (unsigned long long)xorCryptPage,
             (unsigned long long)applyPatchPage, (unsigned long long)maintainPatchPage,
