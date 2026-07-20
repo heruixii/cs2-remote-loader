@@ -185,6 +185,30 @@
 //        安全性: VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch), 无新内存访问模式
 //                降级模式下依赖 SHV_Install patch 兜底 (双重保险), BSOD 风险极低
 //        预期效果: VmxOnWrapper patch 持久有效, EPT 永不构造, 综合 2-5% → 1.5-4%
+// BUILD: 567 (v3.244: 加密窗口内 EK_RAW_LOG 诊断 + ekkoPage+0x3000 豁免)
+//        ★ BUILD 567 v3.244 DIAG+FIX (EkkoSleep 加密窗口精确定位 7/20):
+//          - 背景: v3.243 豁免 sleepObjPage 后仍崩溃 (B238:EK:EA+ pre 仍是最后一条日志),
+//                  说明根因不在 m_regions 被加密. 需精确定位加密窗口内崩溃位置.
+//          - 诊断: memory_cloak.cpp 新增 EK_RAW_LOG 宏, 加密窗口内用内联 WriteFile 输出
+//                  固定字符串 (不调用 CRT 函数, 避免 EkkoDiagLog 的 CRT 依赖问题):
+//                    EA+ post → EncryptAll 成功
+//                    timer OK → CreateWaitableTimerW 成功
+//                    set OK → SetWaitableTimer 成功
+//                    wait OK → WaitForSingleObject 成功
+//                    DA+ pre → DecryptAll 之前
+//                    DA+ post → DecryptAll 成功
+//          - 修复: exemptPages 添加 ekkoPage + 0x3000 (第四页), exemptPageCount 22 → 23.
+//                  原因: EkkoSleep 函数代码 (含 v3.244 新增的 EK_RAW_LOG 宏内联展开) 可能
+//                  跨越到 ekkoPage+0x3000 (第四页), 未豁免会被 EncryptAll 加密 → 崩溃.
+//          - 判读: 根据最后出现的 EK_RAW_LOG 日志判断崩溃位置:
+//                  EA+ post 未出现 → 崩溃在 EncryptAll 内部 (需分析 EncryptAll 代码)
+//                  timer OK 未出现 → 崩溃在 CreateWaitableTimerW (IAT 问题?)
+//                  set OK 未出现 → 崩溃在 SetWaitableTimer
+//                  wait OK 未出现 → 崩溃在 WaitForSingleObject
+//                  DA+ post 未出现 → 崩溃在 DecryptAll 内部
+//                  DA+ post 出现 → EkkoSleep 成功通过加密窗口
+//          - 安全性: EK_RAW_LOG 宏内联展开在 EkkoSleep 内部 (ekkoPage 已豁免),
+//                    只调用 kernel32 函数 (通过 IAT, .idata 已豁免), 不调用 CRT 函数.
 // BUILD: 567 (v3.243: 豁免 SleepObfuscator 对象所在页 — 真正根因修复)
 //        ★ BUILD 567 v3.243 FIX (EncryptAll 加密自身 m_regions 数组 7/20):
 //          - 根因: v3.242 移除加密窗口日志后仍崩溃, 重新分析根因.
@@ -623,7 +647,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.243 启动摘要 (豁免 SleepObfuscator 对象所在页 — 真正根因修复)\n");
+    DiagLog("BUILD 567 v3.244 启动摘要 (加密窗口内 EK_RAW_LOG 诊断 + ekkoPage+0x3000 豁免)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -662,7 +686,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.243 退出摘要\n");
+    DiagLog("BUILD 567 v3.244 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -687,7 +711,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.243 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.244 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
@@ -2634,7 +2658,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         uintptr_t sleepObjAddr = (uintptr_t)&SleepObfuscator::Instance();
         uintptr_t sleepObjPage = sleepObjAddr & ~0xFFFULL;
         uintptr_t exemptPages[48] = {
-            ekkoPage, ekkoPage + 0x1000, ekkoPage + 0x2000,  // ★ BUILD 567 v3.241 FIX: EkkoSleep 跨页保护 (扩展到 3 页)
+            ekkoPage, ekkoPage + 0x1000, ekkoPage + 0x2000, ekkoPage + 0x3000,  // ★ BUILD 567 v3.244 FIX: EkkoSleep 跨页保护 (扩展到 4 页, 防止 EkkoSleep+v3.244 EK_RAW_LOG 代码跨页)
             vehPage,
             encryptAllPage, encryptAllPage + 0x1000,        // ★ FIX-3: EncryptAll 跨页保护
             decryptAllPage, decryptAllPage + 0x1000,        // ★ FIX-3: DecryptAll 跨页保护
@@ -2644,7 +2668,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             diagLogPage, unhideAllPage,
             sleepObjPage, sleepObjPage + 0x1000  // ★ BUILD 567 v3.243 FIX: SleepObfuscator 对象跨页保护
         };
-        int exemptPageCount = 22;  // ★ v3.243: 20 → 22 (添加 sleepObjPage + sleepObjPage+0x1000)
+        int exemptPageCount = 23;  // ★ v3.244: 22 → 23 (添加 ekkoPage + 0x3000)
         // 追加 .idata 段所有页 (IAT 所在, 必须全部豁免)
         for (uintptr_t p = idataPageStart; p < idataPageEnd && exemptPageCount < 30; p += 0x1000) {
             exemptPages[exemptPageCount++] = p;

