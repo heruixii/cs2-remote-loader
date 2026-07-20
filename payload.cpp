@@ -185,6 +185,25 @@
 //        安全性: VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch), 无新内存访问模式
 //                降级模式下依赖 SHV_Install patch 兜底 (双重保险), BSOD 风险极低
 //        预期效果: VmxOnWrapper patch 持久有效, EPT 永不构造, 综合 2-5% → 1.5-4%
+// BUILD: 567 (v3.245: EncryptAll/DecryptAll 关键页跳过保护 + 内部 EK_RAW_LOG 诊断)
+//        ★ BUILD 567 v3.245 FIX+DIAG (EncryptAll 加密自身代码页根因修复 7/20):
+//          - 背景: v3.244 EA+ post 未出现 → 崩溃在 EncryptAll 内部.
+//                  主菜单正常, 进入对局第一次 StealthSleep 就崩溃.
+//          - 根因假设: m_regions 中某个 region 覆盖了 ekkoPage/encryptAllPage/xorCryptPage,
+//                      EncryptAll 加密自身代码页 → 后续执行加密字节 → 崩溃.
+//                      exemptPages 只在 payload.cpp StealthSleep 中使用, EncryptAll 内部
+//                      并不知道哪些页是关键页, 会无差别加密所有 m_regions 中的 region.
+//          - 修复: EncryptAll/DecryptAll 内部添加关键页跳过保护:
+//                  遍历每个 region 前, 检查 region 是否覆盖 ekkoPage(4页)/encryptAllPage(2页)/
+//                  decryptAllPage(2页)/xorCryptPage(2页)/sleepObjPage(2页), 覆盖则跳过.
+//                  DecryptAll 对称跳过 (否则解密未加密 region → 数据损坏).
+//          - 诊断: EncryptAll/DecryptAll 内部添加 EK_RAW_LOG 诊断:
+//                  EA start/EA skip/EA r0-r5/EA VP fail/EA done
+//                  DA start/DA skip/DA VP fail/DA done
+//                  根据最后出现的日志判断崩溃位置 (哪个 region 处理时崩溃).
+//          - 安全性: 关键页跳过保护是深度防御, 即使 region 注册时误覆盖关键页也不会崩溃.
+//                    跳过的 region 不加密 = Sleep 期间该 region 保持明文 (轻微降低隐蔽性,
+//                    但关键页本身已在 exemptPages 中豁免, 不影响整体保护效果).
 // BUILD: 567 (v3.244: 加密窗口内 EK_RAW_LOG 诊断 + ekkoPage+0x3000 豁免)
 //        ★ BUILD 567 v3.244 DIAG+FIX (EkkoSleep 加密窗口精确定位 7/20):
 //          - 背景: v3.243 豁免 sleepObjPage 后仍崩溃 (B238:EK:EA+ pre 仍是最后一条日志),
@@ -647,7 +666,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.244 启动摘要 (加密窗口内 EK_RAW_LOG 诊断 + ekkoPage+0x3000 豁免)\n");
+    DiagLog("BUILD 567 v3.245 启动摘要 (EncryptAll/DecryptAll 关键页跳过保护 + 内部 EK_RAW_LOG 诊断)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -686,7 +705,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.244 退出摘要\n");
+    DiagLog("BUILD 567 v3.245 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -711,7 +730,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.244 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.245 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
