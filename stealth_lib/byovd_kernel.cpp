@@ -9173,6 +9173,15 @@ bool NtReadHooker::GenerateFilterShellcode(uint8_t* outBuf, size_t* outSize,
     //   调用原 NtReadVirtualMemory, 若成功且读取范围与 patch 区域重叠,
     //   在 Buffer 中恢复 patch 字节 (BUILD 566: 由 patchWord 参数化), 返回原 status.
     //   内嵌常量: originalNtRead @ 偏移 0x16, patchAddr @ 偏移 0x35, patchWord @ 偏移 0x5D
+    //
+    // ★ BUILD 567 v3.258 FIX: 严格边界检查 — 修复缓冲区溢出导致的 CS2 崩溃
+    //   原Bug: 当 BaseAddress = patchAddr+1 时 offset=-1, 写入 [Buffer-1] 前溢出;
+    //          当 NumberOfBytesToRead=1 且 BaseAddress=patchAddr 时, 写入 2 字节但 Buffer 只 1 字节, 后溢出.
+    //   修复: 改为严格边界检查:
+    //     - BaseAddress > patchAddr → 跳过 (确保 offset >= 0)
+    //     - patchEnd > readEnd → 跳过 (确保 offset + 2 <= NumberOfBytesToRead)
+    //   字节变化: [0x41] cmp rdx,rcx → cmp rdx,rax; [0x44] jae → ja;
+    //             [0x46] cmp rax,r9 → cmp rcx,r9; [0x49] jae → ja
     static const uint8_t kTemplate[] = {
         // [0x00] push rbp; mov rbp, rsp; sub rsp, 0x40
         0x55, 0x48, 0x89, 0xE5, 0x48, 0x83, 0xEC, 0x40,
@@ -9203,16 +9212,26 @@ bool NtReadHooker::GenerateFilterShellcode(uint8_t* outBuf, size_t* outSize,
         0x4E, 0x8D, 0x0C, 0x0A,
         // [0x33] mov rax, patchAddr (10 字节, 常量在 +2 = 0x35)
         0x48, 0xB8, 0,0,0,0,0,0,0,0,
-        // [0x3D] lea rcx, [rax + 2]   (patchEnd)
+        // [0x3D] lea rcx, [rax + 2]   (patchEnd = patchAddr + 2)
         0x48, 0x8D, 0x48, 0x02,
-        // [0x41] cmp rdx, rcx         (BaseAddress vs patchEnd)
-        0x48, 0x39, 0xCA,
-        // [0x44] jae .return (+0x19 → 0x5F)
-        0x73, 0x19,
-        // [0x46] cmp rax, r9          (patchAddr vs readEnd)
-        0x4C, 0x39, 0xC8,
-        // [0x49] jae .return (+0x14 → 0x5F)
-        0x73, 0x14,
+        // [0x41] cmp rdx, rax         (BaseAddress vs patchAddr)
+        //   ★ v3.258 FIX: 原 cmp rdx, rcx (vs patchEnd) → cmp rdx, rax (vs patchAddr)
+        //   原因: 确保 offset = patchAddr - BaseAddress >= 0, 防止 BaseAddress > patchAddr 时
+        //         offset 变成负数 (0xFFFFFFFFFFFFFFFF) 导致 r8 = Buffer + offset 写入缓冲区前
+        0x48, 0x39, 0xC2,
+        // [0x44] ja .return (+0x19 → 0x5F)
+        //   ★ v3.258 FIX: 原 jae (>=) → ja (>) 允许 BaseAddress == patchAddr (offset=0)
+        //   原因: BaseAddress == patchAddr 时 offset=0 是合法的, 不应跳过
+        0x77, 0x19,
+        // [0x46] cmp rcx, r9          (patchEnd vs readEnd)
+        //   ★ v3.258 FIX: 原 cmp rax, r9 (patchAddr vs readEnd) → cmp rcx, r9 (patchEnd vs readEnd)
+        //   原因: 确保 patchEnd <= readEnd (即 offset + 2 <= NumberOfBytesToRead),
+        //         防止 NumberOfBytesToRead < 2 时写入超过 Buffer 边界
+        0x4C, 0x39, 0xC9,
+        // [0x49] ja .return (+0x14 → 0x5F)
+        //   ★ v3.258 FIX: 原 jae (>=) → ja (>) 允许 patchEnd == readEnd (刚好读完 2 字节)
+        //   原因: patchEnd == readEnd 时 offset + 2 == NumberOfBytesToRead, 刚好不溢出
+        0x77, 0x14,
         // [0x4B] mov rdx, [rbp-0x08]  (BaseAddress)
         0x48, 0x8B, 0x55, 0xF8,
         // [0x4F] sub rax, rdx         (offset = patchAddr - BaseAddress)
