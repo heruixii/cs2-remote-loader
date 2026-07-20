@@ -185,6 +185,19 @@
 //        安全性: VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch), 无新内存访问模式
 //                降级模式下依赖 SHV_Install patch 兜底 (双重保险), BSOD 风险极低
 //        预期效果: VmxOnWrapper patch 持久有效, EPT 永不构造, 综合 2-5% → 1.5-4%
+// BUILD: 567 (v3.241: 扩展 EkkoSleep 跨页保护到 3 页 + 函数地址诊断)
+//        ★ BUILD 567 v3.241 FIX+DIAG (EkkoSleep 跨页保护扩展 7/20):
+//          - 背景: v3.240 添加 ekkoPage+0x1000 豁免后仍然崩溃 (B238:EK:EA+ post 仍未输出)
+//                  说明 EkkoSleep 函数代码跨越到 ekkoPage+0x2000 (第三页), 或编译器将
+//                  EkkoSleep 放在远离 EkkoSleepPageMarker 的位置.
+//          - 修复: exemptPages 添加 ekkoPage + 0x2000, exemptPageCount 19 → 20.
+//          - 诊断: memory_cloak.cpp EkkoSleep 入口添加 B241:EK:self 日志, 使用 GCC &&label
+//                  扩展获取 EkkoSleep 内部 label 地址, 输出 inEkko0/inEkko1/inEkko2 标志.
+//          - 判读: 若 B238:EK:EA+ post 出现 → ekkoPage+0x2000 修复成功
+//                  若仍崩溃 + inEkko2=1 → EkkoSleep 在 ekkoPage+0x2000, 可能需要 +0x3000
+//                  若仍崩溃 + inEkko0/1/2 全 0 → EkkoSleep 在 [ekkoPage, ekkoPage+0x3000) 之外
+//          - 安全性: 多豁免 4KB (累计 12KB 相对 .text 344KB 仅 3.5%), 不影响加密效果.
+//          - 预期: EkkoSleep 跨页代码不被加密, "B238:EK:EA+ post" 日志正常输出.
 // BUILD: 567 (v3.240: 修复 EkkoSleep 跨页 — 添加 ekkoPage+0x1000 豁免)
 //        ★ BUILD 567 v3.240 FIX (EkkoSleep 跨页保护 7/20):
 //          - 根因: v3.239 确认 diagInEkko=1 (EkkoDiagLog 在豁免页), 但 EncryptAll 后仍崩溃.
@@ -576,7 +589,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.240 启动摘要 (修复 EkkoSleep 跨页 — ekkoPage+0x1000 豁免)\n");
+    DiagLog("BUILD 567 v3.241 启动摘要 (扩展 EkkoSleep 跨页保护到 3 页 + 函数地址诊断)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -615,7 +628,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.240 退出摘要\n");
+    DiagLog("BUILD 567 v3.241 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -640,7 +653,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.240 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.241 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
@@ -2577,7 +2590,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         //         防止函数跨页时尾部所在页被加密. 代价: 多 3*4KB=12KB 不加密 (相对 .text 344KB 仅 3.5%)
         //   注: 即使函数不跨页, 多豁免一页也是安全的 (仅减少少量加密范围, 不影响功能)
         uintptr_t exemptPages[48] = {
-            ekkoPage, ekkoPage + 0x1000,                    // ★ BUILD 567 v3.240 FIX: EkkoSleep 跨页保护 (EkkoSleep 函数代码可能跨到下一页)
+            ekkoPage, ekkoPage + 0x1000, ekkoPage + 0x2000,  // ★ BUILD 567 v3.241 FIX: EkkoSleep 跨页保护 (扩展到 3 页)
             vehPage,
             encryptAllPage, encryptAllPage + 0x1000,        // ★ FIX-3: EncryptAll 跨页保护
             decryptAllPage, decryptAllPage + 0x1000,        // ★ FIX-3: DecryptAll 跨页保护
@@ -2586,7 +2599,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             setupDr0Page, clearDr0Page, startStatPage, reportFreqPage,
             diagLogPage, unhideAllPage
         };
-        int exemptPageCount = 19;  // ★ v3.240: 18 → 19 (添加 ekkoPage + 0x1000)
+        int exemptPageCount = 20;  // ★ v3.241: 19 → 20 (添加 ekkoPage + 0x2000)
         // 追加 .idata 段所有页 (IAT 所在, 必须全部豁免)
         for (uintptr_t p = idataPageStart; p < idataPageEnd && exemptPageCount < 30; p += 0x1000) {
             exemptPages[exemptPageCount++] = p;

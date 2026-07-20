@@ -292,6 +292,27 @@ void SleepObfuscator::EkkoSleep(DWORD milliseconds) {
     // Ekko 技术: 使用 WaitableTimer 替代 Sleep
     // 在计时器触发前加密内存, 触发后解密
 
+    // ★ BUILD 567 v3.241 DIAG: EkkoSleep 函数自身地址诊断
+    //   使用 GCC &&label 扩展获取 EkkoSleep 内部 label 地址 (近似 EkkoSleep 入口)
+    //   v3.240 添加 ekkoPage+0x1000 豁免后仍崩溃 → EkkoSleep 可能跨到 ekkoPage+0x2000
+    //   判读: inEkko0=1 → EkkoSleep 在 ekkoPage (已豁免)
+    //         inEkko1=1 → EkkoSleep 在 ekkoPage+0x1000 (v3.240 已豁免)
+    //         inEkko2=1 → EkkoSleep 在 ekkoPage+0x2000 (v3.241 已豁免, 若仍崩溃需 +0x3000)
+    //         全 0 → EkkoSleep 在 [ekkoPage, ekkoPage+0x3000) 之外, 编译器放在远处
+    //   安全性: 此日志在 EncryptAll 之前调用, 代码页未加密, 安全
+ekko_sleep_entry:
+    {
+        uintptr_t ekkoSleepAddr = reinterpret_cast<uintptr_t>(&&ekko_sleep_entry);
+        uintptr_t ekkoPage = GetSelfPage();
+        int sleepInEkko0 = (ekkoSleepAddr >= ekkoPage && ekkoSleepAddr < ekkoPage + 0x1000) ? 1 : 0;
+        int sleepInEkko1 = (ekkoSleepAddr >= ekkoPage + 0x1000 && ekkoSleepAddr < ekkoPage + 0x2000) ? 1 : 0;
+        int sleepInEkko2 = (ekkoSleepAddr >= ekkoPage + 0x2000 && ekkoSleepAddr < ekkoPage + 0x3000) ? 1 : 0;
+        EkkoDiagLog("B241:EK:self ekkoSleep=0x%llX ekkoPage=0x%llX inEkko0=%d inEkko1=%d inEkko2=%d\n",
+            (unsigned long long)ekkoSleepAddr,
+            (unsigned long long)ekkoPage,
+            sleepInEkko0, sleepInEkko1, sleepInEkko2);
+    }
+
     // ★ BUILD 567 v3.239 DIAG: 地址诊断 — 确认 EkkoDiagLog/EkkoSleep 是否在 ekkoPage 中
     //   ekkoPage = GetSelfPage() = EkkoSleepPageMarker 的页 (已豁免)
     //   v3.238 崩溃现象: "B238:EK:EA+ pre" 有日志, "B238:EK:EA+ post" 无日志
