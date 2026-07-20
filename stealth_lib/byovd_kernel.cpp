@@ -7610,16 +7610,32 @@ void KernelDefense::DisableAll() {
         kma.Shutdown();
         StateLog("EXIT", "KMA_SHUTDOWN_DONE", "");
 
-        // 删除注册表服务键 — ★ BUILD 501: 手动构造路径替代 std::wstring 拼接
-        wchar_t keyPath[512] = {};
-        wcscpy_s(keyPath, L"SYSTEM\\CurrentControlSet\\Services\\");
-        wcscat_s(keyPath, svcName);
-        RegDeleteTreeW(HKEY_LOCAL_MACHINE, keyPath);
+        // ★ BUILD 567 v3.281 FIX: CS2 退出蓝屏 0x3B/0x50 修复 — 跳过 RegDeleteTreeW + DeleteFileW
+        //   v3.277 蓝屏 0x3B: DisableAll 完成后 LogExitSummary 的 DiagLog syscall 触发 0x3B
+        //   v3.280 蓝屏 0x3B: DisableAll 内部 KMA_SHUTDOWN_DONE 后 RegDeleteTreeW/DeleteFileW 触发 0x3B
+        //   根因: kma.Shutdown() 只关闭设备句柄, 不卸载 driver (BUILD 470 策略).
+        //         driver 仍在内核运行, 其注册的内核回调仍指向 driver 内存.
+        //         RegDeleteTreeW 删除服务键后, PnP 管理器可能标记 driver 为可卸载,
+        //         触发 driver unload → 回调访问已释放内存 → 0x3B/0x50.
+        //   修复: CS2 退出路径跳过 RegDeleteTreeW + DeleteFileW, 只做 kma.Shutdown (关闭句柄).
+        //         driver 保持加载状态, 回调不会触发.
+        //         残留服务键和 driver 文件在下次启动时由 ForceRemoveRTCore64Services 清理.
+        //   副作用: 服务键和 driver 文件残留 (TEMP 中), 下次启动 ForceRemoveRTCore64Services 清理.
+        //   安全性: driver 保持加载但句柄已关闭, 无法再 IOCTL; 服务键残留不影响功能.
+        //   注: 正常退出路径 (loader.exe 自己退出) 仍需要清理, 由单独路径处理.
+        // 删除注册表服务键 — 跳过 (v3.281: 避免 driver unload 触发 0x3B)
+        // wchar_t keyPath[512] = {};
+        // wcscpy_s(keyPath, L"SYSTEM\\CurrentControlSet\\Services\\");
+        // wcscat_s(keyPath, svcName);
+        // RegDeleteTreeW(HKEY_LOCAL_MACHINE, keyPath);
 
-        // 删除 TEMP 中的驱动文件
-        if (drvPath && drvPath[0]) {
-            DeleteFileW(drvPath);
-        }
+        // 删除 TEMP 中的驱动文件 — 跳过 (v3.281: 避免 driver unload 触发 0x3B)
+        // if (drvPath && drvPath[0]) {
+        //     DeleteFileW(drvPath);
+        // }
+
+        // 标记已跳过清理 (供诊断)
+        StateLog("EXIT", "CLEANUP_SKIPPED", "svc=%S drv=%S", svcName, drvPath ? drvPath : L"(null)");
 
         ByovdDiag("BYOVD: %ls unloaded & cleaned.\n", svcName);
     }
