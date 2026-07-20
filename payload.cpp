@@ -185,6 +185,22 @@
 //        安全性: VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch), 无新内存访问模式
 //                降级模式下依赖 SHV_Install patch 兜底 (双重保险), BSOD 风险极低
 //        预期效果: VmxOnWrapper patch 持久有效, EPT 永不构造, 综合 2-5% → 1.5-4%
+// BUILD: 567 (v3.246: region 3 精细诊断 VP1/XC/VP2/FIC/end)
+//        ★ BUILD 567 v3.246 DIAG (region 3 崩溃步骤精确定位 7/20):
+//          - 背景: v3.245 测试 EA r3 出现, EA r4 未出现 → 崩溃在处理 region 3 时
+//          - 诊断: 对 region 3 添加精细诊断:
+//                  EA r3 VP1 → VirtualProtect(PAGE_READWRITE) 之前
+//                  EA r3 VP1fail → VirtualProtect 失败
+//                  EA r3 XC → XorCrypt 之前
+//                  EA r3 VP2 → 第二次 VirtualProtect(恢复) 之前
+//                  EA r3 FIC → FlushInstructionCache 之前 (仅 isCode)
+//                  EA r3 end → region 3 处理完成
+//          - 判读:
+//                  EA r3 VP1 出现, EA r3 XC 未出现 → 崩溃在 VirtualProtect
+//                  EA r3 XC 出现, EA r3 VP2 未出现 → 崩溃在 XorCrypt
+//                  EA r3 VP2 出现, EA r3 FIC/end 未出现 → 崩溃在第二次 VirtualProtect
+//                  EA r3 FIC 出现, EA r3 end 未出现 → 崩溃在 FlushInstructionCache
+//                  EA r3 end 出现 → region 3 处理完成 (崩溃在其他地方)
 // BUILD: 567 (v3.245: EncryptAll/DecryptAll 关键页跳过保护 + 内部 EK_RAW_LOG 诊断)
 //        ★ BUILD 567 v3.245 FIX+DIAG (EncryptAll 加密自身代码页根因修复 7/20):
 //          - 背景: v3.244 EA+ post 未出现 → 崩溃在 EncryptAll 内部.
@@ -666,7 +682,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.245 启动摘要 (EncryptAll/DecryptAll 关键页跳过保护 + 内部 EK_RAW_LOG 诊断)\n");
+    DiagLog("BUILD 567 v3.246 启动摘要 (region 3 精细诊断 VP1/XC/VP2/FIC/end)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -705,7 +721,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.245 退出摘要\n");
+    DiagLog("BUILD 567 v3.246 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -730,7 +746,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.245 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.246 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",

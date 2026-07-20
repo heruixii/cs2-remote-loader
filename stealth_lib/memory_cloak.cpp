@@ -248,25 +248,40 @@ void SleepObfuscator::EncryptAll() {
         else if (ri == 5) EK_RAW_LOG("EA r5\n");
         else EK_RAW_LOG("EA rX\n");
 
+        // ★ BUILD 567 v3.246 DIAG: 对 region 3 添加精细诊断 (已知崩溃位置)
+        //   v3.245 测试: EA r3 出现, EA r4 未出现 → 崩溃在处理 region 3 时
+        //   本版添加 VP1/XC/VP2/FIC/end 精细诊断, 精确定位崩溃步骤
+        bool diagR3 = (ri == 3);
+
         if (region.isCode) {
             DWORD oldProtect;
+            if (diagR3) EK_RAW_LOG("EA r3 VP1\n");
             if (!VirtualProtect(region.addr, region.size, PAGE_READWRITE, &oldProtect)) {
-                EK_RAW_LOG("EA VP fail\n");
+                if (diagR3) EK_RAW_LOG("EA r3 VP1fail\n");
+                else EK_RAW_LOG("EA VP fail\n");
                 continue;
             }
+            if (diagR3) EK_RAW_LOG("EA r3 XC\n");
             XorCrypt(region.addr, region.size, region.xorKey);
+            if (diagR3) EK_RAW_LOG("EA r3 VP2\n");
             VirtualProtect(region.addr, region.size, oldProtect, &oldProtect);
+            if (diagR3) EK_RAW_LOG("EA r3 FIC\n");
             FlushInstructionCache(GetCurrentProcess(), region.addr, region.size);
         } else {
             // ★ v3.37 FIX: 检查 VirtualProtect 返回值
             DWORD oldProtect = 0;
+            if (diagR3) EK_RAW_LOG("EA r3 VP1\n");
             if (!VirtualProtect(region.addr, region.size, PAGE_READWRITE, &oldProtect)) {
-                EK_RAW_LOG("EA VP fail\n");
+                if (diagR3) EK_RAW_LOG("EA r3 VP1fail\n");
+                else EK_RAW_LOG("EA VP fail\n");
                 continue;
             }
+            if (diagR3) EK_RAW_LOG("EA r3 XC\n");
             XorCrypt(region.addr, region.size, region.xorKey);
+            if (diagR3) EK_RAW_LOG("EA r3 VP2\n");
             VirtualProtect(region.addr, region.size, oldProtect, &oldProtect);
         }
+        if (diagR3) EK_RAW_LOG("EA r3 end\n");
     }
     EK_RAW_LOG("EA done\n");
 }
