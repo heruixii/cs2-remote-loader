@@ -787,7 +787,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.283 启动摘要 (CS2 退出蓝屏 0x3B 修复 — return 0 自然退出, 不 TerminateProcess)\n");
+    DiagLog("BUILD 567 v3.284 启动摘要 (CS2 退出蓝屏 0x3B 修复 — Sleep 10 秒等待 driver 内部缓存清理)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -3713,22 +3713,20 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     //   诊断: 退出摘要信息从 DisableAll 内部 StateLog 获取 (DISABLE_ALL_ENTER/UNHIDE_ALL_DONE/KMA_SHUTDOWN_DONE)
                     //   注: LogExitSummary 的统计信息 (VmxOn/SHV/VEH 等) 不再在 CS2 退出路径打印,
                     //       但主循环正常退出路径 (L4096) 仍会打印.
-                    // ★ BUILD 567 v3.283 FIX: CS2 退出蓝屏 0x3B 修复 — return 0 自然退出, 不 TerminateProcess
-                    //   v3.282 测试: Sleep 2s + DisableAll + TerminateProcess 仍蓝屏 0x3B
-                    //   用户提示: loader.exe 不能直接被清理, 应该通过关闭 CS2 自然退出
-                    //   根因: TerminateProcess 是 syscall, CS2 退出异步清理期间任何 syscall 都可能触发 0x3B
-                    //   修复: DisableAll 后 return 0, 让 CheatMainLoop 自然返回 → DllMain 返回 → loader.exe 自然退出
-                    //   顺序: Sleep(2000) → DisableAll (UnhideAll + kma.Shutdown) → return 0
-                    //   安全性: loader.exe 自然退出时 PspExitProcess 触发的是 PAC 回调 (已摘除),
-                    //           BYOVD driver (PDFWKRNL.sys) 不注册进程通知回调, 只提供 IOCTL 接口,
-                    //           所以 loader.exe 退出安全.
-                    //   注: DllMain DLL_PROCESS_DETACH 路径 (L4119) 会再次调用 UnhideAll (双保险, 幂等).
-                    DiagLog("B583:EXIT:Sleep 2000ms (wait CS2 async cleanup)\n");
-                    Sleep(2000);  // ★ v3.282: 等待 CS2 退出异步清理完成
+                    // ★ BUILD 567 v3.284 FIX: CS2 退出蓝屏 0x3B 修复 — Sleep 10 秒等待 driver 内部缓存清理
+                    //   v3.283 测试: return 0 后 loader.exe 退出过程蓝屏 0x3B
+                    //   根因: BYOVD driver (PDFWKRNL.sys) 通过 IOCTL 映射了 loader.exe 的物理内存,
+                    //         driver 内部缓存了物理页映射. loader.exe 退出时这些物理页被释放,
+                    //         driver 内部缓存的映射变成无效 → driver 访问无效物理页 → 0x3B.
+                    //   修复: Sleep 10 秒, 让 Windows 内核完全清理 CS2 + loader.exe 相关资源,
+                    //         包括 driver 内部缓存的物理页映射.
+                    //   顺序: Sleep(10000) → DisableAll → return 0
+                    //   注: 10 秒是经验值, 如果仍蓝屏需要更长 Sleep 或其他方案.
+                    DiagLog("B584:EXIT:Sleep 10000ms (wait driver cache cleanup)\n");
+                    Sleep(10000);  // ★ v3.284: 等待 driver 内部缓存清理
                     stealth::KernelDefense::DisableAll();  // ★ v3.279: DisableAll (UnhideAll + kma.Shutdown)
                     // ★ v3.283: return 0 自然退出, 不 TerminateProcess
-                    //   让 CheatMainLoop 自然返回 → DllMain 返回 → loader.exe main 返回 0 → 自然退出
-                    DiagLog("B583:EXIT:return 0 (natural exit, no TerminateProcess)\n");
+                    DiagLog("B584:EXIT:return 0 (natural exit after 10s sleep)\n");
                     return 0;  // ★ v3.283: 自然退出, CheatMainLoop 返回 → DllMain 返回 → loader.exe 退出
                 }
             }
