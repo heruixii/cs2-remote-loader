@@ -185,6 +185,21 @@
 //        安全性: VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch), 无新内存访问模式
 //                降级模式下依赖 SHV_Install patch 兜底 (双重保险), BSOD 风险极低
 //        预期效果: VmxOnWrapper patch 持久有效, EPT 永不构造, 综合 2-5% → 1.5-4%
+// BUILD: 567 (v3.242: 移除加密窗口内的 EkkoDiagLog 调用 — 真正根因修复)
+//        ★ BUILD 567 v3.242 FIX (EkkoSleep 加密窗口 CRT 崩溃 7/20):
+//          - 根因: v3.241 B241:EK:self 诊断确认 EkkoSleep 入口在 ekkoPage+0x1000 (已豁免),
+//                  但 EkkoDiagLog 内部调用静态链接的 CRT 函数 (vsnprintf/snprintf/strlen/memcpy),
+//                  这些函数代码页在 payload.dll .text 段未豁免位置, 被 EncryptAll 加密 → 崩溃.
+//                  v3.240/v3.241 的 ekkoPage+0x1000/0x2000 豁免无效 (EkkoSleep 本身已在豁免页).
+//          - 修复: 移除加密窗口内 (EncryptAll 之后 / DecryptAll 之前) 的 3 处 EkkoDiagLog 调用:
+//            1. "B238:EK:EA+ post" (EncryptAll 之后)
+//            2. "B238:EK:timer FAIL" (fallback 路径, EncryptAll 之后 DecryptAll 之前)
+//            3. "B238:EK:DA+ pre" (DecryptAll 之前)
+//          - 保留: EncryptAll 之前 + DecryptAll 之后的日志 (代码页未加密/已解密, 安全)
+//          - 判读: 若 "B238:EK:DA+ post" 出现 → EkkoSleep 成功通过加密窗口
+//                  若 "B238:EK:DA+ post" 未出现 → 崩溃在 EncryptAll/WaitForSingleObject/DecryptAll
+//          - 安全性: 不影响 EkkoSleep 逻辑, 仅移除诊断日志. 系统DLL函数 (CreateWaitableTimerW 等)
+//                    不在加密范围, 加密窗口内调用安全.
 // BUILD: 567 (v3.241: 扩展 EkkoSleep 跨页保护到 3 页 + 函数地址诊断)
 //        ★ BUILD 567 v3.241 FIX+DIAG (EkkoSleep 跨页保护扩展 7/20):
 //          - 背景: v3.240 添加 ekkoPage+0x1000 豁免后仍然崩溃 (B238:EK:EA+ post 仍未输出)
@@ -589,7 +604,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.241 启动摘要 (扩展 EkkoSleep 跨页保护到 3 页 + 函数地址诊断)\n");
+    DiagLog("BUILD 567 v3.242 启动摘要 (移除加密窗口内的 EkkoDiagLog 调用 — 真正根因修复)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -628,7 +643,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.241 退出摘要\n");
+    DiagLog("BUILD 567 v3.242 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -653,7 +668,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.241 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.242 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
