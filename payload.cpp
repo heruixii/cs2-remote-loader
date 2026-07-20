@@ -787,7 +787,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.272 启动摘要 (VAD 修复 — 移除 v3.271 双重解引用 + VadFlags 4字节 + VPN 4字节读取)\n");
+    DiagLog("BUILD 567 v3.273 启动摘要 (VAD 修复 — Parent 低2位 Balance 解码 + v3.272 双重解引用/VadFlags/VPN 修复)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};

@@ -7716,6 +7716,11 @@ void KernelDefense::ReapplyAllCallbacks() {
 //   根因 2: VadFlags (ULONG 4字节) 用 uint64_t 读写 8字节 → 写入覆盖相邻字段 → 蓝屏 0x50
 //   根因 3: validateVadRoot 用 8字节读 VPN (4字节字段) → 垃圾值 → 合法 VadRoot 被拒绝
 //   修复: 移除双重解引用 + VadFlags 改 uint32_t + VPN 改 4字节+VpnHigh (与 FindAndModifyVadNode 一致)
+// ★ BUILD 567 v3.273 FIX: _RTL_BALANCED_NODE.Parent 低 2 位是 Balance (红黑树), 不是指针
+//   根因: 字段名 RbnParentEncoded 已暗示是编码后的 Parent, 但验证时忘了解码
+//   现象: off=0x558 (Win11 24H2 真正 VadRoot) P=0x1 → isValidPtr(0x1)=false → 拒绝
+//         P=0x1 实际是 Balance=1 + Parent=NULL (根节点 Parent=NULL 正常)
+//   修复: 掩码掉低 2 位 Balance (parent & ~0x3) 得到真实 Parent 指针再检查
 struct VadOffsets {
     // EPROCESS 内部偏移 — 全部运行时动态解析, 不再硬编码
     // (Win10/11 23H2: UniqueProcessId=0x440, ActiveProcessLinks=0x448, VadRoot=0x7D8)
@@ -7873,16 +7878,25 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
             VadDiag("B554:EVR:VR off=0x%X FAIL read parent (cand=0x%llX)\n", off, (unsigned long long)vadRootCandidate);
             return false;
         }
-        if (!isValidPtr(left) || !isValidPtr(right) || !isValidPtr(parent)) {
-            VadDiag("B554:EVR:VR off=0x%X FAIL ptr check L=0x%llX R=0x%llX P=0x%llX\n",
-                off, (unsigned long long)left, (unsigned long long)right, (unsigned long long)parent);
+        // ★ BUILD 567 v3.273 FIX: _RTL_BALANCED_NODE.Parent 低 2 位是 Balance (红黑树), 不是指针
+        //   字段名 RbnParentEncoded 已暗示是编码后的 Parent, 但 v3.272 之前验证时忘了解码.
+        //   现象: off=0x558 (Win11 24H2 真正 VadRoot) P=0x1 → isValidPtr(0x1)=false → 拒绝
+        //   根因: P=0x1 实际是 Balance=1 + Parent=NULL (根节点 Parent=NULL 正常)
+        //   修复: 掩码掉低 2 位 Balance 得到真实 Parent 指针再检查
+        uint64_t parentPtr = parent & ~0x3ULL;
+        if (!isValidPtr(left) || !isValidPtr(right) || !isValidPtr(parentPtr)) {
+            VadDiag("B554:EVR:VR off=0x%X FAIL ptr check L=0x%llX R=0x%llX P=0x%llX (parentPtr=0x%llX)\n",
+                off, (unsigned long long)left, (unsigned long long)right,
+                (unsigned long long)parent, (unsigned long long)parentPtr);
             return false;
         }
 
         // ★ BUILD 567 v3.230 FIX: 至少一个非 NULL (完全空的节点不太可能是真实 VadRoot)
         //   深度防御: 真实 VAD 树根节点通常有子节点或父指针, 三字段全 0 极不可能
-        if (!left && !right && !parent) {
-            VadDiag("B554:EVR:VR off=0x%X FAIL all NULL\n", off);
+        // ★ BUILD 567 v3.273: 用 parentPtr (解码后) 判断, parent=0x1 时 parentPtr=0 (Balance=1)
+        if (!left && !right && !parentPtr) {
+            VadDiag("B554:EVR:VR off=0x%X FAIL all NULL (parent=0x%llX Balance=%llu)\n",
+                off, (unsigned long long)parent, (unsigned long long)(parent & 0x3));
             return false;
         }
 
