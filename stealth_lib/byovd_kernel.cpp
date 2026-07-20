@@ -7840,8 +7840,24 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
 
     // 验证候选偏移是否为合法 VadRoot (含 Left/Right/ParentEncoded + VadStartingVpn/VadEndingVpn)
     // ★ BUILD 567 v3.262 DIAG: 添加详细诊断日志, 记录每个失败原因
-    auto validateVadRoot = [&](uint64_t vadRootCandidate, uint32_t off = 0) -> bool {
-        if (!vadRootCandidate || vadRootCandidate < 0xFFFF800000000000ULL) return false;
+    // ★ BUILD 567 v3.271 FIX: _RTL_AVL_TREE 是指针结构, 需要先解引用
+    //   EPROCESS+0x558 是 _RTL_AVL_TREE (8字节), 包含一个 Root 指针指向 _RTL_BALANCED_NODE
+    //   之前错误: 直接把 EPROCESS+offset 的值当作 _RTL_BALANCED_NODE 验证
+    //   修复: EPROCESS+offset 读取的是 Root 指针, 需要 *Root 得到 _RTL_BALANCED_NODE
+    //         然后验证 _RTL_BALANCED_NODE 的 Left/Right/Parent + StartingVpn/EndingVpn
+    auto validateVadRoot = [&](uint64_t avlTreeAddr, uint32_t off = 0) -> bool {
+        if (!avlTreeAddr || avlTreeAddr < 0xFFFF800000000000ULL) return false;
+
+        // ★ v3.271: 解引用 _RTL_AVL_TREE.Root (8字节指针) 得到 _RTL_BALANCED_NODE 地址
+        uint64_t vadRootCandidate = 0;
+        if (!kma.ReadKernelVAUnsafe(avlTreeAddr, &vadRootCandidate, 8)) {
+            VadDiag("B554:EVR:VR off=0x%X FAIL read AVL_TREE.Root (addr=0x%llX)\n", off, (unsigned long long)avlTreeAddr);
+            return false;
+        }
+        if (!vadRootCandidate || vadRootCandidate < 0xFFFF800000000000ULL) {
+            VadDiag("B554:EVR:VR off=0x%X FAIL Root not kernel addr (Root=0x%llX)\n", off, (unsigned long long)vadRootCandidate);
+            return false;
+        }
 
         // ★ BUILD 567 v3.230 FIX: 显式检查 ReadKernelVA 返回值, 避免读取失败被误判为 0
         //   v3.229 缺陷: Read<uint64_t> 模板无法区分"读取失败"和"值为0"
@@ -8242,15 +8258,29 @@ bool VADConcealer::ConcealRegion(DWORD pid, uintptr_t regionBase, SIZE_T regionS
     }
 
     // ★ BUILD 567 v3.233: 使用 ReadUnsafe 读取 vadRoot (eprocess 可能在系统 PTE 区域)
-    uint64_t vadRoot = kma.ReadUnsafe<uint64_t>(eprocess + s_vadRootOffset);
+    // ★ BUILD 567 v3.271 FIX: EPROCESS+s_vadRootOffset 是 _RTL_AVL_TREE, 需要解引用得到 Root 指针
+    //   _RTL_AVL_TREE 只有 8 字节 (Root 指针), Root 指向 _RTL_BALANCED_NODE (_MMVAD_SHORT.VadNode)
+    uint64_t avlTreeAddr = kma.ReadUnsafe<uint64_t>(eprocess + s_vadRootOffset);
+    if (!avlTreeAddr || avlTreeAddr < 0xFFFF800000000000ULL) {
+        VadDiag("B554:CR: FAIL avlTreeAddr invalid (off=0x%X val=0x%llX)\n",
+                  s_vadRootOffset, (unsigned long long)avlTreeAddr);
+        return false;
+    }
+    // ★ v3.271: 解引用 _RTL_AVL_TREE.Root 得到 _RTL_BALANCED_NODE 地址
+    uint64_t vadRoot = 0;
+    if (!kma.ReadKernelVAUnsafe(avlTreeAddr, &vadRoot, 8)) {
+        VadDiag("B554:CR: FAIL read AVL_TREE.Root (addr=0x%llX)\n",
+                  (unsigned long long)avlTreeAddr);
+        return false;
+    }
     if (!vadRoot || vadRoot < 0xFFFF800000000000ULL) {
-        VadDiag("B554:CR: FAIL vadRoot invalid (off=0x%X val=0x%llX)\n",
-                  s_vadRootOffset, (unsigned long long)vadRoot);
+        VadDiag("B554:CR: FAIL vadRoot not kernel addr (avlTree=0x%llX Root=0x%llX)\n",
+                  (unsigned long long)avlTreeAddr, (unsigned long long)vadRoot);
         return false;
     }
 
-    VadDiag("B554:CR: enter FindAndModifyVadNode vadRoot=0x%llX target=0x%llX\n",
-              (unsigned long long)vadRoot, (unsigned long long)regionBase);
+    VadDiag("B554:CR: enter FindAndModifyVadNode vadRoot=0x%llX target=0x%llX (avlTree=0x%llX)\n",
+              (unsigned long long)vadRoot, (unsigned long long)regionBase, (unsigned long long)avlTreeAddr);
     // 遍历 VAD 树, 查找并修改匹配区域
     bool ok = FindAndModifyVadNode(kma, vadRoot, regionBase);
     VadDiag("B554:CR: FindAndModifyVadNode result=%d\n", (int)ok);
