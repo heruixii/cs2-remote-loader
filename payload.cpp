@@ -787,7 +787,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.284 启动摘要 (CS2 退出蓝屏 0x3B 修复 — Sleep 10 秒等待 driver 内部缓存清理)\n");
+    DiagLog("BUILD 567 v3.285 启动摘要 (CS2 退出蓝屏 0x3B 修复 — loader.exe 不退出, 无限 Sleep 循环, 用户手动关闭)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -3713,21 +3713,33 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     //   诊断: 退出摘要信息从 DisableAll 内部 StateLog 获取 (DISABLE_ALL_ENTER/UNHIDE_ALL_DONE/KMA_SHUTDOWN_DONE)
                     //   注: LogExitSummary 的统计信息 (VmxOn/SHV/VEH 等) 不再在 CS2 退出路径打印,
                     //       但主循环正常退出路径 (L4096) 仍会打印.
-                    // ★ BUILD 567 v3.284 FIX: CS2 退出蓝屏 0x3B 修复 — Sleep 10 秒等待 driver 内部缓存清理
-                    //   v3.283 测试: return 0 后 loader.exe 退出过程蓝屏 0x3B
+                    // ★ BUILD 567 v3.285 FIX: CS2 退出蓝屏 0x3B 修复 — loader.exe 不退出, 进入无限 Sleep 循环
+                    //   v3.284 测试: Sleep 10s + return 0 仍蓝屏 0x3B (return 0 后 loader.exe 退出过程)
+                    //   v3.283 测试: Sleep 2s + return 0 仍蓝屏 0x3B (return 0 后 loader.exe 退出过程)
                     //   根因: BYOVD driver (PDFWKRNL.sys) 通过 IOCTL 映射了 loader.exe 的物理内存,
-                    //         driver 内部缓存了物理页映射. loader.exe 退出时这些物理页被释放,
+                    //         driver 内部缓存了物理页映射. loader.exe 退出时 PspExitProcess 释放物理页,
                     //         driver 内部缓存的映射变成无效 → driver 访问无效物理页 → 0x3B.
-                    //   修复: Sleep 10 秒, 让 Windows 内核完全清理 CS2 + loader.exe 相关资源,
-                    //         包括 driver 内部缓存的物理页映射.
-                    //   顺序: Sleep(10000) → DisableAll → return 0
-                    //   注: 10 秒是经验值, 如果仍蓝屏需要更长 Sleep 或其他方案.
-                    DiagLog("B584:EXIT:Sleep 10000ms (wait driver cache cleanup)\n");
-                    Sleep(10000);  // ★ v3.284: 等待 driver 内部缓存清理
+                    //         10 秒 Sleep 无效, 说明 driver 内部缓存不会自动清理.
+                    //         只要 BYOVD driver 还加载, loader.exe 退出就会蓝屏.
+                    //   修复: loader.exe 不退出, 进入无限 Sleep 循环, 让用户手动关闭 loader.exe.
+                    //         用户手动关闭 loader.exe 时, 系统会强制终止进程 (TerminateProcess),
+                    //         不触发 PspExitProcess 的正常清理路径, 避免蓝屏.
+                    //   顺序: Sleep(2000) → DisableAll (UnhideAll + kma.Shutdown) → 无限 Sleep 循环
+                    //   注: DisableAll 仍执行 (恢复 DKOM + 关闭 driver 句柄), 但 loader.exe 保持运行.
+                    //       driver 保持加载 (v3.281 跳过 RegDeleteTreeW + DeleteFileW), 句柄已关闭.
+                    //       loader.exe 进入无限 Sleep, 不再执行任何 syscall (除了 Sleep 本身).
+                    //       用户手动关闭 loader.exe 时, 系统强制终止, 不触发 driver 蓝屏.
+                    DiagLog("B585:EXIT:Sleep 2000ms (wait CS2 async cleanup)\n");
+                    Sleep(2000);  // ★ v3.285: 等待 CS2 退出异步清理完成
                     stealth::KernelDefense::DisableAll();  // ★ v3.279: DisableAll (UnhideAll + kma.Shutdown)
-                    // ★ v3.283: return 0 自然退出, 不 TerminateProcess
-                    DiagLog("B584:EXIT:return 0 (natural exit after 10s sleep)\n");
-                    return 0;  // ★ v3.283: 自然退出, CheatMainLoop 返回 → DllMain 返回 → loader.exe 退出
+                    // ★ v3.285: loader.exe 不退出, 进入无限 Sleep 循环
+                    //   原因: loader.exe 退出会触发 driver 蓝屏 (driver 缓存的物理页映射失效)
+                    //   用户手动关闭 loader.exe 时, 系统强制终止, 不触发 PspExitProcess 正常清理
+                    DiagLog("B585:EXIT:entering infinite Sleep loop (loader.exe stays running, manual close to exit)\n");
+                    while (true) {
+                        Sleep(60000);  // 每分钟 Sleep, 避免忙等待
+                    }
+                    return 0;  // 不会执行, 仅为编译器满意
                 }
             }
         }
