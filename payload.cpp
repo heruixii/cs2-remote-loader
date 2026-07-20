@@ -787,7 +787,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.271 启动摘要 (VAD 修复 — 解引用 _RTL_AVL_TREE.Root 得到 _RTL_BALANCED_NODE)\n");
+    DiagLog("BUILD 567 v3.272 启动摘要 (VAD 修复 — 移除 v3.271 双重解引用 + VadFlags 4字节 + VPN 4字节读取)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -3227,6 +3227,11 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         // ★ BUILD 567 v3.270 FIX: 重新启用 VAD 隐藏 — 已修正 Win11 24H2 所有 VadOffsets
         //   v3.267 卡死根因: VadEndingVpn(0x20→0x1C)/PrivateMemoryBit(bit24→bit21)/ProtectionMask 偏移错误
         //   v3.270 修复: 所有偏移已用 vergiliusproject.com 确认 + 添加环检测防死循环
+        // ★ BUILD 567 v3.272 FIX: 修复 v3.271 引入的 3 个致命 bug
+        //   bug 1: v3.271 对 _RTL_AVL_TREE.Root 双重解引用 → 读到根节点 Left 字段 (非根节点)
+        //   bug 2: VadFlags 用 uint64_t 读写 8 字节 → 写入覆盖相邻字段 → 蓝屏 0x50
+        //   bug 3: validateVadRoot 用 8 字节读 VPN (4字节字段) → 合法 VadRoot 被拒绝 → VAD 0/1 失败
+        //   v3.272 修复: 移除双重解引用 + VadFlags 改 uint32_t + VPN 改 4字节+VpnHigh
         if (kernelResult.driverLoaded) {
             DWORD loaderPid = GetCurrentProcessId();  // payload.dll 在 loader.exe 进程内
             uintptr_t bases[1] = { (uintptr_t)g_diagDllBase };
@@ -3774,6 +3779,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     // ★ BUILD 567 v3.270 FIX: 重新启用 VAD 隐藏 (同初始化阶段)
                     //   注: 主循环 VAD 保持禁用, 仅初始化阶段调用一次 (减少内核操作频率)
                     //   原因: 初始化阶段已隐藏, 主循环频繁调用增加蓝屏风险
+                    // ★ BUILD 567 v3.272: VAD 隐藏已修复 (移除双重解引用 + VadFlags 4字节 + VPN 4字节)
+                    //   初始化阶段调用一次即可, 主循环保持禁用 (if(false) 不变)
                     if (false) {
                         DWORD cs2Pid = GetCurrentProcessId();
                         uintptr_t bases[1] = { (uintptr_t)g_diagDllBase };

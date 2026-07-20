@@ -7711,6 +7711,11 @@ void KernelDefense::ReapplyAllCallbacks() {
 // ★ BUILD 567 v3.270 FIX: 修正 Win11 24H2 VadOffsets (vergiliusproject.com 确认)
 //   v3.267 系统卡死根因: VadEndingVpn/PrivateMemoryBit/ProtectionMask 偏移错误
 //   导致遍历读到错误数据 → 死循环 → 系统卡死
+// ★ BUILD 567 v3.272 FIX: 修复 v3.271 引入的双重解引用 + VadFlags 8字节读写 + VPN 8字节读取
+//   根因 1: v3.271 错误地对 _RTL_AVL_TREE.Root 多解引用一次 → 读到根节点 Left 字段
+//   根因 2: VadFlags (ULONG 4字节) 用 uint64_t 读写 8字节 → 写入覆盖相邻字段 → 蓝屏 0x50
+//   根因 3: validateVadRoot 用 8字节读 VPN (4字节字段) → 垃圾值 → 合法 VadRoot 被拒绝
+//   修复: 移除双重解引用 + VadFlags 改 uint32_t + VPN 改 4字节+VpnHigh (与 FindAndModifyVadNode 一致)
 struct VadOffsets {
     // EPROCESS 内部偏移 — 全部运行时动态解析, 不再硬编码
     // (Win10/11 23H2: UniqueProcessId=0x440, ActiveProcessLinks=0x448, VadRoot=0x7D8)
@@ -7739,9 +7744,10 @@ struct VadOffsets {
     static constexpr uint32_t VadControlArea = 0x38;
 
     // ★ v3.270 FIX: PrivateMemoryBit bit24 → bit21 (vergiliusproject.com _MMVAD_FLAGS 确认)
-    static constexpr uint64_t PrivateMemoryBit  = 0x00200000ULL; // bit 21
+    // ★ v3.272 FIX: 改为 uint32_t — VadFlags 是 ULONG (4字节), 用 uint64_t 读写会覆盖相邻字段
+    static constexpr uint32_t PrivateMemoryBit  = 0x00200000UL; // bit 21
     // ★ v3.270 FIX: ProtectionMask bits 19-23 → bits 7-11
-    static constexpr uint64_t ProtectionMask    = 0x00000F80ULL; // bits 7-11 (5 bits)
+    static constexpr uint32_t ProtectionMask    = 0x00000F80UL; // bits 7-11 (5 bits)
 };
 
 // ★ BUILD 555: 静态偏移缓存成员定义 (header 中声明)
@@ -7840,24 +7846,13 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
 
     // 验证候选偏移是否为合法 VadRoot (含 Left/Right/ParentEncoded + VadStartingVpn/VadEndingVpn)
     // ★ BUILD 567 v3.262 DIAG: 添加详细诊断日志, 记录每个失败原因
-    // ★ BUILD 567 v3.271 FIX: _RTL_AVL_TREE 是指针结构, 需要先解引用
-    //   EPROCESS+0x558 是 _RTL_AVL_TREE (8字节), 包含一个 Root 指针指向 _RTL_BALANCED_NODE
-    //   之前错误: 直接把 EPROCESS+offset 的值当作 _RTL_BALANCED_NODE 验证
-    //   修复: EPROCESS+offset 读取的是 Root 指针, 需要 *Root 得到 _RTL_BALANCED_NODE
-    //         然后验证 _RTL_BALANCED_NODE 的 Left/Right/Parent + StartingVpn/EndingVpn
-    auto validateVadRoot = [&](uint64_t avlTreeAddr, uint32_t off = 0) -> bool {
-        if (!avlTreeAddr || avlTreeAddr < 0xFFFF800000000000ULL) return false;
-
-        // ★ v3.271: 解引用 _RTL_AVL_TREE.Root (8字节指针) 得到 _RTL_BALANCED_NODE 地址
-        uint64_t vadRootCandidate = 0;
-        if (!kma.ReadKernelVAUnsafe(avlTreeAddr, &vadRootCandidate, 8)) {
-            VadDiag("B554:EVR:VR off=0x%X FAIL read AVL_TREE.Root (addr=0x%llX)\n", off, (unsigned long long)avlTreeAddr);
-            return false;
-        }
-        if (!vadRootCandidate || vadRootCandidate < 0xFFFF800000000000ULL) {
-            VadDiag("B554:EVR:VR off=0x%X FAIL Root not kernel addr (Root=0x%llX)\n", off, (unsigned long long)vadRootCandidate);
-            return false;
-        }
+    // ★ BUILD 567 v3.272 FIX: 移除 v3.271 错误的双重解引用
+    //   _RTL_AVL_TREE 只有一个字段 Root (8字节指针), 读取 EPROCESS+offset 得到的值
+    //   就是指向 _RTL_BALANCED_NODE 的指针, 不需要再解引用.
+    //   v3.271 错误: 多解引用一次 → 读到的是根节点的 Left 字段, 不是根节点本身.
+    //   修复: 直接用 candidate 作为 _RTL_BALANCED_NODE 地址验证.
+    auto validateVadRoot = [&](uint64_t vadRootCandidate, uint32_t off = 0) -> bool {
+        if (!vadRootCandidate || vadRootCandidate < 0xFFFF800000000000ULL) return false;
 
         // ★ BUILD 567 v3.230 FIX: 显式检查 ReadKernelVA 返回值, 避免读取失败被误判为 0
         //   v3.229 缺陷: Read<uint64_t> 模板无法区分"读取失败"和"值为0"
@@ -7901,15 +7896,30 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
         }
 
         // 二次验证: VadStartingVpn <= VadEndingVpn
-        uint64_t startVpn = 0, endVpn = 0;
-        if (!kma.ReadKernelVAUnsafe(vadRootCandidate + VadOffsets::VadStartingVpn, &startVpn, 8)) {
-            VadDiag("B554:EVR:VR off=0x%X FAIL read startVpn\n", off);
+        // ★ BUILD 567 v3.272 FIX: VPN 字段是 ULONG (4字节) + UCHAR VpnHigh (1字节)
+        //   v3.271 缺陷: 用 8 字节读取, 跨越 StartingVpn/EndingVpn 两个字段, 得到垃圾值
+        //   导致 startValid/endValid 检查拒绝所有合法 VAD 根 → VAD 隐藏 0/1 失败.
+        //   修复: 读取 4 字节 Vpn + 1 字节 VpnHigh, 合并为 64 位 VPN (与 FindAndModifyVadNode 一致).
+        uint32_t startVpnLow = 0, endVpnLow = 0;
+        uint8_t  startVpnHigh = 0, endVpnHigh = 0;
+        if (!kma.ReadKernelVAUnsafe(vadRootCandidate + VadOffsets::VadStartingVpn, &startVpnLow, 4)) {
+            VadDiag("B554:EVR:VR off=0x%X FAIL read startVpnLow\n", off);
             return false;
         }
-        if (!kma.ReadKernelVAUnsafe(vadRootCandidate + VadOffsets::VadEndingVpn, &endVpn, 8)) {
-            VadDiag("B554:EVR:VR off=0x%X FAIL read endVpn\n", off);
+        if (!kma.ReadKernelVAUnsafe(vadRootCandidate + VadOffsets::VadEndingVpn, &endVpnLow, 4)) {
+            VadDiag("B554:EVR:VR off=0x%X FAIL read endVpnLow\n", off);
             return false;
         }
+        if (!kma.ReadKernelVAUnsafe(vadRootCandidate + 0x20, &startVpnHigh, 1)) {
+            VadDiag("B554:EVR:VR off=0x%X FAIL read startVpnHigh\n", off);
+            return false;
+        }
+        if (!kma.ReadKernelVAUnsafe(vadRootCandidate + 0x21, &endVpnHigh, 1)) {
+            VadDiag("B554:EVR:VR off=0x%X FAIL read endVpnHigh\n", off);
+            return false;
+        }
+        uint64_t startVpn = ((uint64_t)startVpnHigh << 32) | startVpnLow;
+        uint64_t endVpn   = ((uint64_t)endVpnHigh   << 32) | endVpnLow;
         if (startVpn > endVpn) {
             VadDiag("B554:EVR:VR off=0x%X FAIL vpn range start=0x%llX > end=0x%llX\n",
                 off, (unsigned long long)startVpn, (unsigned long long)endVpn);
@@ -7937,6 +7947,7 @@ bool VADConcealer::EnsureVadRootOffset(KernelMemoryAccessor& kma, uint64_t eproc
         //   原因: VAD 是用户态内存映射, endVpn 应该是用户态 VPN, 不应是内核地址
         //   修复: endVpn 只接受 < 0x80000000 (用户态), 不接受内核特殊 VAD
         //   startVpn 保持原逻辑 (允许内核特殊 VAD, 兼容系统进程)
+        // ★ BUILD 567 v3.272: 现在 VPN 值正确 (4字节+VpnHigh), 此检查才真正生效
         bool startValid = (startVpn < 0x80000000ULL) || (startVpn >= 0xFFFF800000000000ULL);
         bool endValid   = (endVpn < 0x80000000ULL);  // ★ v3.263: 收紧, 只接受用户态
         if (!startValid || !endValid) {
@@ -8163,14 +8174,16 @@ static bool FindAndModifyVadNode(KernelMemoryAccessor& kma, uint64_t vadNode, ui
 
         if (targetVpn >= startVpn && targetVpn <= endVpn) {
             // 找到目标 VAD 节点, 修改 PrivateMemory flag
-            uint64_t flags = 0;
-            if (!kma.ReadKernelVAUnsafe(vadNode + VadOffsets::VadFlags, &flags, 8)) {
+            // ★ BUILD 567 v3.272 FIX: VadFlags 是 ULONG (4字节), 用 uint32_t 读写
+            //   v3.271 缺陷: 用 uint64_t 读写 8 字节, 写入会覆盖 0x34 处的相邻字段 → 蓝屏 0x50
+            uint32_t flags = 0;
+            if (!kma.ReadKernelVAUnsafe(vadNode + VadOffsets::VadFlags, &flags, 4)) {
                 VadDiag("B554:FMVN:FAIL read flags (traverse=%d)\n", traverseCount);
                 return false;
             }
 
-            VadDiag("B554:FMVN:FOUND node=0x%llX flags=0x%llX (traverse=%d)\n",
-                (unsigned long long)vadNode, (unsigned long long)flags, traverseCount);
+            VadDiag("B554:FMVN:FOUND node=0x%llX flags=0x%08X (traverse=%d)\n",
+                (unsigned long long)vadNode, (unsigned)flags, traverseCount);
 
             // 检查 PrivateMemory bit 是否已设置
             if (flags & VadOffsets::PrivateMemoryBit) {
@@ -8179,13 +8192,13 @@ static bool FindAndModifyVadNode(KernelMemoryAccessor& kma, uint64_t vadNode, ui
 
                 // 设置 Protection = EXECUTE_READ (5), 模拟 .text 段映射
                 flags &= ~VadOffsets::ProtectionMask;
-                flags |= (5ULL << 7);  // ★ v3.270 FIX: Protection bits 7-11, value 5 = PAGE_EXECUTE_READ
+                flags |= (5UL << 7);  // ★ v3.270 FIX: Protection bits 7-11, value 5 = PAGE_EXECUTE_READ
 
-                // ★ BUILD 567 v3.236 FIX-4: 改用 WriteUnsafe — VAD 节点可能在非分页池扩展区域
-                kma.WriteUnsafe<uint64_t>(vadNode + VadOffsets::VadFlags, flags);
+                // ★ BUILD 567 v3.272 FIX: 改用 uint32_t 写入 4 字节 — 避免覆盖相邻字段
+                kma.WriteUnsafe<uint32_t>(vadNode + VadOffsets::VadFlags, flags);
 
-                VadDiag("B554:FMVN:MODIFIED node=0x%llX newFlags=0x%llX\n",
-                    (unsigned long long)vadNode, (unsigned long long)flags);
+                VadDiag("B554:FMVN:MODIFIED node=0x%llX newFlags=0x%08X\n",
+                    (unsigned long long)vadNode, (unsigned)flags);
                 return true;
             }
             VadDiag("B554:FMVN:already MAPPED (traverse=%d)\n", traverseCount);
@@ -8258,30 +8271,19 @@ bool VADConcealer::ConcealRegion(DWORD pid, uintptr_t regionBase, SIZE_T regionS
     }
 
     // ★ BUILD 567 v3.233: 使用 ReadUnsafe 读取 vadRoot (eprocess 可能在系统 PTE 区域)
-    // ★ BUILD 567 v3.271 FIX: EPROCESS+s_vadRootOffset 是 _RTL_AVL_TREE, 需要解引用得到 Root 指针
-    //   _RTL_AVL_TREE 只有 8 字节 (Root 指针), Root 指向 _RTL_BALANCED_NODE (_MMVAD_SHORT.VadNode)
-    uint64_t avlTreeAddr = kma.ReadUnsafe<uint64_t>(eprocess + s_vadRootOffset);
-    if (!avlTreeAddr || avlTreeAddr < 0xFFFF800000000000ULL) {
-        VadDiag("B554:CR: FAIL avlTreeAddr invalid (off=0x%X val=0x%llX)\n",
-                  s_vadRootOffset, (unsigned long long)avlTreeAddr);
-        return false;
-    }
-    // ★ v3.271: 解引用 _RTL_AVL_TREE.Root 得到 _RTL_BALANCED_NODE 地址
-    uint64_t vadRoot = 0;
-    if (!kma.ReadKernelVAUnsafe(avlTreeAddr, &vadRoot, 8)) {
-        VadDiag("B554:CR: FAIL read AVL_TREE.Root (addr=0x%llX)\n",
-                  (unsigned long long)avlTreeAddr);
-        return false;
-    }
+    // ★ BUILD 567 v3.272 FIX: 移除 v3.271 错误的双重解引用
+    //   EPROCESS+s_vadRootOffset 的值就是指向 _RTL_BALANCED_NODE 的指针 (即 VAD 树根节点).
+    //   _RTL_AVL_TREE 结构体只有一个 Root 字段, 读取该偏移即得到 Root 指针.
+    //   v3.271 错误: 多解引用一次 → 读到根节点的 Left 字段 → 遍历错误子树.
+    uint64_t vadRoot = kma.ReadUnsafe<uint64_t>(eprocess + s_vadRootOffset);
     if (!vadRoot || vadRoot < 0xFFFF800000000000ULL) {
-        VadDiag("B554:CR: FAIL vadRoot not kernel addr (avlTree=0x%llX Root=0x%llX)\n",
-                  (unsigned long long)avlTreeAddr, (unsigned long long)vadRoot);
+        VadDiag("B554:CR: FAIL vadRoot invalid (off=0x%X val=0x%llX)\n",
+                  s_vadRootOffset, (unsigned long long)vadRoot);
         return false;
     }
-
-    VadDiag("B554:CR: enter FindAndModifyVadNode vadRoot=0x%llX target=0x%llX (avlTree=0x%llX)\n",
-              (unsigned long long)vadRoot, (unsigned long long)regionBase, (unsigned long long)avlTreeAddr);
     // 遍历 VAD 树, 查找并修改匹配区域
+    VadDiag("B554:CR: enter FindAndModifyVadNode vadRoot=0x%llX target=0x%llX\n",
+              (unsigned long long)vadRoot, (unsigned long long)regionBase);
     bool ok = FindAndModifyVadNode(kma, vadRoot, regionBase);
     VadDiag("B554:CR: FindAndModifyVadNode result=%d\n", (int)ok);
     return ok;
