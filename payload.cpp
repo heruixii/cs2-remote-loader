@@ -787,7 +787,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.268 启动摘要 (安全修复 — 永久禁用 VAD 隐藏防系统卡死)\n");
+    DiagLog("BUILD 567 v3.266 启动摘要 (安全修复 — 永久禁用 VAD 隐藏防蓝屏, Win11 24H2 VadRoot 偏移量未确认)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -826,7 +826,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.267 退出摘要\n");
+    DiagLog("BUILD 567 v3.269 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -851,7 +851,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.268 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.269 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",
@@ -3224,12 +3224,10 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         //         DKOM 后续断链不影响 VAD (VAD 用缓存的 EPROCESS 访问 VAD 树).
         //   注意: VAD 必须在 BYOVD driver loaded 之后 (需要内核 R/W 访问 VAD 节点).
         //   周期: 60-90s 主循环重新调用 (PAC 可能恢复 VAD 标志), 用缓存的 EPROCESS.
-        // ★ BUILD 567 v3.268 SAFETY: 永久禁用 VAD 隐藏 — 系统卡死风险
-        //   v3.267 测试: VadRoot=0x558 正确, 但系统完全卡死 (没蓝屏但卡住, 只能强制重启)
-        //   原因: FindAndModifyVadNode 遍历 VAD 树可能进入环 → 死循环 → 系统卡死
-        //   VadOffsets (RbnLeft/RbnRight/VadStartingVpn) 在 Win11 24H2 上可能也变了
-        //   决策: VAD 隐藏不是核心功能, 不值得冒系统卡死风险, 永久禁用
-        //   反检测能力影响: 仅降低 VAD 扫描拦截, PAC 未安装时无影响
+        // ★ BUILD 567 v3.266 FIX: 永久禁用 VAD 隐藏 — Win11 24H2 VadRoot 偏移量未确认
+        //   v3.262~v3.265 测试: 找不到正确 VadRoot 偏移量, 误报导致蓝屏风险
+        //   VAD 隐藏失败不影响核心功能 (CS2 不崩溃不蓝屏), 仅降低反检测能力
+        //   未来恢复: 需用 WinDbg 确认 Win11 24H2 的 VadRoot 偏移量后再启用
         if (false && kernelResult.driverLoaded) {
             DWORD loaderPid = GetCurrentProcessId();  // payload.dll 在 loader.exe 进程内
             uintptr_t bases[1] = { (uintptr_t)g_diagDllBase };
@@ -3237,7 +3235,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             DiagLog("B554:VAD:%d/1 base=0x%llX (pre-DKOM, cache eprocess)\n",
                 vadOk, (unsigned long long)g_diagDllBase);
         } else {
-            DiagLog("B554:VAD:disabled (v3.268 system freeze risk)\n");
+            DiagLog("B554:VAD:disabled (v3.266 Win11 24H2 VadRoot offset unconfirmed)\n");
         }
 
         // ★ BUILD 537: Gamma-A — 早期 DKOM 隐藏 (永久断链, 无需周期缓解)
@@ -3776,7 +3774,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     //   原因: PAC 可能通过周期性内核修复恢复 VAD 标志 (MEM_MAPPED → MEM_PRIVATE),
                     //         使 payload.dll 注入区域重新暴露给 VAD 扫描.
                     //   策略: 每 60-90s 与 ReapplyAllCallbacks 同周期重新隐藏, 保持深度防御.
-                    // ★ BUILD 567 v3.268 SAFETY: 永久禁用 VAD 隐藏 (系统卡死风险, 同初始化阶段)
+                    // ★ BUILD 567 v3.266 FIX: 永久禁用 VAD 隐藏 (同初始化阶段)
                     if (false) {
                         DWORD cs2Pid = GetCurrentProcessId();
                         uintptr_t bases[1] = { (uintptr_t)g_diagDllBase };
