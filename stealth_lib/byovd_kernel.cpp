@@ -2134,6 +2134,7 @@ uint64_t KernelMemoryAccessor::GetKernelModuleBase(const char* moduleName) {
 // ============================================================
 
 bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
+    StateLog("BYOVD", "Init_ENTER", "svc=%S", driver.serviceName);
     ByovdDiag("BYOVD:Init: ENTER (driverPath='%ls' svcName='%ls')\n",
         driver.driverPath, driver.serviceName);
     m_driverInfo = driver;
@@ -2161,6 +2162,8 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_EXISTING, 0, nullptr);
+    StateLog("BYOVD", "EarlyProbe", "hDev=0x%llX err=%u",
+        (unsigned long long)m_hDevice, GetLastError());
 
     if (m_hDevice != INVALID_HANDLE_VALUE) {
         ByovdDiag("BYOVD:Init: early probe opened, setting IOCTL + testing...\n");
@@ -2430,7 +2433,9 @@ bool KernelMemoryAccessor::Initialize(const BYOVDDriverInfo& driver) {
     //   僵尸设备检测后需重启系统清除, 正常流程通过 Shutdown() 的
     //   SERVICE_CONTROL_STOP 确保 DriverUnload → IoDeleteDevice 清理.
     ByovdDiag("BYOVD:Init: loading %ls (path=%ls)\n", m_actualServiceName, actualPath);
+    StateLog("BYOVD", "BeforeLoadDriver", "svc=%S", m_actualServiceName);
     bool loadOk = LoadDriver(m_actualServiceName, actualPath);
+    StateLog("BYOVD", "AfterLoadDriver", "ok=%d", loadOk ? 1 : 0);
     ByovdDiag("BYOVD:Init: LoadDriver → %d\n", (int)loadOk);
 
     if (!loadOk) {
@@ -7438,6 +7443,7 @@ void KernelDefense::GuardPac() {
 KernelDefense::Result KernelDefense::EnableAll() {
     Result result;
     auto& kma = KernelMemoryAccessor::Instance();
+    StateLog("BYOVD", "EnableAll_ENTER", "hvci=%d", kma.IsHVCIEnabled() ? 1 : 0);
 
     // ★ v3.37: 诊断 — HVCI 状态检测
     bool hvciEnabled = kma.IsHVCIEnabled();
@@ -7461,8 +7467,10 @@ KernelDefense::Result KernelDefense::EnableAll() {
         ByovdDiag("BYOVD: trying driver[%d/%d] = %ls ...\n", ci+1, candCount, drvName);
 
         BYOVDDriverInfo mutated = MutateAndRandomizeDriver(*cand);
+        StateLog("BYOVD", "MutateDone", "cand=%d/%d", ci+1, candCount);
         ByovdDiag("BYOVD:EnableAll: calling Initialize...\n");
         result.driverLoaded = kma.Initialize(mutated);
+        StateLog("BYOVD", "InitDone", "loaded=%d", result.driverLoaded ? 1 : 0);
         ByovdDiag("BYOVD:EnableAll: Initialize returned %d\n", (int)result.driverLoaded);
 
         if (result.driverLoaded) {
