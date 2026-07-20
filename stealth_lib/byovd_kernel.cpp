@@ -7602,15 +7602,26 @@ KernelDefense::Result KernelDefense::EnableAll() {
 }
 
 void KernelDefense::DisableAll() {
+    auto& kma = KernelMemoryAccessor::Instance();
+    // ★ BUILD 567 v3.276: 诊断日志 (ByovdDiag 在 Release 下被消除, 用 StateLog)
+    StateLog("EXIT", "DISABLE_ALL_ENTER", "kma=%d", kma.IsActive() ? 1 : 0);
     // ★ BUILD 544: 取消隐藏所有进程 (loader2 + basic) — 防止 basic.exe 退出时 0x139 蓝屏
     DKOMProcessHider::Instance().UnhideAll();
-    auto& kma = KernelMemoryAccessor::Instance();
+    StateLog("EXIT", "UNHIDE_ALL_DONE", "");
 
     // ★ v3.110: 在卸载驱动前先恢复所有回调, 防止反作弊检测到回调被移除
-    auto& cbDisabler = EACCallbackDisabler::Instance();
-    if (cbDisabler.HasRemovedCallbacks()) {
-        cbDisabler.RestoreAll();
-    }
+    // ★ BUILD 567 v3.276 FIX: CS2 退出时跳过 RestoreAll — 避免 0x50 蓝屏
+    //   v3.275 测试: 关闭 CS2 蓝屏 0x50 (PAGE_FAULT_IN_NONPAGED_AREA)
+    //   根因: RestoreAll 恢复 PAC 内核回调后, CS2 退出触发这些回调,
+    //         回调访问 CS2 的已释放 EPROCESS/线程内存 → 0x50
+    //   修复: CS2 退出路径不恢复回调 (回调保持摘除状态, CS2 退出不会触发)
+    //         只做 UnhideAll (恢复 DKOM) + kma.Shutdown (关闭 driver)
+    //   副作用: PAC 可能检测到回调未恢复, 但 CS2 已退出, 无游戏可检测
+    //   注: 正常退出 (loader.exe 自己退出) 仍需要 RestoreAll, 由单独路径处理
+    // auto& cbDisabler = EACCallbackDisabler::Instance();
+    // if (cbDisabler.HasRemovedCallbacks()) {
+    //     cbDisabler.RestoreAll();
+    // }
 
     // v3.49: 一用即卸 — 卸载驱动 + 清除注册表 + 删除驱动文件
     if (kma.IsActive()) {
@@ -7623,6 +7634,7 @@ void KernelDefense::DisableAll() {
         KernelTraceCleaner::CleanAllTraces();
 
         kma.Shutdown();
+        StateLog("EXIT", "KMA_SHUTDOWN_DONE", "");
 
         // 删除注册表服务键 — ★ BUILD 501: 手动构造路径替代 std::wstring 拼接
         wchar_t keyPath[512] = {};
