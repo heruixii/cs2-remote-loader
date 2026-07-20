@@ -787,7 +787,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.254 启动摘要 (修正 .idata 硬编码回退值 + 宽松匹配回退)\n");
+    DiagLog("BUILD 567 v3.255 启动摘要 (EncryptAll 入口诊断 — 确认崩溃位置)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -826,7 +826,7 @@ static void LogExitSummary() {
     DWORD seconds = elapsedSec % 60;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.254 退出摘要\n");
+    DiagLog("BUILD 567 v3.255 退出摘要\n");
     DiagLog("运行时长: %u 秒 (%u 分 %u 秒)\n", elapsedSec, minutes, seconds);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
@@ -851,7 +851,7 @@ static bool LogPeriodicSummary() {
     DWORD elapsedSec = elapsed / 1000;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.254 周期摘要 (运行 %u 秒)\n", elapsedSec);
+    DiagLog("BUILD 567 v3.255 周期摘要 (运行 %u 秒)\n", elapsedSec);
     DiagLog("VmxOn: 成功=%u 失败=%u 重patch=%u\n",
         g_logStats.vmxOnPatchSuccess, g_logStats.vmxOnPatchFailure, g_logStats.vmxOnRepatch);
     DiagLog("SHV:   成功=%u 失败=%u 重patch=%u\n",

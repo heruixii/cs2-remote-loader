@@ -217,16 +217,18 @@ static void EncryptAllPageMarker() {
 }
 
 void SleepObfuscator::EncryptAll() {
-    // ★ BUILD 567 v3.252 SIMPLIFY: 移除所有 EK_RAW_LOG 诊断 + D0/D1/E0-E3/F0-F3 页级诊断
-    //   原因: v3.245-v3.251 大量 EK_RAW_LOG 宏展开 + 诊断代码让 EncryptAll 函数 > 8KB (2 页),
-    //         函数跨越多页, 编译器重新布局代码, 导致 import thunk 移到被加密的页 → 崩溃.
-    //   诊断已完成 (v3.252 确认根因: import thunk 在 .text 段被加密), 移除诊断代码简化函数.
-    //   保留: 关键页跳过保护 (v3.245 FIX) — 防止加密 EkkoSleep/EncryptAll/DecryptAll/XorCrypt 自身.
+    // ★ BUILD 567 v3.255 DIAG: EncryptAll 入口诊断
+    //   v3.254 仍崩溃在 EA+ pre 之后, 需确认崩溃位置:
+    //   - EA enter 出现 → EncryptAll 入口被执行, 崩溃在内部
+    //   - EA enter 未出现 → EncryptAll 入口本身被加密 (函数代码页未豁免)
+    EK_RAW_LOG("EA enter\n");
     uintptr_t ekkoPg = GetSelfPage();
+    EK_RAW_LOG("EA g1\n");
     uintptr_t encAPg = GetEncryptAllPage();
     uintptr_t decAPg = GetDecryptAllPage();
     uintptr_t xorCPg = GetXorCryptPage();
     uintptr_t sleepPg = reinterpret_cast<uintptr_t>(this) & ~0xFFFULL;
+    EK_RAW_LOG("EA g2\n");
 
     for (int ri = 0; ri < m_regionCount; ri++) {
         ProtectedRegion& region = m_regions[ri];
@@ -242,19 +244,25 @@ void SleepObfuscator::EncryptAll() {
         if (rStart < sleepPg + 0x2000 && rEnd > sleepPg) overlap = true; // sleepObjPage 2 页
         if (overlap) continue;
 
+        EK_RAW_LOG("EA r0\n");
         if (region.isCode) {
             DWORD oldProtect;
             if (!VirtualProtect(region.addr, region.size, PAGE_READWRITE, &oldProtect)) continue;
+            EK_RAW_LOG("EA vp1\n");
             XorCrypt(region.addr, region.size, region.xorKey);
+            EK_RAW_LOG("EA xc1\n");
             VirtualProtect(region.addr, region.size, oldProtect, &oldProtect);
             FlushInstructionCache(GetCurrentProcess(), region.addr, region.size);
         } else {
             DWORD oldProtect = 0;
             if (!VirtualProtect(region.addr, region.size, PAGE_READWRITE, &oldProtect)) continue;
+            EK_RAW_LOG("EA vp2\n");
             XorCrypt(region.addr, region.size, region.xorKey);
+            EK_RAW_LOG("EA xc2\n");
             VirtualProtect(region.addr, region.size, oldProtect, &oldProtect);
         }
     }
+    EK_RAW_LOG("EA done\n");
 }
 
 // ★ BUILD 544: DecryptAll 页面标记 — 紧邻 DecryptAll 定义确保同 4KB 页
