@@ -275,6 +275,13 @@ void SleepObfuscator::EncryptAll() {
                     if (chunk > 0x10000) chunk = 0x10000; // 64KB
                     if (chunkIdx == 3) {
                         // ★ v3.248: 块 3 细分为 4 个 16KB 子块
+                        // ★ v3.249: D0 (subIdx==0) 进一步细分为 4 个 4KB 页, 精确定位崩溃页
+                        //   v3.248 测试: EA r3 D0 出现, D1 未出现 → 崩溃在 D0 [192KB, 208KB)
+                        //   D0 范围 [dllBase+0x5C000, dllBase+0x60000) 跨越 .text/.data/.rdata
+                        //   E0 = [0x5C000, 0x5D000) — .text 末尾代码
+                        //   E1 = [0x5D000, 0x5E000) — .text/.data 边界
+                        //   E2 = [0x5E000, 0x5F000) — .data 段 (全局变量)
+                        //   E3 = [0x5F000, 0x60000) — .rdata 段开头
                         EK_RAW_LOG("EA r3 C3\n");
                         SIZE_T subProc = 0;
                         int subIdx = 0;
@@ -286,7 +293,26 @@ void SleepObfuscator::EncryptAll() {
                             else if (subIdx == 2) EK_RAW_LOG("EA r3 D2\n");
                             else if (subIdx == 3) EK_RAW_LOG("EA r3 D3\n");
                             else EK_RAW_LOG("EA r3 DX\n");
-                            XorCrypt((BYTE*)region.addr + processed + subProc, sub, region.xorKey);
+                            // ★ v3.249: D0 内部页级诊断
+                            if (subIdx == 0) {
+                                SIZE_T pageProc = 0;
+                                int pageIdx = 0;
+                                while (pageProc < sub) {
+                                    SIZE_T page = sub - pageProc;
+                                    if (page > 0x1000) page = 0x1000; // 4KB
+                                    if (pageIdx == 0) EK_RAW_LOG("EA r3 E0\n");
+                                    else if (pageIdx == 1) EK_RAW_LOG("EA r3 E1\n");
+                                    else if (pageIdx == 2) EK_RAW_LOG("EA r3 E2\n");
+                                    else if (pageIdx == 3) EK_RAW_LOG("EA r3 E3\n");
+                                    else EK_RAW_LOG("EA r3 EX\n");
+                                    XorCrypt((BYTE*)region.addr + processed + subProc + pageProc, page, region.xorKey);
+                                    pageProc += page;
+                                    pageIdx++;
+                                }
+                                EK_RAW_LOG("EA r3 D0done\n");
+                            } else {
+                                XorCrypt((BYTE*)region.addr + processed + subProc, sub, region.xorKey);
+                            }
                             subProc += sub;
                             subIdx++;
                         }
@@ -322,13 +348,14 @@ void SleepObfuscator::EncryptAll() {
             if (diagR3) {
                 // ★ v3.247: 分块 XorCrypt, 每块 64KB, 定位崩溃块
                 // ★ v3.248: 块 3 细分为 4 个 16KB 子块, 精确定位崩溃的 16KB 块
+                // ★ v3.249: D0 进一步细分为 4 个 4KB 页, 精确定位崩溃页
                 SIZE_T processed = 0;
                 int chunkIdx = 0;
                 while (processed < region.size) {
                     SIZE_T chunk = region.size - processed;
                     if (chunk > 0x10000) chunk = 0x10000; // 64KB
                     if (chunkIdx == 3) {
-                        // ★ v3.248: 块 3 细分为 4 个 16KB 子块
+                        // ★ v3.249: D0 内部页级诊断 (对称 isCode 分支)
                         EK_RAW_LOG("EA r3 C3\n");
                         SIZE_T subProc = 0;
                         int subIdx = 0;
@@ -340,7 +367,25 @@ void SleepObfuscator::EncryptAll() {
                             else if (subIdx == 2) EK_RAW_LOG("EA r3 D2\n");
                             else if (subIdx == 3) EK_RAW_LOG("EA r3 D3\n");
                             else EK_RAW_LOG("EA r3 DX\n");
-                            XorCrypt((BYTE*)region.addr + processed + subProc, sub, region.xorKey);
+                            if (subIdx == 0) {
+                                SIZE_T pageProc = 0;
+                                int pageIdx = 0;
+                                while (pageProc < sub) {
+                                    SIZE_T page = sub - pageProc;
+                                    if (page > 0x1000) page = 0x1000; // 4KB
+                                    if (pageIdx == 0) EK_RAW_LOG("EA r3 E0\n");
+                                    else if (pageIdx == 1) EK_RAW_LOG("EA r3 E1\n");
+                                    else if (pageIdx == 2) EK_RAW_LOG("EA r3 E2\n");
+                                    else if (pageIdx == 3) EK_RAW_LOG("EA r3 E3\n");
+                                    else EK_RAW_LOG("EA r3 EX\n");
+                                    XorCrypt((BYTE*)region.addr + processed + subProc + pageProc, page, region.xorKey);
+                                    pageProc += page;
+                                    pageIdx++;
+                                }
+                                EK_RAW_LOG("EA r3 D0done\n");
+                            } else {
+                                XorCrypt((BYTE*)region.addr + processed + subProc, sub, region.xorKey);
+                            }
                             subProc += sub;
                             subIdx++;
                         }
