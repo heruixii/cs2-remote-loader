@@ -3024,6 +3024,11 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     }
     if (!g_egTestMode && !StealthEngine::Instance().AttachToProcess(procNameW)) {
         DiagLog("FAIL: AttachToProcess\n");
+        // ★ v3.296 FIX-9: 恢复 PAC 回调 — 避免 loader.exe 退出后 PAC 检测到回调缺失封号
+        //   场景: EnableAll 摘除 PAC 回调 → CS2 未运行 → return 2 退出 →
+        //         用户启动 CS2 → PAC 检测到回调缺失 → 封号.
+        //   修复: return 2 路径恢复 PAC 回调 (CS2 未运行, 恢复回调无 0x50 蓝屏风险).
+        stealth::KernelDefense::RestoreAllCallbacks();
         stealth::KernelDefense::DisableAll();
         StealthEngine::Instance().Shutdown();
         // ★ BUILD 550: 加密用户消息 (原明文 L"未找到 CS2 进程 (cs2.exe)..." 等)
@@ -3446,6 +3451,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     cs2::Offsets offsets;
     if (!cs2::Memory::Instance().Initialize(offsets)) {
         DiagLog("B549:M:01 FAIL init\n");  // ★ BUILD 549: 去特征化
+        // ★ v3.296 FIX-9: 恢复 PAC 回调 (同 return 2 路径)
+        stealth::KernelDefense::RestoreAllCallbacks();
         stealth::KernelDefense::DisableAll();
         StealthEngine::Instance().Shutdown();
         return 3;

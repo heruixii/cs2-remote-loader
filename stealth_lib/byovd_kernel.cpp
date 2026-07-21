@@ -10579,6 +10579,32 @@ void PvpAlivePatcher::Uninstall() {
         return;
     }
 
+    // ★ BUILD 567 v3.296 FIX: 验证完美平台进程是否仍在运行
+    //   原因: CS2 退出后调用 Uninstall, 如果完美平台进程已退出,
+    //         m_pwaCR3 指向的页表已被内核释放, VaToPa 读取已释放物理页 → 数据损坏风险.
+    //   修复: 用 OpenProcess 检查进程是否存活, 已退出则跳过 Uninstall (PvpAlive.dll 已释放, 无需恢复).
+    //   安全性: PvpAlive.dll 随完美平台进程退出而释放, 不恢复原始字节无影响.
+    if (m_pwaPid) {
+        HANDLE hCheck = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, m_pwaPid);
+        if (!hCheck) {
+            // 进程已退出或无权限 — 跳过 Uninstall
+            StateLog("PVP", "UninstallSkip", "pid=%u exited", m_pwaPid);
+            m_active = false;
+            m_patchedCount = 0;
+            return;
+        }
+        DWORD exitCode = STILL_ACTIVE;
+        BOOL gotExit = GetExitCodeProcess(hCheck, &exitCode);
+        CloseHandle(hCheck);
+        if (gotExit && exitCode != STILL_ACTIVE) {
+            // 进程已退出 — 跳过 Uninstall
+            StateLog("PVP", "UninstallSkip", "pid=%u exit=%u", m_pwaPid, exitCode);
+            m_active = false;
+            m_patchedCount = 0;
+            return;
+        }
+    }
+
     KernelMemoryAccessor& kma = KernelMemoryAccessor::Instance();
 
     for (int i = 0; i < 4; i++) {
