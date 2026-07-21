@@ -787,7 +787,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.292 启动摘要 (EnableAll BSOD 诊断 — StateLog 分步定位蓝屏位置)\n");
+    DiagLog("BUILD 567 v3.293 启动摘要 (CR3 全链路 StateLog 诊断 — 一次测试定位蓝屏/失败位置)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};

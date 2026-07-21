@@ -3411,30 +3411,28 @@ uint64_t DKOMProcessHider::GetCurrentEPROCESS() const {
 // ============================================================
 bool DKOMProcessHider::EnsureOffsetsResolved(KernelMemoryAccessor& kma, uint64_t ntBase) {
     if (m_pidOffset != 0 && m_linksOffset != 0) {
-        ByovdDiag("DKOM: using cached offsets pidOffset=0x%X linksOffset=0x%X\n",
-            m_pidOffset, m_linksOffset);
+        StateLog("PVP", "EO_Cached", "pidOff=0x%X linksOff=0x%X", m_pidOffset, m_linksOffset);
         return true;
     }
 
     // ★ BUILD 555 P2-verify: STEALTH_STR_DECRYPT_TO 加密 PsInitialSystemProcess (原明文进入 .rdata)
     char psInitProcName[40] = {};
     STEALTH_STR_DECRYPT_TO("PsInitialSystemProcess", psInitProcName, sizeof(psInitProcName));
+    StateLog("PVP", "EO_PreResolve", "ntBase=0x%llX", (unsigned long long)ntBase);
     uint64_t psInitProcVA = kma.ResolveExport(ntBase, psInitProcName);
     if (!psInitProcVA) {
-        ByovdDiag("DKOM.EnsureOffsets: FAIL PsInitialSystemProcess not resolved (ntBase=0x%llX)\n",
-            (unsigned long long)ntBase);
+        StateLog("PVP", "EO_Fail", "step=ResolveExport ntBase=0x%llX", (unsigned long long)ntBase);
         return false;
     }
 
+    StateLog("PVP", "EO_PreReadSys", "psInitProcVA=0x%llX", (unsigned long long)psInitProcVA);
     uint64_t systemEPROCESS = kma.Read<uint64_t>(psInitProcVA);
     if (!systemEPROCESS) {
-        ByovdDiag("DKOM.EnsureOffsets: FAIL systemEPROCESS=0 (psInitProcVA=0x%llX)\n",
-            (unsigned long long)psInitProcVA);
+        StateLog("PVP", "EO_Fail", "step=ReadSysEPROC psInitProcVA=0x%llX", (unsigned long long)psInitProcVA);
         return false;
     }
 
-    ByovdDiag("DKOM.EnsureOffsets: scanning EPROCESS offsets (0x100-0x800) sysEPROC=0x%llX...\n",
-        (unsigned long long)systemEPROCESS);
+    StateLog("PVP", "EO_ScanStart", "sysEPROC=0x%llX range=0x100-0x800", (unsigned long long)systemEPROCESS);
 
     for (uint32_t off = 0x100; off < 0x800; off += 8) {
         // ★ BUILD 567 v3.235: 使用 ReadUnsafe (systemEPROCESS 可能在非分页池扩展区域)
@@ -3455,16 +3453,12 @@ bool DKOMProcessHider::EnsureOffsetsResolved(KernelMemoryAccessor& kma, uint64_t
         // 验证通过
         m_pidOffset = off;
         m_linksOffset = off + 8;
-        ByovdDiag("DKOM.EnsureOffsets: offsets found — pidOffset=0x%X linksOffset=0x%X "
-                  "(flink=0x%llX blink=0x%llX nextEPROC=0x%llX nextPid=%llu)\n",
-            m_pidOffset, m_linksOffset,
-            (unsigned long long)flink, (unsigned long long)blink,
-            (unsigned long long)nextEPROC, (unsigned long long)nextPid);
+        StateLog("PVP", "EO_OK", "pidOff=0x%X linksOff=0x%X nextPid=%llu",
+            m_pidOffset, m_linksOffset, (unsigned long long)nextPid);
         return true;
     }
 
-    ByovdDiag("DKOM.EnsureOffsets: FAIL cannot find UniqueProcessId offset (scanned 0x100-0x800, "
-              "no field with value 4 followed by kernel-range LIST_ENTRY)\n");
+    StateLog("PVP", "EO_Fail", "step=scan no PID=4 field in 0x100-0x800");
     return false;
 }
 
@@ -3475,17 +3469,27 @@ bool DKOMProcessHider::EnsureOffsetsResolved(KernelMemoryAccessor& kma, uint64_t
 // ============================================================
 uint64_t DKOMProcessHider::FindEPROCESSByPid(KernelMemoryAccessor& kma, DWORD pid) {
     uint64_t ntBase = kma.GetNtoskrnlBase();
-    if (!ntBase) return 0;
+    if (!ntBase) {
+        StateLog("PVP", "FE_Fail", "step=ntBase");
+        return 0;
+    }
 
     // ★ BUILD 555 P2-verify: STEALTH_STR_DECRYPT_TO 加密 PsInitialSystemProcess
     char psInitProcName2[40] = {};
     STEALTH_STR_DECRYPT_TO("PsInitialSystemProcess", psInitProcName2, sizeof(psInitProcName2));
     uint64_t psInitProcVA = kma.ResolveExport(ntBase, psInitProcName2);
-    if (!psInitProcVA) return 0;
+    if (!psInitProcVA) {
+        StateLog("PVP", "FE_Fail", "step=ResolveExport ntBase=0x%llX", (unsigned long long)ntBase);
+        return 0;
+    }
 
     uint64_t systemEPROCESS = kma.Read<uint64_t>(psInitProcVA);
-    if (!systemEPROCESS) return 0;
+    if (!systemEPROCESS) {
+        StateLog("PVP", "FE_Fail", "step=ReadSysEPROC");
+        return 0;
+    }
 
+    StateLog("PVP", "FE_Start", "pid=%u sysEPROC=0x%llX pidOff=0x%X", pid, (unsigned long long)systemEPROCESS, m_pidOffset);
     uint64_t current = systemEPROCESS;
     uint64_t start   = current;
     DWORD iter = 0;
@@ -3494,8 +3498,7 @@ uint64_t DKOMProcessHider::FindEPROCESSByPid(KernelMemoryAccessor& kma, DWORD pi
     do {
         iter++;
         if (iter > maxIter) {
-            ByovdDiag("DKOM.FindByPid: FAIL exceeded maxIter=%u (possible cycle) pid=%u\n",
-                maxIter, pid);
+            StateLog("PVP", "FE_Fail", "step=maxIter pid=%u iter=%u", pid, maxIter);
             return 0;
         }
 
@@ -3509,22 +3512,22 @@ uint64_t DKOMProcessHider::FindEPROCESSByPid(KernelMemoryAccessor& kma, DWORD pi
         }
 
         if ((DWORD)currentPid == pid) {
+            StateLog("PVP", "FE_OK", "pid=%u EPROC=0x%llX iter=%u", pid, (unsigned long long)current, iter);
             return current;
         }
 
         // 移动到下一个 EPROCESS
         uint64_t flink = kma.ReadUnsafe<uint64_t>(current + m_linksOffset);
         if (!flink || flink < 0xFFFF800000000000ULL) {
-            ByovdDiag("DKOM.FindByPid: chain broken at iter=%u EPROC=0x%llX flink=0x%llX (pid=%u not found)\n",
-                iter, (unsigned long long)current, (unsigned long long)flink, pid);
+            StateLog("PVP", "FE_Fail", "step=chainBroken iter=%u flink=0x%llX pid=%u",
+                iter, (unsigned long long)flink, pid);
             return 0;  // 直接返回, 不 break 避免误导性 "not found" 日志
         }
 
         current = flink - m_linksOffset; // Flink 指向 ActiveProcessLinks, 需要减去偏移回 EPROCESS
     } while (current != start);
 
-    ByovdDiag("DKOM.FindByPid: pid=%u not found after %u iterations (cycle back to start)\n",
-        pid, iter);
+    StateLog("PVP", "FE_Fail", "step=notFound pid=%u iter=%u (cycle back to start)", pid, iter);
     return 0;
 }
 
@@ -10113,14 +10116,20 @@ uint64_t PvpAlivePatcher::GetProcessCR3(DWORD pid) {
     //   1. 先试常见偏移 (0x28, 0x1010)
     //   2. 如果失败, 扫描 0x0-0x1800 范围, 找符合 CR3 特征的值
 
+    // ★ BUILD 567 v3.293 DIAG: 每个常见偏移读取前记录 StateLog
+    //   如果蓝屏发生在 ReadUnsafe, sd.log 会显示最后一个 PreReadOff, 精确定位
     const uint32_t commonOffsets[] = { 0x28, 0x1010, 0x110, 0x140 };
     for (uint32_t off : commonOffsets) {
+        StateLog("PVP", "CR3PreReadOff", "off=0x%X EPROC=0x%llX", off, (unsigned long long)eproc);
         uint64_t val = kma.ReadUnsafe<uint64_t>(eproc + off);
+        StateLog("PVP", "CR3PostReadOff", "off=0x%X val=0x%llX", off, (unsigned long long)val);
         // CR3 特征: 低 12 位为 0 (页对齐), 且 < 16GB (0x400000000)
         if ((val & 0xFFF) == 0 && val >= 0x10000 && val < 0x400000000ULL) {
             // 验证: 用该 CR3 翻译 EPROCESS 自身 VA
+            StateLog("PVP", "CR3PreVaToPa", "off=0x%X CR3=0x%llX VA=0x%llX", off, (unsigned long long)val, (unsigned long long)eproc);
             PageTableWalker walker(val, kma);
             uint64_t pa = walker.VaToPa(eproc);
+            StateLog("PVP", "CR3PostVaToPa", "off=0x%X PA=0x%llX", off, (unsigned long long)pa);
             if (pa != 0) {
                 StateLog("PVP", "CR3OK", "pid=%u EPROC=0x%llX CR3=0x%llX (offset=0x%X)",
                     pid, (unsigned long long)eproc, (unsigned long long)val, off);
@@ -10131,9 +10140,14 @@ uint64_t PvpAlivePatcher::GetProcessCR3(DWORD pid) {
 
     // 扫描 0x0-0x1800 范围
     StateLog("PVP", "CR3Step", "step=scan common offsets failed, trying 0x0-0x1800");
+    // ★ v3.293 DIAG: 扫描分 6 段记录进度, 避免蓝屏时不知道扫描到哪
     for (uint32_t off = 0x0; off < 0x1800; off += 8) {
+        if ((off & 0x3FF) == 0) {
+            StateLog("PVP", "CR3ScanProg", "off=0x%X/0x1800", off);
+        }
         uint64_t val = kma.ReadUnsafe<uint64_t>(eproc + off);
         if ((val & 0xFFF) == 0 && val >= 0x10000 && val < 0x400000000ULL) {
+            StateLog("PVP", "CR3ScanHit", "off=0x%X val=0x%llX", off, (unsigned long long)val);
             PageTableWalker walker(val, kma);
             uint64_t pa = walker.VaToPa(eproc);
             if (pa != 0) {
