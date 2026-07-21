@@ -5665,6 +5665,7 @@ static uint64_t FindFilterByStringScan(uint64_t fltmgrBase, uint64_t fltGlobals,
                 // 读取 Name (UNICODE_STRING: Length, MaxLength, Buffer)
                 // ★ v3.296: 优先尝试标准偏移 0x38, 失败时尝试其他偏移
                 uint64_t nameOffs[] = { 0x38, 0x40, 0x48, 0x50, 0x30, 0x28 };
+                bool nameDumped = false;
                 for (uint64_t no : nameOffs) {
                     uint16_t nameLen = 0;
                     uint16_t nameMax = 0;
@@ -5672,6 +5673,23 @@ static uint64_t FindFilterByStringScan(uint64_t fltmgrBase, uint64_t fltGlobals,
                     if (!kma.ReadKernelVA(filterBase + no, &nameLen, 2)) continue;
                     if (!kma.ReadKernelVA(filterBase + no + 2, &nameMax, 2)) continue;
                     if (!kma.ReadKernelVA(filterBase + no + 8, &nameBuf, 8)) continue;
+
+                    // ★ v3.296 FIX-17 DIAG: dump 所有 filter 名称 (不论长度是否匹配)
+                    //   目的: 诊断为什么找不到 PAC filter — 看看系统里到底加载了哪些 minifilter
+                    if (nameLen > 0 && nameLen <= 256 && nameLen % 2 == 0 &&
+                        nameMax >= nameLen && nameMax <= 512 &&
+                        nameBuf >= 0xFFFF800000000000ULL && nameBuf < 0xFFFFFD0000000000ULL) {
+                        wchar_t diagName[128] = {};
+                        if (kma.ReadKernelVA(nameBuf, diagName, nameLen)) {
+                            diagName[nameLen / 2] = 0;
+                            StateLog("FLT", "FilterDump",
+                                     "filter=0x%llX noff=0x%llX len=%d name='%ls'",
+                                     (unsigned long long)filterBase,
+                                     (unsigned long long)no,
+                                     (int)nameLen, diagName);
+                            nameDumped = true;
+                        }
+                    }
 
                     if (nameLen != targetByteLen || nameMax < nameLen ||
                         nameMax > 512 || nameBuf < 0xFFFF800000000000ULL) continue;
@@ -5705,6 +5723,14 @@ static uint64_t FindFilterByStringScan(uint64_t fltmgrBase, uint64_t fltGlobals,
                         (unsigned long long)flOff, (unsigned long long)no,
                         (unsigned long long)opsVal);
                     return filterBase;
+                }
+
+                // ★ v3.296 FIX-17 DIAG: 如果所有 nameOff 都没找到有效名称, 记录
+                if (!nameDumped) {
+                    StateLog("FLT", "FilterNoName",
+                             "filter=0x%llX flags=0x%llX",
+                             (unsigned long long)filterBase,
+                             (unsigned long long)flags);
                 }
 
                 // 读下一个条目
@@ -7268,6 +7294,9 @@ static uint64_t FindPacFilterInKernel(uint64_t fltmgrBase, uint64_t fltGlobals, 
     }
     if (!filterListHead) return 0;
 
+    // ★ v3.296 FIX-17 DIAG: 记录 filterListHead 找到
+    StateLog("FLT", "KernScanListHead", "addr=0x%llX", (unsigned long long)filterListHead);
+
     // ★ BUILD 513: 扩展 name offset 搜索 (仅 0x008 ActiveLink, 已验证正确)
     uint64_t nameOffsetsFull[] = {
         0x000, 0x008, 0x010, 0x018, 0x020, 0x028, 0x030,
@@ -7304,6 +7333,7 @@ static uint64_t FindPacFilterInKernel(uint64_t fltmgrBase, uint64_t fltGlobals, 
         // ★ BUILD 520: 尝试多个 ActiveLink 偏移, 只有非空名称才算有效
         uint64_t activeLinkOffsets[] = { 0x010, 0x008, 0x018, 0x020, 0x028, 0x030 };
 
+        bool nameDumped = false;
         for (uint64_t alOff : activeLinkOffsets) {
             uint64_t filterBase = current - alOff;
             for (uint64_t nameOff : nameOffsetsFull) {
@@ -7318,10 +7348,22 @@ static uint64_t FindPacFilterInKernel(uint64_t fltmgrBase, uint64_t fltGlobals, 
                         // ★ BUILD 521: 严格验证 — minifilter 名称必须以字母开头
                         wchar_t c0 = filterName[0];
                         bool isAlpha = (c0 >= L'A' && c0 <= L'Z') || (c0 >= L'a' && c0 <= L'z');
+                        // ★ v3.296 FIX-17 DIAG: dump 所有 filter 名称 (第一个 alOff + 第一个有效 nameOff)
+                        if (nchars > 0 && isAlpha && !nameDumped) {
+                            StateLog("FLT", "KernScanFilter",
+                                     "iter=%d filter=0x%llX alOff=0x%llX noff=0x%llX name='%ls'",
+                                     iter, (unsigned long long)filterBase,
+                                     (unsigned long long)alOff,
+                                     (unsigned long long)nameOff, filterName);
+                            nameDumped = true;
+                        }
                         if (nchars > 0 && isAlpha && IsPacPattern(filterName)) {
                             if (outName && outNameChars > 0) {
                                 wcsncpy_s(outName, outNameChars, filterName, (size_t)(outNameChars - 1));
                             }
+                            StateLog("FLT", "KernScanFound",
+                                     "filter=0x%llX name='%ls'",
+                                     (unsigned long long)filterBase, filterName);
                             ByovdDiag("FLT:NTRL: FindFltInKern B520: found '%ls' at 0x%llX (alOff=0x%llX nameOff=0x%llX)\n",
                                 filterName, (unsigned long long)filterBase, alOff, nameOff);
                             return filterBase;
@@ -7333,6 +7375,9 @@ static uint64_t FindPacFilterInKernel(uint64_t fltmgrBase, uint64_t fltGlobals, 
 
         if (!kma.ReadKernelVA(current, &current, sizeof(current))) break;
     }
+
+    // ★ v3.296 FIX-17 DIAG: 记录扫描完成但未找到
+    StateLog("FLT", "KernScanNoFilter", "filterListHead=0x%llX", (unsigned long long)filterListHead);
 
     // ★ BUILD 514: 移除回调范围回退 — PDFWKRNL.sys memcpy 不验证地址, 从不可信 opsPtr 读取会 BSOD
     return 0;
