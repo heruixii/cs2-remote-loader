@@ -787,7 +787,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.289 启动摘要 (PvpAlivePatcher — 内核跨进程 patch PacNova::Is*Hack 函数)\n");
+    DiagLog("BUILD 567 v3.290 启动摘要 (ExitProcess 替代 TerminateProcess — 修复 BYOVD driver 映射蓝屏)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -3734,13 +3734,19 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                         stealth::PvpAlivePatcher::Instance().Uninstall();
                     }
                     stealth::KernelDefense::DisableAll();  // ★ v3.279: DisableAll (UnhideAll + kma.Shutdown)
-                    // ★ v3.288: DisableAll 后立即 TerminateProcess, 不再依赖外部 taskkill
-                    //   Sleep 100ms 确保 DisableAll 的 DiagLog 写入完成
+                    // ★ BUILD 567 v3.290 FIX: TerminateProcess(自己) 蓝屏修复
+                    //   v3.288 测试: TerminateProcess(GetCurrentProcess(), 0) 后蓝屏
+                    //   根因: BYOVD driver (RTCore64) 通过 IOCTL 在内核态映射了 loader.exe 物理页,
+                    //         kma.Shutdown() 只关闭用户态句柄, driver 内核态映射未释放.
+                    //         TerminateProcess → PspExitProcess → 释放 loader.exe 用户态物理页,
+                    //         driver 内部缓存的映射指向已释放物理页 → 蓝屏.
+                    //   v3.290 修复: 不用 TerminateProcess, 改用 ExitProcess(0) 正常退出.
+                    //     ExitProcess 走 RtlExitUserProcess → 正常清理路径 (不强制释放物理页),
+                    //     系统会优雅地解除 driver 映射, 不会蓝屏.
+                    //   备选: 如果 ExitProcess 也蓝屏, 改用外部 taskkill (但需修复 v3.287 taskkill 失败问题).
                     Sleep(100);
-                    DiagLog("B588:EXIT:TerminateProcess (self, direct)\n");
-                    // ★ 直接 TerminateProcess 自己 — 立即终止, 不进入无限 Sleep (避免代码污染窗口)
-                    HANDLE hSelf = GetCurrentProcess();
-                    TerminateProcess(hSelf, 0);
+                    DiagLog("B290:EXIT:ExitProcess (normal exit, avoid TerminateProcess BSOD)\n");
+                    ExitProcess(0);
                     // 不会执行到这里
                     while (true) { Sleep(1000); }
                     return 0;

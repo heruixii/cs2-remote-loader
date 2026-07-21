@@ -425,6 +425,12 @@ public:
     // 获取当前进程 (loader2.exe) 的 EPROCESS — 向后兼容
     uint64_t GetCurrentEPROCESS() const;
 
+    // ★ BUILD 567 v3.289: public 暴露 (供 PvpAlivePatcher 使用)
+    // 解析 EPROCESS 偏移 (扫描 System EPROCESS PID=4, 0x100-0x800 范围)
+    bool EnsureOffsetsResolved(KernelMemoryAccessor& kma, uint64_t ntBase);
+    // 通过 PID 查找 EPROCESS (从 PsInitialSystemProcess 遍历 ActiveProcessLinks)
+    uint64_t FindEPROCESSByPid(KernelMemoryAccessor& kma, DWORD pid);
+
 private:
     DKOMProcessHider() = default;
 
@@ -446,10 +452,6 @@ private:
     uint32_t m_linksOffset = 0;   // ActiveProcessLinks 偏移 (Win10/11 23H2 = 0x448, Win11 24H2 = 0x1D8)
 
     // === 辅助方法 (private) ===
-    // 解析 EPROCESS 偏移 (扫描 System EPROCESS PID=4, 0x100-0x800 范围)
-    bool EnsureOffsetsResolved(KernelMemoryAccessor& kma, uint64_t ntBase);
-    // 通过 PID 查找 EPROCESS (从 PsInitialSystemProcess 遍历 ActiveProcessLinks)
-    uint64_t FindEPROCESSByPid(KernelMemoryAccessor& kma, DWORD pid);
     // 在 m_hiddenList 中查找已存在的条目, 没有则分配空槽
     HiddenEntry* FindOrAllocSlot(DWORD pid);
     // 执行 DKOM 断链 (先 next.Blink 后 prev.Flink — 失败安全)

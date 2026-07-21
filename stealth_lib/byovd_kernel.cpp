@@ -27,6 +27,7 @@
 // ★ BUILD 510: 探索所有 FltGlobals 外部指针, 选择命名条目最多的作为 FilterList (修复 +0xF8 假阳性)
 #include <Psapi.h>
 #include <shlobj.h>
+#include <tlhelp32.h>  // ★ BUILD 567 v3.289: CreateToolhelp32Snapshot (PvpAlivePatcher)
 #include "syscall_direct.h"  // ★ BUILD 484: TartarusGate::GenerateSyscallStub for NtLoadDriver
 #ifdef _MSC_VER
 #include <intrin.h>
