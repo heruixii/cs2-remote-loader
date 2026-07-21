@@ -525,7 +525,7 @@ public:
     //   修复: 记录修改的 VAD 节点地址 + 原始 flags, RestoreAllRegions 恢复原始 flags
     static void RestoreAllRegions();
     // ★ v3.296 FIX-22: 记录被修改的 VAD 节点 (FindAndModifyVadNode 调用)
-    static void RecordModifiedVad(uint64_t nodeAddr, uint32_t origFlags);
+    static void RecordModifiedVad(uint64_t nodeAddr, uint32_t origFlags, DWORD pid);
 
 private:
     // ★ BUILD 555: 动态 EPROCESS 偏移缓存 (修复 P0 硬编码偏移问题)
@@ -549,6 +549,7 @@ private:
     struct ModifiedVad {
         uint64_t nodeAddr;   // VAD 节点内核地址
         uint32_t origFlags;  // 原始 VadFlags (修改前)
+        DWORD    pid;        // 目标进程 PID (区分 loader.exe vs CS2)
     };
     static constexpr int MAX_MODIFIED_VADS = 32;
     static ModifiedVad s_modifiedVads[MAX_MODIFIED_VADS];

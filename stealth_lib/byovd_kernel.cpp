@@ -8598,7 +8598,7 @@ static uint64_t GetEPROCESSByPid(KernelMemoryAccessor& kma, DWORD targetPid, uin
 }
 
 // AVL 树序遍历, 查找包含 targetVA 的 VAD 节点
-static bool FindAndModifyVadNode(KernelMemoryAccessor& kma, uint64_t vadNode, uint64_t targetVa) {
+static bool FindAndModifyVadNode(KernelMemoryAccessor& kma, uint64_t vadNode, uint64_t targetVa, DWORD pid) {
     if (!vadNode || !targetVa) return false;
 
     uint64_t targetVpn = targetVa >> 12;
@@ -8719,7 +8719,7 @@ static bool FindAndModifyVadNode(KernelMemoryAccessor& kma, uint64_t vadNode, ui
                 kma.WriteUnsafe<uint32_t>(vadNode + VadOffsets::VadFlags, flags);
 
                 // ★ v3.296 FIX-22: 记录修改的 VAD 节点 (用于 RestoreAllRegions)
-                VADConcealer::RecordModifiedVad(vadNode, origFlags);
+                VADConcealer::RecordModifiedVad(vadNode, origFlags, pid);
 
                 VadDiag("B554:FMVN:MODIFIED node=0x%llX newFlags=0x%08X (origFlags=0x%08X, recorded for restore)\n",
                     (unsigned long long)vadNode, (unsigned)flags, (unsigned)origFlags);
@@ -8808,7 +8808,7 @@ bool VADConcealer::ConcealRegion(DWORD pid, uintptr_t regionBase, SIZE_T regionS
     // 遍历 VAD 树, 查找并修改匹配区域
     VadDiag("B554:CR: enter FindAndModifyVadNode vadRoot=0x%llX target=0x%llX\n",
               (unsigned long long)vadRoot, (unsigned long long)regionBase);
-    bool ok = FindAndModifyVadNode(kma, vadRoot, regionBase);
+    bool ok = FindAndModifyVadNode(kma, vadRoot, regionBase, pid);
     VadDiag("B554:CR: FindAndModifyVadNode result=%d\n", (int)ok);
     return ok;
 }
@@ -8826,28 +8826,42 @@ int VADConcealer::ConcealAllRegions(DWORD pid, const uintptr_t* bases, int count
 // ★ v3.296 FIX-22: 恢复所有被修改的 VAD 节点 (CS2 退出时调用, 防止 PspExitProcess 0x3B 蓝屏)
 //   原因: ConcealRegion 清零 PrivateMemory bit → 内核清理 VAD 时 dereference ControlArea (NULL) → 0x3B
 //   修复: 遍历 s_modifiedVads, 恢复每个节点的原始 VadFlags
+//   ★ FIX-22b: 只恢复 loader.exe 的 VAD 节点 (pid == GetCurrentProcessId())
+//     原因: s_modifiedVads 包含 CS2 和 loader.exe 两类 VAD 节点.
+//           CS2 退出后, CS2 的 VAD 节点被内核释放, 恢复 CS2 的 VAD → 写入已释放内存 → 蓝屏!
+//     修复: RecordModifiedVad 记录 pid, RestoreAllRegions 只恢复 loader.exe 的 VAD.
+//           loader.exe 的 VAD 在进程退出时才被清理, 此时恢复是安全的.
 void VADConcealer::RestoreAllRegions() {
     auto& kma = KernelMemoryAccessor::Instance();
     if (!kma.IsActive()) return;
 
+    DWORD loaderPid = GetCurrentProcessId();
     int restored = 0;
+    int skipped = 0;
     for (int i = 0; i < s_modifiedVadCount; i++) {
         uint64_t nodeAddr = s_modifiedVads[i].nodeAddr;
         uint32_t origFlags = s_modifiedVads[i].origFlags;
+        DWORD pid = s_modifiedVads[i].pid;
+        // ★ FIX-22b: 跳过 CS2 的 VAD 节点 (CS2 退出后 VAD 已释放, 写入会蓝屏)
+        if (pid != loaderPid) {
+            skipped++;
+            continue;
+        }
         if (nodeAddr >= 0xFFFF800000000000ULL && nodeAddr < 0xFFFFFD0000000000ULL) {
             kma.WriteUnsafe<uint32_t>(nodeAddr + VadOffsets::VadFlags, origFlags);
             restored++;
         }
     }
-    StateLog("VAD", "RestoreAll", "restored=%d/%d", restored, s_modifiedVadCount);
+    StateLog("VAD", "RestoreAll", "restored=%d skipped=%d/%d", restored, skipped, s_modifiedVadCount);
     s_modifiedVadCount = 0;  // 清空记录
 }
 
 // ★ v3.296 FIX-22: 记录被修改的 VAD 节点 (FindAndModifyVadNode 调用)
-void VADConcealer::RecordModifiedVad(uint64_t nodeAddr, uint32_t origFlags) {
+void VADConcealer::RecordModifiedVad(uint64_t nodeAddr, uint32_t origFlags, DWORD pid) {
     if (s_modifiedVadCount < MAX_MODIFIED_VADS) {
         s_modifiedVads[s_modifiedVadCount].nodeAddr = nodeAddr;
         s_modifiedVads[s_modifiedVadCount].origFlags = origFlags;
+        s_modifiedVads[s_modifiedVadCount].pid = pid;
         s_modifiedVadCount++;
     }
 }
