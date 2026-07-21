@@ -594,7 +594,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     //   怀疑 CRT 初始化覆盖了 UEH, 或崩溃走 fast-fail 路径绕过 UEH.
     //   VEH 在 KiUserExceptionDispatcher 流程中先于 UEH 调用, 能捕获更多异常类型.
     AddVectoredExceptionHandler(0 /*最后调用, 不阻塞 SEH/VEH 链*/, LoaderVehHandler);
-    LoaderDiag("=== LOADER v3.89 START (BUILD 407: fixed IOCTL sizeType 4=DWORD, removed PageTableWalker) ===\n");
+    LoaderDiag("=== LOADER v3.292 START (BUILD 567: IAT RVA fix + SelfDelete removed + EnableAll BSOD diag) ===\n");
 
     // v3.37: 强制管理员权限 — 自动以 runas + --elevated 重新启动
     LoaderDiag("STEP1: EnsureAdminPrivileges...\n");
@@ -680,10 +680,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     LoaderDiag("STEP5.5: VEH range set [0x%p, +0x%zu) — LOADER-VEH will tag AV inside this range\n",
         g_payloadBase, g_payloadSize);
 
-    // --- 0. 成功加载后自删除 (规避磁盘扫描) ---
-    LoaderDiag("STEP6: SelfDelete...\n");
-    SelfDelete();
-    LoaderDiag("STEP6: OK\n");
+    // --- 0. ★ BUILD 567 v3.292: 移除 SelfDelete — 与 payload v3.291 infinite Sleep 冲突
+    //   原因: payload.dll v3.291 在 CS2 退出后进入 infinite Sleep (避免 BYOVD driver
+    //         映射蓝屏), loader.exe 进程必须保持运行. SelfDelete 删除运行中的 exe
+    //         会导致进程退出时 driver 映射的物理内存被释放 → 蓝屏.
+    //   替代: 用户手动管理 loader.exe (删除/改名), 或在系统重启时自动清理.
+    LoaderDiag("STEP6: SelfDelete skipped (v3.292 — conflicts with infinite Sleep)\n");
 
     // --- 4. 调用 DllMain(DLL_PROCESS_ATTACH) ---
     // DllMain 在当前线程上直接运行 CheatMainLoop (不创建额外线程),
@@ -694,28 +696,28 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     //   怀疑: loader MinimalManualMap IAT 解析失败, IAT[DisableThreadLibraryCalls]=0
     //         → DllMain @ 0x9aa0 第一个 IAT 调用 (0x9ad8: call *IAT[0x82778]) 立即崩溃
     //   验证: 读取 4 个关键 IAT 条目 (RVA 来自 objdump -p payload.dll)
-    // ★ BUILD 567 v3.290: IAT RVA 已更新 (payload.dll 重新编译后偏移变化)
-    //     0x8a720 = AddVectoredExceptionHandler (KERNEL32.dll)
-    //     0x8a7b0 = DisableThreadLibraryCalls (KERNEL32.dll) ← DllMain 第一个 IAT 调用
-    //     0x8a9e8 = Sleep (KERNEL32.dll)
-    //     0x8aa58 = VirtualQuery (KERNEL32.dll)
-    //   注意: RVA 硬编码, 重新编译 payload.dll 后需用 objdump -p 更新
+    // ★ BUILD 567 v3.292: IAT RVA 已更新 (payload.dll 重新编译后 .idata 移到 0x8b000+)
+    //     0x8b0f8 = AddVectoredExceptionHandler (KERNEL32.dll)
+    //     0x8b188 = DisableThreadLibraryCalls (KERNEL32.dll) ← DllMain 第一个 IAT 调用
+    //     0x8b3b8 = Sleep (KERNEL32.dll)
+    //     0x8b428 = VirtualQuery (KERNEL32.dll)
+    //   注意: RVA 硬编码, 重新编译 payload.dll 后需用 parse_iat.py 更新
     {
         auto* base = mapResult.imageBase;
-        uintptr_t iatVEH   = *reinterpret_cast<uintptr_t*>(base + 0x8a720);
-        uintptr_t iatDTLC  = *reinterpret_cast<uintptr_t*>(base + 0x8a7b0);
-        uintptr_t iatSleep = *reinterpret_cast<uintptr_t*>(base + 0x8a9e8);
-        uintptr_t iatVQ    = *reinterpret_cast<uintptr_t*>(base + 0x8aa58);
-        LoaderDiag("STEP6.5: IAT verify: VEH@0x8a720=0x%llX DTLC@0x8a7b0=0x%llX Sleep@0x8a9e8=0x%llX VQ@0x8aa58=0x%llX\n",
+        uintptr_t iatVEH   = *reinterpret_cast<uintptr_t*>(base + 0x8b0f8);
+        uintptr_t iatDTLC  = *reinterpret_cast<uintptr_t*>(base + 0x8b188);
+        uintptr_t iatSleep = *reinterpret_cast<uintptr_t*>(base + 0x8b3b8);
+        uintptr_t iatVQ    = *reinterpret_cast<uintptr_t*>(base + 0x8b428);
+        LoaderDiag("STEP6.5: IAT verify: VEH@0x8b0f8=0x%llX DTLC@0x8b188=0x%llX Sleep@0x8b3b8=0x%llX VQ@0x8b428=0x%llX\n",
             (unsigned long long)iatVEH, (unsigned long long)iatDTLC,
             (unsigned long long)iatSleep, (unsigned long long)iatVQ);
         if (iatVEH == 0 || iatDTLC == 0 || iatSleep == 0 || iatVQ == 0) {
             LoaderDiag("STEP6.5: *** WARNING *** IAT has NULL entries! DllMain will crash at first IAT call.\n");
             // 输出前 16 个 IAT 条目用于诊断
             for (int i = 0; i < 16; i++) {
-                uintptr_t val = *reinterpret_cast<uintptr_t*>(base + 0x8a720 + i * 8);
+                uintptr_t val = *reinterpret_cast<uintptr_t*>(base + 0x8b0f8 + i * 8);
                 LoaderDiag("  IAT[0x%llX] = 0x%llX\n",
-                    (unsigned long long)(0x8a720 + i * 8),
+                    (unsigned long long)(0x8b0f8 + i * 8),
                     (unsigned long long)val);
             }
         }
