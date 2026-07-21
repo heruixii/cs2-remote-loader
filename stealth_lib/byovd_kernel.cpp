@@ -10071,7 +10071,10 @@ uint64_t PvpAlivePatcher::GetProcessCR3(DWORD pid) {
     // 获取 BYOVD driver 和 EPROCESS
     KernelMemoryAccessor& kma = KernelMemoryAccessor::Instance();
     uint64_t ntBase = kma.GetNtoskrnlBase();
-    if (!ntBase) return 0;
+    if (!ntBase) {
+        StateLog("PVP", "CR3Fail", "step=ntBase (GetNtoskrnlBase failed)");
+        return 0;
+    }
 
     // 确保 DKOM 偏移已解析 (pidOffset, linksOffset)
     auto& dkom = DKOMProcessHider::Instance();
@@ -10086,6 +10089,7 @@ uint64_t PvpAlivePatcher::GetProcessCR3(DWORD pid) {
         StateLog("PVP", "CR3Fail", "step=FindEPROC pid=%u", pid);
         return 0;
     }
+    StateLog("PVP", "CR3Step", "step=EPROC ok=0x%llX pid=%u", (unsigned long long)eproc, pid);
 
     // ★ 扫描 EPROCESS 找 DirectoryBase (CR3)
     //   Windows 10/11: EPROCESS.DirectoryBase 通常在 0x28 (Win10) 或 0x1010 (新版本)
@@ -10105,7 +10109,7 @@ uint64_t PvpAlivePatcher::GetProcessCR3(DWORD pid) {
             PageTableWalker walker(val, kma);
             uint64_t pa = walker.VaToPa(eproc);
             if (pa != 0) {
-                ByovdDiag("PVP.CR3: OK pid=%u EPROC=0x%llX CR3=0x%llX (offset=0x%X)\n",
+                StateLog("PVP", "CR3OK", "pid=%u EPROC=0x%llX CR3=0x%llX (offset=0x%X)",
                     pid, (unsigned long long)eproc, (unsigned long long)val, off);
                 return val;
             }
@@ -10113,21 +10117,21 @@ uint64_t PvpAlivePatcher::GetProcessCR3(DWORD pid) {
     }
 
     // 扫描 0x0-0x1800 范围
-    ByovdDiag("PVP.CR3: common offsets failed, scanning 0x0-0x1800...\n");
+    StateLog("PVP", "CR3Step", "step=scan common offsets failed, trying 0x0-0x1800");
     for (uint32_t off = 0x0; off < 0x1800; off += 8) {
         uint64_t val = kma.ReadUnsafe<uint64_t>(eproc + off);
         if ((val & 0xFFF) == 0 && val >= 0x10000 && val < 0x400000000ULL) {
             PageTableWalker walker(val, kma);
             uint64_t pa = walker.VaToPa(eproc);
             if (pa != 0) {
-                ByovdDiag("PVP.CR3: OK (scan) pid=%u EPROC=0x%llX CR3=0x%llX (offset=0x%X)\n",
+                StateLog("PVP", "CR3OK", "pid=%u EPROC=0x%llX CR3=0x%llX (scan offset=0x%X)",
                     pid, (unsigned long long)eproc, (unsigned long long)val, off);
                 return val;
             }
         }
     }
 
-    ByovdDiag("PVP.CR3: FAIL no valid CR3 found in EPROCESS (pid=%u EPROC=0x%llX)\n",
+    StateLog("PVP", "CR3Fail", "step=scan no valid CR3 in EPROCESS (pid=%u EPROC=0x%llX)",
         pid, (unsigned long long)eproc);
     return 0;
 }
