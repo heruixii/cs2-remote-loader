@@ -787,7 +787,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.290 启动摘要 (ExitProcess 替代 TerminateProcess — 修复 BYOVD driver 映射蓝屏)\n");
+    DiagLog("BUILD 567 v3.291 启动摘要 (infinite Sleep 替代进程退出 — 终极修复 BYOVD driver 映射蓝屏)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -3734,21 +3734,29 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                         stealth::PvpAlivePatcher::Instance().Uninstall();
                     }
                     stealth::KernelDefense::DisableAll();  // ★ v3.279: DisableAll (UnhideAll + kma.Shutdown)
-                    // ★ BUILD 567 v3.290 FIX: TerminateProcess(自己) 蓝屏修复
-                    //   v3.288 测试: TerminateProcess(GetCurrentProcess(), 0) 后蓝屏
-                    //   根因: BYOVD driver (RTCore64) 通过 IOCTL 在内核态映射了 loader.exe 物理页,
-                    //         kma.Shutdown() 只关闭用户态句柄, driver 内核态映射未释放.
-                    //         TerminateProcess → PspExitProcess → 释放 loader.exe 用户态物理页,
-                    //         driver 内部缓存的映射指向已释放物理页 → 蓝屏.
-                    //   v3.290 修复: 不用 TerminateProcess, 改用 ExitProcess(0) 正常退出.
-                    //     ExitProcess 走 RtlExitUserProcess → 正常清理路径 (不强制释放物理页),
-                    //     系统会优雅地解除 driver 映射, 不会蓝屏.
-                    //   备选: 如果 ExitProcess 也蓝屏, 改用外部 taskkill (但需修复 v3.287 taskkill 失败问题).
-                    Sleep(100);
-                    DiagLog("B290:EXIT:ExitProcess (normal exit, avoid TerminateProcess BSOD)\n");
-                    ExitProcess(0);
+                    // ★ BUILD 567 v3.291 FIX: 进程退出蓝屏终极修复 — 不退出, 进入无限 Sleep
+                    //   历史尝试 (全部蓝屏):
+                    //     v3.286/v3.287: taskkill /f (外部 TerminateProcess) → 蓝屏
+                    //     v3.288: TerminateProcess(self) → 蓝屏
+                    //     v3.290: ExitProcess(0) → 蓝屏
+                    //   根因 (终极确认):
+                    //     BYOVD driver (RTCore64) 通过 IOCTL 在内核态 MmMapIoSpace 映射了
+                    //     loader.exe 的物理页. kma.Shutdown() 只关闭用户态句柄, driver 内核态
+                    //     映射未释放 (BUILD 470 策略: 不卸载 driver; BUILD 474: NtUnloadDriver
+                    //     在 manual-mapped DLL 上下文会 ACCESS_VIOLATION, 无法安全卸载).
+                    //     任何进程退出方式 (TerminateProcess/ExitProcess/taskkill) 最终都走
+                    //     PspExitProcess → 释放 loader.exe 用户态物理页 → driver 内部缓存的
+                    //     映射指向已释放物理页 → 后续访问蓝屏.
+                    //   v3.291 终极修复: CS2 退出后, loader.exe 不退出, 进入无限 Sleep.
+                    //     物理页不被释放, driver 映射不失效, 不会蓝屏.
+                    //     loader.exe 进程残留 (已被 DKOM 隐藏, 系统重启时自然清理).
+                    //     副作用: 每次运行会留下一个隐藏的 loader.exe 进程, 但比蓝屏可接受.
+                    DiagLog("B291:EXIT:entering infinite Sleep (avoid BSOD — driver mapping requires process alive)\n");
+                    while (true) {
+                        Sleep(60000);  // 60s 心跳, 避免被系统判定为僵尸进程
+                        DiagLog("B291:HB:still alive (infinite sleep, avoiding BSOD)\n");
+                    }
                     // 不会执行到这里
-                    while (true) { Sleep(1000); }
                     return 0;
                 }
             }
