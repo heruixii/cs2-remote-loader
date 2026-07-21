@@ -206,6 +206,12 @@ static void VadDiag(const char* fmt, ...) {
 //   byovd_kernel.cpp 在 PatchVmxOnWrapper/PatchShvInstallEntry 成功/失败时更新
 extern LogStats g_logStats;
 
+// ★ v3.296 FIX-18: CS2 退出标志 — 防止 minifilter 链表遍历蓝屏
+//   定义在 payload.cpp, 此处声明. 0=CS2 alive, 1=CS2 exited.
+//   NeutralizeMessageTransfer/IsMessageTransferNeutralized 入口检查此标志,
+//   CS2 退出后立即返回, 不遍历已释放的 FilterList 链表.
+extern volatile LONG g_cs2Exited;
+
 // BYOVD 驱动嵌入支持: 将 RTCore64.sys 编译进 payload
 //   python scripts/embed_driver.py RTCore64.sys → rtcore64_embed.h
 //   v3.47: 始终嵌入, 移除 #ifdef 编译开关 — 驱动从 TEMP 提取
@@ -5579,6 +5585,24 @@ static uint64_t FindFilterByStringScan(uint64_t fltmgrBase, uint64_t fltGlobals,
         StateLog("FLT", "StrScanFail", "step=no FltGlobals");
         return 0;
     }
+    // ★ v3.296 FIX-18: 检查 PAC 驱动是否已加载 — 防止 CS2 退出时蓝屏
+    //   CS2 退出过程中, PAC minifilter (MessageTransfer.sys) 先被卸载
+    //   (FltUnregisterFilter → FLT_FILTER 释放), 但 CS2 进程对象还未完全退出
+    //   (GetExitCodeProcess 仍返回 STILL_ACTIVE). 此时遍历 FilterList 会访问
+    //   已释放的池内存 → BSOD 0x50.
+    //   修复: 如果 MessageTransfer.sys 已从 PsLoadedModuleList 消失,
+    //         说明 PAC minifilter 已卸载, 立即返回, 不遍历链表.
+    {
+        char mtName[32];
+        STEALTH_STR_DECRYPT_TO("MessageTransfer.sys", mtName, sizeof(mtName));
+        uint64_t mtBase = kma.GetKernelModuleBase(mtName);
+        SecureZeroMemory(mtName, sizeof(mtName));
+        if (!mtBase) {
+            StateLog("FLT", "StrScanSkip", "reason=PAC driver unloaded");
+            ByovdDiag("FLT:STRSCAN: PAC driver (MessageTransfer.sys) not loaded, skip\n");
+            return 0;
+        }
+    }
 
     // Step 2: 遍历 FltGlobals 中的 FLTP_FRAME 指针, 找 FilterList
     uint64_t globQw[16] = {};
@@ -5736,7 +5760,20 @@ static uint64_t FindFilterByStringScan(uint64_t fltmgrBase, uint64_t fltGlobals,
                 // 读下一个条目
                 uint64_t nextFlink = 0;
                 if (!kma.ReadKernelVA(cur, &nextFlink, 8) ||
-                    nextFlink < 0xFFFF800000000000ULL) break;
+                    nextFlink < 0xFFFF800000000000ULL) {
+                    // ★ v3.296 FIX-18 DIAG: 记录链表遍历中断
+                    StateLog("FLT", "StrScanListBreak",
+                             "iter=%d cur=0x%llX reason=readfail_or_invalid",
+                             iter, (unsigned long long)cur);
+                    break;
+                }
+                // ★ v3.296 FIX-18: 验证 nextFlink 在白名单范围内 — 防止访问已释放内存
+                if (nextFlink >= 0xFFFFFD0000000000ULL) {
+                    StateLog("FLT", "StrScanListBreak",
+                             "iter=%d cur=0x%llX next=0x%llX reason=out_of_whitelist",
+                             iter, (unsigned long long)cur, (unsigned long long)nextFlink);
+                    break;
+                }
                 cur = nextFlink;
             }
         }
@@ -5845,6 +5882,8 @@ static uint64_t FindFilterByDriverBaseMatch(uint64_t filterListHead,
             }
         }
 
+        // ★ v3.296 FIX-18: 验证 current 在白名单范围内 — 防止访问已释放内存
+        if (current >= 0xFFFFFD0000000000ULL) break;
         if (!kma.ReadKernelVA(current, &current, sizeof(current))) break;
     }
 
@@ -5857,6 +5896,18 @@ static uint64_t FindFilterByDriverBaseMatch(uint64_t filterListHead,
 uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t fltGlobals, const wchar_t* name) {
     auto& kma = KernelMemoryAccessor::Instance();
     ByovdDiag("FLT:NTRL: finding filter '%ls'\n", name);
+    // ★ v3.296 FIX-18: 检查 PAC 驱动是否已加载 — 防止 CS2 退出时蓝屏
+    //   (与 FindFilterByStringScan/FindPacFilterInKernel 同理)
+    {
+        char mtName[32];
+        STEALTH_STR_DECRYPT_TO("MessageTransfer.sys", mtName, sizeof(mtName));
+        uint64_t mtBase = kma.GetKernelModuleBase(mtName);
+        SecureZeroMemory(mtName, sizeof(mtName));
+        if (!mtBase) {
+            StateLog("FLT", "FindByNameSkip", "reason=PAC driver unloaded");
+            return 0;
+        }
+    }
 
     // BUILD 466 + BUILD 475: FltGlobals 在 Win10/11 版本间布局不同
     //   不再假设 FrameList 在 +0x00 — 尝试 fltGlobals 前 8 个 qword (Win11 可能更远)
@@ -6085,6 +6136,7 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
                             }
                         }
                         NEXT_EXT_ENTRY_511:
+                        if (cur >= 0xFFFFFD0000000000ULL) break;  // ★ v3.296 FIX-18: 白名单验证
                         if (!kma.ReadKernelVA(cur, &cur, 8)) break;
                     }
                     ByovdDiag("FLT:NTRL: BUILD 511: +0x%llX → 0x%llX: %d named + %d total entries\n",
@@ -6446,6 +6498,13 @@ bool MinifilterNeutralizer::NeutralizeMessageTransfer() {
         ByovdDiag("FLT:NTRL: Neutralize skipped — BYOVD not active\n");
         return false;
     }
+    // ★ v3.296 FIX-18: CS2 退出后不遍历 FilterList — 防止蓝屏
+    //   CS2 关闭时 PAC minifilter 被卸载, FLT_FILTER 结构释放,
+    //   遍历 FilterList 会访问已释放的池内存 → BSOD 0x50.
+    if (g_cs2Exited) {
+        StateLog("FLT", "NtrlSkip", "cs2 exited");
+        return false;
+    }
 
     StateLog("FLT", "NtrlStart", "");
     ByovdDiag("B550:NT:=== ntrl mtf (keep) ===\n");  // ★ BUILD 550: 脱敏 (原含过滤器名)
@@ -6690,6 +6749,7 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
                         if (foundNamed > 0) goto NEXT_ENTRY_GLOB; // 找到 name 即可, 跳至下一个链表节点
                     }
                     NEXT_ENTRY_GLOB:
+                    if (cur >= 0xFFFFFD0000000000ULL) break;  // ★ v3.296 FIX-18: 白名单验证
                     if (!kma.ReadKernelVA(cur, &cur, 8)) break;
                 }
 
@@ -6799,6 +6859,7 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
                     }
                 }
                 NEXT_DIRECT:
+                if (cur >= 0xFFFFFD0000000000ULL) break;  // ★ v3.296 FIX-18: 白名单验证
                 if (!kma.ReadKernelVA(cur, &cur, 8)) break;
             }
             if (namedFound > 0) {
@@ -6897,6 +6958,7 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
                         }
                     }
                     NEXT_EXT_510:
+                    if (cur >= 0xFFFFFD0000000000ULL) break;  // ★ v3.296 FIX-18: 白名单验证
                     if (!kma.ReadKernelVA(cur, &cur, 8)) break;
                 }
                 ByovdDiag("FLT:VERIFY: BUILD 510: +0x%llX → 0x%llX: %d named + %d total entries\n",
@@ -6975,6 +7037,11 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
 bool MinifilterNeutralizer::IsMessageTransferNeutralized() {
     auto& kma = KernelMemoryAccessor::Instance();
     if (!kma.IsActive()) return true; // BYOVD 未激活时不报错
+    // ★ v3.296 FIX-18: CS2 退出后不遍历 FilterList — 防止蓝屏
+    //   CS2 关闭时 PAC minifilter 被卸载, FLT_FILTER 结构释放,
+    //   遍历 FilterList 会访问已释放的池内存 → BSOD 0x50.
+    //   返回 true (视为已中和) — CS2 已退出, 无需中和, 也不应触发 patch.
+    if (g_cs2Exited) return true;
 
     // 检查 fltmgr FilterFindFirst 列表中的 minifilter 是否仍然是 stub
     // 简化为: 检查 fltmgr 内是否有非 stub 的 MessageTransfer 回调
@@ -7212,6 +7279,24 @@ static int WStringToString(const wchar_t* ws, char* outBuf, int outBufSize) {
 static uint64_t FindPacFilterInKernel(uint64_t fltmgrBase, uint64_t fltGlobals, wchar_t* outName, int outNameChars) {
     auto& kma = KernelMemoryAccessor::Instance();
     if (!kma.IsActive()) return 0;
+    // ★ v3.296 FIX-18: 检查 PAC 驱动是否已加载 — 防止 CS2 退出时蓝屏
+    //   CS2 退出过程中, PAC minifilter (MessageTransfer.sys) 先被卸载
+    //   (FltUnregisterFilter → FLT_FILTER 释放), 但 CS2 进程对象还未完全退出
+    //   (GetExitCodeProcess 仍返回 STILL_ACTIVE). 此时遍历 FilterList 会访问
+    //   已释放的池内存 → BSOD 0x50.
+    //   修复: 如果 MessageTransfer.sys 已从 PsLoadedModuleList 消失,
+    //         说明 PAC minifilter 已卸载, 立即返回, 不遍历链表.
+    {
+        char mtName[32];
+        STEALTH_STR_DECRYPT_TO("MessageTransfer.sys", mtName, sizeof(mtName));
+        uint64_t mtBase = kma.GetKernelModuleBase(mtName);
+        SecureZeroMemory(mtName, sizeof(mtName));
+        if (!mtBase) {
+            StateLog("FLT", "KernScanSkip", "reason=PAC driver unloaded");
+            ByovdDiag("FLT:KERNSCAN: PAC driver (MessageTransfer.sys) not loaded, skip\n");
+            return 0;
+        }
+    }
 
     // ★ BUILD 506: 尝试 fltGlobals 前 8 qword 找 FrameList (Win10/Win11 兼容)
     uint64_t globQw[8] = {};
@@ -7286,6 +7371,8 @@ static uint64_t FindPacFilterInKernel(uint64_t fltmgrBase, uint64_t fltGlobals, 
                             }
                         }
                     }
+                    // ★ v3.296 FIX-18: 验证 cur 在白名单范围内
+                    if (cur >= 0xFFFFFD0000000000ULL) break;
                     if (!kma.ReadKernelVA(cur, &cur, 8)) break;
                 }
                 EXT_FOUND_PAC:;
@@ -7373,7 +7460,19 @@ static uint64_t FindPacFilterInKernel(uint64_t fltmgrBase, uint64_t fltGlobals, 
             }
         }
 
-        if (!kma.ReadKernelVA(current, &current, sizeof(current))) break;
+        // ★ v3.296 FIX-18: 验证 current 在白名单范围内 — 防止访问已释放内存
+        if (current >= 0xFFFFFD0000000000ULL) {
+            StateLog("FLT", "KernScanListBreak",
+                     "iter=%d current=0x%llX reason=out_of_whitelist",
+                     iter, (unsigned long long)current);
+            break;
+        }
+        if (!kma.ReadKernelVA(current, &current, sizeof(current))) {
+            StateLog("FLT", "KernScanListBreak",
+                     "iter=%d current=0x%llX reason=readfail",
+                     iter, (unsigned long long)current);
+            break;
+        }
     }
 
     // ★ v3.296 FIX-17 DIAG: 记录扫描完成但未找到
@@ -7693,6 +7792,11 @@ KernelDefense::PacStatus KernelDefense::DisablePac() {
 }
 
 void KernelDefense::GuardPac() {
+    // ★ v3.296 FIX-18: CS2 退出后不执行 GuardPac — 防止蓝屏
+    //   GuardPac 调用 IsMessageTransferNeutralized + NeutralizeMessageTransfer,
+    //   两者遍历 FilterList 链表. CS2 退出时 PAC minifilter 卸载, 链表节点释放,
+    //   遍历会访问已释放的池内存 → BSOD 0x50.
+    if (g_cs2Exited) return;
     // ★ BUILD 530: GuardPac 整体废弃 — SCM 操作 (OpenSCManagerW/OpenServiceW/
     //   QueryServiceStatusEx) 在 manual-mapped DLL 上下文中导致 ntdll 崩溃
     //   (CRASH: 0xC0000005 in ntdll +0x127D29, ReapplyAllCallbacks → GuardPac → OpenSCManagerW).

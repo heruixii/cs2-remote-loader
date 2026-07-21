@@ -906,6 +906,15 @@ static bool g_byovdDriverLoaded = false;
 //   更新点: EnableAll (初始化) + GuardPac (周期 30-45s)
 static bool g_pacNeutralized = false;
 
+// ★ v3.296 FIX-18: CS2 退出标志 — 防止 minifilter 链表遍历蓝屏
+//   根因: CS2 关闭时 PAC minifilter (MessageTransfer.sys) 被卸载, FLT_FILTER 结构释放.
+//         但主循环/GuardPac 仍调用 NeutralizeMessageTransfer/IsMessageTransferNeutralized
+//         → FindFilterByStringScan/FindPacFilterInKernel 遍历 FilterList 链表
+//         → 访问已释放的池内存 → BSOD 0x50.
+//   修复: CS2 退出后设置 g_cs2Exited=true, 所有 minifilter 访问函数入口检查此标志.
+//   重置: CS2 重新启动时由 StealthEngine 重置 (loader 重新注入时).
+volatile LONG g_cs2Exited = 0;  // 0=alive, 1=exited
+
 // ★ BUILD 536: ntdll!RtlDeactivateActivationContext 地址范围 — 用于 VEH 捕获 worker 线程激活上下文栈 NULL 崩溃
 //   根因: 某些系统 worker 线程 (线程池/RPC) TEB+0x98 (ActivationContextStackPointer) 为 NULL,
 //   线程退出时 LdrShutdownThread → RtlDeactivateActivationContext 解引用 NULL+0x38 崩溃.
@@ -3735,6 +3744,16 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             if (hCs2) {
                 DWORD cs2ExitCode = STILL_ACTIVE;
                 if (GetExitCodeProcess(hCs2, &cs2ExitCode) && cs2ExitCode != STILL_ACTIVE) {
+                    // ★ v3.296 FIX-18: 设置全局退出标志 — 阻止所有 minifilter 链表遍历
+                    //   CS2 退出检测在主循环开头, 先于 minifilter 重试.
+                    //   但 CS2 退出过程中 (FltUnregisterFilter 已执行, 进程对象未完全退出),
+                    //   GetExitCodeProcess 可能仍返回 STILL_ACTIVE, 此时 minifilter 重试会蓝屏.
+                    //   FindFilterByStringScan/FindPacFilterInKernel 入口的 PAC 驱动加载检查
+                    //   是最后一道防线 (MessageTransfer.sys 卸载即跳过链表遍历).
+                    if (!g_cs2Exited) {
+                        DiagLog("B549:CS2_EXIT: setting g_cs2Exited=1 (CS2 exit detected, code=%u)\n", cs2ExitCode);
+                        InterlockedExchange(&g_cs2Exited, 1);
+                    }
                     DiagLog("B550:EX:tgt-exit=%u safe-exit\n", cs2ExitCode);  // ★ BUILD 550: 脱敏 (原含 CS2)
                     // ★ BUILD 567 v3.274 FIX: CS2 退出蓝屏修复 — 调整 safe-exit 清理顺序
                     //   根因: v3.273 测试发现关闭 CS2 瞬间蓝屏. 日志显示 LogExitSummary 第一行打印后
@@ -3851,6 +3870,11 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                 }
                 if (!cs2AliveForCb) {
                     // CS2 已退出 — 跳过回调重应用, 防止访问已释放的 minifilter 内存
+                    // ★ v3.296 FIX-18: 设置全局退出标志, 阻止所有 minifilter 链表遍历
+                    if (!g_cs2Exited) {
+                        DiagLog("B549:CS2_EXIT: setting g_cs2Exited=1 (CS2 exited, CB path)\n");
+                        InterlockedExchange(&g_cs2Exited, 1);
+                    }
                     DiagLogState("CB", "SKIP_CS2_EXIT", "tick=%u", (unsigned)GetTickCount());
                 } else if (stealth::KernelMemoryAccessor::Instance().IsActive()) {
                     stealth::KernelDefense::ReapplyAllCallbacks();
@@ -3985,11 +4009,30 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         if (now - lastObCheckTime >= obCheckInterval) {
             lastObCheckTime = now;
             obCheckInterval = RandomJitter(20000, 10000);  // 20-30 秒随机
-            // 始终尝试重新移除 — ReDisablePacCallbacks 内部会扫描 ObpCallbackArray
-            // 找到 PAC 注册的新回调并 NULL 化, 已移除的不会重复处理
-            int reRemoved = stealth::EACCallbackDisabler::Instance().ReDisablePacCallbacks();
-            if (reRemoved > 0) {
-                DiagLog("E+G: ObCallbacks re-removed (count=%d)\n", reRemoved);
+            // ★ v3.296 FIX-18: CS2 退出后跳过 ObCallbacks 重移除 — 减少 IOCTL
+            //   ObpCallbackArrayHead 在 ntoskrnl 数据段 (不会随 CS2 退出释放),
+            //   不会蓝屏, 但 CS2 退出后无意义, 跳过减少 IOCTL 负担.
+            bool cs2AliveForOb = false;
+            {
+                HANDLE hCs2 = StealthEngine::Instance().GetProcessHandle();
+                if (hCs2) {
+                    DWORD ec = STILL_ACTIVE;
+                    if (GetExitCodeProcess(hCs2, &ec) && ec == STILL_ACTIVE) cs2AliveForOb = true;
+                }
+            }
+            if (!cs2AliveForOb) {
+                // CS2 已退出 — 跳过 ObCallbacks 重移除
+                // ★ v3.296 FIX-18: 设置全局退出标志 (兜底, 防止其他路径遗漏)
+                if (!g_cs2Exited) {
+                    InterlockedExchange(&g_cs2Exited, 1);
+                }
+            } else {
+                // 始终尝试重新移除 — ReDisablePacCallbacks 内部会扫描 ObpCallbackArray
+                // 找到 PAC 注册的新回调并 NULL 化, 已移除的不会重复处理
+                int reRemoved = stealth::EACCallbackDisabler::Instance().ReDisablePacCallbacks();
+                if (reRemoved > 0) {
+                    DiagLog("E+G: ObCallbacks re-removed (count=%d)\n", reRemoved);
+                }
             }
         }
 
@@ -4088,6 +4131,11 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             }
             if (!cs2AliveForPatch) {
                 // CS2 已退出 — 停止 patch 维护, 防止访问已释放的 minifilter 内存
+                // ★ v3.296 FIX-18: 设置全局退出标志, 阻止所有 minifilter 链表遍历
+                if (!g_cs2Exited) {
+                    DiagLog("B549:CS2_EXIT: setting g_cs2Exited=1 (CS2 exited)\n");
+                    InterlockedExchange(&g_cs2Exited, 1);
+                }
                 if (g_cs2Patched) {
                     DiagLog("B549:CS2_EXIT: stopping patch maintenance (CS2 exited)\n");
                     g_cs2Patched = false;
