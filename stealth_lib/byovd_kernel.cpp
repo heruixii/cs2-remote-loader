@@ -10116,23 +10116,29 @@ uint64_t PvpAlivePatcher::GetProcessCR3(DWORD pid) {
     //   1. 先试常见偏移 (0x28, 0x1010)
     //   2. 如果失败, 扫描 0x0-0x1800 范围, 找符合 CR3 特征的值
 
-    // ★ BUILD 567 v3.293 DIAG: 每个常见偏移读取前记录 StateLog
-    //   如果蓝屏发生在 ReadUnsafe, sd.log 会显示最后一个 PreReadOff, 精确定位
+    // ★ BUILD 567 v3.294 FIX: PCID 支持 — CR3 低 12 位可能包含 PCID (Process Context ID)
+    //   Windows 10/11 启用 PCID 后, EPROCESS.DirectoryBase 低 12 位不再全为 0,
+    //   例如 0x2B83F3002 (低12位=0x002 是 PCID, 不是页对齐错误)
+    //   PageTableWalker 构造函数已用 (cr3 & ~0xFFF) 清除低 12 位, 所以 VaToPa 仍正确
+    //   修复: 放宽验证条件, 用 VaToPa 成功作为唯一判据 (不再要求低 12 位为 0)
+    //   日志证据: v3.293 测试 off=0x28 val=0x2B83F3002 被错误拒绝 (PCID=0x002)
     const uint32_t commonOffsets[] = { 0x28, 0x1010, 0x110, 0x140 };
     for (uint32_t off : commonOffsets) {
         StateLog("PVP", "CR3PreReadOff", "off=0x%X EPROC=0x%llX", off, (unsigned long long)eproc);
         uint64_t val = kma.ReadUnsafe<uint64_t>(eproc + off);
         StateLog("PVP", "CR3PostReadOff", "off=0x%X val=0x%llX", off, (unsigned long long)val);
-        // CR3 特征: 低 12 位为 0 (页对齐), 且 < 16GB (0x400000000)
-        if ((val & 0xFFF) == 0 && val >= 0x10000 && val < 0x400000000ULL) {
-            // 验证: 用该 CR3 翻译 EPROCESS 自身 VA
+        // ★ v3.294: 放宽条件 — 只要求高 52 位 (PFN) 在合理物理内存范围 (< 16GB)
+        //   低 12 位可能包含 PCID 标志, 不再要求为 0
+        uint64_t pfn = val & ~0xFFFULL;  // 取高 52 位 (物理页帧)
+        if (pfn >= 0x10000 && pfn < 0x400000000ULL && val != 0) {
+            // 验证: 用该 CR3 翻译 EPROCESS 自身 VA (唯一可靠判据)
             StateLog("PVP", "CR3PreVaToPa", "off=0x%X CR3=0x%llX VA=0x%llX", off, (unsigned long long)val, (unsigned long long)eproc);
             PageTableWalker walker(val, kma);
             uint64_t pa = walker.VaToPa(eproc);
             StateLog("PVP", "CR3PostVaToPa", "off=0x%X PA=0x%llX", off, (unsigned long long)pa);
             if (pa != 0) {
-                StateLog("PVP", "CR3OK", "pid=%u EPROC=0x%llX CR3=0x%llX (offset=0x%X)",
-                    pid, (unsigned long long)eproc, (unsigned long long)val, off);
+                StateLog("PVP", "CR3OK", "pid=%u EPROC=0x%llX CR3=0x%llX (offset=0x%X PCID=0x%X)",
+                    pid, (unsigned long long)eproc, (unsigned long long)val, off, (unsigned)(val & 0xFFF));
                 return val;
             }
         }
@@ -10146,13 +10152,15 @@ uint64_t PvpAlivePatcher::GetProcessCR3(DWORD pid) {
             StateLog("PVP", "CR3ScanProg", "off=0x%X/0x1800", off);
         }
         uint64_t val = kma.ReadUnsafe<uint64_t>(eproc + off);
-        if ((val & 0xFFF) == 0 && val >= 0x10000 && val < 0x400000000ULL) {
+        // ★ v3.294: 同样放宽扫描条件
+        uint64_t pfn = val & ~0xFFFULL;
+        if (pfn >= 0x10000 && pfn < 0x400000000ULL && val != 0) {
             StateLog("PVP", "CR3ScanHit", "off=0x%X val=0x%llX", off, (unsigned long long)val);
             PageTableWalker walker(val, kma);
             uint64_t pa = walker.VaToPa(eproc);
             if (pa != 0) {
-                StateLog("PVP", "CR3OK", "pid=%u EPROC=0x%llX CR3=0x%llX (scan offset=0x%X)",
-                    pid, (unsigned long long)eproc, (unsigned long long)val, off);
+                StateLog("PVP", "CR3OK", "pid=%u EPROC=0x%llX CR3=0x%llX (scan offset=0x%X PCID=0x%X)",
+                    pid, (unsigned long long)eproc, (unsigned long long)val, off, (unsigned)(val & 0xFFF));
                 return val;
             }
         }

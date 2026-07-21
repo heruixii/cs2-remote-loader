@@ -787,7 +787,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.293 启动摘要 (CR3 全链路 StateLog 诊断 — 一次测试定位蓝屏/失败位置)\n");
+    DiagLog("BUILD 567 v3.294 启动摘要 (PCID 支持 — 修复 CR3 低12位非0导致的 GetCR3 失败)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
