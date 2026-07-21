@@ -3804,13 +3804,44 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     //   ★ v3.291 增强: 无限 Sleep 中检测 CS2 重新打开, 自动重新 attach + patch
                     //     场景: 用户关闭 CS2 后重新打开 CS2, loader.exe 自动恢复透视功能
                     //     实现: 每 5s 扫描 cs2.exe 进程, 发现新 PID 后重新初始化 + patch
-                    DiagLog("B291:EXIT:entering infinite Sleep (avoid BSOD — driver mapping requires process alive)\n");
-                    // ★ v3.291: CS2 重开检测循环
+                    DiagLog("B291:EXIT:entering wait loop (CS2 reopen or safe exit)\n");
+                    // ★ v3.296 SAFE-EXIT: 不再无限 Sleep, 支持安全退出
+                    //   背景: v3.291 因担心蓝屏用无限 Sleep (进程残留, 需重启清理).
+                    //   分析: 当前用 PDFWKRNL.sys (kernel VA memcpy), 不涉及 MmMapIoSpace,
+                    //         v3.291 的"物理页映射"蓝屏分析基于旧 RTCore64.sys, 不适用.
+                    //         DKOM 用 self-loop 恢复 (v3.277), 进程退出时 RemoveEntryList 是 no-op.
+                    //         所有清理 (UnhideAll/NtReadHooker/PvpAlive/kma.Shutdown) 已完成.
+                    //   退出条件 (任一满足):
+                    //     1. CS2 重开 → 重新 attach + patch (保留原功能)
+                    //     2. %TEMP%\loader_exit.flag 文件存在 → 用户手动触发安全退出
+                    //     3. 超时 120s 未重开 → 自动安全退出 (避免进程长期残留)
+                    //   退出方式: ExitProcess(0) — 所有内核状态已恢复, 不会蓝屏
                     //   注意: DisableAll 已关闭 driver 句柄 (kma.Shutdown), 但 driver 仍加载
-                    //   重新 attach 需要重新 Initialize BYOVD (复用已有 driver)
+                    //         重新 attach 需要重新 Initialize BYOVD (复用已有 driver)
                     bool cs2Reopened = false;
+                    DWORD waitStartTick = GetTickCount();
+                    DWORD safeExitTimeout = 120000;  // 120s 超时
                     while (!cs2Reopened) {
                         Sleep(5000);  // 5s 扫描间隔
+                        DWORD elapsed = GetTickCount() - waitStartTick;
+
+                        // ★ 退出条件 2: 检测退出标志文件
+                        wchar_t exitFlagPath[MAX_PATH];
+                        GetTempPathW(MAX_PATH, exitFlagPath);
+                        wcscat_s(exitFlagPath, L"loader_exit.flag");
+                        DWORD attr = GetFileAttributesW(exitFlagPath);
+                        if (attr != INVALID_FILE_ATTRIBUTES) {
+                            DiagLog("B291:EXIT:loader_exit.flag detected — safe exit\n");
+                            DeleteFileW(exitFlagPath);  // 清理标志文件
+                            ExitProcess(0);
+                        }
+
+                        // ★ 退出条件 3: 超时自动退出
+                        if (elapsed >= safeExitTimeout) {
+                            DiagLog("B291:EXIT:timeout %us — safe exit\n", (unsigned)(elapsed / 1000));
+                            ExitProcess(0);
+                        }
+
                         // 扫描 cs2.exe 进程
                         DWORD newCs2Pid = 0;
                         {
@@ -3834,7 +3865,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                             DiagLog("B291:REOPEN:cs2.exe detected pid=%u — breaking sleep loop for re-attach\n", newCs2Pid);
                             cs2Reopened = true;
                         } else {
-                            DiagLog("B291:HB:still alive (waiting for CS2 reopen)\n");
+                            DiagLog("B291:HB:still alive (waiting %us/%us for CS2 reopen)\n",
+                                    (unsigned)(elapsed / 1000), (unsigned)(safeExitTimeout / 1000));
                         }
                     }
                     if (cs2Reopened) {
@@ -3872,12 +3904,27 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                             // attach 失败, 继续等待
                         }
                     }
-                    // 如果 cs2Reopened 但 attach 失败, 继续无限 Sleep
+                    // 如果 cs2Reopened 但 attach 失败, 等待超时后安全退出
                     if (!cs2Reopened || !StealthEngine::Instance().GetProcessHandle()) {
-                        DiagLog("B291:EXIT:fallback to infinite Sleep (re-attach failed)\n");
+                        DiagLog("B291:EXIT:fallback to wait loop (re-attach failed, will exit on timeout)\n");
+                        DWORD fallbackStart = GetTickCount();
                         while (true) {
-                            Sleep(60000);
-                            DiagLog("B291:HB:still alive (infinite sleep, re-attach failed)\n");
+                            Sleep(10000);
+                            DWORD elapsed = GetTickCount() - fallbackStart;
+                            // ★ 退出标志文件检测
+                            wchar_t exitFlagPath[MAX_PATH];
+                            GetTempPathW(MAX_PATH, exitFlagPath);
+                            wcscat_s(exitFlagPath, L"loader_exit.flag");
+                            if (GetFileAttributesW(exitFlagPath) != INVALID_FILE_ATTRIBUTES) {
+                                DeleteFileW(exitFlagPath);
+                                DiagLog("B291:EXIT:loader_exit.flag (fallback) — safe exit\n");
+                                ExitProcess(0);
+                            }
+                            if (elapsed >= 60000) {  // 60s 超时
+                                DiagLog("B291:EXIT:fallback timeout %us — safe exit\n", (unsigned)(elapsed / 1000));
+                                ExitProcess(0);
+                            }
+                            DiagLog("B291:HB:still alive (fallback %us/60s)\n", (unsigned)(elapsed / 1000));
                         }
                     }
                     // cs2Reopened && attach OK — 继续主循环 (不 return, 跳过下面的 return)
