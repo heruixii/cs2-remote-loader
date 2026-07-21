@@ -3838,7 +3838,21 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             if (nowTick - lastPacCheck >= pacCheckInterval) {
                 lastPacCheck = nowTick;
                 pacCheckInterval = RandomJitter(30000, 15000);  // ★ BUILD 556: 30-45s 随机
-                if (stealth::KernelMemoryAccessor::Instance().IsActive()) {
+                // ★ v3.296 FIX-18: CS2 退出后停止 ReapplyAllCallbacks — 防止蓝屏
+                //   ReapplyAllCallbacks → GuardPac → NeutralizeMessageTransfer
+                //   → FindPacFilterInKernel 遍历已释放的 FilterList → BSOD
+                bool cs2AliveForCb = false;
+                {
+                    HANDLE hCs2 = StealthEngine::Instance().GetProcessHandle();
+                    if (hCs2) {
+                        DWORD ec = STILL_ACTIVE;
+                        if (GetExitCodeProcess(hCs2, &ec) && ec == STILL_ACTIVE) cs2AliveForCb = true;
+                    }
+                }
+                if (!cs2AliveForCb) {
+                    // CS2 已退出 — 跳过回调重应用, 防止访问已释放的 minifilter 内存
+                    DiagLogState("CB", "SKIP_CS2_EXIT", "tick=%u", (unsigned)GetTickCount());
+                } else if (stealth::KernelMemoryAccessor::Instance().IsActive()) {
                     stealth::KernelDefense::ReapplyAllCallbacks();
                     // ★ BUILD 567 v3.227: 回调重应用计数 + 状态日志
                     g_logStats.cbReapply++;
@@ -4056,7 +4070,29 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         //   修复: patch 前检查 MessageTransfer.sys 是否已加载, 若已加载则验证中和状态.
         //   开销: GetKernelModuleBase ~2 IOCTL, 仅在 g_pacNeutralized=true 且 !g_cs2Patched 时执行.
         if (GetTickCount() - lastPatchCheck > 5000) {
-            if (!g_cs2Patched && g_pacNeutralized) {
+            // ★ v3.296 FIX-18: CS2 退出后停止所有 minifilter 重试 — 防止蓝屏
+            //   根因: CS2 关闭时 PAC minifilter (MessageTransfer.sys) 被卸载,
+            //         FLT_FILTER 结构被释放. 但主循环仍然调用 NeutralizeMessageTransfer
+            //         → FindFilterByStringScan/FindPacFilterInKernel 遍历 FilterList 链表
+            //         → 访问已释放的 FLT_FILTER 池内存 → BSOD 0x50.
+            //   日志证据: StrScanNoFilter entries=33 (正常 23-25) 后日志戛然而止,
+            //            蓝屏发生在随后的 FindPacFilterInKernel 链表遍历中.
+            //   修复: CS2 退出后 (cs2Alive=false) 跳过所有 minifilter 重试和 patch 维护.
+            bool cs2AliveForPatch = false;
+            {
+                HANDLE hCs2 = StealthEngine::Instance().GetProcessHandle();
+                if (hCs2) {
+                    DWORD ec = STILL_ACTIVE;
+                    if (GetExitCodeProcess(hCs2, &ec) && ec == STILL_ACTIVE) cs2AliveForPatch = true;
+                }
+            }
+            if (!cs2AliveForPatch) {
+                // CS2 已退出 — 停止 patch 维护, 防止访问已释放的 minifilter 内存
+                if (g_cs2Patched) {
+                    DiagLog("B549:CS2_EXIT: stopping patch maintenance (CS2 exited)\n");
+                    g_cs2Patched = false;
+                }
+            } else if (!g_cs2Patched && g_pacNeutralized) {
                 // ★ v3.296: 封号防护 — 只在 g_pacNeutralized=true 时才考虑 patch
                 //   中和失败时 g_pacNeutralized=false → 跳过 patch → 防止 minifilter 扫描发现 patch 封号
                 //   g_pacNeutralized 由 ReapplyAllCallbacks (30-45s) 或 GuardPac 更新
