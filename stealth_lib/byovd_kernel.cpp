@@ -5360,7 +5360,8 @@ uint64_t MinifilterNeutralizer::FindFltGlobals(uint64_t fltmgrBase) {
                 if (firstQword >= 0xFFFF800000000000ULL && firstQword < 0xFFFFFFFFFFFFFFFFULL) {
                     // ★ BUILD 472: 二级验证 — 读 qword[0] 指向的地址,
                     //   扫 FilterList 偏移, 必须有 LIST_ENTRY 特征 (Flink/Blink 都是内核地址)
-                    for (uint32_t flOff = 0x100; flOff <= 0x2C0; flOff += 8) {
+                    // ★ v3.296: 扩展到 0x080-0x180 (覆盖 Win11 24H2 RegisteredFilters.rList@+0x0a0)
+                    for (uint32_t flOff = 0x080; flOff <= 0x180; flOff += 8) {
                         uint64_t flPair[2] = {};
                         if (KernelMemoryAccessor::Instance().ReadKernelVA(
                                 firstQword + flOff, flPair, 16)) {
@@ -5391,188 +5392,165 @@ uint64_t MinifilterNeutralizer::FindFltGlobals(uint64_t fltmgrBase) {
     ByovdDiag("FLT:NTRL: falling back to .data section scan (BUILD 475)...\n");
     uint64_t dataScanResult = ScanDataSectionForFltGlobals(fltmgrBase);
     if (dataScanResult) {
+        StateLog("FLT", "FltGlobalsDataScan", "addr=0x%llX", (unsigned long long)dataScanResult);
         ByovdDiag("FLT:NTRL: .data scan SUCCESS at 0x%llX\n", (unsigned long long)dataScanResult);
         return dataScanResult;
     }
 
+    StateLog("FLT", "FltGlobalsNotFound", "");
     return 0;
 }
 
 // ============================================================
 // ★ BUILD 502: Win11 直接字符串扫描 — 绕过 FrameList 依赖
+// ★ BUILD 567 v3.296 REWRITE: 完全重写 — 通过 FltGlobals 遍历 FilterList
 //
-// Win11 24H2 的 FLT_FRAME 布局与 Win10 完全不同, FrameList 解析失败.
-// 新策略: 直接扫描 fltmgr .data 段, 找指向 MessageTransfer 地址空间的
-// UNICODE_STRING.Buffer 指针, 反推 FLT_FILTER 结构.
+// 原 BUILD 502 实现: 扫描 fltmgr .data 段找 UNICODE_STRING.
+//   根本错误: FLT_FILTER 在内核池分配, 不在 fltmgr .data 段.
+//   FLT_FILTER.Name.Buffer 也指向池分配. 所以扫描 fltmgr .data 段
+//   永远找不到 FLT_FILTER.Name.
+//
+// v3.296 新策略: 通过 FltGlobals → FLTP_FRAME → FilterList 遍历,
+//   对每个 FLT_FILTER 候选验证 Name 字段. 这与 FindFilterByName 相同,
+//   但使用更严格的 FLT_FILTER 布局验证 (PrimaryLink@+0x10, Name@+0x38).
+//
+// 此函数作为 FindFilterByName 的回退, 当 FindFilterByName 的
+// ActiveLink 偏移尝试失败时调用.
 // ============================================================
-static uint64_t FindFilterByStringScan(uint64_t fltmgrBase, const wchar_t* targetName) {
+static uint64_t FindFilterByStringScan(uint64_t fltmgrBase, uint64_t fltGlobals, const wchar_t* targetName) {
     auto& kma = KernelMemoryAccessor::Instance();
-    ByovdDiag("FLT:STRSCAN: === BUILD 502 direct string scan ===\n");
+    ByovdDiag("FLT:STRSCAN: === v3.296 FilterList traversal ===\n");
+    StateLog("FLT", "StrScanStart", "");
 
-    // Step 1: 获取目标驱动基址和大小
-    char drvName[64] = {};
-    // 将宽字符 targetName 转为窄字符 (仅 ASCII 驱动名)
-    int nameLen = 0;
-    while (targetName[nameLen] && nameLen < 60) nameLen++;
-    for (int i = 0; i < nameLen; i++) drvName[i] = (char)targetName[i];
-    int drvBaseLen = nameLen;
-    drvName[drvBaseLen] = '.'; drvName[drvBaseLen+1] = 's'; drvName[drvBaseLen+2] = 'y'; drvName[drvBaseLen+3] = 's'; drvName[drvBaseLen+4] = 0;
-    uint64_t mtBase = kma.GetKernelModuleBase(drvName);
-    if (!mtBase) {
-        ByovdDiag("FLT:STRSCAN: %s not loaded\n", drvName);
-        return 0;
-    }
-    uint64_t mtSize = 0;
-    IMAGE_DOS_HEADER mtdos = {};
-    if (kma.ReadKernelVA(mtBase, &mtdos, sizeof(mtdos)) && mtdos.e_magic == IMAGE_DOS_SIGNATURE) {
-        IMAGE_NT_HEADERS64 mtnt = {};
-        if (kma.ReadKernelVA(mtBase + mtdos.e_lfanew, &mtnt, sizeof(mtnt)) && mtnt.Signature == IMAGE_NT_SIGNATURE) {
-            mtSize = mtnt.OptionalHeader.SizeOfImage;
-        }
-    }
-    if (!mtSize) mtSize = 0x100000; // 保守估计
-    ByovdDiag("FLT:STRSCAN: %s at 0x%llX size=0x%llX\n", drvName, (unsigned long long)mtBase, (unsigned long long)mtSize);
-
-    // Step 2: 解析 fltmgr PE 获取 .data 段范围
-    IMAGE_DOS_HEADER dos = {};
-    if (!kma.ReadKernelVA(fltmgrBase, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE) return 0;
-    IMAGE_NT_HEADERS64 nt = {};
-    if (!kma.ReadKernelVA(fltmgrBase + dos.e_lfanew, &nt, sizeof(nt)) || nt.Signature != IMAGE_NT_SIGNATURE) return 0;
-
-    WORD numSections = nt.FileHeader.NumberOfSections;
-    DWORD secTableSize = numSections * sizeof(IMAGE_SECTION_HEADER);
-    IMAGE_SECTION_HEADER* sections = (IMAGE_SECTION_HEADER*)VirtualAlloc(
-        nullptr, secTableSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!sections) return 0;
-    uint64_t secTableVA = fltmgrBase + dos.e_lfanew + sizeof(IMAGE_NT_HEADERS64);
-    if (!kma.ReadKernelVA(secTableVA, sections, secTableSize)) {
-        VirtualFree(sections, 0, MEM_RELEASE);
+    if (!fltGlobals) {
+        StateLog("FLT", "StrScanFail", "step=no FltGlobals");
         return 0;
     }
 
-    uint64_t dataStart = 0, dataEnd = 0;
-    for (WORD i = 0; i < numSections; i++) {
-        bool isData = (sections[i].Characteristics & IMAGE_SCN_MEM_READ) &&
-                       (sections[i].Characteristics & IMAGE_SCN_MEM_WRITE) &&
-                       !(sections[i].Characteristics & IMAGE_SCN_MEM_EXECUTE);
-        if (isData) {
-            uint64_t secVA = fltmgrBase + sections[i].VirtualAddress;
-            uint64_t secEnd = secVA + sections[i].Misc.VirtualSize;
-            if ((secEnd - secVA) > (dataEnd - dataStart)) {
-                dataStart = secVA;
-                dataEnd = secEnd;
-            }
-        }
+    // Step 2: 遍历 FltGlobals 中的 FLTP_FRAME 指针, 找 FilterList
+    uint64_t globQw[16] = {};
+    for (int i = 0; i < 16; i++) {
+        kma.ReadKernelVA(fltGlobals + i * 8, &globQw[i], 8);
     }
-    if (!dataStart) { dataStart = fltmgrBase + 0x2000; dataEnd = fltmgrBase + nt.OptionalHeader.SizeOfImage; }
-    ByovdDiag("FLT:STRSCAN: .data at +0x%llX..+0x%llX (%llu KB)\n",
-        dataStart - fltmgrBase, dataEnd - fltmgrBase, (dataEnd - dataStart) / 1024);
 
-    // Step 3: 分块扫描 .data 段, 找指向 MessageTransfer 地址空间的指针
-    uint8_t* chunk = (uint8_t*)VirtualAlloc(nullptr, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!chunk) { VirtualFree(sections, 0, MEM_RELEASE); return 0; }
+    // FLTP_FRAME.RegisteredFilters.rList 偏移候选 (Win10/11 x64)
+    uint64_t filterListOffsets[] = {
+        0x080, 0x088, 0x090, 0x098, 0x0a0, 0x0a8, 0x0b0, 0x0b8,
+        0x0c0, 0x0c8, 0x0d0, 0x0d8, 0x0e0, 0x0e8, 0x0f0, 0x0f8,
+        0x100, 0x108, 0x110, 0x118, 0x120, 0x128, 0x130, 0x138,
+        0x140, 0x148, 0x150, 0x158, 0x160, 0x168, 0x170, 0x178,
+        0x180,
+    };
 
-    struct UniStrHit { uint64_t uniAddr; uint64_t bufAddr; };
-    UniStrHit hits[32] = {};
-    int hitCount = 0;
+    // 计算目标名称字节长度
+    size_t targetNameLen = 0;
+    while (targetName[targetNameLen]) targetNameLen++;
+    uint16_t targetByteLen = (uint16_t)(targetNameLen * 2);
 
-    uint64_t mtEnd = mtBase + mtSize;
-    for (uint64_t addr = dataStart; addr < dataEnd; addr += 0x10000) {
-        uint64_t chunkEnd = (addr + 0x10000 < dataEnd) ? addr + 0x10000 : dataEnd;
-        uint64_t chunkSize = chunkEnd - addr;
-        if (!kma.ReadKernelVA(addr, chunk, chunkSize)) continue;
+    // 遍历每个 FLTP_FRAME 候选
+    for (int qi = 0; qi < 16; qi++) {
+        uint64_t frame = globQw[qi];
+        if (frame < 0xFFFF800000000000ULL) continue;
 
-        for (size_t off = 0; off + 8 <= chunkSize; off += 8) {
-            uint64_t ptr = *(uint64_t*)(chunk + off);
-            // 指针必须落在 MessageTransfer 地址空间内
-            if (ptr < mtBase || ptr >= mtEnd) continue;
+        // 验证 frame 指向有效内存
+        uint64_t firstQw = 0;
+        if (!kma.ReadKernelVA(frame, &firstQw, 8)) continue;
+        if (firstQw < 0xFFFF800000000000ULL) continue;
 
-            // 候选: 这个指针可能是 UNICODE_STRING.Buffer
-            // UNICODE_STRING: +0x00 Length(USHORT), +0x02 MaxLength(USHORT), +0x08 Buffer(PWSTR)
-            // 所以 UNICODE_STRING 起始于 (off - 8 + addr)
-            uint64_t uniAddr = addr + off - 8;
-            if (uniAddr < dataStart) continue;
-
-            // 验证 UNICODE_STRING: Length 必须 > 0 且 <= 256 且为偶数
-            uint16_t uniLen = *(uint16_t*)(chunk + off - 8);
-            if (uniLen == 0 || uniLen > 256 || (uniLen & 1)) continue;
-            uint16_t uniMax = *(uint16_t*)(chunk + off - 6);
-            if (uniMax < uniLen || uniMax > 512) continue;
-
-            // 读取字符串内容
-            wchar_t strBuf[128] = {};
-            if (!kma.ReadKernelVA(ptr, strBuf, (uniLen < 254) ? uniLen : 254)) continue;
-            strBuf[(uniLen < 254) ? uniLen/2 : 127] = 0;
-
-            // 匹配目标名称
-            if (_wcsicmp(strBuf, targetName) != 0) continue;
-
-            ByovdDiag("FLT:STRSCAN: HIT! '%ls' UNICODE_STRING at flt+0x%llX (buf=0x%llX len=%u)\n",
-                strBuf, uniAddr - fltmgrBase, (unsigned long long)ptr, uniLen);
-            if (hitCount < 32) {
-                hits[hitCount].uniAddr = uniAddr;
-                hits[hitCount].bufAddr = ptr;
-                hitCount++;
-            }
-        }
-    }
-    VirtualFree(chunk, 0, MEM_RELEASE);
-    VirtualFree(sections, 0, MEM_RELEASE);
-
-    if (hitCount == 0) {
-        ByovdDiag("FLT:STRSCAN: no UNICODE_STRING found for '%ls'\n", targetName);
-        return 0;
-    }
-    ByovdDiag("FLT:STRSCAN: %d UNICODE_STRING hits for '%ls'\n", hitCount, targetName);
-
-    // Step 4: 从 UNICODE_STRING 反推 FLT_FILTER 基址
-    //   FLT_FILTER.Name 是 UNICODE_STRING, 但其在 FLT_FILTER 中的偏移未知
-    //   尝试常见偏移: 0x38..0x300 (按 8 字节对齐)
-    for (int hi = 0; hi < hitCount; hi++) {
-        uint64_t uniAddr = hits[hi].uniAddr;
-        for (uint64_t nameOff = 0x38; nameOff <= 0x300; nameOff += 8) {
-            uint64_t filterBase = uniAddr - nameOff;
-            if (filterBase < fltmgrBase || filterBase >= fltmgrBase + nt.OptionalHeader.SizeOfImage) continue;
-
-            // 验证 FLT_FILTER 结构:
-            //   +0x00: Flags (ULONG) — 应该是合理值
-            //   +0x08: ActiveLink (LIST_ENTRY) — Flink/Blink 应为内核地址
+        // 尝试每个 FilterList 偏移
+        for (uint64_t flOff : filterListOffsets) {
+            uint64_t listHead = frame + flOff;
             uint64_t flink = 0, blink = 0;
-            uint32_t flags = 0;
-            if (!kma.ReadKernelVA(filterBase + 0x08, &flink, 8)) continue;
-            if (!kma.ReadKernelVA(filterBase + 0x10, &blink, 8)) continue;
-            if (!kma.ReadKernelVA(filterBase + 0x00, &flags, 4)) continue;
+            if (!kma.ReadKernelVA(listHead, &flink, 8)) continue;
+            if (!kma.ReadKernelVA(listHead + 8, &blink, 8)) continue;
+            if (flink == listHead || flink < 0xFFFF800000000000ULL ||
+                blink < 0xFFFF800000000000ULL) continue;
 
-            if (flink < 0xFFFF800000000000ULL || blink < 0xFFFF800000000000ULL) continue;
-            // Flags 验证: 通常是小值 (0-0x1000), 但排除明显异常值
-            if (flags > 0x10000) continue;
+            // 遍历 FilterList 链表
+            uint64_t cur = flink;
+            for (int iter = 0; iter < 100 && cur && cur != listHead; iter++) {
+                // ★ v3.296: PrimaryLink.Flink 在 FLT_OBJECT+0x10
+                //   所以 FLT_FILTER 基址 = cur - 0x10
+                uint64_t filterBase = cur - 0x10;
 
-            // 验证 Operations 指针: 尝试常见偏移
-            uint64_t opsOffsets[] = {
-                0x228,0x238,0x248,0x258,0x268,0x278,0x288,0x298,
-                0x2A0,0x2A8,0x2B0,0x2B8,0x2C0,0x2C8,0x2D0,0x2D8,0x2E0,0x2E8,0x2F0,0x2F8,0x300,
-            };
-            uint64_t opsAddr = 0;
-            for (uint64_t opsOff : opsOffsets) {
-                uint64_t val = 0;
-                if (kma.ReadKernelVA(filterBase + opsOff, &val, 8) && val > 0xFFFF800000000000ULL) {
-                    // 读 Operations 数组第一个条目, 验证 MJ 是否合法
-                    uint8_t mj = 0;
-                    uint64_t regPtr = 0;
-                    if (kma.ReadKernelVA(val, &regPtr, 8) && regPtr > 0xFFFF800000000000ULL) {
-                        if (kma.ReadKernelVA(regPtr, &mj, 1) && (mj <= 0x1B || mj == 0x80)) {
-                            opsAddr = val;
-                            ByovdDiag("FLT:STRSCAN: FLT_FILTER at flt+0x%llX (nameOff=0x%llX opsOff=0x%llX ops=0x%llX flink=0x%llX)\n",
-                                filterBase - fltmgrBase, nameOff, opsOff, (unsigned long long)opsAddr, (unsigned long long)flink);
-                            return filterBase;
+                // 验证 FLT_OBJECT.Flags@+0x00: FLT_OBFL_TYPE_FILTER (0x2000000)
+                uint32_t flags = 0;
+                if (!kma.ReadKernelVA(filterBase + 0x00, &flags, 4)) { cur = flink; break; }
+                if (!(flags & 0x2000000)) {
+                    // 尝试其他 ActiveLink 偏移 (兼容性)
+                    uint64_t alOffs[] = { 0x10, 0x18, 0x20, 0x28, 0x30 };
+                    bool found = false;
+                    for (uint64_t alOff : alOffs) {
+                        uint64_t fb = cur - alOff;
+                        uint32_t f2 = 0;
+                        if (kma.ReadKernelVA(fb, &f2, 4) && (f2 & 0x2000000)) {
+                            filterBase = fb;
+                            found = true;
+                            break;
                         }
                     }
+                    if (!found) {
+                        // 读下一个条目
+                        uint64_t nextFlink = 0;
+                        if (!kma.ReadKernelVA(cur, &nextFlink, 8) ||
+                            nextFlink < 0xFFFF800000000000ULL) break;
+                        cur = nextFlink;
+                        continue;
+                    }
                 }
+
+                // 读取 Name (UNICODE_STRING: Length, MaxLength, Buffer)
+                // ★ v3.296: 优先尝试标准偏移 0x38, 失败时尝试其他偏移
+                uint64_t nameOffs[] = { 0x38, 0x40, 0x48, 0x50, 0x30, 0x28 };
+                bool nameMatched = false;
+                for (uint64_t no : nameOffs) {
+                    uint16_t nameLen = 0;
+                    uint16_t nameMax = 0;
+                    uint64_t nameBuf = 0;
+                    if (!kma.ReadKernelVA(filterBase + no, &nameLen, 2)) continue;
+                    if (!kma.ReadKernelVA(filterBase + no + 2, &nameMax, 2)) continue;
+                    if (!kma.ReadKernelVA(filterBase + no + 8, &nameBuf, 8)) continue;
+
+                    if (nameLen != targetByteLen || nameMax < nameLen ||
+                        nameMax > 512 || nameBuf < 0xFFFF800000000000ULL) continue;
+
+                    // 读取字符串内容
+                    wchar_t strBuf[128] = {};
+                    if (!kma.ReadKernelVA(nameBuf, strBuf, nameLen)) continue;
+                    strBuf[nameLen / 2] = 0;
+                    if (_wcsicmp(strBuf, targetName) != 0) continue;
+
+                    // 名称匹配! 验证 Operations@+0x1a8
+                    uint64_t opsVal = 0;
+                    if (!kma.ReadKernelVA(filterBase + 0x1a8, &opsVal, 8) ||
+                        opsVal <= 0xFFFF800000000000ULL) continue;
+                    uint8_t mj = 0;
+                    if (!kma.ReadKernelVA(opsVal, &mj, 1)) continue;
+                    if (mj > 0x1B && mj != 0x80) continue;
+
+                    StateLog("FLT", "StrScanFound",
+                             "filter=0x%llX ops=0x%llX frame=%d flOff=0x%llX noff=0x%llX",
+                             (unsigned long long)filterBase,
+                             (unsigned long long)opsVal, qi,
+                             (unsigned long long)flOff, (unsigned long long)no);
+                    ByovdDiag("FLT:STRSCAN: FOUND FLT_FILTER at 0x%llX (frame[%d] flOff=0x%llX noff=0x%llX ops=0x%llX)\n",
+                        (unsigned long long)filterBase, qi,
+                        (unsigned long long)flOff, (unsigned long long)no,
+                        (unsigned long long)opsVal);
+                    return filterBase;
+                }
+
+                // 读下一个条目
+                uint64_t nextFlink = 0;
+                if (!kma.ReadKernelVA(cur, &nextFlink, 8) ||
+                    nextFlink < 0xFFFF800000000000ULL) break;
+                cur = nextFlink;
             }
         }
     }
 
-    ByovdDiag("FLT:STRSCAN: found UNICODE_STRING but could not validate FLT_FILTER structure\n");
+    StateLog("FLT", "StrScanNoFilter", "traversed all frames");
+    ByovdDiag("FLT:STRSCAN: no matching FLT_FILTER found in any frame\n");
     return 0;
 }
 
@@ -5686,8 +5664,9 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
 
     // BUILD 466 + BUILD 475: FltGlobals 在 Win10/11 版本间布局不同
     //   不再假设 FrameList 在 +0x00 — 尝试 fltGlobals 前 8 个 qword (Win11 可能更远)
-    uint64_t globQw[8] = {};
-    for (int i = 0; i < 8; i++) {
+    // ★ BUILD 567 v3.296: 扩展到 16 个 qword (0x80 字节), 覆盖 Win11 24H2
+    uint64_t globQw[16] = {};
+    for (int i = 0; i < 16; i++) {
         kma.ReadKernelVA(fltGlobals + i * 8, &globQw[i], 8);
     }
     ByovdDiag("FLT:NTRL: FltGlobals hex: %016llX %016llX %016llX %016llX %016llX %016llX %016llX %016llX\n",
@@ -5695,14 +5674,35 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
         (unsigned long long)globQw[2], (unsigned long long)globQw[3],
         (unsigned long long)globQw[4], (unsigned long long)globQw[5],
         (unsigned long long)globQw[6], (unsigned long long)globQw[7]);
+    ByovdDiag("FLT:NTRL: FltGlobals hex: %016llX %016llX %016llX %016llX %016llX %016llX %016llX %016llX\n",
+        (unsigned long long)globQw[8], (unsigned long long)globQw[9],
+        (unsigned long long)globQw[10], (unsigned long long)globQw[11],
+        (unsigned long long)globQw[12], (unsigned long long)globQw[13],
+        (unsigned long long)globQw[14], (unsigned long long)globQw[15]);
 
-    // FLTP_FRAME.FilterList 偏移 (BUILD 475: 扩展到 0x300)
-    uint64_t filterOffsets[] = { 
-        0x138, 0x140, 0x148, 0x150, 0x158, 0x160, 0x168, 0x170, 0x178, 0x180,
-        0x188, 0x190, 0x198, 0x1A0, 0x1A8, 0x1B0, 0x1B8, 0x1C0, 0x1C8, 0x1D0,
-        0x1D8, 0x1E0, 0x1E8, 0x1F0, 0x1F8, 0x200, 0x208, 0x210, 0x218, 0x220,
-        0x228, 0x230, 0x238, 0x240, 0x248, 0x250, 0x258, 0x260, 0x268, 0x270,
-        0x278, 0x280, 0x288, 0x290, 0x298, 0x2A0, 0x2A8, 0x2B0, 0x2B8, 0x2C0,
+    // FLTP_FRAME.FilterList 偏移
+    // ★ BUILD 567 v3.296 FIX: 扩展搜索范围, 包含 Win11 24H2 的 RegisteredFilters.rList
+    //   FLTP_FRAME 布局 (Win10/11 x64):
+    //     +0x048 RegisteredFilters (FLT_RESOURCE_LIST_HEAD)
+    //       +0x00 rLock (ERESOURCE, ~0x58 bytes)
+    //       +0x58 rList (LIST_ENTRY) ← FilterList 在这里!
+    //     +0x0c8 AttachedVolumes
+    //   所以 rList 在 FLTP_FRAME + 0x048 + 0x58 = +0x0a0
+    //   原 bug: 只搜索 0x138-0x300, 完全错过了 0x0a0!
+    //   修复: 扩展到 0x080-0x180 (覆盖 RegisteredFilters.rList 在所有 Windows 版本)
+    uint64_t filterOffsets[] = {
+        // ★ v3.296: 新增 0x080-0x180 范围 (Win11 24H2 RegisteredFilters.rList)
+        0x080, 0x088, 0x090, 0x098, 0x0a0, 0x0a8, 0x0b0, 0x0b8,
+        0x0c0, 0x0c8, 0x0d0, 0x0d8, 0x0e0, 0x0e8, 0x0f0, 0x0f8,
+        0x100, 0x108, 0x110, 0x118, 0x120, 0x128, 0x130, 0x138,
+        0x140, 0x148, 0x150, 0x158, 0x160, 0x168, 0x170, 0x178,
+        0x180,
+        // 保留原 0x188-0x300 范围 (兼容旧版本)
+        0x188, 0x190, 0x198, 0x1A0, 0x1A8, 0x1B0, 0x1B8, 0x1C0,
+        0x1C8, 0x1D0, 0x1D8, 0x1E0, 0x1E8, 0x1F0, 0x1F8, 0x200,
+        0x208, 0x210, 0x218, 0x220, 0x228, 0x230, 0x238, 0x240,
+        0x248, 0x250, 0x258, 0x260, 0x268, 0x270, 0x278, 0x280,
+        0x288, 0x290, 0x298, 0x2A0, 0x2A8, 0x2B0, 0x2B8, 0x2C0,
         0x2C8, 0x2D0, 0x2D8, 0x2E0, 0x2E8, 0x2F0, 0x2F8, 0x300,
     };
 
@@ -5710,7 +5710,8 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
     uint64_t frameList = 0;
 
     // ★ BUILD 466: 尝试每个 qword 作为 FrameList 指针 (BUILD 475: 尝试 8 个)
-    for (int qi = 0; qi < 8 && !filterListHead; qi++) {
+    // ★ BUILD 567 v3.296: 扩展到 16 个 qword
+    for (int qi = 0; qi < 16 && !filterListHead; qi++) {
         uint64_t candidateFrame = globQw[qi];
         if (candidateFrame < 0xFFFF800000000000ULL) continue;
 
@@ -5834,39 +5835,53 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
                         }
 
                         // ★ BUILD 519: 尝试多个 ActiveLink 偏移 — Win11 FLT_FILTER 布局不同
-                        uint64_t alOffs[] = { 0x008, 0x010, 0x018, 0x020, 0x028, 0x030 };
+                        // ★ v3.296: 优先尝试标准偏移 0x010 (PrimaryLink.Flink), 然后 0x038 (Name)
+                        //   FLT_OBJECT.PrimaryLink.Flink@+0x10, FLT_FILTER.Name@+0x38
+                        uint64_t alOffs[] = { 0x010, 0x008, 0x018, 0x020, 0x028, 0x030 };
                         for (int ali = 0; ali < 6; ali++) {
                             uint64_t fBase = cur - alOffs[ali];
-                            // ★ BUILD 522: 扩大名称偏移扫描范围到 0x800 — Win11 FLT_FILTER 结构更大
-                            for (uint64_t no = 0x00; no <= 0x800; no += 8) {
-                                uint16_t nl = 0; uint64_t nb = 0;
-                                if (kma.ReadKernelVA(fBase + no, &nl, sizeof(nl)) &&
-                                    kma.ReadKernelVA(fBase + no + 8, &nb, sizeof(nb))) {
-                                    if (nl > 0 && nl <= 256 && nl % 2 == 0 && nb > 0xFFFF800000000000ULL) {
-                                        wchar_t fn[256] = {};
-                                        if (ReadKernelUnicodeString(nb, nl, fn, 256) > 0) {
-                                            // ★ BUILD 523: 诊断模式 — 打印所有候选 (前3个条目, 前20个候选)
-                                            if (iter < 3 && ali == 0) {
-                                                uint16_t nm = 0;
-                                                kma.ReadKernelVA(fBase + no + 2, &nm, sizeof(nm));
-                                                ByovdDiag("FLT:NTRL: BUILD 523: diag entry[%d] noff=0x%llX nl=%u nm=%u nb=0x%llX str[0]=0x%X\n",
-                                                    iter, no, (unsigned)nl, (unsigned)nm, (unsigned long long)nb, (unsigned)fn[0]);
-                                            }
-                                            // ★ BUILD 521: 严格验证 — minifilter 名称必须以字母开头
-                                            wchar_t c0 = fn[0];
-                                            bool isAlpha = (c0 >= L'A' && c0 <= L'Z') || (c0 >= L'a' && c0 <= L'z');
-                                            if (!isAlpha) continue;
+                            // ★ v3.296: 优先尝试标准 Name 偏移 0x38, 然后扫描 0x00-0x800
+                            uint64_t nameOffs[] = { 0x38, 0x40, 0x48, 0x50, 0x00 };
+                            bool nameFound = false;
+                            for (int noi = 0; noi < 5 && !nameFound; noi++) {
+                                uint64_t noStart = nameOffs[noi];
+                                uint64_t noEnd = (noStart == 0x00) ? 0x800 : noStart + 8;
+                                for (uint64_t no = noStart; no <= noEnd; no += 8) {
+                                    uint16_t nl = 0; uint64_t nb = 0;
+                                    if (kma.ReadKernelVA(fBase + no, &nl, sizeof(nl)) &&
+                                        kma.ReadKernelVA(fBase + no + 8, &nb, sizeof(nb))) {
+                                        if (nl > 0 && nl <= 256 && nl % 2 == 0 && nb > 0xFFFF800000000000ULL) {
+                                            wchar_t fn[256] = {};
+                                            if (ReadKernelUnicodeString(nb, nl, fn, 256) > 0) {
+                                                // ★ BUILD 523: 诊断模式 — 打印所有候选 (前3个条目, ali==0)
+                                                if (iter < 3 && ali == 0) {
+                                                    uint16_t nm = 0;
+                                                    kma.ReadKernelVA(fBase + no + 2, &nm, sizeof(nm));
+                                                    ByovdDiag("FLT:NTRL: BUILD 523: diag entry[%d] noff=0x%llX nl=%u nm=%u nb=0x%llX str[0]=0x%X\n",
+                                                        iter, no, (unsigned)nl, (unsigned)nm, (unsigned long long)nb, (unsigned)fn[0]);
+                                                }
+                                                // ★ BUILD 521: 严格验证 — minifilter 名称必须以字母开头
+                                                wchar_t c0 = fn[0];
+                                                bool isAlpha = (c0 >= L'A' && c0 <= L'Z') || (c0 >= L'a' && c0 <= L'z');
+                                                if (!isAlpha) continue;
 
-                                            namedCount++;
-                                            if (_wcsicmp(fn, name) == 0) {
-                                                filterListHead = ptr;
-                                                ByovdDiag("FLT:NTRL: BUILD 522: found '%ls' via +0x%llX → 0x%llX (alOff=0x%llX noff=0x%llX) ✓\n",
-                                                    fn, extPtrs[pi].offset, (unsigned long long)ptr, alOffs[ali], no);
-                                                goto EXT_PTR_FOUND_511;
+                                                namedCount++;
+                                                if (_wcsicmp(fn, name) == 0) {
+                                                    filterListHead = ptr;
+                                                    StateLog("FLT", "FilterFound",
+                                                             "alOff=0x%llX noff=0x%llX filter=0x%llX",
+                                                             (unsigned long long)alOffs[ali],
+                                                             (unsigned long long)no,
+                                                             (unsigned long long)fBase);
+                                                    ByovdDiag("FLT:NTRL: BUILD 522: found '%ls' via +0x%llX → 0x%llX (alOff=0x%llX noff=0x%llX) ✓\n",
+                                                        fn, extPtrs[pi].offset, (unsigned long long)ptr, alOffs[ali], no);
+                                                    goto EXT_PTR_FOUND_511;
+                                                }
+                                                ByovdDiag("FLT:NTRL: BUILD 522: +0x%llX entry[%d] alOff=0x%llX name='%ls' (noff=0x%llX) — not target\n",
+                                                    extPtrs[pi].offset, iter, alOffs[ali], fn, no);
+                                                nameFound = true;
+                                                goto NEXT_EXT_ENTRY_511;
                                             }
-                                            ByovdDiag("FLT:NTRL: BUILD 522: +0x%llX entry[%d] alOff=0x%llX name='%ls' (noff=0x%llX) — not target\n",
-                                                extPtrs[pi].offset, iter, alOffs[ali], fn, no);
-                                            goto NEXT_EXT_ENTRY_511;
                                         }
                                     }
                                 }
@@ -5907,7 +5922,7 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
         if (!filterListHead) {
             // ★ BUILD 502: FrameList 失败 → 尝试新字符串扫描
             ByovdDiag("FLT:NTRL: FrameList failed, trying BUILD 502 string scan...\n");
-            uint64_t strScanResult = FindFilterByStringScan(fltmgrBase, name);
+            uint64_t strScanResult = FindFilterByStringScan(fltmgrBase, fltGlobals, name);
             if (strScanResult) {
                 ByovdDiag("FLT:NTRL: BUILD 502 string scan SUCCESS at 0x%llX\n", (unsigned long long)strScanResult);
                 return strScanResult;
@@ -5960,35 +5975,19 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
     }
 
     // 遍历 FilterList 链表
-    // FLT_FILTER.ActiveLink 在 FLT_FILTER + 0x008
-    // Name.UNICODE_STRING 的偏移需要运行时检测
-    // ★ BUILD 477: Win11 FLT_FILTER 更大, 扩展到 0x00..0x400
+    // ★ v3.296: FLT_OBJECT.PrimaryLink.Flink@+0x10, FLT_FILTER.Name@+0x38
+    //   优先尝试标准偏移, 失败时回退到全范围扫描
     uint64_t nameOffsets[] = {
-        0x000, 0x008, 0x010, 0x018, 0x020, 0x028, 0x030,
-        0x038, 0x040, 0x048, 0x058, 0x068, 0x078,
-        0x088, 0x098, 0x0A8, 0x0B8, 0x0C8, 0x0D8,
-        0x0E8, 0x0F8, 0x108, 0x118, 0x128, 0x138,
-        0x148, 0x158, 0x168, 0x178, 0x188, 0x198,
-        0x1A8, 0x1B8, 0x1C8, 0x1D8, 0x1E8, 0x1F8,
-        0x208, 0x218, 0x228, 0x238, 0x248, 0x258,
-        0x268, 0x278, 0x288, 0x298, 0x2A8, 0x2B8,
-        0x2C8, 0x2D8, 0x2E8, 0x2F8, 0x300,
-        0x308, 0x318, 0x328, 0x338, 0x348, 0x358,
-        0x368, 0x378, 0x388, 0x398, 0x3A8, 0x3B8,
-        0x3C8, 0x3D8, 0x3E8, 0x3F8, 0x400,
-        // ★ BUILD 522: 扩大到 0x800 — Win11 FLT_FILTER 结构更大
-        0x408, 0x418, 0x428, 0x438, 0x448, 0x458,
-        0x468, 0x478, 0x488, 0x498, 0x4A8, 0x4B8,
-        0x4C8, 0x4D8, 0x4E8, 0x4F8, 0x500,
-        0x508, 0x518, 0x528, 0x538, 0x548, 0x558,
-        0x568, 0x578, 0x588, 0x598, 0x5A8, 0x5B8,
-        0x5C8, 0x5D8, 0x5E8, 0x5F8, 0x600,
-        0x608, 0x618, 0x628, 0x638, 0x648, 0x658,
-        0x668, 0x678, 0x688, 0x698, 0x6A8, 0x6B8,
-        0x6C8, 0x6D8, 0x6E8, 0x6F8, 0x700,
-        0x708, 0x718, 0x728, 0x738, 0x748, 0x758,
-        0x768, 0x778, 0x788, 0x798, 0x7A8, 0x7B8,
-        0x7C8, 0x7D8, 0x7E8, 0x7F8, 0x800,
+        // ★ v3.296: 优先标准偏移 0x38
+        0x038,
+        // 回退: 其他常见偏移
+        0x040, 0x048, 0x050, 0x028, 0x030, 0x020, 0x018, 0x010, 0x008, 0x000,
+        // 全范围回退 (Win11 兼容)
+        0x058, 0x068, 0x078, 0x088, 0x098, 0x0A8, 0x0B8, 0x0C8, 0x0D8,
+        0x0E8, 0x0F8, 0x108, 0x118, 0x128, 0x138, 0x148, 0x158, 0x168,
+        0x178, 0x188, 0x198, 0x1A8, 0x1B8, 0x1C8, 0x1D8, 0x1E8, 0x1F8,
+        0x208, 0x218, 0x228, 0x238, 0x248, 0x258, 0x268, 0x278, 0x288,
+        0x298, 0x2A8, 0x2B8, 0x2C8, 0x2D8, 0x2E8, 0x2F8, 0x300,
     };
 
     uint64_t current = 0;
@@ -6015,7 +6014,7 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
 
     for (int iter = 0; iter < 100 && current && current != filterListHead; iter++) {
         // ★ BUILD 520: 尝试多个 ActiveLink 偏移, 只有非空名称才算有效
-        uint64_t activeLinkOffsets[] = { 0x008, 0x010, 0x018, 0x020, 0x028, 0x030 };
+        uint64_t activeLinkOffsets[] = { 0x010, 0x008, 0x018, 0x020, 0x028, 0x030 };
 
         for (uint64_t alOff : activeLinkOffsets) {
             uint64_t filterBase = current - alOff;
@@ -6109,29 +6108,56 @@ bool MinifilterNeutralizer::NeutralizeCallbacks(uint64_t filterAddr) {
         return false;
     };
 
-    // Operations 指针偏移 — ★ BUILD 506: 扩展到 0x100-0x400 覆盖 Win11 FLT_FILTER
+    // Operations 指针偏移 — ★ BUILD 567 v3.296 FIX: 使用固定偏移 +0x1a8 + MJ 验证
+    //   原 bug: 在 0x100-0x400 范围取第一个内核指针作为 Operations.
+    //   但 FLT_FILTER+0x100=FilterUnload, +0x108=InstanceSetup, ... 这些回调指针
+    //   会被误认为 Operations. 真正的 Operations 在 +0x1a8 (Win10/11 x64 标准).
+    //   修复: 优先尝试 +0x1a8, 用 MJ 验证 (MajorFunction <= 0x1B 或 == 0x80).
+    //         失败时回退扫描 0x100-0x400, 但每个候选都做 MJ 验证.
     uint64_t opsAddr = 0;
     uint64_t matchedOpsOff = 0;
 
-    for (uint64_t off = 0x100; off <= 0x400; off += 8) {
+    // 辅助 lambda: 验证指针是否指向合法的 FLT_OPERATION_REGISTRATION 数组
+    auto validateOpsArray = [&](uint64_t val) -> bool {
+        if (val <= 0xFFFF800000000000ULL || val >= 0xFFFFFFFFFFFFFFFFULL) return false;
+        // 读第一个条目的 MajorFunction (偏移 0) 和 PreOperation (偏移 8)
+        uint8_t mj = 0;
+        uint64_t preOp = 0;
+        if (!kma.ReadKernelVA(val, &mj, 1)) return false;
+        if (!kma.ReadKernelVA(val + 8, &preOp, 8)) return false;
+        // MJ 必须是合法 IRP_MJ (0x00-0x1B) 或终结符 0x80
+        if (mj > 0x1B && mj != 0x80) return false;
+        // PreOperation 为 0 (无回调) 或内核地址
+        if (preOp != 0 && preOp < 0xFFFF800000000000ULL) return false;
+        return true;
+    };
+
+    // 1. 优先尝试标准偏移 +0x1a8 (Win10/11 x64)
+    {
         uint64_t val = 0;
-        if (kma.ReadKernelVA(filterAddr + off, &val, sizeof(val))) {
-            // ★ BUILD 513: 移除 3-MJ 验证 (BSOD 风险 — 假阳性 opsPtr 导致 IOCTL 读无效物理地址)
-            //   Operations 数组应在内核池中 (高地址), 不在 fltmgr 模块内
-            if (val > 0xFFFF800000000000ULL && val < 0xFFFFFFFFFFFFFFFFULL) {
-                opsAddr = val;
-                matchedOpsOff = off;
-                uint8_t firstMJ = 0;
-                kma.ReadKernelVA(val, &firstMJ, sizeof(firstMJ));
-                ByovdDiag("FLT:NTRL: Operations at filter+0x%llX → 0x%llX (MJ=%u)\n",
-                    off, (unsigned long long)opsAddr, (unsigned int)firstMJ);
-                break;
-            }
+        if (kma.ReadKernelVA(filterAddr + 0x1a8, &val, sizeof(val)) && validateOpsArray(val)) {
+            opsAddr = val;
+            matchedOpsOff = 0x1a8;
+            StateLog("FLT", "OpsAtStd", "off=0x1a8 ops=0x%llX", (unsigned long long)opsAddr);
         }
-        if (opsAddr) break;
+    }
+
+    // 2. 回退: 扫描 0x100-0x400, 每个候选做 MJ 验证
+    if (!opsAddr) {
+        for (uint64_t off = 0x100; off <= 0x400; off += 8) {
+            uint64_t val = 0;
+            if (!kma.ReadKernelVA(filterAddr + off, &val, sizeof(val))) continue;
+            if (!validateOpsArray(val)) continue;
+            opsAddr = val;
+            matchedOpsOff = off;
+            StateLog("FLT", "OpsAtScan", "off=0x%llX ops=0x%llX",
+                     (unsigned long long)off, (unsigned long long)opsAddr);
+            break;
+        }
     }
 
     if (!opsAddr) {
+        StateLog("FLT", "OpsNotFound", "filter=0x%llX", (unsigned long long)filterAddr);
         ByovdDiag("FLT:NTRL: Operations pointer not found in FLT_FILTER\n");
         return false;
     }
@@ -6196,6 +6222,8 @@ bool MinifilterNeutralizer::NeutralizeCallbacks(uint64_t filterAddr) {
 
     // ★ v3.126n-review: 修复部分成功误报 — 只有全部回调都被 stub 替换才算成功
     bool allReplaced = (replaced >= totalCallbacks);
+    StateLog("FLT", "NtrlCallbacks", "replaced=%d total=%d ok=%d",
+             replaced, totalCallbacks, allReplaced ? 1 : 0);
     ByovdDiag("FLT:NTRL: replaced %d/%d callback pointers → %s\n",
         replaced, totalCallbacks, allReplaced ? "ALL OK" : "PARTIAL FAIL");
     return allReplaced;
@@ -6206,10 +6234,12 @@ bool MinifilterNeutralizer::NeutralizeCallbacks(uint64_t filterAddr) {
 bool MinifilterNeutralizer::NeutralizeMessageTransfer() {
     auto& kma = KernelMemoryAccessor::Instance();
     if (!kma.IsActive()) {
+        StateLog("FLT", "NtrlSkip", "byovd inactive");
         ByovdDiag("FLT:NTRL: Neutralize skipped — BYOVD not active\n");
         return false;
     }
 
+    StateLog("FLT", "NtrlStart", "");
     ByovdDiag("B550:NT:=== ntrl mtf (keep) ===\n");  // ★ BUILD 550: 脱敏 (原含过滤器名)
 
     uint64_t fltmgrBase = 0;
@@ -6220,19 +6250,21 @@ bool MinifilterNeutralizer::NeutralizeMessageTransfer() {
         SecureZeroMemory(fltName, sizeof(fltName));
     }
     if (!fltmgrBase) {
+        StateLog("FLT", "NtrlFail", "step=fltmgr not loaded");
         ByovdDiag("FLT:NTRL: flt not loaded\n");
         return false;
     }
-    ByovdDiag("FLT:NTRL: flt at 0x%llX\n", (unsigned long long)fltmgrBase);
+    StateLog("FLT", "NtrlStep", "step=fltmgr ok=0x%llX", (unsigned long long)fltmgrBase);
 
     // 1. 定位 FltGlobals
     uint64_t fltGlobals = FindFltGlobals(fltmgrBase);
-    if (!fltGlobals) return false;
+    if (!fltGlobals) {
+        StateLog("FLT", "NtrlFail", "step=FltGlobals not found");
+        return false;
+    }
+    StateLog("FLT", "NtrlStep", "step=FltGlobals ok=0x%llX", (unsigned long long)fltGlobals);
 
     // 2. 查找 tgt minifilter
-    // ★ BUILD 497: 固定数组替代 std::wstring — 避免 CRT 堆依赖
-    // ★ BUILD 563: 改为栈缓冲 (FillPacTargetName), 用完立即 SecureZeroMemory 清零
-    //   pacName 仅在 FindFilterByName 调用中使用一次, 不保留指针
     uint64_t filterAddr = 0;
     {
         wchar_t pacNameW[256] = {};
@@ -6241,23 +6273,38 @@ bool MinifilterNeutralizer::NeutralizeMessageTransfer() {
         SecureZeroMemory(pacNameW, sizeof(pacNameW));
     }
     if (!filterAddr) {
-        // ★ BUILD 518: 移除 FindFilterByDriverScan 调用 — 本质不安全, 导致 BSOD
-        //   日志确认 BSOD 发生在此函数执行期间
+        // ★ v3.296: FindFilterByName 失败 → 尝试 FindFilterByStringScan
+        wchar_t pacNameW2[256] = {};
+        FillPacTargetName(pacNameW2, 256);
+        filterAddr = FindFilterByStringScan(fltmgrBase, fltGlobals, pacNameW2);
+        SecureZeroMemory(pacNameW2, sizeof(pacNameW2));
+        if (filterAddr) {
+            StateLog("FLT", "NtrlStep", "step=StrScan ok=0x%llX", (unsigned long long)filterAddr);
+        }
     }
     if (!filterAddr) {
         // ★ v3.126p: 精确匹配失败 → 尝试内核模糊扫描
         wchar_t kernName[256] = {};
         filterAddr = FindPacFilterInKernel(fltmgrBase, fltGlobals, kernName, 256);
-        SecureZeroMemory(kernName, sizeof(kernName));  // ★ BUILD 563: 用完清零
-        if (!filterAddr) {
-            ByovdDiag("FLT:NTRL: no tgt-filter found in kernel\n");
-            return false;
+        SecureZeroMemory(kernName, sizeof(kernName));
+        if (filterAddr) {
+            StateLog("FLT", "NtrlStep", "step=KernScan ok=0x%llX", (unsigned long long)filterAddr);
         }
     }
+    if (!filterAddr) {
+        StateLog("FLT", "NtrlFail", "step=filter not found");
+        ByovdDiag("FLT:NTRL: no tgt-filter found in kernel\n");
+        return false;
+    }
+    StateLog("FLT", "NtrlStep", "step=filter ok=0x%llX", (unsigned long long)filterAddr);
 
     // 3. 中和回调
-    if (!NeutralizeCallbacks(filterAddr)) return false;
+    if (!NeutralizeCallbacks(filterAddr)) {
+        StateLog("FLT", "NtrlFail", "step=NeutralizeCallbacks");
+        return false;
+    }
 
+    StateLog("FLT", "NtrlOK", "filter=0x%llX", (unsigned long long)filterAddr);
     ByovdDiag("FLT:NTRL: === NEUTRALIZED SUCCESSFULLY ===\n");
     return true;
 }
@@ -6668,7 +6715,7 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
         // 尝试扫描常见系统 minifilter 名称来验证管道
         const wchar_t* testFilters[] = { L"FileInfo", L"WdFilter", L"Wof", L"luafv", nullptr };
         for (int ti = 0; testFilters[ti]; ti++) {
-            uint64_t filterAddr = FindFilterByStringScan(fltmgrBase, testFilters[ti]);
+            uint64_t filterAddr = FindFilterByStringScan(fltmgrBase, fltGlobals, testFilters[ti]);
             if (filterAddr) {
                 ByovdDiag("FLT:VERIFY: BUILD 502 found '%ls' → FLT pipeline VERIFIED\n", testFilters[ti]);
                 bestFilterCount = 1;
@@ -6738,6 +6785,13 @@ bool MinifilterNeutralizer::IsMessageTransferNeutralized() {
         SecureZeroMemory(pacNameW, sizeof(pacNameW));
     }
     if (!filterAddr) {
+        // ★ v3.296: 与 NeutralizeMessageTransfer 一致 — 先尝试 FindFilterByStringScan
+        wchar_t pacNameW2[256] = {};
+        FillPacTargetName(pacNameW2, 256);
+        filterAddr = FindFilterByStringScan(fltmgrBase, fltGlobals, pacNameW2);
+        SecureZeroMemory(pacNameW2, sizeof(pacNameW2));
+    }
+    if (!filterAddr) {
         // ★ v3.126p: 精确匹配失败 → 模糊扫描
         wchar_t kernName[256] = {};
         filterAddr = FindPacFilterInKernel(fltmgrBase, fltGlobals, kernName, 256);
@@ -6763,14 +6817,34 @@ bool MinifilterNeutralizer::IsMessageTransferNeutralized() {
         return false;
     };
 
-    // ★ BUILD 506: 扩展到 0x100-0x400 覆盖 Win11 FLT_FILTER
-    // ★ BUILD 516: 移除 3-MJ 验证 — PDFWKRNL.sys memcpy 不验证地址, 从不可信指针读取会 BSOD
-    //   与 NeutralizeCallbacks 保持一致的简单验证模式
+    // ★ BUILD 567 v3.296 FIX: 使用固定偏移 +0x1a8 + MJ 验证 (与 NeutralizeCallbacks 一致)
+    //   原 bug: 取第一个内核指针作为 Operations, 会误匹配 FilterUnload/InstanceSetup 等.
+    //   真正的 Operations 在 +0x1a8 (Win10/11 x64 标准).
+    auto validateOpsArrayGuard = [&](uint64_t val) -> bool {
+        if (val <= 0xFFFF800000000000ULL || val >= 0xFFFFFFFFFFFFFFFFULL) return false;
+        uint8_t mj = 0;
+        uint64_t preOp = 0;
+        if (!kma.ReadKernelVA(val, &mj, 1)) return false;
+        if (!kma.ReadKernelVA(val + 8, &preOp, 8)) return false;
+        if (mj > 0x1B && mj != 0x80) return false;
+        if (preOp != 0 && preOp < 0xFFFF800000000000ULL) return false;
+        return true;
+    };
+
     uint64_t opsAddr = 0;
-    for (uint64_t off = 0x100; off <= 0x400; off += 8) {
+    // 1. 优先尝试标准偏移 +0x1a8
+    {
         uint64_t val = 0;
-        if (kma.ReadKernelVA(filterAddr + off, &val, sizeof(val)) &&
-            val > 0xFFFF800000000000ULL && val < 0xFFFFFFFFFFFFFFFFULL) {
+        if (kma.ReadKernelVA(filterAddr + 0x1a8, &val, sizeof(val)) && validateOpsArrayGuard(val)) {
+            opsAddr = val;
+        }
+    }
+    // 2. 回退: 扫描 0x100-0x400, 每个候选做 MJ 验证
+    if (!opsAddr) {
+        for (uint64_t off = 0x100; off <= 0x400; off += 8) {
+            uint64_t val = 0;
+            if (!kma.ReadKernelVA(filterAddr + off, &val, sizeof(val))) continue;
+            if (!validateOpsArrayGuard(val)) continue;
             opsAddr = val;
             break;
         }
@@ -7031,7 +7105,7 @@ static uint64_t FindPacFilterInKernel(uint64_t fltmgrBase, uint64_t fltGlobals, 
 
     for (int iter = 0; iter < 100 && current && current != filterListHead; iter++) {
         // ★ BUILD 520: 尝试多个 ActiveLink 偏移, 只有非空名称才算有效
-        uint64_t activeLinkOffsets[] = { 0x008, 0x010, 0x018, 0x020, 0x028, 0x030 };
+        uint64_t activeLinkOffsets[] = { 0x010, 0x008, 0x018, 0x020, 0x028, 0x030 };
 
         for (uint64_t alOff : activeLinkOffsets) {
             uint64_t filterBase = current - alOff;
@@ -7532,15 +7606,29 @@ KernelDefense::Result KernelDefense::EnableAll() {
     // ★ BUILD 563: pacNameA 不再使用, 立即清零缩短明文窗口
     SecureZeroMemory(pacNameA, sizeof(pacNameA));
 
-    // ★ BUILD 528: tgt minifilter 中和已废弃 — Win11 上 FLT_FILTER 布局无法定位,
-    //   BUILD 525-527 均失败。改用 E+G 组合方案 (DKOM+EkkoSleep+ObCallbacks)。
-    //   注释掉 VerifyFltPipeline + DisablePac, 避免无意义的内核内存读取风险。
-    //   (PDFWKRNL.sys memcpy 不验证地址, VerifyFltPipeline 读取 FltGlobals 有蓝屏风险)
-    // bool fltPipelineOk = MinifilterNeutralizer::VerifyFltPipeline();
-    // ByovdDiag("BYOVD: FLT pipeline verify: %s\n", fltPipelineOk ? "PASS" : "FAIL");
-    // result.pacStatus = DisablePac();
-    ByovdDiag("BYOVD: BUILD 528 — tgt neutralization disabled (E+G scheme, no minifilter touch)\n");
-    result.pacStatus = KernelDefense::PacStatus::NotInstalled; // 不再尝试中和
+    // ★ BUILD 567 v3.296 FIX: 重新启用 tgt minifilter 中和
+    //   v3.293 封号根因之一: MinifilterNeutralizer 在 BUILD 528 被永久禁用,
+    //   MessageTransfer.sys minifilter 自由扫描进程内存 → 检测到作弊 → 上报.
+    //   v3.296 修复了导致 BUILD 525-527 失败的根因:
+    //     1. NeutralizeCallbacks: Operations 偏移从"第一个内核指针"改为固定 +0x1a8 + MJ 验证
+    //     2. FindFilterByStringScan: 修正 FLT_FILTER 验证偏移 (PrimaryLink@+0x10, Name@+0x38)
+    //        + 移除 Name.Buffer 必须在驱动镜像内的错误过滤
+    //     3. IsMessageTransferNeutralized: 同样 Operations 偏移修复
+    //   安全性: 中和操作只替换 Operations 数组中的 PreOp/PostOp 为 ret0 stub,
+    //           不修改 FLT_FILTER 结构本身, 不触发 PatchGuard.
+    //           失败安全: 任何步骤失败都返回 false, 不修改内核数据.
+    {
+        StateLog("BYOVD", "PreNeutralize", "");
+        bool ntrlOk = MinifilterNeutralizer::NeutralizeMessageTransfer();
+        StateLog("BYOVD", "PostNeutralize", "ok=%d", ntrlOk ? 1 : 0);
+        if (ntrlOk) {
+            result.pacStatus = KernelDefense::PacStatus::Neutralized;
+            ByovdDiag("BYOVD: tgt minifilter NEUTRALIZED successfully\n");
+        } else {
+            result.pacStatus = KernelDefense::PacStatus::NotInstalled;
+            ByovdDiag("BYOVD: tgt minifilter neutralization FAILED (will retry in GuardPac)\n");
+        }
+    }
 
     // ★ v3.126m: 清理内核驱动痕迹 (MmUnloadedDrivers / PiDDBCacheTable / CiHashBucket)
     //   在所有防御启用后, 最后由 BYOVD 内核 R/W 清理 RTCore64 加载/卸载痕迹

@@ -787,7 +787,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.295 启动摘要 (IAT hook 重启 + 66 90 patch + Uninstall 修复)\n");
+    DiagLog("BUILD 567 v3.296 启动摘要 (MinifilterNeutralizer 重启 + Operations 偏移修复)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
