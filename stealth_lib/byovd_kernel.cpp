@@ -7429,6 +7429,21 @@ static uint64_t FindPacFilterInKernel(uint64_t fltmgrBase, uint64_t fltGlobals, 
         // ★ BUILD 520: 尝试多个 ActiveLink 偏移, 只有非空名称才算有效
         uint64_t activeLinkOffsets[] = { 0x010, 0x008, 0x018, 0x020, 0x028, 0x030 };
 
+        // ★ v3.296 FIX-23 DIAG: dump 第一个 filter 的前 0x100 字节 (16 个 qword)
+        //   目的: 推断 Win11 26100 的 FLT_FILTER 实际布局 (Name 偏移)
+        //   只对第一个 iter dump, 避免日志爆炸
+        if (iter == 0) {
+            uint64_t dumpBase = current - activeLinkOffsets[0];
+            uint64_t dumpQw[32] = {};
+            if (kma.ReadKernelVA(dumpBase, dumpQw, sizeof(dumpQw))) {
+                for (int di = 0; di < 32; di++) {
+                    StateLog("FLT", "Fix23Dump",
+                             "iter=0 off=+0x%03X val=0x%llX",
+                             di * 8, (unsigned long long)dumpQw[di]);
+                }
+            }
+        }
+
         bool nameDumped = false;
         for (uint64_t alOff : activeLinkOffsets) {
             uint64_t filterBase = current - alOff;
@@ -10580,11 +10595,37 @@ uint64_t PvpAlivePatcher::GetProcessCR3(DWORD pid) {
     // ★ 扫描 EPROCESS 找 DirectoryBase (CR3)
     //   Windows 10/11: EPROCESS.DirectoryBase 通常在 0x28 (Win10) 或 0x1010 (新版本)
     //   特征: 值是物理地址 (低 12 位通常为 0, 且 < 16GB)
-    //   验证: 用该 CR3 翻译 EPROCESS 自身 VA, 应该能成功
+    //   验证: 用该 CR3 翻译用户态 VA (PEB), 应该能成功
+    //
+    // ★ v3.296 FIX-24: 验证用 PEB VA (用户态), 不用 EPROCESS VA (内核态)
+    //   原因: KPTI (Kernel Page Table Isolation) 下, 用户进程的 CR3 只包含
+    //         少量内核 stub 页表, 不包含 EPROCESS 等内核数据结构.
+    //         用用户进程 CR3 翻译内核 VA (EPROCESS) 必然失败 → CR3 被错误拒绝.
+    //   修复: 先扫描 EPROCESS 找 PEB VA (用户态), 用 PEB VA 验证 CR3.
+    //   日志证据: v3.293 测试 off=0x28 val=0x1557A1002 VaToPa(EPROC)=0x0 (失败)
+    //         但该 CR3 实际有效, 只是 EPROCESS 不在用户进程页表中.
     //
     // 扫描策略:
-    //   1. 先试常见偏移 (0x28, 0x1010)
-    //   2. 如果失败, 扫描 0x0-0x1800 范围, 找符合 CR3 特征的值
+    //   1. 先扫描 EPROCESS 找 PEB VA (用户态地址, 偏移 0x300-0x600)
+    //   2. 先试常见 CR3 偏移 (0x28, 0x1010), 用 PEB VA 验证
+    //   3. 如果失败, 扫描 0x0-0x1800 范围, 用 PEB VA 验证
+
+    // Step 1: 扫描 EPROCESS 找 PEB VA (用户态地址)
+    //   PEB 是用户态地址 (0x00000000-0x00007FFFFFFF), 页对齐
+    //   EPROCESS.PEB 偏移通常在 0x3F8-0x550 范围 (Win10/11)
+    uint64_t pebVA = 0;
+    for (uint32_t off = 0x300; off < 0x600; off += 8) {
+        uint64_t val = kma.ReadUnsafe<uint64_t>(eproc + off);
+        if (val >= 0x10000 && val < 0x10000000000ULL && (val & 0xFFF) == 0) {
+            pebVA = val;
+            StateLog("PVP", "CR3PebFound", "pebVA=0x%llX (off=0x%X)", (unsigned long long)pebVA, off);
+            break;
+        }
+    }
+    if (!pebVA) {
+        StateLog("PVP", "CR3Fail", "step=FindPEB (no user VA in EPROC 0x300-0x600) pid=%u", pid);
+        return 0;
+    }
 
     // ★ BUILD 567 v3.294 FIX: PCID 支持 — CR3 低 12 位可能包含 PCID (Process Context ID)
     //   Windows 10/11 启用 PCID 后, EPROCESS.DirectoryBase 低 12 位不再全为 0,
@@ -10601,11 +10642,11 @@ uint64_t PvpAlivePatcher::GetProcessCR3(DWORD pid) {
         //   低 12 位可能包含 PCID 标志, 不再要求为 0
         uint64_t pfn = val & ~0xFFFULL;  // 取高 52 位 (物理页帧)
         if (pfn >= 0x10000 && pfn < 0x400000000ULL && val != 0) {
-            // 验证: 用该 CR3 翻译 EPROCESS 自身 VA (唯一可靠判据)
-            StateLog("PVP", "CR3PreVaToPa", "off=0x%X CR3=0x%llX VA=0x%llX", off, (unsigned long long)val, (unsigned long long)eproc);
+            // ★ v3.296 FIX-24: 用 PEB VA (用户态) 验证, 不用 EPROCESS VA (内核态)
+            StateLog("PVP", "CR3PreVaToPa", "off=0x%X CR3=0x%llX PEB_VA=0x%llX", off, (unsigned long long)val, (unsigned long long)pebVA);
             PageTableWalker walker(val, kma);
-            uint64_t pa = walker.VaToPa(eproc);
-            StateLog("PVP", "CR3PostVaToPa", "off=0x%X PA=0x%llX", off, (unsigned long long)pa);
+            uint64_t pa = walker.VaToPa(pebVA);
+            StateLog("PVP", "CR3PostVaToPa", "off=0x%X PEB_PA=0x%llX", off, (unsigned long long)pa);
             if (pa != 0) {
                 StateLog("PVP", "CR3OK", "pid=%u EPROC=0x%llX CR3=0x%llX (offset=0x%X PCID=0x%X)",
                     pid, (unsigned long long)eproc, (unsigned long long)val, off, (unsigned)(val & 0xFFF));
@@ -10626,8 +10667,9 @@ uint64_t PvpAlivePatcher::GetProcessCR3(DWORD pid) {
         uint64_t pfn = val & ~0xFFFULL;
         if (pfn >= 0x10000 && pfn < 0x400000000ULL && val != 0) {
             StateLog("PVP", "CR3ScanHit", "off=0x%X val=0x%llX", off, (unsigned long long)val);
+            // ★ v3.296 FIX-24: 用 PEB VA 验证
             PageTableWalker walker(val, kma);
-            uint64_t pa = walker.VaToPa(eproc);
+            uint64_t pa = walker.VaToPa(pebVA);
             if (pa != 0) {
                 StateLog("PVP", "CR3OK", "pid=%u EPROC=0x%llX CR3=0x%llX (scan offset=0x%X PCID=0x%X)",
                     pid, (unsigned long long)eproc, (unsigned long long)val, off, (unsigned)(val & 0xFFF));
