@@ -787,7 +787,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.294 启动摘要 (PCID 支持 — 修复 CR3 低12位非0导致的 GetCR3 失败)\n");
+    DiagLog("BUILD 567 v3.295 启动摘要 (IAT hook 重启 + 66 90 patch + Uninstall 修复)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -1742,14 +1742,18 @@ static bool ApplyCs2Patch() {
         return true;  // 已补丁, 无需重复
     }
 
-    // 9. 跨程修改保护 + 写入 patch (90 90 = nop nop)
+    // 9. 跨程修改保护 + 写入 patch (66 90 = 2字节标准NOP, Intel推荐编码)
+    //    ★ BUILD 567 v3.295: patch 字节从 90 90 改为 66 90 (Intel 标准多字节NOP)
+    //      原因: 90 90 (两个单字节NOP) 是最常见的 patch 模式, 反作弊扫描易识别.
+    //            66 90 (operand size prefix + NOP) 是 Intel 推荐的 2 字节 NOP 编码,
+    //            在正常代码中作为对齐填充出现, 更隐蔽.
     //    ★ BUILD 558 FIX-4: 用 StealthMemory::Protect + Write 替代 VirtualProtect + 直接写入
     DWORD oldProtect = 0;
     if (!stealth::StealthMemory::Protect(hProcess, patchAddr, 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
         DiagLog("B549:AP:03 VP fail err=%lu\n", GetLastError());
         return false;
     }
-    uint8_t patchBytes[2] = { 0x90, 0x90 };
+    uint8_t patchBytes[2] = { 0x66, 0x90 };
     if (!stealth::StealthMemory::Write(hProcess, patchAddr, patchBytes, 2)) {
         DiagLog("B549:AP:04 write fail\n");
         DWORD dummy = 0;
@@ -1765,7 +1769,7 @@ static bool ApplyCs2Patch() {
         DiagLog("B549:AP:04 verify read fail\n");
         return false;
     }
-    if (verifyBytes[0] != 0x90 || verifyBytes[1] != 0x90) {
+    if (verifyBytes[0] != 0x66 || verifyBytes[1] != 0x90) {
         DiagLog("B549:AP:04 verify fail b0=0x%02X b1=0x%02X\n", verifyBytes[0], verifyBytes[1]);
         return false;
     }
@@ -1801,11 +1805,12 @@ static void MaintainCs2Patch() {
 
     if ((uint8_t)(curBytes[0] ^ g_patKey) == PAT_ENC[0] &&
         (uint8_t)(curBytes[1] ^ g_patKey) == PAT_ENC[1]) {
-        // patch 被 PAC 恢复为原始字节 (32 c0), 重新写入 (90 90)
+        // patch 被 PAC 恢复为原始字节 (32 c0), 重新写入 (66 90)
+        // ★ v3.295: patch 字节从 90 90 改为 66 90 (Intel 标准 2 字节 NOP)
         DiagLog("B558:MP:repatch (restored to orig)\n");
         DWORD oldProtect = 0;
         if (stealth::StealthMemory::Protect(hProcess, patchAddr, 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-            uint8_t patchBytes[2] = { 0x90, 0x90 };
+            uint8_t patchBytes[2] = { 0x66, 0x90 };
             stealth::StealthMemory::Write(hProcess, patchAddr, patchBytes, 2);
             DWORD dummy = 0;
             stealth::StealthMemory::Protect(hProcess, patchAddr, 2, oldProtect, &dummy);
@@ -3305,12 +3310,15 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             //   在 Buffer 中恢复 patch 区域 (RVA 0xC125D9, 2 字节) 原始字节 (32 c0).
             //   方案 B (IAT hook PvpAlive) 优先, 失败时启用方案 A (inline hook ntdll).
             //   失败安全: Install 失败不影响其他防御功能.
-            // ★ BUILD 567 v3.261 FIX: NtReadHooker 永久禁用 — inline hook ntdll 被 CS2 自检检测
-            //   v3.259 测试确认: NtReadHooker (inline hook ntdll!NtReadVirtualMemory) 是
-            //   CS2 对局加载崩溃根因. CS2 对局加载时自检 ntdll 完整性, 检测到 inline hook 后自杀.
-            //   修复方案: 永久禁用 NtReadHooker, 依赖 patch 自身隐蔽性 (patch 仅 2 字节 90 90).
-            //   未来若需恢复: 改用 IAT hook PvpAlive.dll (需检测 PvpAlive.dll 加载).
-            if (false && g_cs2Patched && g_patchAddr && g_clientBase) {
+            // ★ BUILD 567 v3.295 FIX: 重新启用 NtReadHooker (仅 IAT hook 模式)
+            //   v3.261 永久禁用 NtReadHooker 是因为 inline hook ntdll (方案 A) 被 CS2 自检检测.
+            //   但 IAT hook PvpAlive.dll (方案 B) 不碰 ntdll, CS2 自检不会发现.
+            //   v3.293 封号根因: NtReadHooker 被一并禁用, PvpAlive.dll 自由扫描 client.dll
+            //   发现 90 90 patch → 上报 → 封号.
+            //   v3.295 修复: Install() 内部已移除 inline hook 回退, 只用 IAT hook.
+            //   安全性: IAT hook 只修改 PvpAlive.dll 的 IAT 条目, 不碰 ntdll,
+            //           CS2 自检 ntdll 完整性不会发现. PvpAlive.dll 自身不会自检 IAT.
+            if (g_cs2Patched && g_patchAddr && g_clientBase) {
                 HANDLE hCs2ForHook = StealthEngine::Instance().GetProcessHandle();
                 if (hCs2ForHook) {
                     bool ntReadHooked = stealth::NtReadHooker::Instance().Install(
@@ -3730,6 +3738,14 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     //         蓝屏发生在 taskkill 失败 + 关机时 (系统清理 loader 触发 driver 缓存失效).
                     DiagLog("B588:EXIT:Sleep 2000ms (wait CS2 async cleanup)\n");
                     Sleep(2000);  // ★ v3.288: 等待 CS2 退出异步清理完成
+                    // ★ BUILD 567 v3.295 FIX: 恢复 NtReadHooker IAT hook (需 driver 还活着)
+                    //   原因: v3.295 重新启用 NtReadHooker IAT hook, CS2 退出时必须恢复 IAT +
+                    //         释放 shellcode 内存, 避免 PvpAlive.dll 检测到 IAT 被修改.
+                    //   安全性: Uninstall 是用户态操作 (恢复 IAT + VirtualFreeEx), 不需要 driver.
+                    //           在 DisableAll 之前调用, driver 还活着, StealthMemory 可正常工作.
+                    if (!g_egTestMode && !g_halfTestMode) {
+                        stealth::NtReadHooker::Instance().Uninstall();
+                    }
                     // ★ BUILD 567 v3.289: 恢复 PvpAlive.dll 原始字节 (需 driver 还活着)
                     if (!g_egTestMode && !g_halfTestMode) {
                         stealth::PvpAlivePatcher::Instance().Uninstall();
@@ -4052,9 +4068,10 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     // StartDR0FrequencyStat();  // ★ v3.237: 禁用
                     // ★ BUILD 565: 若初始化阶段 NtReadHooker 未安装 (ApplyCs2Patch 失败),
                     //   主循环中重试安装 (5s 间隔, 与 ApplyCs2Patch 同周期)
-                    // ★ BUILD 567 v3.261 FIX: NtReadHooker 主循环重试永久禁用 (同初始化阶段)
-                    //   v3.259 测试确认 NtReadHooker 是 CS2 崩溃根因, 永久禁用.
-                    if (false && !stealth::NtReadHooker::Instance().IsActive() && g_patchAddr && g_clientBase) {
+                    // ★ BUILD 567 v3.295 FIX: 重新启用主循环重试 (仅 IAT hook 模式)
+                    //   v3.261 禁用是因为 inline hook ntdll 被 CS2 自检检测.
+                    //   v3.295 Install() 已移除 inline hook 回退, 只用 IAT hook, 安全.
+                    if (!stealth::NtReadHooker::Instance().IsActive() && g_patchAddr && g_clientBase) {
                         HANDLE hCs2ForHook = StealthEngine::Instance().GetProcessHandle();
                         if (hCs2ForHook) {
                             // ★ BUILD 567 v3.238 DIAG: NtReadHooker::Install 前后诊断
@@ -4239,6 +4256,14 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
     // ★ BUILD 548: basic.exe 已移除, 不需要 TerminateBasicESP
     // ★ BUILD 556: 移除 ShadowPageManager::Uninstall (影子页方案已废弃)
     //   VirtualProtect patch 无需卸载 (进程退出时自动释放)
+    // ★ BUILD 567 v3.295 FIX: 正常退出路径也调用 Uninstall (恢复 IAT + PvpAlive patch)
+    //   原因: v3.295 重新启用 NtReadHooker IAT hook, 退出时必须恢复 IAT + 释放 shellcode.
+    //         PvpAlivePatcher 也需要恢复原始字节, 避免 PAC 检测到 patch.
+    //   顺序: Uninstall (需 driver 还活着) → LogExitSummary → DisableAll → Shutdown
+    if (!g_egTestMode && !g_halfTestMode) {
+        stealth::NtReadHooker::Instance().Uninstall();
+        stealth::PvpAlivePatcher::Instance().Uninstall();
+    }
     // ★ BUILD 567 v3.227: 退出摘要 (主循环正常退出路径)
     LogExitSummary();
     stealth::KernelDefense::DisableAll();

@@ -4666,7 +4666,8 @@ uint64_t PsLoadedModuleHider::LocatePsLoadedModuleList(uint64_t ntosBase) {
     VirtualFree(chunk, 0, MEM_RELEASE);
 
     if (!found) {
-        ByovdDiag("B564:Loc: FAIL no candidate matched all 5 conditions\n");
+        StateLog("B564", "LocateFail", "reason=no_candidate dataVA=0x%llX dataSize=0x%llX",
+                 (unsigned long long)dataVA, (unsigned long long)dataSize);
     }
     return found;
 }
@@ -4684,7 +4685,8 @@ uint64_t PsLoadedModuleHider::FindEntryByBaseName(uint64_t listHead, const wchar
 
     // 终止条件: current == listHead (循环回到头), current == 0, 或超过 512 次迭代
     constexpr int MAX_ITER = 512;
-    for (int iter = 0; iter < MAX_ITER; iter++) {
+    int iter = 0;
+    for (; iter < MAX_ITER; iter++) {
         if (current == listHead || current == 0) break;
         if (current <= 0xFFFF800000000000ULL) break;  // 非内核地址, 异常终止
         // ★ BUILD 567 v3.229 FIX: 白名单 (与 LocatePsLoadedModuleList 一致)
@@ -4723,6 +4725,9 @@ uint64_t PsLoadedModuleHider::FindEntryByBaseName(uint64_t listHead, const wchar
         current = next;
     }
 
+    // ★ v3.295: 添加 StateLog 诊断查找失败
+    StateLog("B564", "FindFail", "target='%ls' iter=%d current=0x%llX",
+             baseName, iter, (unsigned long long)current);
     return 0;
 }
 
@@ -4803,39 +4808,40 @@ bool PsLoadedModuleHider::PerformUnlink(uint64_t entryAddr, uint64_t listHead) {
 bool PsLoadedModuleHider::HideDriver(const wchar_t* driverBaseName) {
     auto& kma = KernelMemoryAccessor::Instance();
     if (!kma.IsActive()) {
-        ByovdDiag("B564:Hide: FAIL kma not active\n");
+        StateLog("B564", "HideFail", "reason=kma_not_active");
         return false;
     }
     if (!driverBaseName) {
-        ByovdDiag("B564:Hide: FAIL driverBaseName null\n");
+        StateLog("B564", "HideFail", "reason=driverBaseName_null");
         return false;
     }
 
     uint64_t ntosBase = kma.GetNtoskrnlBase();
     if (!ntosBase) {
-        ByovdDiag("B564:Hide: FAIL ntosBase=0\n");
+        StateLog("B564", "HideFail", "reason=ntosBase_zero");
         return false;
     }
 
     // 1. 定位 PsLoadedModuleList 头节点
     uint64_t listHead = LocatePsLoadedModuleList(ntosBase);
     if (!listHead) {
-        ByovdDiag("B564:Hide: FAIL PsLoadedModuleList not located\n");
+        StateLog("B564", "HideFail", "reason=locate_failed ntosBase=0x%llX",
+                 (unsigned long long)ntosBase);
         return false;
     }
 
     // 2. 查找目标驱动条目
     uint64_t entry = FindEntryByBaseName(listHead, driverBaseName);
     if (!entry) {
-        ByovdDiag("B564:Hide: %ls not found (may be already hidden)\n", driverBaseName);
+        StateLog("B564", "HideFail", "reason=entry_not_found listHead=0x%llX",
+                 (unsigned long long)listHead);
         return false;
     }
 
     // 3. DKOM 断链 + SelfLoopHarden
     bool ok = PerformUnlink(entry, listHead);
-    ByovdDiag("B564:Hide: %ls hidden=%d (entry=0x%llX listHead=0x%llX)\n",
-        driverBaseName, ok?1:0,
-        (unsigned long long)entry, (unsigned long long)listHead);
+    StateLog("B564", "HideResult", "ok=%d entry=0x%llX listHead=0x%llX",
+             ok ? 1 : 0, (unsigned long long)entry, (unsigned long long)listHead);
     return ok;
 }
 
@@ -9794,7 +9800,14 @@ bool NtReadHooker::Install(HANDLE cs2Process, uintptr_t clientBase, uintptr_t pa
     StateLog("NRD", "InstallEntry", "cs2Proc=0x%p clientBase=0x%llX patchAddr=0x%llX",
              cs2Process, (unsigned long long)clientBase, (unsigned long long)patchAddr);
 
-    // 方案 B: IAT hook PvpAlive.dll (优先)
+    // 方案 B: IAT hook PvpAlive.dll (唯一方案)
+    // ★ BUILD 567 v3.295 FIX: 移除 inline hook ntdll 回退 (方案 A)
+    //   原因: v3.261 永久禁用 NtReadHooker 是因为 inline hook ntdll 被 CS2 自检检测.
+    //         但 IAT hook PvpAlive.dll (方案 B) 不碰 ntdll, CS2 自检不会发现.
+    //         v3.293 封号根因: IAT hook 被一并禁用, PvpAlive.dll 自由扫描 client.dll
+    //         发现 90 90 patch → 上报 → 封号.
+    //   修复: 只启用 IAT hook (方案 B), 永不回退到 inline hook (方案 A).
+    //         IAT hook 失败时直接返回 false, 不 hook ntdll.
     uintptr_t pvpBase = FindPvpAliveBase(cs2Process);
     if (pvpBase) {
         StateLog("NRD", "PvpFound", "pvpBase=0x%llX", (unsigned long long)pvpBase);
@@ -9804,35 +9817,22 @@ bool NtReadHooker::Install(HANDLE cs2Process, uintptr_t clientBase, uintptr_t pa
             if (InstallIATHook(cs2Process, iatEntry, originalNtRead, clientBase, patchAddr)) {
                 m_active = true;
                 m_pvpAliveBase = pvpBase;
-                StateLog("NRD", "IATSuccess", "pvp=0x%llX ff=0x%llX skip inline",
+                StateLog("NRD", "IATSuccess", "pvp=0x%llX ff=0x%llX",
                          (unsigned long long)pvpBase,
                          (unsigned long long)m_filterFuncAddr);
                 return true;
             }
-            StateLog("NRD", "IATFail", "fallback to inline (A)");
+            StateLog("NRD", "IATFail", "no fallback (inline disabled)");
         } else {
-            StateLog("NRD", "NtReadNotInIAT", "entry=0x%llX orig=0x%llX fallback A",
+            StateLog("NRD", "NtReadNotInIAT", "entry=0x%llX orig=0x%llX no fallback",
                      (unsigned long long)iatEntry, (unsigned long long)originalNtRead);
         }
     } else {
-        StateLog("NRD", "PvpNotFound", "fallback to inline (A)");
+        StateLog("NRD", "PvpNotFound", "no fallback (inline disabled)");
     }
 
-    // 方案 A: inline hook ntdll!NtReadVirtualMemory (兜底)
-    uintptr_t ntReadAddr = FindNtdllNtRead(cs2Process);
-    if (!ntReadAddr) {
-        StateLog("NRD", "FindNtdllFail", "both B and A failed");
-        return false;
-    }
-    if (InstallInlineHook(cs2Process, ntReadAddr, clientBase, patchAddr)) {
-        m_active = true;
-        StateLog("NRD", "InlineSuccess", "ntRead=0x%llX ff=0x%llX",
-                 (unsigned long long)ntReadAddr,
-                 (unsigned long long)m_inlineFilterFuncAddr);
-        return true;
-    }
-
-    StateLog("NRD", "AllInstallFail", "both B and A failed");
+    // ★ v3.295: 不再回退到 inline hook ntdll (方案 A 被 CS2 自检检测)
+    StateLog("NRD", "InstallFail", "IAT hook only, inline disabled");
     return false;
 }
 
@@ -9922,7 +9922,7 @@ bool NtReadHooker::Maintain() {
             }
             m_iatHookActive = false;
 
-            // 重新安装 (B 优先, A 兜底)
+            // ★ v3.295: 只重新安装 IAT hook (方案 B), 不回退到 inline hook (方案 A)
             if (curPvpBase) {
                 uintptr_t originalNtRead = 0;
                 uintptr_t iatEntry = FindNtReadInIAT(m_cs2Process, curPvpBase, &originalNtRead);
@@ -9939,66 +9939,16 @@ bool NtReadHooker::Maintain() {
                     return true;
                 }
             }
-            // B 失败, 尝试 A
-            StateLog("NRD", "IATRehookFail", "try inline (A)");
-            uintptr_t ntReadAddr = FindNtdllNtRead(m_cs2Process);
-            if (ntReadAddr && InstallInlineHook(m_cs2Process, ntReadAddr,
-                                                 m_clientBase, m_patchAddr)) {
-                StateLog("NRD", "InlineFallback", "ntRead=0x%llX ff=0x%llX",
-                         (unsigned long long)ntReadAddr,
-                         (unsigned long long)m_inlineFilterFuncAddr);
-                return true;
-            }
-            StateLog("NRD", "AllRehookFail", "m_active=false");
+            // ★ v3.295: IAT rehook 失败, 不再尝试 inline hook, 直接标记 inactive
+            StateLog("NRD", "IATRehookFail", "no inline fallback, m_active=false");
             m_active = false;
             return false;
         }
     }
 
-    // 方案 A: 检测 ntdll 是否被 PAC 恢复 (前 12 字节是否还是我们的 jmp)
-    if (m_inlineHookActive && m_ntdllNtReadAddr) {
-        uint8_t curBytes[12] = {};
-        if (stealth::StealthMemory::Read(m_cs2Process, m_ntdllNtReadAddr, curBytes, 12)) {
-            uint8_t expectedJmp[12] = {};
-            expectedJmp[0] = 0x48;
-            expectedJmp[1] = 0xB8;
-            memcpy(expectedJmp + 2, &m_inlineFilterFuncAddr, sizeof(m_inlineFilterFuncAddr));
-            expectedJmp[10] = 0xFF;
-            expectedJmp[11] = 0xE0;
-
-            int cmpResult = memcmp(curBytes, expectedJmp, 12);
-            // ★ BUILD 567 v3.257 DIAG: ntdll hook 检测结果
-            //   cmpResult!=0 → ntdll 被 PAC 恢复 (前 12 字节不再是我们的 jmp)
-            StateLog("NRD", "NtdllCheck", "ntRead=0x%llX cmp=%d lost=%d",
-                     (unsigned long long)m_ntdllNtReadAddr,
-                     cmpResult,
-                     (cmpResult != 0) ? 1 : 0);
-            if (cmpResult != 0) {
-                StateLog("NRD", "NtdllHookLost", "rehooking ntRead=0x%llX",
-                         (unsigned long long)m_ntdllNtReadAddr);
-                // 释放旧 trampoline + filter
-                if (m_inlineFilterFuncAddr) {
-                    VirtualFreeEx(m_cs2Process, (LPVOID)m_inlineFilterFuncAddr, 0, MEM_RELEASE);
-                    m_inlineFilterFuncAddr = 0;
-                }
-                m_inlineHookActive = false;
-
-                if (InstallInlineHook(m_cs2Process, m_ntdllNtReadAddr,
-                                       m_clientBase, m_patchAddr)) {
-                    StateLog("NRD", "InlineRehooked", "ntRead=0x%llX ff=0x%llX",
-                             (unsigned long long)m_ntdllNtReadAddr,
-                             (unsigned long long)m_inlineFilterFuncAddr);
-                    return true;
-                }
-                StateLog("NRD", "InlineRehookFail", "m_active=false");
-                m_active = false;
-                return false;
-            }
-        } else {
-            StateLog("NRD", "NtdllReadFail", "ntRead=0x%llX",
-                     (unsigned long long)m_ntdllNtReadAddr);
-        }
-    }
+    // ★ v3.295: 移除方案 A (inline hook ntdll) 的维护逻辑
+    //   原因: inline hook ntdll 被 CS2 自检检测, 永久禁用.
+    //   IAT hook 模式不需要检测 ntdll 是否被恢复.
 
     StateLog("NRD", "MaintainExit", "OK (no change)");
     return true;  // hook 仍活跃
