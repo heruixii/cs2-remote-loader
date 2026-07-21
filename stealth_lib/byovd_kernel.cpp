@@ -1735,7 +1735,7 @@ bool KernelMemoryAccessor::ReadKernelVAUnsafe(uint64_t va, void* outBuf, size_t 
     // ★ v3.234: 安全边界 [0xFFFF8000, 0xFFFFFE00) — 覆盖所有 EPROCESS 可能分配区域
     //   包含: 非分页池扩展/PFN (0xFFFF8000-0xFFFFF680) ← Win11 24H2/25H2 EPROCESS 所在
     //         系统缓存         (0xFFFFF680-0xFFFFF800)
-    //         PTE 自映射        (0xFFFFF800-0xFFFFFA00) — 注: 此处注释有误, 实际 PTE 自映射在 0xFFFFF680
+    //         PTE 自映射        (0xFFFFF680-0xFFFFF700) — 实际 PTE 自映射
     //         内核镜像          (0xFFFFF800-0xFFFFFA00)
     //         非分页池          (0xFFFFFA00-0xFFFFFC00)
     //         分页池            (0xFFFFFC00-0xFFFFFD00) ← VAD 节点所在
@@ -1743,6 +1743,9 @@ bool KernelMemoryAccessor::ReadKernelVAUnsafe(uint64_t va, void* outBuf, size_t 
     //   排除: 系统映射 (0xFFFFFE00+) + Hypervisor (0xFFFFFF00+)
     if (va < 0xFFFF800000000000ULL) return false;
     if (va >= 0xFFFFFE0000000000ULL) return false;
+    // ★ v3.296 FIX-15: 检查结束地址 va+size 不超过安全边界上限
+    //   (同 ReadKernelVA FIX-13, 防止跨边界读取未映射页)
+    if (va + size > 0xFFFFFE0000000000ULL) return false;
 
     // ★ BUILD 489: 根据驱动类型分发
     if (g_isPdfwKrnl) {
@@ -1762,6 +1765,8 @@ bool KernelMemoryAccessor::WriteKernelVAUnsafe(uint64_t va, const void* inBuf, s
     // ★ v3.235: 安全边界 [0xFFFF8000, 0xFFFFFE00) — 与 ReadKernelVAUnsafe 一致
     if (va < 0xFFFF800000000000ULL) return false;
     if (va >= 0xFFFFFE0000000000ULL) return false;
+    // ★ v3.296 FIX-15: 检查结束地址 va+size 不超过安全边界上限 (同 ReadKernelVAUnsafe)
+    if (va + size > 0xFFFFFE0000000000ULL) return false;
 
     // ★ BUILD 489: 根据驱动类型分发
     if (g_isPdfwKrnl) {
@@ -4197,6 +4202,10 @@ bool KernelTraceCleaner::ClearMmUnloadedDrivers(uint64_t ntosBase) {
 
         if (!nameLen || !nameBuf || nameLen > 256)
             continue;
+        // ★ v3.296 FIX-15: 验证 nameBuf 在内核白名单内 (防止读取未映射页)
+        //   MmUnloadedDrivers 条目的 Buffer 应在非分页池, 但防御性验证.
+        if (nameBuf < 0xFFFF800000000000ULL || nameBuf >= 0xFFFFFD0000000000ULL)
+            continue;
 
         wchar_t name[256] = {};
         int nchars = ReadKernelUnicodeString(nameBuf, nameLen, name, 256);
@@ -4240,7 +4249,9 @@ static int TraverseAndClearPiDDBAVL(uint64_t nodeAddr, int depth) {
     }
 
     // 处理当前节点
-    if (entry.DriverNameLength > 0 && entry.DriverNameLength <= 256 && entry.DriverNameBuffer) {
+    // ★ v3.296 FIX-15: 验证 DriverNameBuffer 在内核白名单内
+    if (entry.DriverNameLength > 0 && entry.DriverNameLength <= 256 && entry.DriverNameBuffer &&
+        entry.DriverNameBuffer >= 0xFFFF800000000000ULL && entry.DriverNameBuffer < 0xFFFFFD0000000000ULL) {
         wchar_t name[256] = {};
         int nchars = ReadKernelUnicodeString(entry.DriverNameBuffer, entry.DriverNameLength, name, 256);
         if (nchars > 0 && IsTraceTarget(name)) {
@@ -6009,7 +6020,8 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
                                     uint16_t nl = 0; uint64_t nb = 0;
                                     if (kma.ReadKernelVA(fBase + no, &nl, sizeof(nl)) &&
                                         kma.ReadKernelVA(fBase + no + 8, &nb, sizeof(nb))) {
-                                        if (nl > 0 && nl <= 256 && nl % 2 == 0 && nb > 0xFFFF800000000000ULL) {
+                                        if (nl > 0 && nl <= 256 && nl % 2 == 0 &&
+                                            nb >= 0xFFFF800000000000ULL && nb < 0xFFFFFD0000000000ULL) {
                                             wchar_t fn[256] = {};
                                             if (ReadKernelUnicodeString(nb, nl, fn, 256) > 0) {
                                                 // ★ BUILD 523: 诊断模式 — 打印所有候选 (前3个条目, ali==0)
@@ -6191,7 +6203,7 @@ uint64_t MinifilterNeutralizer::FindFilterByName(uint64_t fltmgrBase, uint64_t f
                     kma.ReadKernelVA(uniAddr + 8, &nameBuf, sizeof(nameBuf))) {
 
                     if (nameLen > 0 && nameLen <= 256 && nameLen % 2 == 0 &&
-                        nameBuf > 0xFFFF800000000000ULL) {
+                        nameBuf >= 0xFFFF800000000000ULL && nameBuf < 0xFFFFFD0000000000ULL) {
 
                         wchar_t filterName[256] = {};
                         ReadKernelUnicodeString(nameBuf, nameLen, filterName, 256);
@@ -6636,7 +6648,7 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
                         if (kma.ReadKernelVA(uniAddr, &nl, sizeof(nl)) &&
                             kma.ReadKernelVA(uniAddr + 8, &nb, sizeof(nb))) {
                             if (nl > 0 && nl <= 256 && nl % 2 == 0 &&
-                                nb > 0xFFFF800000000000ULL) {
+                                nb >= 0xFFFF800000000000ULL && nb < 0xFFFFFD0000000000ULL) {
                                 // ★ BUILD 500: 固定数组替代 std::wstring — 避免 CRT 堆依赖
                                 wchar_t fn[256] = {};
                                 int fnChars = ReadKernelUnicodeString(nb, nl, fn, 256);
@@ -6745,7 +6757,8 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
                     uint16_t nl = 0; uint64_t nb = 0;
                     if (kma.ReadKernelVA(fBase + no, &nl, sizeof(nl)) &&
                         kma.ReadKernelVA(fBase + no + 8, &nb, sizeof(nb))) {
-                        if (nl > 0 && nl <= 256 && nl % 2 == 0 && nb > 0xFFFF800000000000ULL) {
+                        if (nl > 0 && nl <= 256 && nl % 2 == 0 &&
+                            nb >= 0xFFFF800000000000ULL && nb < 0xFFFFFD0000000000ULL) {
                             wchar_t fn[256] = {};
                             int fnChars = ReadKernelUnicodeString(nb, nl, fn, 256);
                             if (fnChars > 0) {
@@ -6842,7 +6855,8 @@ bool MinifilterNeutralizer::VerifyFltPipeline() {
                         uint16_t nl = 0; uint64_t nb = 0;
                         if (kma.ReadKernelVA(fBase + no, &nl, sizeof(nl)) &&
                             kma.ReadKernelVA(fBase + no + 8, &nb, sizeof(nb))) {
-                            if (nl > 0 && nl <= 256 && nl % 2 == 0 && nb > 0xFFFF800000000000ULL) {
+                            if (nl > 0 && nl <= 256 && nl % 2 == 0 &&
+                                nb >= 0xFFFF800000000000ULL && nb < 0xFFFFFD0000000000ULL) {
                                 wchar_t fn[256] = {};
                                 int fnChars = ReadKernelUnicodeString(nb, nl, fn, 256);
                                 if (fnChars > 0) {
@@ -7238,7 +7252,8 @@ static uint64_t FindPacFilterInKernel(uint64_t fltmgrBase, uint64_t fltGlobals, 
                             uint16_t nl = 0; uint64_t nb = 0;
                             if (kma.ReadKernelVA(fBase + no, &nl, sizeof(nl)) &&
                                 kma.ReadKernelVA(fBase + no + 8, &nb, sizeof(nb))) {
-                                if (nl > 0 && nl <= 256 && nl % 2 == 0 && nb > 0xFFFF800000000000ULL) {
+                                if (nl > 0 && nl <= 256 && nl % 2 == 0 &&
+                                    nb >= 0xFFFF800000000000ULL && nb < 0xFFFFFD0000000000ULL) {
                                     filterListHead = val;
                                     goto EXT_FOUND_PAC;
                                 }
@@ -7297,7 +7312,7 @@ static uint64_t FindPacFilterInKernel(uint64_t fltmgrBase, uint64_t fltGlobals, 
                 if (kma.ReadKernelVA(filterBase + nameOff, &nameLen, sizeof(nameLen)) &&
                     kma.ReadKernelVA(filterBase + nameOff + 8, &nameBuf, sizeof(nameBuf))) {
                     if (nameLen > 0 && nameLen <= 256 && nameLen % 2 == 0 &&
-                        nameBuf > 0xFFFF800000000000ULL) {
+                        nameBuf >= 0xFFFF800000000000ULL && nameBuf < 0xFFFFFD0000000000ULL) {
                         wchar_t filterName[256] = {};
                         int nchars = ReadKernelUnicodeString(nameBuf, nameLen, filterName, 256);
                         // ★ BUILD 521: 严格验证 — minifilter 名称必须以字母开头
