@@ -900,6 +900,12 @@ static bool g_hollowJmpSet = false;
 // ★ v3.126g: BYOVD 驱动加载状态 — 当驱动成功加载时跳过 Process Hollowing
 static bool g_byovdDriverLoaded = false;
 
+// ★ BUILD 567 v3.296: PAC minifilter 中和状态 — 防止中和失败时 ApplyCs2Patch 封号
+//   true = 中和成功 (或 PAC 未安装), 安全执行 patch
+//   false = 中和失败, 跳过 patch (GuardPac 会周期重试中和)
+//   更新点: EnableAll (初始化) + GuardPac (周期 30-45s)
+static bool g_pacNeutralized = false;
+
 // ★ BUILD 536: ntdll!RtlDeactivateActivationContext 地址范围 — 用于 VEH 捕获 worker 线程激活上下文栈 NULL 崩溃
 //   根因: 某些系统 worker 线程 (线程池/RPC) TEB+0x98 (ActivationContextStackPointer) 为 NULL,
 //   线程退出时 LdrShutdownThread → RtlDeactivateActivationContext 解引用 NULL+0x38 崩溃.
@@ -3222,6 +3228,8 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         }
 
         g_byovdDriverLoaded = kernelResult.driverLoaded;
+        // ★ v3.296: 设置 PAC 中和状态 — 中和成功或 PAC 未安装时允许 patch
+        g_pacNeutralized = (kernelResult.pacStatus != stealth::KernelDefense::PacStatus::Failed);
 
         // ★ BUILD 567 v3.235: VAD 隐藏 (先执行, 缓存 EPROCESS)
         //   原因: DKOM 成功后会断链 loader.exe, VAD GetEPROCESSByPid 遍历 ActiveProcessLinks
@@ -3292,7 +3300,23 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         //   原本由 basic.exe 通过 OpenProcess + WriteProcessMemory 补丁
         //   现在 payload.dll 在 CS2 进程内直接补丁 client.dll
         //   测试模式/半测试模式跳过补丁 (避免封号, 仅验证保护层)
-        if (!g_egTestMode && !g_halfTestMode) {
+        // ★ BUILD 567 v3.296 FIX: PAC 中和失败时跳过 ApplyCs2Patch — 防止封号
+        //   根因: v3.293 封号是因为 minifilter 中和失败 (BUILD 528 禁用) +
+        //         NtReadHooker 禁用 + PvpAlivePatcher 失败, 导致 PAC minifilter
+        //         自由扫描 CS2 内存, 发现 ApplyCs2Patch 的 NOP patch → 上报封号.
+        //   修复: minifilter 中和失败 (pacStatus=Failed) 时, 不执行 ApplyCs2Patch.
+        //         GuardPac 会在 30-45s 后重新中和, 中和成功后主循环会自动 patch
+        //         (g_cs2Patched=false 触发主循环重试).
+        //   安全性: 跳过 patch 仅影响透视功能, 不会封号 (无 patch 无特征).
+        //           中和成功后主循环 5s 内自动补 patch.
+        // ★ BUILD 567 v3.296 FIX-3: pacStatus=NotInstalled 时也跳过初始化 patch
+        //   场景: EnableAll 时 PAC 未加载 → pacStatus=NotInstalled → 初始化 patch 已安装
+        //         → PAC 在 10s 后加载 → minifilter 扫描发现已存在的 patch → 封号.
+        //   修复: 初始化时只在 pacStatus=Neutralized 时才 patch.
+        //         NotInstalled 让主循环处理 (主循环有 FIX-2 延迟加载检查).
+        //         如果 PAC 真的未安装, 主循环 5s 内 GetKernelModuleBase 返回 0 → 正常 patch.
+        if (!g_egTestMode && !g_halfTestMode &&
+            kernelResult.pacStatus == stealth::KernelDefense::PacStatus::Neutralized) {
             g_cs2Patched = ApplyCs2Patch();
             DiagLog("B549:I:01 %s\n", g_cs2Patched ? "ok" : "pend");  // ★ BUILD 549: 去特征化
             // ★ BUILD 557: 补丁成功后启动 DR0 频率统计 (60s 窗口)
@@ -3326,6 +3350,15 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     DiagLog("B565:I:01 %s\n", ntReadHooked ? "ok" : "fail");
                 }
             }
+        } else if (kernelResult.pacStatus == stealth::KernelDefense::PacStatus::Failed) {
+            // ★ v3.296: PAC 中和失败 — 跳过 patch, 等待 GuardPac 重新中和
+            DiagLog("B549:I:03 skip (pac neutralize failed, will retry)\n");
+            g_cs2Patched = false;
+        } else if (kernelResult.pacStatus == stealth::KernelDefense::PacStatus::NotInstalled) {
+            // ★ v3.296 FIX-3: PAC 未加载 — 跳过初始化 patch, 让主循环处理
+            //   主循环有 FIX-2 延迟加载检查, 会先验证 MessageTransfer.sys 未加载才 patch
+            DiagLog("B549:I:04 skip (pac not installed, main loop will verify)\n");
+            g_cs2Patched = false;
         } else {
             DiagLog("B549:I:02 skip (test)\n");  // ★ BUILD 549: 去特征化
         }
@@ -3815,6 +3848,23 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                             // 重置 patch 状态, 让主循环重新 patch
                             g_cs2Patched = false;
                             g_patchReverted = false;
+                            // ★ v3.296 FIX: CS2 重开时立即检查中和状态
+                            //   原因: g_pacNeutralized 可能是 30-45s 前的旧值,
+                            //         CS2 重开期间 PAC 可能已恢复 Operations.
+                            //   主循环 5s 内会尝试 patch, 必须确保 g_pacNeutralized 是最新值.
+                            // ★ v3.296 FIX-5: PAC 未加载时 g_pacNeutralized=true (patch 安全)
+                            if (stealth::KernelMemoryAccessor::Instance().IsActive()) {
+                                char mtName[32];
+                                STEALTH_STR_DECRYPT_TO("MessageTransfer.sys", mtName, sizeof(mtName));
+                                uint64_t mtBase = stealth::KernelMemoryAccessor::Instance().GetKernelModuleBase(mtName);
+                                SecureZeroMemory(mtName, sizeof(mtName));
+                                if (mtBase) {
+                                    g_pacNeutralized = stealth::MinifilterNeutralizer::IsMessageTransferNeutralized();
+                                } else {
+                                    g_pacNeutralized = true;  // PAC 未加载, patch 安全
+                                }
+                                DiagLog("B291:REOPEN:pac=%d\n", g_pacNeutralized ? 1 : 0);
+                            }
                             // 跳出 safe-exit 路径, 回到主循环
                             // 注意: 不 return, 直接 break 出 if 块, 继续主循环
                         } else {
@@ -3872,6 +3922,31 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     // ★ BUILD 567 v3.227: 回调重应用计数 + 状态日志
                     g_logStats.cbReapply++;
                     DiagLogState("CB", "REAPPLIED", "tick=%u", (unsigned)GetTickCount());
+
+                    // ★ BUILD 567 v3.296: 更新 PAC 中和状态 (GuardPac 内部已重新中和)
+                    //   ReapplyAllCallbacks → GuardPac → IsMessageTransferNeutralized → 重新中和
+                    //   此处检查中和状态, 更新 g_pacNeutralized 供主循环 ApplyCs2Patch 决策
+                    //   IOCTL 开销: ~50 (缓存命中) — 安全
+                    // ★ v3.296 FIX-5: IsMessageTransferNeutralized 在 PAC 未加载时返回 false
+                    //   (filterAddr=0 → "需要重新中和"), 但 PAC 未加载时 patch 是安全的.
+                    //   修复: 先检查 MessageTransfer.sys 是否加载, 未加载时 g_pacNeutralized=true.
+                    bool wasNeutralized = g_pacNeutralized;
+                    {
+                        char mtName[32];
+                        STEALTH_STR_DECRYPT_TO("MessageTransfer.sys", mtName, sizeof(mtName));
+                        uint64_t mtBase = stealth::KernelMemoryAccessor::Instance().GetKernelModuleBase(mtName);
+                        SecureZeroMemory(mtName, sizeof(mtName));
+                        if (mtBase) {
+                            // PAC 已加载 — 用 IsMessageTransferNeutralized 的返回值
+                            g_pacNeutralized = stealth::MinifilterNeutralizer::IsMessageTransferNeutralized();
+                        } else {
+                            // PAC 未加载 — patch 安全, g_pacNeutralized=true
+                            g_pacNeutralized = true;
+                        }
+                    }
+                    if (g_pacNeutralized != wasNeutralized) {
+                        DiagLog("B553:PN:%s\n", g_pacNeutralized ? "ok" : "fail");
+                    }
 
                     // ★ BUILD 552: 周期性验证 SHV_Install patch 仍然有效
                     //   若 PAC 重载驱动或自我修复 patch, 此处重新 patch
@@ -4052,9 +4127,55 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         }
 
         // ★ BUILD 553: 补丁维护 — 5s 间隔 (从 BUILD 549 的 500ms 降频, 1% 占空比)
+        // ★ BUILD 567 v3.296 FIX: 中和失败时跳过 patch — 防止 PAC minifilter 扫描发现 patch 封号
+        //   g_pacNeutralized 由 ReapplyAllCallbacks (30-45s) 更新, 中和成功后自动补 patch
+        // ★ BUILD 567 v3.296 FIX-2: 防止 PAC 延迟加载导致封号
+        //   场景: EnableAll 时 PAC 未加载 (pacStatus=NotInstalled, g_pacNeutralized=true),
+        //         但 PAC 在 10s 后加载 → minifilter 活跃 → 主循环 5s 内 ApplyCs2Patch → 封号.
+        //   修复: patch 前检查 MessageTransfer.sys 是否已加载, 若已加载则验证中和状态.
+        //   开销: GetKernelModuleBase ~2 IOCTL, 仅在 g_pacNeutralized=true 且 !g_cs2Patched 时执行.
         if (GetTickCount() - lastPatchCheck > 5000) {
-            if (!g_cs2Patched) {
-                g_cs2Patched = ApplyCs2Patch();
+            if (!g_cs2Patched && g_pacNeutralized) {
+                // ★ v3.296 FIX-2: 防止 PAC 延迟加载 — 检查 MessageTransfer.sys
+                if (stealth::KernelMemoryAccessor::Instance().IsActive()) {
+                    char mtName[32];
+                    STEALTH_STR_DECRYPT_TO("MessageTransfer.sys", mtName, sizeof(mtName));
+                    uint64_t mtBase = stealth::KernelMemoryAccessor::Instance().GetKernelModuleBase(mtName);
+                    SecureZeroMemory(mtName, sizeof(mtName));
+                    if (mtBase) {
+                        // MessageTransfer.sys 已加载 — 验证中和状态
+                        bool currentlyNeutralized = stealth::MinifilterNeutralizer::IsMessageTransferNeutralized();
+                        if (!currentlyNeutralized) {
+                            // 中和失效或未中和 — 跳过 patch, 立即重新中和
+                            g_pacNeutralized = false;
+                            // ★ v3.296 FIX-6: 连续中和失败降频 — 避免每 5s 重复中和+验证导致 IOCTL 风暴
+                            //   首次失败: 立即重试. 连续失败 ≥3 次: 降频到 30s (等 GuardPac 周期).
+                            //   原因: 中和失败通常是 FindFilterByName 找不到 filter (PAC 注册延迟),
+                            //         每 5s 重试无意义, 30s 后 PAC 注册完成再重试.
+                            static int ntrlFailCount = 0;
+                            static DWORD lastNtrlRetry = 0;
+                            if (ntrlFailCount < 3 || GetTickCount() - lastNtrlRetry > 30000) {
+                                lastNtrlRetry = GetTickCount();
+                                DiagLog("B549:PN:late-load detected, re-neutralizing (attempt=%d)\n",
+                                        ntrlFailCount + 1);
+                                stealth::MinifilterNeutralizer::NeutralizeMessageTransfer();
+                                g_pacNeutralized = stealth::MinifilterNeutralizer::IsMessageTransferNeutralized();
+                                if (g_pacNeutralized) {
+                                    ntrlFailCount = 0;  // 中和成功, 重置计数
+                                } else {
+                                    ntrlFailCount++;
+                                }
+                            } else {
+                                // 降频期间不重试, 等待 GuardPac (30-45s) 处理
+                                DiagLog("B549:PN:neutralize failed %d times, waiting for GuardPac\n",
+                                        ntrlFailCount);
+                            }
+                        }
+                    }
+                }
+                if (!g_cs2Patched && g_pacNeutralized) {
+                    g_cs2Patched = ApplyCs2Patch();
+                }
                 // ★ BUILD 558 FIX-5: 主循环中 ApplyCs2Patch 成功后补启动 DR0 频率统计
                 //   原因: 初始化阶段 ApplyCs2Patch 在 cs2::Memory::Initialize 之前调用 (阶段3 vs 阶段4),
                 //         导致初始化阶段 ApplyCs2Patch 失败 ("mod not loaded"), StartDR0FrequencyStat 未被调用.
@@ -4086,7 +4207,35 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     }
                 }
             } else if (!g_patchReverted) {  // 截图工具运行期间不维护补丁
-                MaintainCs2Patch();
+                // ★ v3.296 FIX-4: patch 已安装时也检查 PAC 延迟加载
+                //   场景: PAC 未加载时 patch 已安装 (g_cs2Patched=true),
+                //         PAC 后加载 → minifilter 扫描发现已存在 patch → 封号.
+                //   修复: 维护 patch 前检查 MessageTransfer.sys 是否新加载,
+                //         若已加载且未中和 → 恢复原始字节 + 立即中和.
+                if (g_cs2Patched && stealth::KernelMemoryAccessor::Instance().IsActive()) {
+                    char mtName[32];
+                    STEALTH_STR_DECRYPT_TO("MessageTransfer.sys", mtName, sizeof(mtName));
+                    uint64_t mtBase = stealth::KernelMemoryAccessor::Instance().GetKernelModuleBase(mtName);
+                    SecureZeroMemory(mtName, sizeof(mtName));
+                    if (mtBase) {
+                        // MessageTransfer.sys 已加载 — 验证中和状态
+                        bool currentlyNeutralized = stealth::MinifilterNeutralizer::IsMessageTransferNeutralized();
+                        if (!currentlyNeutralized) {
+                            // PAC 新加载且未中和 — 立即恢复原始字节 (防封号)
+                            DiagLog("B549:PN:late-load with patch, reverting\n");
+                            TemporarilyRevertPatch();
+                            g_cs2Patched = false;
+                            g_pacNeutralized = false;
+                            // 立即重新中和
+                            stealth::MinifilterNeutralizer::NeutralizeMessageTransfer();
+                            g_pacNeutralized = stealth::MinifilterNeutralizer::IsMessageTransferNeutralized();
+                            // 中和成功后下个循环会自动补 patch
+                        }
+                    }
+                }
+                if (g_cs2Patched) {
+                    MaintainCs2Patch();
+                }
             }
             lastPatchCheck = GetTickCount();
         }
@@ -4184,7 +4333,9 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             } else if (!toolRunning && g_patchReverted) {
                 // ★ BUILD 556: 移除影子页 ReapplyPatch, 直接走 ApplyCs2Patch 回退路径
                 //   恢复补丁: 检查返回值 — 失败则保持 g_patchReverted=true, 下次循环重试
-                if (ApplyCs2Patch()) {
+                // ★ BUILD 567 v3.296 FIX: 中和失败时不恢复 patch — 防止封号
+                //   截图期间中和可能失败, 恢复 patch 会被 minifilter 扫描发现
+                if (g_pacNeutralized && ApplyCs2Patch()) {
                     g_patchReverted = false;
                 }
             }
