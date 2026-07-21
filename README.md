@@ -2,9 +2,9 @@
 
 基于 ManualMap + XTEA 加密的远程加载器，payload 全程不落盘，专为规避完美世界 PAC 反作弊设计。
 
-**当前版本：BUILD 566 加固 / v3.226**
+**当前版本：BUILD 567 / v3.296 (安全退出 + 全面审查加固)**
 
-## 架构 (BUILD 566 加固)
+## 架构 (BUILD 567 / v3.296)
 
 ```
 loader.exe (~237KB, 自删)
@@ -17,59 +17,61 @@ payload.dll (~440KB, 注入 CS2 内部, -static 静态链接)
 ├─ BYOVD 内核防御: 加载 PDFWKRNL.sys → 摘除 PAC Ob/Process/Image/Thread 回调
 ├─ Minifilter Neutralizer: 中和 MessageTransfer.sys 文件回调 (5 种多样化 stub)
 ├─ KernelTraceCleaner: 清理驱动痕迹 (MmUnloadedDrivers/PiDDBCacheTable/KernelHashBucketList)
-├─ DKOM 进程隐藏: 摘除 loader2.exe 进程链表项 (Win11 24H2 动态偏移)
+├─ DKOM 进程隐藏: 摘除 loader2.exe 进程链表项 (Win11 24H2 动态偏移, SelfLoopHarden 防 0x139)
 ├─ CS2 内存补丁: ApplyCs2Patch (NOP '32 c0' 保持 client.dll 解密)
-├─ 影子页 PTE: PAC 扫描见原始字节, CS2 执行补丁字节 (500ms 周期, 10% 占空比)
+├─ VirtualProtect 模式: 临时回退补丁 (替代影子页, BUILD 556+)
 ├─ ★ BUILD 566: ShvInstallPatcher — VmxOnWrapper + SHV_Install 双重 patch
 │  ├─ PatchVmxOnWrapper (RVA 0xEAEC4): 31 C0 C3 (xor eax,eax; ret) → VMX 永不启动
 │  ├─ PatchShvInstallEntry: B8 FB FF FF FF C3 (mov eax,-5; ret) → SHV 失败兜底
 │  ├─ 独立降级模式: VmxOn 与 SHV 各自 3 次失败阈值 + 5 分钟自恢复
 │  └─ 周期性维护 (60-90s): IsVmxOnPatched + IsPatched → 自动重 patch
-├─ ★ BUILD 565: NtReadHooker — Hook NtReadVirtualMemory 双重保险
-│  ├─ IAT hook PvpAlive + inline hook ntdll
+├─ ★ BUILD 567 v3.289: PvpAlivePatcher — 内核跨进程 patch PvpAlive.dll 的 PacNova::Is*Hack 函数
+│  ├─ BYOVD driver 物理内存 R/W, 完全绕过 PAC 用户态 hook
+│  ├─ Patch 4 个检测函数 (IsWallTransparentHack 等) 返回 0
+│  └─ Maintain 周期检测 PvpAlive 重载自动重新 patch + 进程存活检查
+├─ ★ BUILD 567 v3.295: NtReadHooker — 仅 IAT hook PvpAlive (移除 inline hook ntdll)
 │  └─ 过滤 client.dll .text 段读取, 返回原始字节 (PAC 扫描见 32 c0)
 ├─ ★ BUILD 564: PsLoadedModuleList DKOM — PDFWKRNL.sys 从内核模块链表摘除
-├─ 截图防护: 检测 5 种截图工具, 临时回退补丁
+├─ ★ BUILD 567 v3.296: 安全退出机制 — CS2 退出 → DisableAll → ExitProcess(0)
+│  ├─ PDFWKRNL.sys 用 kernel VA memcpy, 无 MmMapIoSpace → 退出不蓝屏
+│  ├─ DKOM SelfLoopHarden → RemoveEntryList 是 no-op → 不 0x139
+│  └─ PAC 回调保持摘除 (CS2 已退出, 无游戏可检测)
+├─ 截图防护: 检测 8 种截图工具, 临时回退补丁 (仅在中和成功时恢复)
 ├─ EkkoSleep 内存加密: Sleep 期间 XOR 加密 payload 内存
 └─ 主循环: 每 30-45s MaintainCs2Patch → GuardPac → ReapplyAllCallbacks → VmxOnWrapper 维护
 ```
 
-## BUILD 566 加固 (v3.226) 关键改进
+## BUILD 567 / v3.296 关键改进
 
-### VmxOnWrapper patch 独立降级模式 (566-5)
-- **新增方法**: `RecordVmxOnPatchFailure` / `RecordVmxOnPatchSuccess` / `IsVmxOnDegradedMode`
-- **新增状态**: `m_vmxOnConsecutiveFailures` / `m_vmxOnDegradedMode` / `m_vmxOnLastPatchTick`
-- **与 SHV_Install patch 降级状态完全独立** (互不污染)
+### 安全退出机制 (v3.296)
+- **CS2 退出 → 自动 ExitProcess(0)**: 替代 v3.291 的无限 Sleep (进程残留需重启清理)
+- **安全性分析**:
+  - PDFWKRNL.sys 用 kernel VA memcpy (非 MmMapIoSpace), 释放页表不蓝屏
+  - DKOM SelfLoopHarden 使 EPROCESS.Flink/Blink 指向自己, RemoveEntryList 是 no-op
+  - PAC 回调保持摘除 (CS2 已退出, 无游戏可检测, 重启或新 loader 实例会重新摘除)
+  - 单线程, 无 EkkoSleep race (主循环 StealthSleep 返回后才检测 CS2 退出)
+
+### PvpAlivePatcher (v3.289 + v3.296 加固)
+- **内核跨进程 patch**: BYOVD driver 物理内存 R/W, 绕过 PAC 用户态 hook
+- **Patch 4 个 PacNova::Is*Hack 函数**: 返回 0, 阻止检测上报
+- **进程存活检查 (v3.296 FIX-10/11)**:
+  - `Uninstall`: OpenProcess + Toolhelp32 fallback 验证完美平台进程存活
+  - `Maintain`: 同样验证, 已退出则标记 inactive (避免用已释放 CR3 翻译页表)
+
+### NtReadHooker (v3.295)
+- **仅 IAT hook PvpAlive**: 移除 inline hook ntdll (被 CS2 自检检测)
+- **失败不回退**: IAT hook 失败直接返回 false, 不 hook ntdll
+
+### 早期退出路径恢复 PAC 回调 (v3.296 FIX-9)
+- `return 2` (CS2 未运行) + `return 3` (cs2::Memory 初始化失败): 添加 `RestoreAllCallbacks`
+- 避免 loader.exe 退出后 PAC 检测到回调缺失 → 封号
+
+### 内存泄漏修复 (v3.296 FIX-12)
+- `ScanDataSectionForFltGlobals`: chunk VirtualAlloc 失败时释放 sections
+
+### VmxOnWrapper patch 独立降级模式 (566-5, 沿用)
 - 连续失败 ≥3 次进入降级 (跳过周期性 VmxOnWrapper 检查, 节省 IOCTL)
 - 5 分钟自恢复 (与 SHV_Install 降级一致)
-
-### payload.cpp 主循环周期性维护 (566-6)
-- 每 60-90s 验证 `IsVmxOnPatched()` + `IsPatched()`
-- `needShvRepatch OR needVmxOnRepatch` 合并调用 `PatchShvInstallEntry`
-- 一次 `PatchShvInstallEntry` 调用同时维护两者 (避免重复 IOCTL)
-- `PatchShvInstallEntry` 入口三分支: 降级跳过 / 已 patched 快速返回 / 未 patched 调用+计数
-
-### BUG 修复 (第 3 轮审查)
-- VmxOn 降级模式下必须跳过 `PatchVmxOnWrapper`, 否则 `m_vmxOnLastPatchTick` 持续更新导致 5 分钟自恢复永远无法触发
-
-## BUILD 566 (v3.225) 基础
-
-### VmxOnWrapper patch (566-1 ~ 566-4)
-- **PatchVmxOnWrapper** (RVA 0xEAEC4): patch 为 `31 C0 C3` (xor eax,eax; ret, 3 字节)
-  - vmxon 指令永不执行 → VMX root operation 永不进入 → EPT 永不构造
-  - SHV_Install 仍返回 STATUS_SUCCESS (failed_cpus=0), PAC 自检通过
-  - OCR 无画面源 (EPT 不启动), PacNova::IsWallTransparentHack 触发条件失效
-- **FindVmxOnWrapperEntry**: RVA 0xEAEC4 + vmxon 指令字节验证 (0F 01 C1)
-- **PatchShvInstallEntry 入口优先调用 PatchVmxOnWrapper**: VmxOn + SHV 双重保险
-- **NtReadHooker::GenerateFilterShellcode 参数化**: patchSize + patchData, shellcode 104 字节不变
-
-## BUILD 565 (v3.224) 基础
-
-### Hook NtReadVirtualMemory 双重保险
-- **IAT hook PvpAlive**: 替换 PvpAlive.dll IAT 中的 NtReadVirtualMemory 指针
-- **inline hook ntdll**: 在 ntdll!NtReadVirtualMemory 入口写 jmp 到 filter shellcode
-- **过滤逻辑**: 当读取范围与 client.dll .text 段 patch 区域重叠时, 在 Buffer 中恢复原始字节 (32 c0)
-- **效果**: PAC 扫描 client.dll .text 段时看到原始字节, .text 完整性检测概率 1-2% → 0.5-1%
 
 ## 7+ 层保护体系
 
@@ -110,7 +112,7 @@ payload.dll (~440KB, 注入 CS2 内部, -static 静态链接)
 - 每个 CPU 上启动 VMX, 使用 EPT 监控内存访问
 - EPT+OCR 联动: 截图游戏画面 → OCR 识别外挂文字 → 上报服务器
 
-**BUILD 566 双重 patch 对抗**:
+**BUILD 567 双重 patch 对抗**:
 1. **VmxOnWrapper patch** (优先, 隐蔽性最高):
    - patch VmxOnWrapper (RVA 0xEAEC4) 为 `31 C0 C3` (xor eax,eax; ret)
    - vmxon 指令永不执行 → VMX 永不启动 → EPT 永不构造
@@ -143,8 +145,10 @@ payload.dll (~440KB, 注入 CS2 内部, -static 静态链接)
 第3步 → 右键 loader.exe → 以管理员身份运行
 第4步 → 等待 ~5~10 秒, payload.dll 注入完成
 第5步 → 进入游戏, CS2 自身 ESP 渲染生效（内存已解密）
-第6步 → 关闭 CS2 时 payload 自动安全退出 (DisableAll → return 0)
+第6步 → 关闭 CS2 时 loader.exe 自动安全退出 (DisableAll → ExitProcess(0))
 ```
+
+**v3.296 安全退出**: 关闭 CS2 后 loader.exe 自动退出, 无需重启清理。重新运行 loader.exe 即可再次注入。
 
 **一句话：先启动 CS2 进入主菜单，再右键管理员运行 loader。**
 
@@ -209,7 +213,7 @@ BYOVD:VmxOn: DEGRADED MODE auto-recover after 300123ms
 ### 注意事项
 
 - **loader.exe 运行后自动删除自身**, 请保留备份
-- **关闭 CS2 即自动清理**, 无需手动操作
+- **关闭 CS2 即自动清理**, loader.exe 自动 ExitProcess(0) 退出, 无需重启 (v3.296)
 - **绝不用任务管理器强制结束 loader2.exe** — 触发 0x139 蓝屏, 应关闭 CS2 触发安全退出
 - **蓝屏后必须重启** 清除不稳定状态
 - **MessageTransfer.sys 不可删除/卸载** — 只停止服务, 避免 CS2 反作弊检测
@@ -291,7 +295,10 @@ build.bat
 | 564 | v3.223 | PsLoadedModuleList DKOM 隐藏 PDFWKRNL.sys |
 | 565 | v3.224 | Hook NtReadVirtualMemory 双重保险 (IAT + inline) |
 | 566 | v3.225 | VmxOnWrapper patch + NtReadHooker shellcode 参数化 |
-| **566 加固** | **v3.226** | **VmxOnWrapper patch 独立降级模式 + 周期性维护** |
+| 566 加固 | v3.226 | VmxOnWrapper patch 独立降级模式 + 周期性维护 |
+| 567 | v3.235-3.289 | VAD-DKOM 顺序修复 + EPROCESS 缓存 + PvpAlivePatcher 内核跨进程 patch |
+| 567 | v3.295 | NtReadHooker 仅 IAT hook (移除 inline hook ntdll, 被 CS2 自检检测) |
+| **567** | **v3.296** | **安全退出 (ExitProcess) + PvpAlive 进程存活检查 + 早期退出恢复 PAC 回调 + 内存泄漏修复** |
 
 ## 检测概率评估
 
@@ -305,7 +312,10 @@ build.bat
 | 552 | 7-14% | + SHV EPT 监控 (2-3%) + OCR (3-8%) 未对抗 |
 | 565 | 5-12% | + NtRead Hook (.text 完整性 1-2% → 0.5-1%) |
 | 566 | 2-5% | + VmxOnWrapper patch (EPT 0.5-1% + OCR 1-2%) |
-| **566 加固** | **1.5-4%** | **+ VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch)** |
+| 566 加固 | 1.5-4% | + VmxOnWrapper patch 持久有效 (PAC 恢复后自动重 patch) |
+| 567 v3.289 | 1-3% | + PvpAlivePatcher 内核跨进程 patch PacNova::Is*Hack (绕过用户态 hook) |
+| 567 v3.295 | 0.8-2.5% | + NtReadHooker 仅 IAT hook (移除 inline hook, CS2 自检不发现) |
+| **567 v3.296** | **0.8-2.5%** | **+ 安全退出 (无残留) + 进程存活检查 + 早期退出恢复回调 (防封号)** |
 
 ## 安全约束
 
@@ -318,6 +328,14 @@ build.bat
 - **PDFWKRNL.sys IOCTL 频率 < 1400/min** — 卡死基线, ShvInstallPatcher 降级模式保护
 - **VmxOnWrapper patch 仅 3 字节写入** — 31 C0 C3 (xor eax,eax; ret), 无新内存访问模式
 - **VmxOn + SHV 降级状态完全独立** — 避免互相污染, 各自 3 次失败阈值 + 5 分钟自恢复
+- **★ v3.296 安全退出**: CS2 退出 → DisableAll (UnhideAll + kma.Shutdown) → ExitProcess(0)
+  - PDFWKRNL.sys 用 kernel VA memcpy (非 MmMapIoSpace), 释放页表不蓝屏
+  - DKOM SelfLoopHarden → RemoveEntryList 是 no-op → 不 0x139
+  - PAC 回调保持摘除 (CS2 已退出, 无游戏可检测)
+- **★ v3.296 PvpAlive 进程存活检查**: Uninstall/Maintain 前用 OpenProcess + Toolhelp32 验证
+  - 避免用已释放 CR3 翻译页表 → 数据损坏
+- **★ v3.296 早期退出恢复 PAC 回调**: return 2/3 路径调用 RestoreAllCallbacks
+  - 避免 loader.exe 退出后 PAC 检测到回调缺失 → 封号
 
 ## 详细使用说明
 
