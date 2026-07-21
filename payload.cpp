@@ -787,7 +787,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.286 启动摘要 (CS2 退出蓝屏 0x3B 修复 — 自动 taskkill /f 清理 loader.exe, 不触发 PspExitProcess)\n");
+    DiagLog("BUILD 567 v3.287 启动摘要 (taskkill 修复 — 去掉 timeout, 直接 taskkill, 缩短 Sleep 间隔)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -3713,28 +3713,24 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     //   诊断: 退出摘要信息从 DisableAll 内部 StateLog 获取 (DISABLE_ALL_ENTER/UNHIDE_ALL_DONE/KMA_SHUTDOWN_DONE)
                     //   注: LogExitSummary 的统计信息 (VmxOn/SHV/VEH 等) 不再在 CS2 退出路径打印,
                     //       但主循环正常退出路径 (L4096) 仍会打印.
-                    // ★ BUILD 567 v3.286 FIX: CS2 退出蓝屏 0x3B 修复 — 自动 taskkill /f 清理 loader.exe
-                    //   v3.285 问题: 无限 Sleep 循环, loader.exe 隐藏后用户无法手动关闭
-                    //   v3.284 确认: loader.exe 退出会触发 driver 蓝屏 (driver 缓存物理页映射失效)
-                    //   根因: BYOVD driver (PDFWKRNL.sys) 通过 IOCTL 映射 loader.exe 物理内存,
-                    //         driver 内部缓存物理页映射. loader.exe 正常退出时 PspExitProcess 释放物理页,
-                    //         driver 缓存的映射失效 → driver 访问无效物理页 → 0x3B.
-                    //   修复: 启动独立 cmd 子进程, 延迟 2 秒后 taskkill /f /pid <自己PID> 强制终止 loader.exe.
-                    //         taskkill /f 是 TerminateProcess, 不触发 PspExitProcess 正常清理路径, 避免蓝屏.
-                    //         loader.exe 保持隐藏 (DKOM self-loop 不恢复 ActiveProcessLinks), 防检测性能不受影响.
-                    //   顺序: Sleep(2000) → DisableAll → 启动 taskkill 子进程 → 无限 Sleep 等待被杀
-                    //   注: cmd 子进程延迟 2 秒确保 DisableAll 完成后再 taskkill.
-                    //       driver 保持加载 (v3.281 跳过 RegDeleteTreeW + DeleteFileW), 句柄已关闭.
-                    //       残留 driver 文件和注册表项在下次启动时由 ForceRemoveRTCore64Services 清理.
-                    DiagLog("B586:EXIT:Sleep 2000ms (wait CS2 async cleanup)\n");
-                    Sleep(2000);  // ★ v3.286: 等待 CS2 退出异步清理完成
+                    // ★ BUILD 567 v3.287 FIX: taskkill 没有成功执行 + 无限 Sleep 期间代码污染
+                    //   v3.286 测试: taskkill spawned 后 4分27秒 loader.exe 仍在运行, 02:17:37 CRASH 0xC0000005
+                    //   根因 1: timeout /t 2 /nobreak >nul 在 CREATE_NO_WINDOW 环境下卡住 (需要控制台输入句柄)
+                    //           导致 taskkill 永远没有执行
+                    //   根因 2: BYOVD driver 句柄已关闭但 driver 仍在内核运行, 继续映射物理内存污染 loader.exe 代码页
+                    //           无限 Sleep 期间 VEH 自愈尝试恢复但失败 (faultAddr=0x38 空指针解引用)
+                    //   修复 1: 去掉 timeout, 用 loader.exe 内部 Sleep 延迟, 然后直接 taskkill (不带 timeout)
+                    //   修复 2: 缩短无限 Sleep 时间, taskkill 立即执行, 减少代码污染窗口
+                    //   顺序: Sleep(2000) → DisableAll → Sleep(1000) → CreateProcessA taskkill → 无限 Sleep
+                    DiagLog("B587:EXIT:Sleep 2000ms (wait CS2 async cleanup)\n");
+                    Sleep(2000);  // ★ v3.287: 等待 CS2 退出异步清理完成
                     stealth::KernelDefense::DisableAll();  // ★ v3.279: DisableAll (UnhideAll + kma.Shutdown)
-                    // ★ v3.286: 启动自动 taskkill 子进程
+                    // ★ v3.287: Sleep 1 秒确保 DisableAll 完全完成, 然后直接 taskkill (不用 timeout)
+                    Sleep(1000);
+                    // ★ v3.287: 启动自动 taskkill 子进程 (不带 timeout, 直接 taskkill)
                     DWORD myPid = GetCurrentProcessId();
                     char cmd[256];
-                    snprintf(cmd, sizeof(cmd),
-                        "cmd.exe /c \"timeout /t 2 /nobreak >nul & taskkill /f /pid %u\"",
-                        (unsigned)myPid);
+                    snprintf(cmd, sizeof(cmd), "taskkill /f /pid %u", (unsigned)myPid);
                     STARTUPINFOA si = {};
                     si.cb = sizeof(si);
                     si.dwFlags = STARTF_USESHOWWINDOW;
@@ -3744,17 +3740,16 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
                         CloseHandle(pi.hProcess);
                         CloseHandle(pi.hThread);
-                        DiagLog("B586:EXIT:taskkill spawned (pid=%u, cmd child will kill loader in 2s)\n",
+                        DiagLog("B587:EXIT:taskkill spawned (pid=%u, will kill loader immediately)\n",
                             (unsigned)myPid);
                     } else {
-                        DiagLog("B586:EXIT:CreateProcessA FAILED err=%u (loader will infinite sleep)\n",
+                        DiagLog("B587:EXIT:CreateProcessA FAILED err=%u (loader will infinite sleep)\n",
                             GetLastError());
                     }
-                    // ★ v3.286: 无限 Sleep 等待被 taskkill /f 强制终止
-                    //   taskkill /f = TerminateProcess, 不触发 PspExitProcess 正常清理, 避免 driver 蓝屏
-                    DiagLog("B586:EXIT:infinite Sleep (waiting for taskkill /f)\n");
+                    // ★ v3.287: 无限 Sleep 等待被 taskkill /f 强制终止 (应该很快被杀)
+                    DiagLog("B587:EXIT:infinite Sleep (waiting for taskkill /f)\n");
                     while (true) {
-                        Sleep(60000);  // 每分钟 Sleep, 避免忙等待
+                        Sleep(1000);  // ★ v3.287: 缩短到 1 秒, 减少代码污染窗口
                     }
                     return 0;  // 不会执行, 仅为编译器满意
                 }
