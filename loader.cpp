@@ -16,12 +16,45 @@
 #include <wininet.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
+#include <psapi.h>
 #pragma comment(lib, "wininet.lib")
+#pragma comment(lib, "psapi.lib")
 #include <cstdint>
 #include <cstdio>
 #include <cstdarg>
 #include <vector>
 #include <string>
+
+// ★ v3.296 FIX-25: NtQuerySystemInformation 声明 — 用于枚举 DKOM 隐藏的进程
+//   原因: CreateToolhelp32Snapshot 用 ActiveProcessLinks 枚举进程,
+//         DKOM self-loop (UnhideAll) 后进程不在链表中, Toolhelp 找不到.
+//         NtQuerySystemInformation(SystemProcessInformation) 从 PspCidTable 枚举,
+//         不依赖 ActiveProcessLinks, 能找到 DKOM 隐藏的进程.
+extern "C" {
+typedef LONG (WINAPI *NtQuerySystemInformation_t)(ULONG, PVOID, ULONG, PULONG);
+}
+#define SYSTEM_PROCESS_INFORMATION_CLASS 5
+
+// UNICODE_STRING for ntdll structs (if not defined by subauth.h etc.)
+typedef struct _UNICODE_STRING_FIX25 {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR Buffer;
+} UNICODE_STRING_FIX25;
+
+typedef struct _SYSTEM_PROCESS_INFORMATION_FIX25 {
+    ULONG NextEntryOffset;
+    ULONG NumberOfThreads;
+    LARGE_INTEGER SpareLi1;
+    LARGE_INTEGER SpareLi2;
+    LARGE_INTEGER SpareLi3;
+    LARGE_INTEGER CreateTime;
+    LARGE_INTEGER UserTime;
+    LARGE_INTEGER KernelTime;
+    UNICODE_STRING_FIX25 ImageName;
+    HANDLE UniqueProcessId;
+    // ... 后续字段不需要
+} SYSTEM_PROCESS_INFORMATION_FIX25;
 // ★ BUILD 551: 移除 embedded_basic_loader.h — basic.exe 已在 BUILD 548 集成到 payload.dll
 //   原因: embedded_basic_loader.h 在 BUILD 550 清理时被移到 obsolete_binaries,
 //         但 loader.cpp 仍引用它,导致 loader.exe 编译失败 (当前 loader.exe 是旧版本)
@@ -578,32 +611,38 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     AddVectoredExceptionHandler(0 /*最后调用, 不阻塞 SEH/VEH 链*/, LoaderVehHandler);
     LoaderDiag("=== LOADER v3.296 FIX-21 START (BUILD 567: infinite Sleep + old loader cleanup) ===\n");
 
-    // ★ v3.296 FIX-21: 清理旧 loader.exe 进程 (CS2 退出后旧 loader 进入无限 Sleep)
+    // ★ v3.296 FIX-21/FIX-25: 清理旧 loader.exe 进程 (CS2 退出后旧 loader 进入无限 Sleep)
     //   原因: v3.296 FIX-21 策略 — CS2 退出后旧 loader 不退出 (无限 Sleep, 避免 PspExitProcess 蓝屏).
     //         新 loader 启动时必须清理旧进程, 否则多个 loader 实例冲突.
     //   安全性: 旧 loader 在 Sleep 中, 不访问内核资源, TerminateProcess 安全.
-    //           旧 loader 的 DKOM 已恢复 (UnhideAll), 进程可见, 可被 TerminateProcess.
+    //           旧 loader 的 VAD 已恢复 (FIX-22), PspExitProcess 不会蓝屏.
     //           旧 loader 的 driver 句柄已关闭 (kma.Shutdown), 无内核回调风险.
+    //   ★ FIX-25: DKOM self-loop (UnhideAll) 后进程不在 ActiveProcessLinks 链表中,
+    //     CreateToolhelp32Snapshot 找不到. 改用 NtQuerySystemInformation (PspCidTable)
+    //     枚举所有进程, 包括 DKOM 隐藏的.
     {
         DWORD currentPid = GetCurrentProcessId();
+        wchar_t exeName[MAX_PATH] = {};
+        GetModuleFileNameW(NULL, exeName, MAX_PATH);
+        wchar_t* baseName = wcsrchr(exeName, L'\\');
+        const wchar_t* loaderName = baseName ? baseName + 1 : exeName;
+        LoaderDiag("FIX25: current loader name='%ls' pid=%u\n", loaderName, currentPid);
+
+        // 方法 1: CreateToolhelp32Snapshot (走 ActiveProcessLinks, 找不到 DKOM 隐藏进程)
+        int killedByToolhelp = 0;
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (snap != INVALID_HANDLE_VALUE) {
             PROCESSENTRY32W pe = {};
             pe.dwSize = sizeof(pe);
-            wchar_t exeName[MAX_PATH] = {};
-            GetModuleFileNameW(NULL, exeName, MAX_PATH);
-            // 提取文件名 (不含路径)
-            wchar_t* baseName = wcsrchr(exeName, L'\\');
-            const wchar_t* loaderName = baseName ? baseName + 1 : exeName;
             if (Process32FirstW(snap, &pe)) {
                 do {
-                    if (pe.th32ProcessID == currentPid) continue;  // 跳过自己
+                    if (pe.th32ProcessID == currentPid) continue;
                     if (_wcsicmp(pe.szExeFile, loaderName) == 0) {
-                        // 找到旧 loader 进程 — 终止
                         HANDLE hOld = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
                         if (hOld) {
                             if (TerminateProcess(hOld, 0)) {
-                                LoaderDiag("FIX21: killed old loader pid=%u\n", pe.th32ProcessID);
+                                LoaderDiag("FIX21: killed old loader pid=%u (Toolhelp)\n", pe.th32ProcessID);
+                                killedByToolhelp++;
                             }
                             CloseHandle(hOld);
                         }
@@ -611,6 +650,63 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                 } while (Process32NextW(snap, &pe));
             }
             CloseHandle(snap);
+        }
+
+        // 方法 2: NtQuerySystemInformation (走 PspCidTable, 找得到 DKOM 隐藏进程)
+        //   当 Toolhelp 找不到时, 用此方法清理 DKOM 隐藏的旧 loader
+        if (killedByToolhelp == 0) {
+            HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+            if (hNtdll) {
+                auto pNtQSI = (NtQuerySystemInformation_t)GetProcAddress(hNtdll, "NtQuerySystemInformation");
+                if (pNtQSI) {
+                    // 先查询所需缓冲区大小
+                    ULONG bufSize = 0;
+                    pNtQSI(SYSTEM_PROCESS_INFORMATION_CLASS, NULL, 0, &bufSize);
+                    if (bufSize == 0) bufSize = 0x100000;  // 兜底 1MB
+                    std::vector<uint8_t> buf(bufSize);
+                    ULONG retLen = 0;
+                    LONG status = pNtQSI(SYSTEM_PROCESS_INFORMATION_CLASS, buf.data(), (ULONG)buf.size(), &retLen);
+                    if (status == 0 && retLen > 0) {
+                        // 遍历 SYSTEM_PROCESS_INFORMATION 链表
+                        uint8_t* p = buf.data();
+                        int killedByNtQSI = 0;
+                        while (p < buf.data() + retLen) {
+                            auto* spi = (SYSTEM_PROCESS_INFORMATION_FIX25*)p;
+                            HANDLE pid = spi->UniqueProcessId;
+                            // 跳过 System (pid=4) 和 Idle (pid=0) 和自己
+                            if (pid != (HANDLE)0 && pid != (HANDLE)4 &&
+                                pid != (HANDLE)currentPid && pid != (HANDLE)-1) {
+                                DWORD pid32 = (DWORD)(ULONG_PTR)pid;
+                                // 验证进程名: 用 OpenProcess + GetModuleFileNameExW
+                                //   (NtQSI 的 ImageName 可能为空, 用 psapi 验证更可靠)
+                                HANDLE hOld = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, FALSE, pid32);
+                                if (hOld) {
+                                    wchar_t procPath[MAX_PATH] = {};
+                                    DWORD pathLen = GetModuleFileNameExW(hOld, NULL, procPath, MAX_PATH);
+                                    if (pathLen > 0) {
+                                        wchar_t* pName = wcsrchr(procPath, L'\\');
+                                        const wchar_t* pBase = pName ? pName + 1 : procPath;
+                                        if (_wcsicmp(pBase, loaderName) == 0) {
+                                            if (TerminateProcess(hOld, 0)) {
+                                                LoaderDiag("FIX25: killed old loader pid=%u (NtQSI, was DKOM hidden)\n", pid32);
+                                                killedByNtQSI++;
+                                            }
+                                        }
+                                    }
+                                    CloseHandle(hOld);
+                                }
+                            }
+                            if (spi->NextEntryOffset == 0) break;
+                            p += spi->NextEntryOffset;
+                        }
+                        if (killedByNtQSI == 0) {
+                            LoaderDiag("FIX25: NtQSI found no old loader (clean startup)\n");
+                        }
+                    } else {
+                        LoaderDiag("FIX25: NtQuerySystemInformation failed status=0x%08X retLen=%u\n", (unsigned)status, retLen);
+                    }
+                }
+            }
         }
     }
 
