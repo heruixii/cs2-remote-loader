@@ -1410,6 +1410,7 @@ static bool ResolveImportTable(HANDLE hProcess, void* remoteBase,
 //             ApplyCs2Patch 报 "mod not loaded" (GetModuleBaseFromPEB 在本进程找不到 client.dll).
 static uintptr_t g_patchAddr = 0;       // CS2 进程内 patch 地址 (跨进程访问)
 static bool g_cs2Patched = false;
+static bool g_patchReverted = false;  // ★ BUILD 567 v3.291: 移到全局, 供 CS2 重开路径访问
 // ★ BUILD 556: 移除 g_shadowPageTried (影子页方案已废弃, 降级到 VirtualProtect)
 // ★ BUILD 558 FIX-4: g_clientBase 类型从 uint8_t* 改为 uintptr_t (CS2 进程内地址)
 static uintptr_t g_clientBase = 0;  // ★ BUILD 555 P2-4: client.dll 基址缓存 (跨进程访问)
@@ -3751,13 +3752,74 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     //     物理页不被释放, driver 映射不失效, 不会蓝屏.
                     //     loader.exe 进程残留 (已被 DKOM 隐藏, 系统重启时自然清理).
                     //     副作用: 每次运行会留下一个隐藏的 loader.exe 进程, 但比蓝屏可接受.
+                    //   ★ v3.291 增强: 无限 Sleep 中检测 CS2 重新打开, 自动重新 attach + patch
+                    //     场景: 用户关闭 CS2 后重新打开 CS2, loader.exe 自动恢复透视功能
+                    //     实现: 每 5s 扫描 cs2.exe 进程, 发现新 PID 后重新初始化 + patch
                     DiagLog("B291:EXIT:entering infinite Sleep (avoid BSOD — driver mapping requires process alive)\n");
-                    while (true) {
-                        Sleep(60000);  // 60s 心跳, 避免被系统判定为僵尸进程
-                        DiagLog("B291:HB:still alive (infinite sleep, avoiding BSOD)\n");
+                    // ★ v3.291: CS2 重开检测循环
+                    //   注意: DisableAll 已关闭 driver 句柄 (kma.Shutdown), 但 driver 仍加载
+                    //   重新 attach 需要重新 Initialize BYOVD (复用已有 driver)
+                    bool cs2Reopened = false;
+                    while (!cs2Reopened) {
+                        Sleep(5000);  // 5s 扫描间隔
+                        // 扫描 cs2.exe 进程
+                        DWORD newCs2Pid = 0;
+                        {
+                            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+                            if (snap != INVALID_HANDLE_VALUE) {
+                                PROCESSENTRY32W pe = {};
+                                pe.dwSize = sizeof(pe);
+                                if (Process32FirstW(snap, &pe)) {
+                                    do {
+                                        // _wcsicmp 比较进程名 (cs2.exe)
+                                        if (_wcsicmp(pe.szExeFile, L"cs2.exe") == 0) {
+                                            newCs2Pid = pe.th32ProcessID;
+                                            break;
+                                        }
+                                    } while (Process32NextW(snap, &pe));
+                                }
+                                CloseHandle(snap);
+                            }
+                        }
+                        if (newCs2Pid) {
+                            DiagLog("B291:REOPEN:cs2.exe detected pid=%u — breaking sleep loop for re-attach\n", newCs2Pid);
+                            cs2Reopened = true;
+                        } else {
+                            DiagLog("B291:HB:still alive (waiting for CS2 reopen)\n");
+                        }
                     }
-                    // 不会执行到这里
-                    return 0;
+                    if (cs2Reopened) {
+                        // ★ CS2 重新打开 — 重新初始化并 patch
+                        //   注意: 不重新 Initialize BYOVD (driver 仍加载, 复用即可)
+                        //   只需重新 AttachToProcess + ApplyCs2Patch
+                        DiagLog("B291:REOPEN:re-attaching CS2...\n");
+                        // 重新 attach CS2 (用进程名)
+                        if (StealthEngine::Instance().AttachToProcess(L"cs2.exe")) {
+                            DiagLog("B291:REOPEN:attach OK\n");
+                            // 重置 patch 状态, 让主循环重新 patch
+                            g_cs2Patched = false;
+                            g_patchReverted = false;
+                            // 跳出 safe-exit 路径, 回到主循环
+                            // 注意: 不 return, 直接 break 出 if 块, 继续主循环
+                        } else {
+                            DiagLog("B291:REOPEN:attach FAIL — continue sleep\n");
+                            // attach 失败, 继续等待
+                        }
+                    }
+                    // 如果 cs2Reopened 但 attach 失败, 继续无限 Sleep
+                    if (!cs2Reopened || !StealthEngine::Instance().GetProcessHandle()) {
+                        DiagLog("B291:EXIT:fallback to infinite Sleep (re-attach failed)\n");
+                        while (true) {
+                            Sleep(60000);
+                            DiagLog("B291:HB:still alive (infinite sleep, re-attach failed)\n");
+                        }
+                    }
+                    // cs2Reopened && attach OK — 继续主循环 (不 return, 跳过下面的 return)
+                    DiagLog("B291:REOPEN:resuming main loop\n");
+                    // 跳过 return, 继续主循环 (需要重新初始化 cs2::Memory)
+                    // ★ 注意: 这里不直接 continue 主循环, 因为需要重新初始化 cs2::Memory
+                    //   简化方案: 让主循环自己处理 (g_cs2Patched=false 会触发重新 patch)
+                    //   但 cs2::Memory 需要重新 Initialize — 这个由主循环的 ApplyCs2Patch 内部处理
                 }
             }
         }
@@ -3945,7 +4007,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         //   截图检测: 1s → 5s (减少 NtQSI 调用频率)
         static DWORD lastPatchCheck = 0;
         static DWORD lastScreenshotCheck = 0;
-        static bool g_patchReverted = false;  // ★ BUILD 548: 移到前面, 供 patch 维护分支检查
+        // ★ BUILD 567 v3.291: g_patchReverted 已移到全局 (供 CS2 重开路径访问)
 
         // ★ BUILD 557: DR0 频率统计报告 — 每秒检查, 60s 后触发
         //   ReportDR0Frequency 内部检查 elapsed >= 60s 才真正执行, 提前调用是 no-op
