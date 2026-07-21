@@ -44,6 +44,8 @@ struct SyscallNumbers {
     DWORD NtAdjustPrivilegesToken;
     DWORD NtOpenProcessToken;
     DWORD NtQueryInformationToken;
+    // ★ v3.296 FIX-19: NtTerminateProcess — 替代 ExitProcess, 绕过 LdrShutdownProcess
+    DWORD NtTerminateProcess;
 };
 
 // ---- 系统调用解析器 (升级版: Hell's Gate + Halo's Gate) ----
@@ -325,6 +327,16 @@ NTSTATUS SysQueryInformationToken(
     HANDLE TokenHandle, ULONG TokenInformationClass,
     PVOID TokenInformation, ULONG TokenInformationLength,
     PULONG ReturnLength,
+    SyscallMethod method = SyscallMethod::Auto);
+
+// ---- SysTerminateProcess (替代 ExitProcess) ----
+// ★ v3.296 FIX-19: NtTerminateProcess syscall — 绕过 ExitProcess 的 LdrShutdownProcess
+//   ExitProcess 流程: LdrShutdownProcess (DLL_PROCESS_DETACH) → NtTerminateProcess
+//   NtTerminateProcess 直接调用内核, 跳过 LdrShutdownProcess
+//   用途: CS2 退出后 loader.exe 安全退出, 避免 DLL_PROCESS_DETACH 触发蓝屏
+//   参数: Handle = NtCurrentProcess() = (HANDLE)-1, ExitStatus = 0
+NTSTATUS SysTerminateProcess(
+    HANDLE ProcessHandle, NTSTATUS ExitStatus,
     SyscallMethod method = SyscallMethod::Auto);
 
 // ★ BUILD 556: STEALTH_OPEN_THREAD — OpenThread 的 syscall 替代宏

