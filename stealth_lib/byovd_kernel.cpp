@@ -10584,21 +10584,39 @@ void PvpAlivePatcher::Uninstall() {
     //         m_pwaCR3 指向的页表已被内核释放, VaToPa 读取已释放物理页 → 数据损坏风险.
     //   修复: 用 OpenProcess 检查进程是否存活, 已退出则跳过 Uninstall (PvpAlive.dll 已释放, 无需恢复).
     //   安全性: PvpAlive.dll 随完美平台进程退出而释放, 不恢复原始字节无影响.
+    //   ★ v3.296 FIX-10: OpenProcess 失败时用 Toolhelp32 验证进程是否存在
+    //     原因: OpenProcess 可能因权限不足返回 NULL (完美平台以更高权限运行),
+    //           误判为"进程已退出"跳过 Uninstall → PvpAlive.dll patch 未恢复 → 封号.
+    //     修复: OpenProcess 失败时用 CreateToolhelp32Snapshot 验证 PID 是否存在,
+    //           存在则继续 Uninstall (页表有效), 不存在则跳过.
     if (m_pwaPid) {
+        bool processAlive = false;
         HANDLE hCheck = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, m_pwaPid);
-        if (!hCheck) {
-            // 进程已退出或无权限 — 跳过 Uninstall
-            StateLog("PVP", "UninstallSkip", "pid=%u exited", m_pwaPid);
-            m_active = false;
-            m_patchedCount = 0;
-            return;
+        if (hCheck) {
+            DWORD exitCode = STILL_ACTIVE;
+            BOOL gotExit = GetExitCodeProcess(hCheck, &exitCode);
+            CloseHandle(hCheck);
+            processAlive = (!gotExit || exitCode == STILL_ACTIVE);
+        } else {
+            // OpenProcess 失败 — 用 Toolhelp32 验证进程是否存在
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (snap != INVALID_HANDLE_VALUE) {
+                PROCESSENTRY32W pe = {};
+                pe.dwSize = sizeof(pe);
+                if (Process32FirstW(snap, &pe)) {
+                    do {
+                        if (pe.th32ProcessID == m_pwaPid) {
+                            processAlive = true;
+                            break;
+                        }
+                    } while (Process32NextW(snap, &pe));
+                }
+                CloseHandle(snap);
+            }
         }
-        DWORD exitCode = STILL_ACTIVE;
-        BOOL gotExit = GetExitCodeProcess(hCheck, &exitCode);
-        CloseHandle(hCheck);
-        if (gotExit && exitCode != STILL_ACTIVE) {
+        if (!processAlive) {
             // 进程已退出 — 跳过 Uninstall
-            StateLog("PVP", "UninstallSkip", "pid=%u exit=%u", m_pwaPid, exitCode);
+            StateLog("PVP", "UninstallSkip", "pid=%u exited", m_pwaPid);
             m_active = false;
             m_patchedCount = 0;
             return;
