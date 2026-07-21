@@ -10076,14 +10076,14 @@ uint64_t PvpAlivePatcher::GetProcessCR3(DWORD pid) {
     // 确保 DKOM 偏移已解析 (pidOffset, linksOffset)
     auto& dkom = DKOMProcessHider::Instance();
     if (!dkom.EnsureOffsetsResolved(kma, ntBase)) {
-        ByovdDiag("PVP.CR3: FAIL EnsureOffsetsResolved\n");
+        StateLog("PVP", "CR3Fail", "step=EnsureOffsets ntBase=0x%llX", (unsigned long long)ntBase);
         return 0;
     }
 
     // 查找目标进程 EPROCESS
     uint64_t eproc = dkom.FindEPROCESSByPid(kma, pid);
     if (!eproc) {
-        ByovdDiag("PVP.CR3: FAIL FindEPROCESSByPid (pid=%u)\n", pid);
+        StateLog("PVP", "CR3Fail", "step=FindEPROC pid=%u", pid);
         return 0;
     }
 
@@ -10159,7 +10159,7 @@ uintptr_t PvpAlivePatcher::FindPvpAliveBase(DWORD pid, uint64_t cr3) {
         }
     }
     if (!pebVA) {
-        ByovdDiag("PVP.FindBase: FAIL PEB not found in EPROCESS (pid=%u)\n", pid);
+        StateLog("PVP", "FindBaseFail", "step=PEB pid=%u", pid);
         return 0;
     }
 
@@ -10167,8 +10167,7 @@ uintptr_t PvpAlivePatcher::FindPvpAliveBase(DWORD pid, uint64_t cr3) {
     PageTableWalker walker(cr3, kma);
     uint64_t pebPA = walker.VaToPa(pebVA);
     if (!pebPA) {
-        ByovdDiag("PVP.FindBase: FAIL PEB VA→PA translation (PEB=0x%llX)\n",
-            (unsigned long long)pebVA);
+        StateLog("PVP", "FindBaseFail", "step=PEB_VaToPa pebVA=0x%llX", (unsigned long long)pebVA);
         return 0;
     }
 
@@ -10303,29 +10302,32 @@ bool PvpAlivePatcher::PatchFunction(uint64_t cr3, uintptr_t pvpAliveBase,
 bool PvpAlivePatcher::Install() {
     if (m_active) return true;
 
-    ByovdDiag("PVP.Install: starting...\n");
+    // ★ v3.290 DIAG: 用 StateLog 替代 ByovdDiag (NDEBUG 下 ByovdDiag 被消除)
+    StateLog("PVP", "InstallStart", "");
 
     // 1. 查找完美平台 PID
     m_pwaPid = FindPerfectWorldPid();
     if (!m_pwaPid) {
-        ByovdDiag("PVP.Install: FAIL 完美平台 not found\n");
+        StateLog("PVP", "InstallFail", "step=FindPid 完美平台 not found");
         return false;
     }
-    ByovdDiag("PVP.Install: 完美平台 pid=%u\n", m_pwaPid);
+    StateLog("PVP", "InstallStep", "step=pid ok=%u", m_pwaPid);
 
     // 2. 获取 CR3
     m_pwaCR3 = GetProcessCR3(m_pwaPid);
     if (!m_pwaCR3) {
-        ByovdDiag("PVP.Install: FAIL GetProcessCR3\n");
+        StateLog("PVP", "InstallFail", "step=GetCR3 pid=%u", m_pwaPid);
         return false;
     }
+    StateLog("PVP", "InstallStep", "step=cr3 ok=0x%llX", (unsigned long long)m_pwaCR3);
 
     // 3. 查找 PvpAlive.dll 基址
     m_pvpAliveBase = FindPvpAliveBase(m_pwaPid, m_pwaCR3);
     if (!m_pvpAliveBase) {
-        ByovdDiag("PVP.Install: FAIL PvpAlive.dll not found (可能未加载)\n");
+        StateLog("PVP", "InstallFail", "step=FindBase PvpAlive.dll not loaded");
         return false;
     }
+    StateLog("PVP", "InstallStep", "step=base ok=0x%llX", (unsigned long long)m_pvpAliveBase);
 
     // 4. Patch 4 个函数
     m_patchedCount = 0;
@@ -10350,7 +10352,7 @@ bool PvpAlivePatcher::Install() {
         }
     }
 
-    ByovdDiag("PVP.Install: done (%d/4 patched)\n", m_patchedCount);
+    StateLog("PVP", "InstallDone", "patched=%d/4", m_patchedCount);
     m_active = (m_patchedCount > 0);
     return m_active;
 }

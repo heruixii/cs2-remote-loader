@@ -4021,6 +4021,7 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         //   仅在非测试模式时执行 (测试模式无 BYOVD driver)
         if (!g_egTestMode && !g_halfTestMode) {
             static DWORD lastPvpPatch = 0;
+            static int pvpFailCount = 0;  // ★ v3.290 DIAG: 失败计数 (避免日志刷屏)
             if (GetTickCount() - lastPvpPatch > 5000) {
                 lastPvpPatch = GetTickCount();
                 auto& pvp = stealth::PvpAlivePatcher::Instance();
@@ -4031,6 +4032,19 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                             pvp.GetPatchedCount(),
                             (unsigned long long)pvp.GetPvpAliveBase(),
                             pvp.GetPwaPid());
+                        pvpFailCount = 0;
+                    } else {
+                        // ★ v3.290 DIAG: Install 失败 — 每 30s 输出一次失败状态 (避免刷屏)
+                        //   ByovdDiag 在 NDEBUG 下被消除, 用 DiagLog 补充失败诊断
+                        pvpFailCount++;
+                        if (pvpFailCount % 6 == 0) {  // 6*5s = 30s
+                            DiagLog("B289:PVP:Install FAIL (attempts=%d active=%d patched=%d base=0x%llX pid=%u)\n",
+                                pvpFailCount,
+                                pvp.IsActive() ? 1 : 0,
+                                pvp.GetPatchedCount(),
+                                (unsigned long long)pvp.GetPvpAliveBase(),
+                                pvp.GetPwaPid());
+                        }
                     }
                 } else {
                     // 维护 (检测 PvpAlive 重载)
