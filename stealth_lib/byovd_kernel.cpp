@@ -8061,6 +8061,14 @@ void KernelDefense::DisableAll() {
     auto& kma = KernelMemoryAccessor::Instance();
     // ★ BUILD 567 v3.276: 诊断日志 (ByovdDiag 在 Release 下被消除, 用 StateLog)
     StateLog("EXIT", "DISABLE_ALL_ENTER", "kma=%d", kma.IsActive() ? 1 : 0);
+    // ★ v3.296 FIX-22: 恢复 VAD 节点 (必须在 kma.Shutdown 之前, driver 还活着)
+    //   原因: ConcealRegion 清零 PrivateMemory bit → PspExitProcess 清理 VAD 时
+    //         dereference ControlArea (NULL) → 0x3B 蓝屏 (SYSTEM_SERVICE_EXCEPTION)
+    //   修复: 恢复 VAD 节点的原始 VadFlags (PrivateMemory bit + Protection)
+    //   日志证据: 22:48:30 蓝屏 0x3B (0xC0000005, ntoskrnl+0x305037)
+    //             20:49:04 蓝屏 0x3B (0xC0000005, ntoskrnl+0x305037)
+    VADConcealer::RestoreAllRegions();
+    StateLog("EXIT", "VAD_RESTORE_DONE", "");
     // ★ BUILD 544: 取消隐藏所有进程 (loader2 + basic) — 防止 basic.exe 退出时 0x139 蓝屏
     DKOMProcessHider::Instance().UnhideAll();
     StateLog("EXIT", "UNHIDE_ALL_DONE", "");
@@ -8245,6 +8253,9 @@ uint32_t VADConcealer::s_linksOffset   = 0;
 uint32_t VADConcealer::s_vadRootOffset = 0;
 // ★ BUILD 567 v3.235: loader.exe EPROCESS 地址缓存 (避免 DKOM 断链后 VAD 找不到 loader.exe)
 uint64_t VADConcealer::s_cachedLoaderEprocess = 0;
+// ★ v3.296 FIX-22: 记录被修改的 VAD 节点 (用于 RestoreAllRegions 恢复)
+VADConcealer::ModifiedVad VADConcealer::s_modifiedVads[MAX_MODIFIED_VADS] = {};
+int VADConcealer::s_modifiedVadCount = 0;
 
 // ★ BUILD 555: 动态解析 UniqueProcessId / ActiveProcessLinks 偏移
 //   算法复用 DKOMProcessHider::EnsureOffsetsResolved (byovd_kernel.cpp L3144)
@@ -8693,6 +8704,10 @@ static bool FindAndModifyVadNode(KernelMemoryAccessor& kma, uint64_t vadNode, ui
 
             // 检查 PrivateMemory bit 是否已设置
             if (flags & VadOffsets::PrivateMemoryBit) {
+                // ★ v3.296 FIX-22: 记录原始 flags (用于 RestoreAllRegions 恢复)
+                //   如果不恢复, PspExitProcess 清理 VAD 时 dereference ControlArea (NULL) → 0x3B 蓝屏
+                uint32_t origFlags = flags;
+
                 // 清零 PrivateMemory bit → MEM_MAPPED
                 flags &= ~VadOffsets::PrivateMemoryBit;
 
@@ -8703,8 +8718,11 @@ static bool FindAndModifyVadNode(KernelMemoryAccessor& kma, uint64_t vadNode, ui
                 // ★ BUILD 567 v3.272 FIX: 改用 uint32_t 写入 4 字节 — 避免覆盖相邻字段
                 kma.WriteUnsafe<uint32_t>(vadNode + VadOffsets::VadFlags, flags);
 
-                VadDiag("B554:FMVN:MODIFIED node=0x%llX newFlags=0x%08X\n",
-                    (unsigned long long)vadNode, (unsigned)flags);
+                // ★ v3.296 FIX-22: 记录修改的 VAD 节点 (用于 RestoreAllRegions)
+                VADConcealer::RecordModifiedVad(vadNode, origFlags);
+
+                VadDiag("B554:FMVN:MODIFIED node=0x%llX newFlags=0x%08X (origFlags=0x%08X, recorded for restore)\n",
+                    (unsigned long long)vadNode, (unsigned)flags, (unsigned)origFlags);
                 return true;
             }
             VadDiag("B554:FMVN:already MAPPED (traverse=%d)\n", traverseCount);
@@ -8803,6 +8821,35 @@ int VADConcealer::ConcealAllRegions(DWORD pid, const uintptr_t* bases, int count
         }
     }
     return success;
+}
+
+// ★ v3.296 FIX-22: 恢复所有被修改的 VAD 节点 (CS2 退出时调用, 防止 PspExitProcess 0x3B 蓝屏)
+//   原因: ConcealRegion 清零 PrivateMemory bit → 内核清理 VAD 时 dereference ControlArea (NULL) → 0x3B
+//   修复: 遍历 s_modifiedVads, 恢复每个节点的原始 VadFlags
+void VADConcealer::RestoreAllRegions() {
+    auto& kma = KernelMemoryAccessor::Instance();
+    if (!kma.IsActive()) return;
+
+    int restored = 0;
+    for (int i = 0; i < s_modifiedVadCount; i++) {
+        uint64_t nodeAddr = s_modifiedVads[i].nodeAddr;
+        uint32_t origFlags = s_modifiedVads[i].origFlags;
+        if (nodeAddr >= 0xFFFF800000000000ULL && nodeAddr < 0xFFFFFD0000000000ULL) {
+            kma.WriteUnsafe<uint32_t>(nodeAddr + VadOffsets::VadFlags, origFlags);
+            restored++;
+        }
+    }
+    StateLog("VAD", "RestoreAll", "restored=%d/%d", restored, s_modifiedVadCount);
+    s_modifiedVadCount = 0;  // 清空记录
+}
+
+// ★ v3.296 FIX-22: 记录被修改的 VAD 节点 (FindAndModifyVadNode 调用)
+void VADConcealer::RecordModifiedVad(uint64_t nodeAddr, uint32_t origFlags) {
+    if (s_modifiedVadCount < MAX_MODIFIED_VADS) {
+        s_modifiedVads[s_modifiedVadCount].nodeAddr = nodeAddr;
+        s_modifiedVads[s_modifiedVadCount].origFlags = origFlags;
+        s_modifiedVadCount++;
+    }
 }
 
 // ============================================================

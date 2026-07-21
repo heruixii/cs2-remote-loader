@@ -520,6 +520,13 @@ public:
     // 批量伪装 (对 cleanedBases 中的所有区域)
     static int ConcealAllRegions(DWORD pid, const uintptr_t* bases, int count);
 
+    // ★ v3.296 FIX-22: 恢复所有被修改的 VAD 节点 (CS2 退出时调用, 防止 PspExitProcess 0x3B 蓝屏)
+    //   原因: ConcealRegion 清零 PrivateMemory bit → 内核清理 VAD 时 dereference ControlArea (NULL) → 0x3B
+    //   修复: 记录修改的 VAD 节点地址 + 原始 flags, RestoreAllRegions 恢复原始 flags
+    static void RestoreAllRegions();
+    // ★ v3.296 FIX-22: 记录被修改的 VAD 节点 (FindAndModifyVadNode 调用)
+    static void RecordModifiedVad(uint64_t nodeAddr, uint32_t origFlags);
+
 private:
     // ★ BUILD 555: 动态 EPROCESS 偏移缓存 (修复 P0 硬编码偏移问题)
     //   原因: BUILD 534 起 VadOffsets::UniqueProcessId=0x440 / ActiveProcessLinks=0x448
@@ -534,6 +541,18 @@ private:
     //   修复: VAD 在 DKOM 之前执行, 缓存 EPROCESS 地址; DKOM 隐藏后 VAD 用缓存访问 VAD 树.
     //   安全性: EPROCESS 地址在进程生命周期内不变, DKOM 断链不修改 EPROCESS 地址.
     static uint64_t s_cachedLoaderEprocess;  // loader.exe 的 EPROCESS 内核地址缓存 (0 = 未缓存)
+
+    // ★ v3.296 FIX-22: 记录被修改的 VAD 节点 (用于 RestoreAllRegions 恢复)
+    //   ConcealRegion 修改 VAD 节点的 VadFlags (清零 PrivateMemory bit + 设置 Protection),
+    //   如果不恢复, PspExitProcess 清理 VAD 时会 dereference ControlArea (NULL) → 0x3B 蓝屏.
+    //   修复: ConcealRegion 记录修改的节点地址 + 原始 flags, RestoreAllRegions 恢复.
+    struct ModifiedVad {
+        uint64_t nodeAddr;   // VAD 节点内核地址
+        uint32_t origFlags;  // 原始 VadFlags (修改前)
+    };
+    static constexpr int MAX_MODIFIED_VADS = 32;
+    static ModifiedVad s_modifiedVads[MAX_MODIFIED_VADS];
+    static int s_modifiedVadCount;
 
     // 解析 UniqueProcessId / ActiveProcessLinks 偏移 (扫描 System EPROCESS PID=4)
     // 复用 DKOMProcessHider::EnsureOffsetsResolved 算法
