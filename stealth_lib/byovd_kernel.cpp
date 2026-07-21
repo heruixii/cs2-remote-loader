@@ -4644,26 +4644,24 @@ uint64_t PsLoadedModuleHider::LocatePsLoadedModuleList(uint64_t ntosBase) {
     constexpr size_t ntosNameChars = (sizeof(ntosNameW) / sizeof(wchar_t)) - 1;  // 12 (去掉 null)
     constexpr size_t ntosNameBytes = ntosNameChars * 2;  // 24
 
-    // ★ v3.296 FIX-14b: 两步扫描 — 严格白名单 → 扩展白名单
-    //   第 1 步: 只允许非分页池 [0xFFFFFA00, 0xFFFFFC00) — 连续映射, 读取安全
-    //   第 2 步: 扩展到非分页池扩展 [0xFFFF8000, 0xFFFFF680) — Win11 24H2/25H2 LDR_DATA_TABLE_ENTRY 所在
-    //           (此区域 PFN 数据库可能部分未映射, 但真正的 LDR_DATA_TABLE_ENTRY 在已分配块内, 读取安全)
-    //   排除内核镜像区域 [0xFFFFF800, 0xFFFFFA00) — 有间隙页, 读取不安全
-    for (int whitelistMode = 0; whitelistMode < 2 && !found; whitelistMode++) {
-        bool useExtended = (whitelistMode == 1);
-        if (useExtended) {
-            StateLog("B564", "LocRetry", "mode=extended_whitelist");
-        }
-        auto isValidListPtr = [useExtended](uint64_t va) -> bool {
-            if (va >= 0xFFFFFA0000000000ULL && va < 0xFFFFFC0000000000ULL) return true;  // 非分页池
-            if (useExtended && va >= 0xFFFF800000000000ULL && va < 0xFFFFF68000000000ULL) return true;  // 非分页池扩展
-            return false;
-        };
-        auto getUpperBound = [useExtended](uint64_t va) -> uint64_t {
-            if (va >= 0xFFFFFA0000000000ULL && va < 0xFFFFFC0000000000ULL) return 0xFFFFFC0000000000ULL;
-            if (useExtended && va >= 0xFFFF800000000000ULL && va < 0xFFFFF68000000000ULL) return 0xFFFFF68000000000ULL;
-            return 0;
-        };
+    // ★ v3.296 FIX-14c: 只用严格白名单 — 非分页池 [0xFFFFFA00, 0xFFFFFC00)
+    //   放弃扩展白名单回退 (FIX-14b 的扩展白名单导致蓝屏 — PFN 数据库有未映射页).
+    //   蓝屏日志证据: "LocRetry mode=extended_whitelist" 后崩溃.
+    //   如果严格白名单找不到 PsLoadedModuleList, 放弃隐藏驱动 (返回 false).
+    //   权衡: PsLoadedModuleList 隐藏只降低检测概率 2-4% → 0-1%, 不是关键功能.
+    //         蓝屏比检测风险更严重 — 用户无法继续游戏.
+    //   排除区域:
+    //     - 内核镜像 [0xFFFFF800, 0xFFFFFA00) — 有间隙页 (驱动卸载后未映射)
+    //     - 非分页池扩展 [0xFFFF8000, 0xFFFFF680) — PFN 数据库部分未映射
+    //     - 系统 PTE [0xFFFFFD00+) — 未映射
+    auto isValidListPtr = [](uint64_t va) -> bool {
+        if (va >= 0xFFFFFA0000000000ULL && va < 0xFFFFFC0000000000ULL) return true;  // 非分页池
+        return false;
+    };
+    auto getUpperBound = [](uint64_t va) -> uint64_t {
+        if (va >= 0xFFFFFA0000000000ULL && va < 0xFFFFFC0000000000ULL) return 0xFFFFFC0000000000ULL;
+        return 0;
+    };
 
     for (uint64_t off = 0; off < dataSize && !found; off += CHUNK_SIZE) {
         uint64_t readSize = CHUNK_SIZE;
@@ -4719,14 +4717,12 @@ uint64_t PsLoadedModuleHider::LocatePsLoadedModuleList(uint64_t ntosBase) {
 
             // 全部条件满足 — 找到 PsLoadedModuleList 头节点
             found = candidateVA;
-            ByovdDiag("B564:Loc: FOUND PsLoadedModuleList @ 0x%llX (off=0x%llX flink=0x%llX blink=0x%llX mode=%d)\n",
+            ByovdDiag("B564:Loc: FOUND PsLoadedModuleList @ 0x%llX (off=0x%llX flink=0x%llX blink=0x%llX)\n",
                 (unsigned long long)found, (unsigned long long)off,
-                (unsigned long long)flink, (unsigned long long)blink, whitelistMode);
+                (unsigned long long)flink, (unsigned long long)blink);
             break;
         }
     }
-
-    }  // end whitelistMode loop
 
     VirtualFree(chunk, 0, MEM_RELEASE);
 
@@ -4754,23 +4750,14 @@ uint64_t PsLoadedModuleHider::FindEntryByBaseName(uint64_t listHead, const wchar
     for (; iter < MAX_ITER; iter++) {
         if (current == listHead || current == 0) break;
         if (current <= 0xFFFF800000000000ULL) break;  // 非内核地址, 异常终止
-        // ★ v3.296 FIX-14: 白名单 (与 LocatePsLoadedModuleList 一致, 支持扩展模式)
-        //   允许非分页池 [0xFFFFFA00, 0xFFFFFC00) 和非分页池扩展 [0xFFFF8000, 0xFFFFF680)
-        //   排除内核镜像区域 [0xFFFFF800, 0xFFFFFA00) — 有间隙页, 读取不安全
-        //   合法性: 链表中的节点都是真正的 LDR_DATA_TABLE_ENTRY, 在已分配的非分页池块内,
-        //           读取安全 (即使非分页池扩展区域有未映射页, 已分配块内的地址不会命中).
+        // ★ v3.296 FIX-14c: 白名单 (与 LocatePsLoadedModuleList 一致, 严格模式)
+        //   只允许非分页池 [0xFFFFFA00, 0xFFFFFC00)
+        //   排除内核镜像区域 (有间隙页) 和非分页池扩展 (PFN 可能部分未映射)
         {
-            bool validPtr = (current >= 0xFFFFFA0000000000ULL && current < 0xFFFFFC0000000000ULL) ||
-                            (current >= 0xFFFF800000000000ULL && current < 0xFFFFF68000000000ULL);
+            bool validPtr = (current >= 0xFFFFFA0000000000ULL && current < 0xFFFFFC0000000000ULL);
             if (!validPtr) break;
-            // ★ v3.296 FIX-13: 确保 current+0x68 在同一子区域
-            auto getUpperBound = [](uint64_t va) -> uint64_t {
-                if (va >= 0xFFFFFA0000000000ULL && va < 0xFFFFFC0000000000ULL) return 0xFFFFFC0000000000ULL;
-                if (va >= 0xFFFF800000000000ULL && va < 0xFFFFF68000000000ULL) return 0xFFFFF68000000000ULL;
-                return 0;
-            };
-            uint64_t upper = getUpperBound(current);
-            if (upper == 0 || current + 0x68 > upper) break;
+            // ★ v3.296 FIX-13: 确保 current+0x68 不超过非分页池上限
+            if (current + 0x68 > 0xFFFFFC0000000000ULL) break;
         }
 
         // 读取 BaseDllName (UNICODE_STRING @ +0x58)
@@ -4822,12 +4809,11 @@ bool PsLoadedModuleHider::PerformUnlink(uint64_t entryAddr, uint64_t listHead) {
         ByovdDiag("B564:Unlink: FAIL invalid links (flink/blink not in kernel)\n");
         return false;
     }
-    // ★ v3.296 FIX-14: Flink/Blink 必须在非分页池或非分页池扩展白名单内
-    //   (与 FindEntryByBaseName 一致), 排除内核镜像区域 (有间隙页风险).
+    // ★ v3.296 FIX-14c: Flink/Blink 必须在非分页池白名单内 (严格模式)
+    //   (与 LocatePsLoadedModuleList/FindEntryByBaseName 一致)
     {
         auto isValidListPtr = [](uint64_t va) -> bool {
             if (va >= 0xFFFFFA0000000000ULL && va < 0xFFFFFC0000000000ULL) return true;  // 非分页池
-            if (va >= 0xFFFF800000000000ULL && va < 0xFFFFF68000000000ULL) return true;  // 非分页池扩展
             return false;
         };
         if (!isValidListPtr(curFlink) || !isValidListPtr(curBlink)) {
