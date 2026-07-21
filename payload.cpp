@@ -3784,155 +3784,22 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                         stealth::PvpAlivePatcher::Instance().Uninstall();
                     }
                     stealth::KernelDefense::DisableAll();  // ★ v3.279: DisableAll (UnhideAll + kma.Shutdown)
-                    // ★ BUILD 567 v3.291 FIX: 进程退出蓝屏终极修复 — 不退出, 进入无限 Sleep
-                    //   历史尝试 (全部蓝屏):
-                    //     v3.286/v3.287: taskkill /f (外部 TerminateProcess) → 蓝屏
-                    //     v3.288: TerminateProcess(self) → 蓝屏
-                    //     v3.290: ExitProcess(0) → 蓝屏
-                    //   根因 (终极确认):
-                    //     BYOVD driver (RTCore64) 通过 IOCTL 在内核态 MmMapIoSpace 映射了
-                    //     loader.exe 的物理页. kma.Shutdown() 只关闭用户态句柄, driver 内核态
-                    //     映射未释放 (BUILD 470 策略: 不卸载 driver; BUILD 474: NtUnloadDriver
-                    //     在 manual-mapped DLL 上下文会 ACCESS_VIOLATION, 无法安全卸载).
-                    //     任何进程退出方式 (TerminateProcess/ExitProcess/taskkill) 最终都走
-                    //     PspExitProcess → 释放 loader.exe 用户态物理页 → driver 内部缓存的
-                    //     映射指向已释放物理页 → 后续访问蓝屏.
-                    //   v3.291 终极修复: CS2 退出后, loader.exe 不退出, 进入无限 Sleep.
-                    //     物理页不被释放, driver 映射不失效, 不会蓝屏.
-                    //     loader.exe 进程残留 (已被 DKOM 隐藏, 系统重启时自然清理).
-                    //     副作用: 每次运行会留下一个隐藏的 loader.exe 进程, 但比蓝屏可接受.
-                    //   ★ v3.291 增强: 无限 Sleep 中检测 CS2 重新打开, 自动重新 attach + patch
-                    //     场景: 用户关闭 CS2 后重新打开 CS2, loader.exe 自动恢复透视功能
-                    //     实现: 每 5s 扫描 cs2.exe 进程, 发现新 PID 后重新初始化 + patch
-                    DiagLog("B291:EXIT:entering wait loop (CS2 reopen or safe exit)\n");
-                    // ★ v3.296 SAFE-EXIT: 不再无限 Sleep, 支持安全退出
-                    //   背景: v3.291 因担心蓝屏用无限 Sleep (进程残留, 需重启清理).
-                    //   分析: 当前用 PDFWKRNL.sys (kernel VA memcpy), 不涉及 MmMapIoSpace,
-                    //         v3.291 的"物理页映射"蓝屏分析基于旧 RTCore64.sys, 不适用.
-                    //         DKOM 用 self-loop 恢复 (v3.277), 进程退出时 RemoveEntryList 是 no-op.
-                    //         所有清理 (UnhideAll/NtReadHooker/PvpAlive/kma.Shutdown) 已完成.
-                    //   退出条件 (任一满足):
-                    //     1. CS2 重开 → 重新 attach + patch (保留原功能)
-                    //     2. %TEMP%\loader_exit.flag 文件存在 → 用户手动触发安全退出
-                    //     3. 超时 120s 未重开 → 自动安全退出 (避免进程长期残留)
-                    //   退出方式: ExitProcess(0) — 所有内核状态已恢复, 不会蓝屏
-                    //   注意: DisableAll 已关闭 driver 句柄 (kma.Shutdown), 但 driver 仍加载
-                    //         重新 attach 需要重新 Initialize BYOVD (复用已有 driver)
-                    bool cs2Reopened = false;
-                    DWORD waitStartTick = GetTickCount();
-                    DWORD safeExitTimeout = 120000;  // 120s 超时
-                    while (!cs2Reopened) {
-                        Sleep(5000);  // 5s 扫描间隔
-                        DWORD elapsed = GetTickCount() - waitStartTick;
-
-                        // ★ 退出条件 2: 检测退出标志文件
-                        wchar_t exitFlagPath[MAX_PATH];
-                        GetTempPathW(MAX_PATH, exitFlagPath);
-                        wcscat_s(exitFlagPath, L"loader_exit.flag");
-                        DWORD attr = GetFileAttributesW(exitFlagPath);
-                        if (attr != INVALID_FILE_ATTRIBUTES) {
-                            DiagLog("B291:EXIT:loader_exit.flag detected — safe exit\n");
-                            DeleteFileW(exitFlagPath);  // 清理标志文件
-                            ExitProcess(0);
-                        }
-
-                        // ★ 退出条件 3: 超时自动退出
-                        if (elapsed >= safeExitTimeout) {
-                            DiagLog("B291:EXIT:timeout %us — safe exit\n", (unsigned)(elapsed / 1000));
-                            ExitProcess(0);
-                        }
-
-                        // 扫描 cs2.exe 进程
-                        DWORD newCs2Pid = 0;
-                        {
-                            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-                            if (snap != INVALID_HANDLE_VALUE) {
-                                PROCESSENTRY32W pe = {};
-                                pe.dwSize = sizeof(pe);
-                                if (Process32FirstW(snap, &pe)) {
-                                    do {
-                                        // _wcsicmp 比较进程名 (cs2.exe)
-                                        if (_wcsicmp(pe.szExeFile, L"cs2.exe") == 0) {
-                                            newCs2Pid = pe.th32ProcessID;
-                                            break;
-                                        }
-                                    } while (Process32NextW(snap, &pe));
-                                }
-                                CloseHandle(snap);
-                            }
-                        }
-                        if (newCs2Pid) {
-                            DiagLog("B291:REOPEN:cs2.exe detected pid=%u — breaking sleep loop for re-attach\n", newCs2Pid);
-                            cs2Reopened = true;
-                        } else {
-                            DiagLog("B291:HB:still alive (waiting %us/%us for CS2 reopen)\n",
-                                    (unsigned)(elapsed / 1000), (unsigned)(safeExitTimeout / 1000));
-                        }
-                    }
-                    if (cs2Reopened) {
-                        // ★ CS2 重新打开 — 重新初始化并 patch
-                        //   注意: 不重新 Initialize BYOVD (driver 仍加载, 复用即可)
-                        //   只需重新 AttachToProcess + ApplyCs2Patch
-                        DiagLog("B291:REOPEN:re-attaching CS2...\n");
-                        // 重新 attach CS2 (用进程名)
-                        if (StealthEngine::Instance().AttachToProcess(L"cs2.exe")) {
-                            DiagLog("B291:REOPEN:attach OK\n");
-                            // 重置 patch 状态, 让主循环重新 patch
-                            g_cs2Patched = false;
-                            g_patchReverted = false;
-                            // ★ v3.296 FIX: CS2 重开时立即检查中和状态
-                            //   原因: g_pacNeutralized 可能是 30-45s 前的旧值,
-                            //         CS2 重开期间 PAC 可能已恢复 Operations.
-                            //   主循环 5s 内会尝试 patch, 必须确保 g_pacNeutralized 是最新值.
-                            // ★ v3.296 FIX-5: PAC 未加载时 g_pacNeutralized=true (patch 安全)
-                            if (stealth::KernelMemoryAccessor::Instance().IsActive()) {
-                                char mtName[32];
-                                STEALTH_STR_DECRYPT_TO("MessageTransfer.sys", mtName, sizeof(mtName));
-                                uint64_t mtBase = stealth::KernelMemoryAccessor::Instance().GetKernelModuleBase(mtName);
-                                SecureZeroMemory(mtName, sizeof(mtName));
-                                if (mtBase) {
-                                    g_pacNeutralized = stealth::MinifilterNeutralizer::IsMessageTransferNeutralized();
-                                } else {
-                                    g_pacNeutralized = true;  // PAC 未加载, patch 安全
-                                }
-                                DiagLog("B291:REOPEN:pac=%d\n", g_pacNeutralized ? 1 : 0);
-                            }
-                            // 跳出 safe-exit 路径, 回到主循环
-                            // 注意: 不 return, 直接 break 出 if 块, 继续主循环
-                        } else {
-                            DiagLog("B291:REOPEN:attach FAIL — continue sleep\n");
-                            // attach 失败, 继续等待
-                        }
-                    }
-                    // 如果 cs2Reopened 但 attach 失败, 等待超时后安全退出
-                    if (!cs2Reopened || !StealthEngine::Instance().GetProcessHandle()) {
-                        DiagLog("B291:EXIT:fallback to wait loop (re-attach failed, will exit on timeout)\n");
-                        DWORD fallbackStart = GetTickCount();
-                        while (true) {
-                            Sleep(10000);
-                            DWORD elapsed = GetTickCount() - fallbackStart;
-                            // ★ 退出标志文件检测
-                            wchar_t exitFlagPath[MAX_PATH];
-                            GetTempPathW(MAX_PATH, exitFlagPath);
-                            wcscat_s(exitFlagPath, L"loader_exit.flag");
-                            if (GetFileAttributesW(exitFlagPath) != INVALID_FILE_ATTRIBUTES) {
-                                DeleteFileW(exitFlagPath);
-                                DiagLog("B291:EXIT:loader_exit.flag (fallback) — safe exit\n");
-                                ExitProcess(0);
-                            }
-                            if (elapsed >= 60000) {  // 60s 超时
-                                DiagLog("B291:EXIT:fallback timeout %us — safe exit\n", (unsigned)(elapsed / 1000));
-                                ExitProcess(0);
-                            }
-                            DiagLog("B291:HB:still alive (fallback %us/60s)\n", (unsigned)(elapsed / 1000));
-                        }
-                    }
-                    // cs2Reopened && attach OK — 继续主循环 (不 return, 跳过下面的 return)
-                    DiagLog("B291:REOPEN:resuming main loop\n");
-                    // 跳过 return, 继续主循环 (需要重新初始化 cs2::Memory)
-                    // ★ 注意: 这里不直接 continue 主循环, 因为需要重新初始化 cs2::Memory
-                    //   简化方案: 让主循环自己处理 (g_cs2Patched=false 会触发重新 patch)
-                    //   但 cs2::Memory 需要重新 Initialize — 这个由主循环的 ApplyCs2Patch 内部处理
+                    // ★ BUILD 567 v3.296 SAFE-EXIT: CS2 退出后 loader.exe 直接退出
+                    //   历史:
+                    //     v3.286-v3.290: 各种退出方式蓝屏 (基于旧 RTCore64.sys, MmMapIoSpace 映射物理页)
+                    //     v3.291:        无限 Sleep 规避蓝屏 (进程残留, 需重启清理)
+                    //     v3.296:        安全退出 (等待重开/标志文件/超时)
+                    //   v3.296-final 简化: CS2 退出 → 直接 ExitProcess(0)
+                    //   安全性分析 (与 v3.296 SAFE-EXIT 相同):
+                    //     1. 当前用 PDFWKRNL.sys (kernel VA memcpy), 不涉及 MmMapIoSpace,
+                    //        v3.291 的"物理页映射"蓝屏分析基于旧 RTCore64.sys, 不适用.
+                    //     2. DKOM 用 self-loop 恢复 (v3.277), 进程退出时 RemoveEntryList 是 no-op,
+                    //        不会 0x139 也不会 0x50.
+                    //     3. 所有清理已完成 (UnhideAll + NtReadHooker::Uninstall +
+                    //        PvpAlivePatcher::Uninstall + kma.Shutdown), 内核状态已恢复.
+                    //   使用方式: 关闭 CS2 → loader.exe 自动退出. 重新运行 loader.exe 即可.
+                    DiagLog("B291:EXIT:safe exit (CS2 closed, all cleanup done)\n");
+                    ExitProcess(0);
                 }
             }
         }
