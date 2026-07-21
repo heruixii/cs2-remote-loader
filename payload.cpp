@@ -3810,35 +3810,31 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                         stealth::PvpAlivePatcher::Instance().Uninstall();
                     }
                     stealth::KernelDefense::DisableAll();  // ★ v3.279: DisableAll (UnhideAll + kma.Shutdown)
-                    // ★ BUILD 567 v3.296 FIX-19: CS2 退出后用 NtTerminateProcess 替代 ExitProcess
+                    // ★ BUILD 567 v3.296 FIX-21: CS2 退出后无限 Sleep — 避免 PspExitProcess 蓝屏
                     //   历史:
                     //     v3.286-v3.290: 各种退出方式蓝屏 (基于旧 RTCore64.sys, MmMapIoSpace 映射物理页)
                     //     v3.291:        无限 Sleep 规避蓝屏 (进程残留, 需重启清理)
                     //     v3.296:        ExitProcess(0) — 20:48:36 测试蓝屏 (PspExitProcess 触发)
-                    //   v3.296 FIX-19: NtTerminateProcess — 绕过 ExitProcess 的 LdrShutdownProcess
-                    //   根因: ExitProcess(0) 流程:
-                    //           1. LdrShutdownProcess (DLL_PROCESS_DETACH) — 可能触发蓝屏
-                    //              (manual-mapped DLL 的 DLL_PROCESS_DETACH 访问已释放内存)
-                    //           2. NtTerminateProcess (内核终止) — 可能触发 PspExitProcess 蓝屏
-                    //   修复: 直接调用 NtTerminateProcess(NtCurrentProcess(), 0),
-                    //         跳过 LdrShutdownProcess (DLL_PROCESS_DETACH).
-                    //         如果 NtTerminateProcess 也蓝屏, 则回退到无限 Sleep.
-                    //   优势: 不残留进程 (与无限 Sleep 相比), 可直接重新运行 loader.exe.
+                    //     v3.296 FIX-19: NtTerminateProcess — 22:48:02 测试仍然蓝屏 (PspExitProcess 触发)
+                    //   v3.296 FIX-21: 回退到无限 Sleep (v3.291 策略) + 新 loader 清理旧进程
+                    //   根因: NtTerminateProcess(-1, 0) → PspExitProcess 蓝屏.
+                    //         日志显示所有清理完成 (UNHIDE_ALL_DONE + KMA_SHUTDOWN_DONE),
+                    //         但 PspExitProcess 本身触发蓝屏.
+                    //         可能原因:
+                    //           1. PatchGuard 检测到修改的内核结构 (NULLed callbacks)
+                    //           2. 内核回调访问已释放内存
+                    //           3. DKOM 恢复不完整 (ActiveProcessLinks 链表状态异常)
+                    //   修复: CS2 退出后无限 Sleep, 不调用任何退出函数.
+                    //         新 loader.exe 启动时检测并清理旧 loader 进程.
+                    //   副作用: loader.exe 进程残留, 但 DKOM 已恢复 (UnhideAll), 进程可见.
+                    //           新 loader 启动时会用 TerminateProcess 清理旧进程
+                    //           (旧进程在 Sleep 中, 不访问内核资源, TerminateProcess 安全).
                     //   安全性: 所有内核清理已完成 (driver 句柄已关闭, DKOM 已恢复),
-                    //           NtTerminateProcess 只做进程终止, 不访问 minifilter/driver.
-                    DiagLog("B291:EXIT:safe exit via NtTerminateProcess (CS2 closed, all cleanup done)\n");
-                    // ★ v3.296 FIX-19: NtTerminateProcess(NtCurrentProcess(), 0)
-                    //   NtCurrentProcess() = (HANDLE)-1 (伪句柄, 指向当前进程)
-                    //   跳过 LdrShutdownProcess, 直接内核终止
-                    {
-                        NTSTATUS termStatus = stealth::SysTerminateProcess((HANDLE)-1, 0);
-                        DiagLog("B291:EXIT:NtTerminateProcess returned 0x%lX (unexpected — should not return)\n",
-                                (unsigned long)termStatus);
-                        // 如果 NtTerminateProcess 返回 (不应该), 回退到无限 Sleep
-                        DiagLog("B291:EXIT:fallback to infinite Sleep\n");
-                        while (true) {
-                            Sleep(0xFFFFFFFF);
-                        }
+                    //           无限 Sleep 不访问任何内核资源, 不会蓝屏.
+                    DiagLog("B291:EXIT:safe sleep (CS2 closed, all cleanup done, avoiding PspExitProcess BSOD)\n");
+                    // ★ v3.296 FIX-21: 无限 Sleep — 不调用 ExitProcess/NtTerminateProcess
+                    while (true) {
+                        Sleep(0xFFFFFFFF);  // ~49.7 天, 实际上无限
                     }
                 }
             }

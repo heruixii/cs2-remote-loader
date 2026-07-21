@@ -15,6 +15,7 @@
 #include <windows.h>
 #include <wininet.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
 #pragma comment(lib, "wininet.lib")
 #include <cstdint>
 #include <cstdio>
@@ -575,7 +576,43 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     //   怀疑 CRT 初始化覆盖了 UEH, 或崩溃走 fast-fail 路径绕过 UEH.
     //   VEH 在 KiUserExceptionDispatcher 流程中先于 UEH 调用, 能捕获更多异常类型.
     AddVectoredExceptionHandler(0 /*最后调用, 不阻塞 SEH/VEH 链*/, LoaderVehHandler);
-    LoaderDiag("=== LOADER v3.292 START (BUILD 567: IAT RVA fix + SelfDelete removed + EnableAll BSOD diag) ===\n");
+    LoaderDiag("=== LOADER v3.296 FIX-21 START (BUILD 567: infinite Sleep + old loader cleanup) ===\n");
+
+    // ★ v3.296 FIX-21: 清理旧 loader.exe 进程 (CS2 退出后旧 loader 进入无限 Sleep)
+    //   原因: v3.296 FIX-21 策略 — CS2 退出后旧 loader 不退出 (无限 Sleep, 避免 PspExitProcess 蓝屏).
+    //         新 loader 启动时必须清理旧进程, 否则多个 loader 实例冲突.
+    //   安全性: 旧 loader 在 Sleep 中, 不访问内核资源, TerminateProcess 安全.
+    //           旧 loader 的 DKOM 已恢复 (UnhideAll), 进程可见, 可被 TerminateProcess.
+    //           旧 loader 的 driver 句柄已关闭 (kma.Shutdown), 无内核回调风险.
+    {
+        DWORD currentPid = GetCurrentProcessId();
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe = {};
+            pe.dwSize = sizeof(pe);
+            wchar_t exeName[MAX_PATH] = {};
+            GetModuleFileNameW(NULL, exeName, MAX_PATH);
+            // 提取文件名 (不含路径)
+            wchar_t* baseName = wcsrchr(exeName, L'\\');
+            const wchar_t* loaderName = baseName ? baseName + 1 : exeName;
+            if (Process32FirstW(snap, &pe)) {
+                do {
+                    if (pe.th32ProcessID == currentPid) continue;  // 跳过自己
+                    if (_wcsicmp(pe.szExeFile, loaderName) == 0) {
+                        // 找到旧 loader 进程 — 终止
+                        HANDLE hOld = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+                        if (hOld) {
+                            if (TerminateProcess(hOld, 0)) {
+                                LoaderDiag("FIX21: killed old loader pid=%u\n", pe.th32ProcessID);
+                            }
+                            CloseHandle(hOld);
+                        }
+                    }
+                } while (Process32NextW(snap, &pe));
+            }
+            CloseHandle(snap);
+        }
+    }
 
     // v3.37: 强制管理员权限 — 自动以 runas + --elevated 重新启动
     LoaderDiag("STEP1: EnsureAdminPrivileges...\n");
