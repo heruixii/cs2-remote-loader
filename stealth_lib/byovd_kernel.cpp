@@ -5530,6 +5530,10 @@ static uint64_t FindFilterByStringScan(uint64_t fltmgrBase, uint64_t fltGlobals,
     uint16_t targetByteLen = (uint16_t)(targetNameLen * 2);
 
     // 遍历每个 FLTP_FRAME 候选
+    int validFrameCount = 0;
+    int validListCount = 0;
+    int filterEntryCount = 0;
+    int flagsMatchCount = 0;
     for (int qi = 0; qi < 16; qi++) {
         uint64_t frame = globQw[qi];
         if (frame < 0xFFFF800000000000ULL) continue;
@@ -5538,6 +5542,7 @@ static uint64_t FindFilterByStringScan(uint64_t fltmgrBase, uint64_t fltGlobals,
         uint64_t firstQw = 0;
         if (!kma.ReadKernelVA(frame, &firstQw, 8)) continue;
         if (firstQw < 0xFFFF800000000000ULL) continue;
+        validFrameCount++;
 
         // 尝试每个 FilterList 偏移
         for (uint64_t flOff : filterListOffsets) {
@@ -5547,10 +5552,13 @@ static uint64_t FindFilterByStringScan(uint64_t fltmgrBase, uint64_t fltGlobals,
             if (!kma.ReadKernelVA(listHead + 8, &blink, 8)) continue;
             if (flink == listHead || flink < 0xFFFF800000000000ULL ||
                 blink < 0xFFFF800000000000ULL) continue;
+            validListCount++;
 
             // 遍历 FilterList 链表
             uint64_t cur = flink;
+            int entryCount = 0;
             for (int iter = 0; iter < 100 && cur && cur != listHead; iter++) {
+                entryCount++;
                 // ★ v3.296: PrimaryLink.Flink 在 FLT_OBJECT+0x10
                 //   所以 FLT_FILTER 基址 = cur - 0x10
                 uint64_t filterBase = cur - 0x10;
@@ -5580,6 +5588,8 @@ static uint64_t FindFilterByStringScan(uint64_t fltmgrBase, uint64_t fltGlobals,
                         continue;
                     }
                 }
+                flagsMatchCount++;
+                filterEntryCount++;
 
                 // 读取 Name (UNICODE_STRING: Length, MaxLength, Buffer)
                 // ★ v3.296: 优先尝试标准偏移 0x38, 失败时尝试其他偏移
@@ -5635,7 +5645,10 @@ static uint64_t FindFilterByStringScan(uint64_t fltmgrBase, uint64_t fltGlobals,
         }
     }
 
-    StateLog("FLT", "StrScanNoFilter", "traversed all frames");
+    // ★ v3.296 DIAG: 汇总诊断 — Release 模式可见
+    StateLog("FLT", "StrScanNoFilter",
+             "frames=%d lists=%d entries=%d flagsMatch=%d",
+             validFrameCount, validListCount, filterEntryCount, flagsMatchCount);
     ByovdDiag("FLT:STRSCAN: no matching FLT_FILTER found in any frame\n");
     return 0;
 }

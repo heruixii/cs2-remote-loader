@@ -4136,7 +4136,15 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
         //   开销: GetKernelModuleBase ~2 IOCTL, 仅在 g_pacNeutralized=true 且 !g_cs2Patched 时执行.
         if (GetTickCount() - lastPatchCheck > 5000) {
             if (!g_cs2Patched && g_pacNeutralized) {
+                // ★ v3.296: 封号防护 — 只在 g_pacNeutralized=true 时才考虑 patch
+                //   中和失败时 g_pacNeutralized=false → 跳过 patch → 防止 minifilter 扫描发现 patch 封号
+                //   g_pacNeutralized 由 ReapplyAllCallbacks (30-45s) 或 GuardPac 更新
+                //   中和成功后自动补 patch
                 // ★ v3.296 FIX-2: 防止 PAC 延迟加载 — 检查 MessageTransfer.sys
+                //   场景: EnableAll 时 PAC 未加载 (pacStatus=NotInstalled, g_pacNeutralized=true),
+                //         但 PAC 在 10s 后加载 → minifilter 活跃 → 主循环 5s 内 ApplyCs2Patch → 封号.
+                //   修复: patch 前检查 MessageTransfer.sys 是否已加载, 若已加载则验证中和状态.
+                //   开销: GetKernelModuleBase ~2 IOCTL, 仅在 g_pacNeutralized=true 且 !g_cs2Patched 时执行.
                 if (stealth::KernelMemoryAccessor::Instance().IsActive()) {
                     char mtName[32];
                     STEALTH_STR_DECRYPT_TO("MessageTransfer.sys", mtName, sizeof(mtName));
