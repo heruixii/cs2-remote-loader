@@ -5214,6 +5214,8 @@ static uint64_t ScanDataSectionForFltGlobals(uint64_t fltmgrBase) {
     uint8_t* chunk = (uint8_t*)VirtualAlloc(nullptr, 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!chunk) {
         ByovdDiag("FLT:NTRL: .data scan - VirtualAlloc for chunk failed\n");
+        // ★ v3.296 FIX-12: 释放之前分配的 sections (L5170), 避免内存泄漏
+        VirtualFree(sections, 0, MEM_RELEASE);
         return 0;
     }
 
