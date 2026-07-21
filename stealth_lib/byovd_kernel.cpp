@@ -10650,6 +10650,45 @@ bool PvpAlivePatcher::Maintain() {
         return Install();
     }
 
+    // ★ v3.296 FIX-11: 验证完美平台进程是否仍在运行
+    //   原因: Maintain 用 m_pwaCR3 翻译页表, 如果完美平台进程已退出,
+    //         m_pwaCR3 指向已释放的页表, VaToPa 读取已释放物理页 → 数据损坏.
+    //   修复: 用 OpenProcess + Toolhelp32 验证进程存活, 已退出则标记 inactive.
+    if (m_pwaPid) {
+        bool processAlive = false;
+        HANDLE hCheck = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, m_pwaPid);
+        if (hCheck) {
+            DWORD exitCode = STILL_ACTIVE;
+            BOOL gotExit = GetExitCodeProcess(hCheck, &exitCode);
+            CloseHandle(hCheck);
+            processAlive = (!gotExit || exitCode == STILL_ACTIVE);
+        } else {
+            // OpenProcess 失败 — 用 Toolhelp32 验证进程是否存在
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (snap != INVALID_HANDLE_VALUE) {
+                PROCESSENTRY32W pe = {};
+                pe.dwSize = sizeof(pe);
+                if (Process32FirstW(snap, &pe)) {
+                    do {
+                        if (pe.th32ProcessID == m_pwaPid) {
+                            processAlive = true;
+                            break;
+                        }
+                    } while (Process32NextW(snap, &pe));
+                }
+                CloseHandle(snap);
+            }
+        }
+        if (!processAlive) {
+            // 完美平台进程已退出 — 标记 inactive, 不再 patch
+            StateLog("PVP", "MaintainSkip", "pid=%u exited", m_pwaPid);
+            m_active = false;
+            m_patchedCount = 0;
+            for (int i = 0; i < 4; i++) m_funcs[i].patched = false;
+            return false;
+        }
+    }
+
     // 检测 PvpAlive.dll 是否重载 (基址变化)
     uintptr_t curBase = FindPvpAliveBase(m_pwaPid, m_pwaCR3);
     if (curBase == m_pvpAliveBase) {
