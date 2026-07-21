@@ -1,0 +1,8 @@
+=== MinifilterNeutralizer 状态 ===
+
+=== PAC 状态 ===
+[12:17:04.458] B552:SHV:skip (PAC not installed)
+[12:17:04.460] OK: BYOVD driver=1 ob=0 proc=0 img=0 thread=0 pac=0
+
+=== BYOVD 启动状态 ===
+[12:17:04.460] OK: BYOVD driver=1 ob=0 proc=0 img=0 thread=0 pac=0

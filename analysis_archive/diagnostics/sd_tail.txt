@@ -1,0 +1,31 @@
+last session from line 41657, total 71544 lines
+=== last 30 lines ===
+timer OK
+set OK
+wait OK
+DA+ pre
+DA+ post
+[12:26:05.981] B238:EK:exit (normal)
+[12:26:05.983] B238:SS:post
+[12:26:05.984] B558:MP:cur b0=0x90 b1=0x90 (patAddr=0x7FFFF9B52629)
+[12:26:05.987] STATE:PVP:InstallStart 
+[12:26:06.007] STATE:PVP:InstallStep step=pid ok=34080
+[12:26:06.008] STATE:PVP:EO_Cached pidOff=0x1D0 linksOff=0x1D8
+[12:26:06.010] STATE:PVP:FE_Fail step=ResolveExport ntBase=0xFFFFF80690C00000
+[12:26:06.013] STATE:PVP:CR3Fail step=FindEPROC pid=34080
+[12:26:06.014] STATE:PVP:InstallFail step=GetCR3 pid=34080
+[12:26:06.015] B289:PVP:Install FAIL (attempts=102 active=0 patched=0 base=0x0 pid=34080)
+[12:26:06.018] B257:HB:fc=2322 cs2=1 act=0 iat=0 inl=0 pvp=0x0 ff=0x0 nf=0x0 pat=1 rev=0 pa=0x7FFFF9B52629
+[12:26:06.029] B238:SS:pre ms=98 dr0=0 eg=0
+[12:26:06.031] B241:EK:self ekkoSleep=0x21E4FB77CB0 ekkoPage=0x21E4FB75000 inEkko0=0 inEkko1=0 inEkko2=1
+[12:26:06.033] B239:EK:addr ekkoPage=0x21E4FB75000 diagLog=0x21E4FB75650 marker=0x21E4FB75640 encA=0x21E4FB75000 decA=0x21E4FB75000 xorC=0x21E4FB75000 diagInEkko=1 markerInEkko=1
+[12:26:06.034] B243:EK:this this=0x21E4FBD7340 m_regions=0x21E4FBD7340 m_regionCount=11 thisPage=0x21E4FBD7000 objInEkko=0 objInEncA=0 objInDecA=0
+[12:26:06.036] B238:EK:enter ms=98 regions=11
+[12:26:06.037] B238:EK:EA+ pre
+EA enter
+EA g1
+EA g2
+EA r0
+EA r0
+EA r0
+EA r0

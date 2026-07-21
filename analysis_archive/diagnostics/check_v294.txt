@@ -1,0 +1,3 @@
+v3.294 NOT found in sd.log -- user is still running v3.293
+Last loader version: LOADER v3.292 START (BUILD 567: IAT RVA fix + SelfDelete removed + EnableAll BSOD diag) ===
+v3.292 found in loader_diag.log

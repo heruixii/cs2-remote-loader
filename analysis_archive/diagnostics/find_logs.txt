@@ -1,0 +1,4 @@
+C:\Users\29066\AppData\Local\Temp\sd_decoded.txt  size=100788  mtime=2026-07-21 01:41:03.576649
+C:\Users\29066\AppData\Local\Temp\loader_stderr.txt  size=0  mtime=2026-07-15 18:30:07.740672
+C:\Users\29066\AppData\Local\Temp\loader_stdout.txt  size=0  mtime=2026-07-15 18:30:07.739666
+C:\Users\29066\AppData\Local\Temp\loader_strings.txt  size=37010  mtime=2026-07-19 10:21:48.068849
