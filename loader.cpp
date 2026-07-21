@@ -694,27 +694,28 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     //   怀疑: loader MinimalManualMap IAT 解析失败, IAT[DisableThreadLibraryCalls]=0
     //         → DllMain @ 0x9aa0 第一个 IAT 调用 (0x9ad8: call *IAT[0x82778]) 立即崩溃
     //   验证: 读取 4 个关键 IAT 条目 (RVA 来自 objdump -p payload.dll)
-    //     0x826f0 = AddVectoredExceptionHandler (KERNEL32.dll)
-    //     0x82778 = DisableThreadLibraryCalls (KERNEL32.dll) ← DllMain 第一个 IAT 调用
-    //     0x82988 = Sleep (KERNEL32.dll)
-    //     0x829f8 = VirtualQuery (KERNEL32.dll)
+    // ★ BUILD 567 v3.290: IAT RVA 已更新 (payload.dll 重新编译后偏移变化)
+    //     0x8a720 = AddVectoredExceptionHandler (KERNEL32.dll)
+    //     0x8a7b0 = DisableThreadLibraryCalls (KERNEL32.dll) ← DllMain 第一个 IAT 调用
+    //     0x8a9e8 = Sleep (KERNEL32.dll)
+    //     0x8aa58 = VirtualQuery (KERNEL32.dll)
     //   注意: RVA 硬编码, 重新编译 payload.dll 后需用 objdump -p 更新
     {
         auto* base = mapResult.imageBase;
-        uintptr_t iatVEH   = *reinterpret_cast<uintptr_t*>(base + 0x826f0);
-        uintptr_t iatDTLC  = *reinterpret_cast<uintptr_t*>(base + 0x82778);
-        uintptr_t iatSleep = *reinterpret_cast<uintptr_t*>(base + 0x82988);
-        uintptr_t iatVQ    = *reinterpret_cast<uintptr_t*>(base + 0x829f8);
-        LoaderDiag("STEP6.5: IAT verify: VEH@0x826f0=0x%llX DTLC@0x82778=0x%llX Sleep@0x82988=0x%llX VQ@0x829f8=0x%llX\n",
+        uintptr_t iatVEH   = *reinterpret_cast<uintptr_t*>(base + 0x8a720);
+        uintptr_t iatDTLC  = *reinterpret_cast<uintptr_t*>(base + 0x8a7b0);
+        uintptr_t iatSleep = *reinterpret_cast<uintptr_t*>(base + 0x8a9e8);
+        uintptr_t iatVQ    = *reinterpret_cast<uintptr_t*>(base + 0x8aa58);
+        LoaderDiag("STEP6.5: IAT verify: VEH@0x8a720=0x%llX DTLC@0x8a7b0=0x%llX Sleep@0x8a9e8=0x%llX VQ@0x8aa58=0x%llX\n",
             (unsigned long long)iatVEH, (unsigned long long)iatDTLC,
             (unsigned long long)iatSleep, (unsigned long long)iatVQ);
         if (iatVEH == 0 || iatDTLC == 0 || iatSleep == 0 || iatVQ == 0) {
             LoaderDiag("STEP6.5: *** WARNING *** IAT has NULL entries! DllMain will crash at first IAT call.\n");
             // 输出前 16 个 IAT 条目用于诊断
             for (int i = 0; i < 16; i++) {
-                uintptr_t val = *reinterpret_cast<uintptr_t*>(base + 0x826f0 + i * 8);
+                uintptr_t val = *reinterpret_cast<uintptr_t*>(base + 0x8a720 + i * 8);
                 LoaderDiag("  IAT[0x%llX] = 0x%llX\n",
-                    (unsigned long long)(0x826f0 + i * 8),
+                    (unsigned long long)(0x8a720 + i * 8),
                     (unsigned long long)val);
             }
         }
