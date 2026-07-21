@@ -1,7 +1,0 @@
-找到 4 个日志文件
-
-=== D:\技术研发\sd_dump.txt (4 matches) ===
-  [12:17:04.458] B552:SHV:skip (PAC not installed)
-  [12:17:04.460] OK: BYOVD driver=1 ob=0 proc=0 img=0 thread=0 pac=0
-  [12:17:05.480] STATE:CB:REAPPLIED tick=1116171
-  [12:17:42.273] STATE:CB:REAPPLIED tick=1152953
