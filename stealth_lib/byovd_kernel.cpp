@@ -7190,8 +7190,17 @@ static void FillPacPatterns(wchar_t patterns[8][32], const wchar_t* patternPtrs[
     STEALTH_WSTR_DECRYPT_TO("perfectworldac", patterns[3], 32);   // 完整名称
     STEALTH_WSTR_DECRYPT_TO("perfectworld", patterns[4], 32);     // 完美世界
     STEALTH_WSTR_DECRYPT_TO("pwanti", patterns[5], 32);           // PerfectWorld Anti-*
-    // patterns[6], patterns[7] 保持全零 (作为终止符缓冲)
-    for (int i = 0; i < 8; i++) patternPtrs[i] = patterns[i];
+    // ★ v3.296 FIX-20: patterns[6], patterns[7] 保持全零 (空字符串)
+    //   BUG: 旧代码 `for (int i = 0; i < 8; i++) patternPtrs[i] = patterns[i]`
+    //        把 patternPtrs[6/7] 设为指向空字符串 (不是 nullptr).
+    //        IsPacPattern 的子串匹配: while(*a && *b && ...) 不执行 (因为 *b==0),
+    //        if (!*b) -> true -> 空模式匹配任何名称!
+    //        导致 IsPacPattern("MicrosoftMalwareProtectionAsyncPortWD") 返回 true,
+    //        代码错误地把 Defender filter 当作 PAC filter, 修改其回调指针 -> BSOD.
+    //   修复: 只设置前 6 个 patternPtrs, patternPtrs[6] = nullptr 终止循环.
+    for (int i = 0; i < 6; i++) patternPtrs[i] = patterns[i];
+    patternPtrs[6] = nullptr;  // 终止符
+    patternPtrs[7] = nullptr;
     patternPtrs[8] = nullptr;
 }
 
