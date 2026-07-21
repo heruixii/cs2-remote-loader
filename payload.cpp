@@ -787,7 +787,7 @@ static void LogStartSummary() {
     g_logStats.lastSummaryTick = g_logStats.startTick;
 
     DiagLog("============================================\n");
-    DiagLog("BUILD 567 v3.288 启动摘要 (直接 TerminateProcess — 不依赖外部 taskkill, 避免子进程失败)\n");
+    DiagLog("BUILD 567 v3.289 启动摘要 (PvpAlivePatcher — 内核跨进程 patch PacNova::Is*Hack 函数)\n");
 
     // Windows 版本 (RtlGetVersion, 不被 deprecated)
     OSVERSIONINFOEXW osvi = {};
@@ -3729,6 +3729,10 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
                     //         蓝屏发生在 taskkill 失败 + 关机时 (系统清理 loader 触发 driver 缓存失效).
                     DiagLog("B588:EXIT:Sleep 2000ms (wait CS2 async cleanup)\n");
                     Sleep(2000);  // ★ v3.288: 等待 CS2 退出异步清理完成
+                    // ★ BUILD 567 v3.289: 恢复 PvpAlive.dll 原始字节 (需 driver 还活着)
+                    if (!g_egTestMode && !g_halfTestMode) {
+                        stealth::PvpAlivePatcher::Instance().Uninstall();
+                    }
                     stealth::KernelDefense::DisableAll();  // ★ v3.279: DisableAll (UnhideAll + kma.Shutdown)
                     // ★ v3.288: DisableAll 后立即 TerminateProcess, 不再依赖外部 taskkill
                     //   Sleep 100ms 确保 DisableAll 的 DiagLog 写入完成
@@ -4002,6 +4006,31 @@ static DWORD CheatMainLoop(HMODULE dllBase, SIZE_T dllSize) {
             DiagLog("B238:NR:M+ pre\n");
             stealth::NtReadHooker::Instance().Maintain();
             DiagLog("B238:NR:M+ post\n");
+        }
+
+        // ★ BUILD 567 v3.289: PvpAlivePatcher — 内核跨进程 patch PvpAlive.dll 的 PacNova::Is*Hack 函数
+        //   目标: patch 完美平台进程中的 PvpAlive.dll, 使 4 个检测函数返回 0
+        //   原理: BYOVD driver 物理内存 R/W, 完全绕过 PAC 用户态 hook
+        //   周期: 5s 间隔 (与 NtReadHooker 同), 检测 PvpAlive 重载自动重新 patch
+        //   仅在非测试模式时执行 (测试模式无 BYOVD driver)
+        if (!g_egTestMode && !g_halfTestMode) {
+            static DWORD lastPvpPatch = 0;
+            if (GetTickCount() - lastPvpPatch > 5000) {
+                lastPvpPatch = GetTickCount();
+                auto& pvp = stealth::PvpAlivePatcher::Instance();
+                if (!pvp.IsActive()) {
+                    // 尝试安装 (完美平台可能刚启动或 PvpAlive 刚加载)
+                    if (pvp.Install()) {
+                        DiagLog("B289:PVP:Install OK (patched=%d/4 base=0x%llX pid=%u)\n",
+                            pvp.GetPatchedCount(),
+                            (unsigned long long)pvp.GetPvpAliveBase(),
+                            pvp.GetPwaPid());
+                    }
+                } else {
+                    // 维护 (检测 PvpAlive 重载)
+                    pvp.Maintain();
+                }
+            }
         }
 
         // ★ BUILD 567 v3.257 DIAG: 主循环心跳 — 5s 间隔

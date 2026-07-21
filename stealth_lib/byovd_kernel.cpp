@@ -9987,4 +9987,443 @@ bool NtReadHooker::Maintain() {
     return true;  // hook 仍活跃
 }
 
+// ============================================================
+// ★ BUILD 567 v3.289: PvpAlivePatcher 实现
+// ============================================================
+
+// 4 个函数的 patch 数据 (基于 PvpAlive_dumped.dll 逆向分析)
+namespace {
+    struct PacNovaFuncInfo {
+        const char* name;
+        uintptr_t rva;
+        const uint8_t* sig;     // 特征字节 (32B)
+        size_t sigLen;
+        const uint8_t* patch;   // patch 字节
+        size_t patchLen;
+    };
+
+    // 特征字节 (32 字节)
+    const uint8_t g_sigGetIsXrayOpen[] = {
+        0x55,0x8B,0xEC,0x6A,0xFF,0x68,0xED,0x7A,0xCC,0x5B,0x64,0xA1,0x00,0x00,0x00,0x00,
+        0x50,0x83,0xEC,0x10,0xA1,0xD4,0xF8,0xE0,0x5B,0x33,0xC5,0x89,0x45,0xF0,0x50,0x8D
+    };
+    const uint8_t g_sigIsWallTransparentHack[] = {
+        0x55,0x8B,0xEC,0x6A,0xFF,0x68,0xE5,0x5C,0xCD,0x5B,0x64,0xA1,0x00,0x00,0x00,0x00,
+        0x50,0x83,0xEC,0x1C,0xA1,0xD4,0xF8,0xE0,0x5B,0x33,0xC5,0x89,0x45,0xF0,0x50,0x8D
+    };
+    const uint8_t g_sigIsWallMaterialHack[] = {
+        0x55,0x8B,0xEC,0x6A,0xFF,0x68,0x87,0x33,0xCD,0x5B,0x64,0xA1,0x00,0x00,0x00,0x00,
+        0x50,0x51,0x81,0xEC,0x00,0x0A,0x00,0x00,0xA1,0xD4,0xF8,0xE0,0x5B,0x33,0xC5,0x89
+    };
+    const uint8_t g_sigIsNameHack[] = {
+        0x55,0x8B,0xEC,0x6A,0xFF,0x68,0x71,0x18,0xCD,0x5B,0x64,0xA1,0x00,0x00,0x00,0x00,
+        0x50,0x81,0xEC,0x54,0x02,0x00,0x00,0xA1,0xD4,0xF8,0xE0,0x5B,0x33,0xC5,0x89,0x45
+    };
+
+    // patch 字节
+    const uint8_t g_patchRet[]      = { 0x31, 0xC0, 0xC3 };           // xor eax,eax; ret
+    const uint8_t g_patchRet0C[]    = { 0x31, 0xC0, 0xC2, 0x0C, 0x00 }; // xor eax,eax; ret 0xc
+
+    const PacNovaFuncInfo g_funcs[] = {
+        { "GetIsXrayOpen",         0x00198D40, g_sigGetIsXrayOpen,        32, g_patchRet,   3 },
+        { "IsWallTransparentHack", 0x0017B0E0, g_sigIsWallTransparentHack, 32, g_patchRet,   3 },
+        { "IsWallMaterialHack",    0x001669E0, g_sigIsWallMaterialHack,    32, g_patchRet,   3 },
+        { "IsNameHack",            0x001591C0, g_sigIsNameHack,            32, g_patchRet0C, 5 },
+    };
+}
+
+// --- FindPerfectWorldPid ---
+// 枚举进程, 查找 "完美世界竞技平台.exe"
+// 用 Toolhelp32 (用户态 API), 不需要内核 driver
+// ★ 注意: STEALTH_WSTR_DECRYPT_TO 只支持 ASCII, 中文进程名用明文 (低风险, 进程名本身不是敏感信息)
+DWORD PvpAlivePatcher::FindPerfectWorldPid() {
+    const wchar_t* pwaName = L"完美世界竞技平台.exe";
+
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+
+    PROCESSENTRY32W pe = {};
+    pe.dwSize = sizeof(pe);
+    DWORD pid = 0;
+
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, pwaName) == 0) {
+                pid = pe.th32ProcessID;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+
+    CloseHandle(snap);
+    return pid;
+}
+
+// --- GetProcessCR3 ---
+// 获取目标进程的 CR3 (DirectoryBase)
+// 通过 EPROCESS 读取, 偏移运行时扫描
+uint64_t PvpAlivePatcher::GetProcessCR3(DWORD pid) {
+    if (!pid) return 0;
+
+    // 获取 BYOVD driver 和 EPROCESS
+    KernelMemoryAccessor& kma = KernelMemoryAccessor::Instance();
+    uint64_t ntBase = kma.GetNtoskrnlBase();
+    if (!ntBase) return 0;
+
+    // 确保 DKOM 偏移已解析 (pidOffset, linksOffset)
+    auto& dkom = DKOMProcessHider::Instance();
+    if (!dkom.EnsureOffsetsResolved(kma, ntBase)) {
+        ByovdDiag("PVP.CR3: FAIL EnsureOffsetsResolved\n");
+        return 0;
+    }
+
+    // 查找目标进程 EPROCESS
+    uint64_t eproc = dkom.FindEPROCESSByPid(kma, pid);
+    if (!eproc) {
+        ByovdDiag("PVP.CR3: FAIL FindEPROCESSByPid (pid=%u)\n", pid);
+        return 0;
+    }
+
+    // ★ 扫描 EPROCESS 找 DirectoryBase (CR3)
+    //   Windows 10/11: EPROCESS.DirectoryBase 通常在 0x28 (Win10) 或 0x1010 (新版本)
+    //   特征: 值是物理地址 (低 12 位通常为 0, 且 < 16GB)
+    //   验证: 用该 CR3 翻译 EPROCESS 自身 VA, 应该能成功
+    //
+    // 扫描策略:
+    //   1. 先试常见偏移 (0x28, 0x1010)
+    //   2. 如果失败, 扫描 0x0-0x1800 范围, 找符合 CR3 特征的值
+
+    const uint32_t commonOffsets[] = { 0x28, 0x1010, 0x110, 0x140 };
+    for (uint32_t off : commonOffsets) {
+        uint64_t val = kma.ReadUnsafe<uint64_t>(eproc + off);
+        // CR3 特征: 低 12 位为 0 (页对齐), 且 < 16GB (0x400000000)
+        if ((val & 0xFFF) == 0 && val >= 0x10000 && val < 0x400000000ULL) {
+            // 验证: 用该 CR3 翻译 EPROCESS 自身 VA
+            PageTableWalker walker(val, kma);
+            uint64_t pa = walker.VaToPa(eproc);
+            if (pa != 0) {
+                ByovdDiag("PVP.CR3: OK pid=%u EPROC=0x%llX CR3=0x%llX (offset=0x%X)\n",
+                    pid, (unsigned long long)eproc, (unsigned long long)val, off);
+                return val;
+            }
+        }
+    }
+
+    // 扫描 0x0-0x1800 范围
+    ByovdDiag("PVP.CR3: common offsets failed, scanning 0x0-0x1800...\n");
+    for (uint32_t off = 0x0; off < 0x1800; off += 8) {
+        uint64_t val = kma.ReadUnsafe<uint64_t>(eproc + off);
+        if ((val & 0xFFF) == 0 && val >= 0x10000 && val < 0x400000000ULL) {
+            PageTableWalker walker(val, kma);
+            uint64_t pa = walker.VaToPa(eproc);
+            if (pa != 0) {
+                ByovdDiag("PVP.CR3: OK (scan) pid=%u EPROC=0x%llX CR3=0x%llX (offset=0x%X)\n",
+                    pid, (unsigned long long)eproc, (unsigned long long)val, off);
+                return val;
+            }
+        }
+    }
+
+    ByovdDiag("PVP.CR3: FAIL no valid CR3 found in EPROCESS (pid=%u EPROC=0x%llX)\n",
+        pid, (unsigned long long)eproc);
+    return 0;
+}
+
+// --- FindPvpAliveBase ---
+// 在目标进程内查找 PvpAlive.dll 基址
+// 通过 PEB.Ldr 枚举模块 (用目标进程 CR3 翻译 PEB VA)
+uintptr_t PvpAlivePatcher::FindPvpAliveBase(DWORD pid, uint64_t cr3) {
+    if (!pid || !cr3) return 0;
+
+    KernelMemoryAccessor& kma = KernelMemoryAccessor::Instance();
+    uint64_t ntBase = kma.GetNtoskrnlBase();
+    if (!ntBase) return 0;
+
+    auto& dkom = DKOMProcessHider::Instance();
+    uint64_t eproc = dkom.FindEPROCESSByPid(kma, pid);
+    if (!eproc) return 0;
+
+    // ★ 读取 EPROCESS.PEB (偏移因版本不同, 扫描)
+    //   PEB 是用户态地址 (0x00000000-0x00007FFFFFFF)
+    //   EPROCESS.PEB 偏移通常在 0x3F8-0x550 范围
+    uint64_t pebVA = 0;
+    for (uint32_t off = 0x300; off < 0x600; off += 8) {
+        uint64_t val = kma.ReadUnsafe<uint64_t>(eproc + off);
+        // PEB 是用户态地址, 且通常 < 0x10000000000 (64-bit user space)
+        if (val >= 0x10000 && val < 0x10000000000ULL && (val & 0xFFF) == 0) {
+            pebVA = val;
+            break;
+        }
+    }
+    if (!pebVA) {
+        ByovdDiag("PVP.FindBase: FAIL PEB not found in EPROCESS (pid=%u)\n", pid);
+        return 0;
+    }
+
+    // ★ 用目标进程 CR3 翻译 PEB VA → PA
+    PageTableWalker walker(cr3, kma);
+    uint64_t pebPA = walker.VaToPa(pebVA);
+    if (!pebPA) {
+        ByovdDiag("PVP.FindBase: FAIL PEB VA→PA translation (PEB=0x%llX)\n",
+            (unsigned long long)pebVA);
+        return 0;
+    }
+
+    // PEB.Ldr (PEB 偏移 0x18, 64-bit)
+    uint64_t ldrVA = 0;
+    kma.ReadPhysical(pebPA + 0x18, &ldrVA, sizeof(ldrVA));
+    if (!ldrVA) {
+        ByovdDiag("PVP.FindBase: FAIL PEB.Ldr=0\n");
+        return 0;
+    }
+
+    // PEB_LDR_DATA.InLoadOrderModuleList (偏移 0x10, 64-bit)
+    // Flink 指向第一个 LDR_DATA_TABLE_ENTRY.InLoadOrderLinks
+    uint64_t ldrPA = walker.VaToPa(ldrVA);
+    if (!ldrPA) return 0;
+
+    uint64_t flinkVA = 0;
+    kma.ReadPhysical(ldrPA + 0x10, &flinkVA, sizeof(flinkVA));
+    if (!flinkVA) return 0;
+
+    // ★ 加密 "PvpAlive.dll" 用于比较 (ASCII, 可用 STEALTH_WSTR_DECRYPT_TO)
+    wchar_t pvpAliveW[32] = {};
+    STEALTH_WSTR_DECRYPT_TO("PvpAlive.dll", pvpAliveW, (int)(sizeof(pvpAliveW) / sizeof(wchar_t)));
+
+    // 遍历 InLoadOrderModuleList (最多 512 个模块)
+    uint64_t current = flinkVA;
+    uintptr_t result = 0;
+    for (int i = 0; i < 512 && current; i++) {
+        uint64_t currentPA = walker.VaToPa(current);
+        if (!currentPA) break;
+
+        // LDR_DATA_TABLE_ENTRY (64-bit) 布局:
+        //   +0x00: InLoadOrderLinks (LIST_ENTRY, 16 bytes)
+        //   +0x10: InMemoryOrderLinks (LIST_ENTRY, 16 bytes)
+        //   +0x20: InInitializationOrderLinks (LIST_ENTRY, 16 bytes)
+        //   +0x30: DllBase (void*)
+        //   +0x38: EntryPoint (void*)
+        //   +0x40: SizeOfImage (ULONG)
+        //   +0x48: FullDllName (UNICODE_STRING, 16 bytes: Len, MaxLen, Buf)
+        //   +0x58: BaseDllName (UNICODE_STRING, 16 bytes: Len, MaxLen, Buf)
+
+        uint64_t dllBase = 0;
+        kma.ReadPhysical(currentPA + 0x30, &dllBase, sizeof(dllBase));
+        if (!dllBase) {
+            // 移动到下一个
+            kma.ReadPhysical(currentPA, &current, sizeof(current));
+            continue;
+        }
+
+        // 读取 BaseDllName (UNICODE_STRING)
+        uint16_t nameLen = 0;
+        uint64_t nameBuf = 0;
+        kma.ReadPhysical(currentPA + 0x58, &nameLen, sizeof(nameLen));
+        kma.ReadPhysical(currentPA + 0x60, &nameBuf, sizeof(nameBuf));
+
+        if (nameLen > 0 && nameLen < 512 && nameBuf) {
+            uint64_t namePA = walker.VaToPa(nameBuf);
+            if (namePA) {
+                wchar_t nameBufW[128] = {};
+                size_t readChars = nameLen / sizeof(wchar_t);
+                if (readChars > 127) readChars = 127;
+                kma.ReadPhysical(namePA, nameBufW, readChars * sizeof(wchar_t));
+                nameBufW[readChars] = 0;
+
+                if (_wcsicmp(nameBufW, pvpAliveW) == 0) {
+                    result = (uintptr_t)dllBase;
+                    ByovdDiag("PVP.FindBase: OK PvpAlive.dll base=0x%llX (pid=%u)\n",
+                        (unsigned long long)dllBase, pid);
+                    break;
+                }
+            }
+        }
+
+        // 移动到下一个 (InLoadOrderLinks.Flink)
+        kma.ReadPhysical(currentPA, &current, sizeof(current));
+    }
+
+    SecureZeroMemory(pvpAliveW, sizeof(pvpAliveW));
+    return result;
+}
+
+// --- PatchFunction ---
+// Patch 单个函数 (特征字节匹配 + 写入 patch)
+bool PvpAlivePatcher::PatchFunction(uint64_t cr3, uintptr_t pvpAliveBase,
+                                     uintptr_t rva, const uint8_t* sig, size_t sigLen,
+                                     const uint8_t* patch, size_t patchLen,
+                                     uint8_t* outOriginal, size_t originalBufSize) {
+    if (!cr3 || !pvpAliveBase || !sig || !patch) return false;
+
+    KernelMemoryAccessor& kma = KernelMemoryAccessor::Instance();
+
+    // 计算函数 VA
+    uint64_t funcVA = pvpAliveBase + rva;
+
+    // 翻译 VA → PA
+    PageTableWalker walker(cr3, kma);
+    uint64_t funcPA = walker.VaToPa(funcVA);
+    if (!funcPA) {
+        ByovdDiag("PVP.Patch: FAIL VA→PA (VA=0x%llX)\n", (unsigned long long)funcVA);
+        return false;
+    }
+
+    // 读取函数入口 64 字节
+    uint8_t entryBuf[64] = {};
+    if (!kma.ReadPhysical(funcPA, entryBuf, sizeof(entryBuf))) {
+        ByovdDiag("PVP.Patch: FAIL ReadPhysical (PA=0x%llX)\n", (unsigned long long)funcPA);
+        return false;
+    }
+
+    // 特征字节匹配 (前 sigLen 字节)
+    if (memcmp(entryBuf, sig, sigLen) != 0) {
+        ByovdDiag("PVP.Patch: FAIL sig mismatch (VA=0x%llX)\n", (unsigned long long)funcVA);
+        return false;
+    }
+
+    // 保存原始字节
+    size_t saveLen = (patchLen < originalBufSize) ? patchLen : originalBufSize;
+    memcpy(outOriginal, entryBuf, saveLen);
+
+    // 写入 patch
+    if (!kma.WritePhysical(funcPA, patch, patchLen)) {
+        ByovdDiag("PVP.Patch: FAIL WritePhysical (PA=0x%llX)\n", (unsigned long long)funcPA);
+        return false;
+    }
+
+    ByovdDiag("PVP.Patch: OK VA=0x%llX PA=0x%llX (%zu bytes)\n",
+        (unsigned long long)funcVA, (unsigned long long)funcPA, patchLen);
+    return true;
+}
+
+// --- Install ---
+bool PvpAlivePatcher::Install() {
+    if (m_active) return true;
+
+    ByovdDiag("PVP.Install: starting...\n");
+
+    // 1. 查找完美平台 PID
+    m_pwaPid = FindPerfectWorldPid();
+    if (!m_pwaPid) {
+        ByovdDiag("PVP.Install: FAIL 完美平台 not found\n");
+        return false;
+    }
+    ByovdDiag("PVP.Install: 完美平台 pid=%u\n", m_pwaPid);
+
+    // 2. 获取 CR3
+    m_pwaCR3 = GetProcessCR3(m_pwaPid);
+    if (!m_pwaCR3) {
+        ByovdDiag("PVP.Install: FAIL GetProcessCR3\n");
+        return false;
+    }
+
+    // 3. 查找 PvpAlive.dll 基址
+    m_pvpAliveBase = FindPvpAliveBase(m_pwaPid, m_pwaCR3);
+    if (!m_pvpAliveBase) {
+        ByovdDiag("PVP.Install: FAIL PvpAlive.dll not found (可能未加载)\n");
+        return false;
+    }
+
+    // 4. Patch 4 个函数
+    m_patchedCount = 0;
+    for (int i = 0; i < 4; i++) {
+        const auto& fi = g_funcs[i];
+        m_funcs[i].rva = fi.rva;
+        m_funcs[i].originalLen = fi.patchLen;
+
+        bool ok = PatchFunction(m_pwaCR3, m_pvpAliveBase,
+                                fi.rva, fi.sig, fi.sigLen,
+                                fi.patch, fi.patchLen,
+                                m_funcs[i].original, sizeof(m_funcs[i].original));
+        if (ok) {
+            m_funcs[i].patched = true;
+            m_patchedCount++;
+            StateLog("PVP", "PatchOK", "func=%s rva=0x%llX",
+                     fi.name, (unsigned long long)fi.rva);
+        } else {
+            m_funcs[i].patched = false;
+            StateLog("PVP", "PatchFail", "func=%s rva=0x%llX",
+                     fi.name, (unsigned long long)fi.rva);
+        }
+    }
+
+    ByovdDiag("PVP.Install: done (%d/4 patched)\n", m_patchedCount);
+    m_active = (m_patchedCount > 0);
+    return m_active;
+}
+
+// --- Uninstall ---
+void PvpAlivePatcher::Uninstall() {
+    if (!m_active || !m_pwaCR3 || !m_pvpAliveBase) {
+        m_active = false;
+        return;
+    }
+
+    KernelMemoryAccessor& kma = KernelMemoryAccessor::Instance();
+
+    for (int i = 0; i < 4; i++) {
+        if (!m_funcs[i].patched) continue;
+
+        uint64_t funcVA = m_pvpAliveBase + m_funcs[i].rva;
+        PageTableWalker walker(m_pwaCR3, kma);
+        uint64_t funcPA = walker.VaToPa(funcVA);
+        if (funcPA) {
+            kma.WritePhysical(funcPA, m_funcs[i].original, m_funcs[i].originalLen);
+            ByovdDiag("PVP.Uninstall: restored VA=0x%llX\n", (unsigned long long)funcVA);
+        }
+        m_funcs[i].patched = false;
+    }
+
+    m_active = false;
+    m_patchedCount = 0;
+    StateLog("PVP", "Uninstall", "OK");
+}
+
+// --- Maintain ---
+bool PvpAlivePatcher::Maintain() {
+    if (!m_active) {
+        // 尝试安装 (完美平台可能刚启动)
+        return Install();
+    }
+
+    // 检测 PvpAlive.dll 是否重载 (基址变化)
+    uintptr_t curBase = FindPvpAliveBase(m_pwaPid, m_pwaCR3);
+    if (curBase == m_pvpAliveBase) {
+        return true;  // 基址未变, patch 仍有效
+    }
+
+    // PvpAlive.dll 重载, 重新 patch
+    ByovdDiag("PVP.Maintain: PvpAlive reloaded (old=0x%llX new=0x%llX), re-patching...\n",
+        (unsigned long long)m_pvpAliveBase, (unsigned long long)curBase);
+
+    // 标记所有函数为未 patch
+    for (int i = 0; i < 4; i++) m_funcs[i].patched = false;
+    m_patchedCount = 0;
+    m_pvpAliveBase = curBase;
+
+    if (!m_pvpAliveBase) {
+        m_active = false;
+        return false;
+    }
+
+    // 重新 patch
+    for (int i = 0; i < 4; i++) {
+        const auto& fi = g_funcs[i];
+        bool ok = PatchFunction(m_pwaCR3, m_pvpAliveBase,
+                                fi.rva, fi.sig, fi.sigLen,
+                                fi.patch, fi.patchLen,
+                                m_funcs[i].original, sizeof(m_funcs[i].original));
+        if (ok) {
+            m_funcs[i].patched = true;
+            m_patchedCount++;
+        }
+    }
+
+    ByovdDiag("PVP.Maintain: re-patch done (%d/4)\n", m_patchedCount);
+    m_active = (m_patchedCount > 0);
+    return m_active;
+}
+
 } // namespace stealth

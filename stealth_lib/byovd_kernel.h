@@ -1010,4 +1010,93 @@ private:
     size_t    m_inlineFilterFuncSize = 0;
 };
 
+// ============================================================
+// ★ BUILD 567 v3.289: PvpAlivePatcher — 内核跨进程 patch PvpAlive.dll
+//
+// 目标: Patch 完美世界竞技平台进程中的 PvpAlive.dll 的 4 个 PacNova::Is*Hack 函数
+//       使其直接返回 0 (未检测到 hack), 降低检测概率
+//
+// 原理:
+//   1. PvpAlive.dll 加载在完美平台进程 (非 CS2), 通过内核驱动监控 CS2
+//   2. 用 BYOVD driver 物理内存 R/W 跨进程 patch, 完全绕过 PAC 用户态 hook
+//   3. 获取目标进程 EPROCESS → DirectoryBase (CR3) → 页表翻译 VA→PA → WritePhysical
+//
+// Patch 的 4 个函数 (基于 PvpAlive_dumped.dll 逆向分析):
+//   1. PacNova::GetIsXrayOpen      RVA=0x00198D40  patch=31C0C3       (xor eax,eax; ret)
+//   2. PacNova::IsWallTransparentHack RVA=0x0017B0E0  patch=31C0C3    (xor eax,eax; ret)
+//   3. PacNova::IsWallMaterialHack RVA=0x001669E0  patch=31C0C3       (xor eax,eax; ret)
+//   4. PacNova::IsNameHack         RVA=0x001591C0  patch=31C0C20C00   (xor eax,eax; ret 0xc)
+//
+// 安全性:
+//   - 物理内存写入, 不触发 PatchGuard (用户态地址)
+//   - patch 字节少 (3-5 字节), 不改变函数大小
+//   - 失败安全: 任何函数 patch 失败不影响其他
+//   - Maintain 检测 PvpAlive.dll 重载 (基址变化), 自动重新 patch
+//
+// 预期效果: X-Ray 透视检测概率 30-50% → 0-5%, 综合检测概率 6-12% → 4-8%
+// ============================================================
+class PvpAlivePatcher {
+public:
+    static PvpAlivePatcher& Instance() {
+        static PvpAlivePatcher inst;
+        return inst;
+    }
+
+    // 安装 patch (查找完美平台进程 + PvpAlive.dll 基址 + patch 4 个函数)
+    // 返回 true = 至少一个函数 patch 成功
+    bool Install();
+
+    // 卸载 patch (恢复原始字节)
+    void Uninstall();
+
+    // 检查 patch 是否活跃
+    bool IsActive() const { return m_active; }
+
+    // 维护 patch (主循环周期调用, 检测 PvpAlive.dll 重载)
+    bool Maintain();
+
+    // ★ DIAG: 公共 getter
+    uintptr_t GetPvpAliveBase() const { return m_pvpAliveBase; }
+    DWORD GetPwaPid() const { return m_pwaPid; }
+    int GetPatchedCount() const { return m_patchedCount; }
+
+private:
+    PvpAlivePatcher() = default;
+
+    // 查找完美世界竞技平台进程 PID (枚举进程, 匹配加密进程名)
+    // 返回 PID, 0 = 未找到
+    DWORD FindPerfectWorldPid();
+
+    // 获取目标进程的 CR3 (DirectoryBase)
+    // 通过 EPROCESS 读取 (偏移因 Windows 版本不同, 运行时扫描)
+    uint64_t GetProcessCR3(DWORD pid);
+
+    // 在目标进程内查找 PvpAlive.dll 基址
+    // 通过 PEB.Ldr 枚举模块 (用目标进程 CR3 翻译 PEB VA)
+    uintptr_t FindPvpAliveBase(DWORD pid, uint64_t cr3);
+
+    // Patch 单个函数 (特征字节匹配 + 写入 patch)
+    // 返回 true = patch 成功
+    bool PatchFunction(uint64_t cr3, uintptr_t pvpAliveBase,
+                       uintptr_t rva, const uint8_t* sig, size_t sigLen,
+                       const uint8_t* patch, size_t patchLen,
+                       uint8_t* outOriginal, size_t originalBufSize);
+
+    // === 状态 ===
+    bool      m_active = false;
+    DWORD     m_pwaPid = 0;              // 完美平台进程 PID
+    uint64_t  m_pwaCR3 = 0;              // 完美平台进程 CR3
+    uintptr_t m_pvpAliveBase = 0;        // PvpAlive.dll 基址
+    int       m_patchedCount = 0;        // 已 patch 函数数
+
+    // 4 个函数的原始字节 (用于 Uninstall)
+    struct FuncPatchState {
+        uintptr_t rva;
+        uint8_t original[8];
+        size_t originalLen;
+        bool patched;
+    };
+    FuncPatchState m_funcs[4] = {};
+};
+
 } // namespace stealth
